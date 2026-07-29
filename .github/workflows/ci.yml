@@ -4,8 +4,10 @@
 # Behavioral job (`compile`): shared local verifier (`npm test`), M002 quality-gate
 # checks, Settings docs + live-evidence ledger verifiers, then `npm run compile`
 # before packaging fast-tier contracts (`test:m022-s02`, `test:m022-s03`,
-# `test:m022-s04`) so the webview bundle assertion sees a real `dist/webview`.
-# S04 validates tracked clean-clone + entrypoint-regression evidence (D069).
+# `test:m022-s04`, `test:m022-s05`) so the webview bundle assertion sees a real
+# `dist/webview`. S04 validates tracked clean-clone + entrypoint-regression
+# evidence (D069). S05 validates tracked install-gate evidence plus listing
+# credibility + human sign-off ledger (D071).
 # Svelte check and the full Playwright webview suite follow on Node 24 LTS.
 #
 # SQLite job (`sqlite-extension-host`): packaged Extension Host matrix across
@@ -15,6 +17,11 @@
 # under xvfb. Always uploads `docs/plans/m022-s01-packaging-gate-evidence.json` so a
 # failed hosted run leaves a machine-readable snapshot (ok, mode, allowlist,
 # entrypoints, activation, bridgePhase).
+#
+# Install job (`packaging-install-gate`): real `code --install-extension` into a
+# disposable extensions-dir under xvfb (M022/S05). Always uploads
+# `docs/plans/m022-s05-install-gate-evidence.json` so a failed hosted run leaves
+# a machine-readable install-origin snapshot.
 #
 # Visual regression (M014) is intentionally not a required CI job for now —
 # goldens need Linux Docker re-authoring after protocol v9; run locally via
@@ -51,6 +58,7 @@ jobs:
       - run: npm run test:m022-s02
       - run: npm run test:m022-s03
       - run: npm run test:m022-s04
+      - run: npm run test:m022-s05
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webview
@@ -102,4 +110,27 @@ jobs:
         with:
           name: packaging-gate-evidence
           path: docs/plans/m022-s01-packaging-gate-evidence.json
+          if-no-files-found: warn
+
+  packaging-install-gate:
+    name: Packaging install gate (real install)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run compile
+      - run: xvfb-run -a npm run test:m022-s05-install
+
+      - name: Upload install-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m022-s05-install-gate-evidence
+          path: docs/plans/m022-s05-install-gate-evidence.json
           if-no-files-found: warn

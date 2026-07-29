@@ -381,6 +381,8 @@
     "test:m022-s05-install": "node scripts/run-m022-s05-install-gate.mjs",
     "test:m022-s05-install-negative": "node scripts/run-m022-s05-install-negative.mjs",
     "test:m022-s05-install-evidence": "node --test scripts/verify-m022-s05-install-evidence.test.mjs",
+    "test:m022-s05-listing": "node --test scripts/packaging-listing-credibility.test.mjs scripts/verify-m022-s05-listing-signoff.test.mjs",
+    "test:m022-s05": "npm run test:m022-s05-install-evidence && npm run test:m022-s05-listing",
     "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",

@@ -53,8 +53,13 @@ Drift between the literal allowlist and the real lockfile production walk is rej
 | `npm run test:m022-s04-clean-clone` | Real clean-clone drill: `git clone` → `npm ci` → documented `npm run package` emits a `.vsix` | multi-minute |
 | `npm run test:m022-s04-clean-clone-evidence` | Bounds the tracked clean-clone package evidence artifact | seconds |
 | `npm run test:m022-s04` | Aggregate S04 evidence contracts (clean-clone + entrypoint-regression) | seconds |
+| `npm run test:m022-s05-install` | Real CLI install into a disposable `--extensions-dir` + activation/bridge/closure from `installedOrigin=extensions-dir` | multi-minute |
+| `npm run test:m022-s05-install-negative` | Fail-closed corrupt-temp-VSIX drill (typed phase, zero tracked mutations) | multi-minute |
+| `npm run test:m022-s05-install-evidence` | Bounds tracked install-gate + negative evidence artifacts | seconds |
+| `npm run test:m022-s05-listing` | Listing credibility machine checks + human sign-off ledger contract | seconds |
+| `npm run test:m022-s05` | Aggregate S05: install evidence + listing credibility + sign-off ledger | seconds |
 
-`--census-only` separates a staging regression from a host regression. It does **not** prove activation, bridge listen, or Extension Host behavior — use `npm run test:packaging` for that.
+`--census-only` separates a staging regression from a host regression. It does **not** prove activation, bridge listen, or Extension Host behavior — use `npm run test:packaging` for that. Real install (not `extensionDevelopmentPath`) is proven only by `npm run test:m022-s05-install`.
 
 ## CI enforcement surface
 
@@ -65,9 +70,17 @@ Drift between the literal allowlist and the real lockfile production walk is rej
 | Fast tier | `compile` | `npm run test:m022-s02` | `allowlist.violations` / dependency-shape diagnostics (seconds) |
 | Fast tier | `compile` | `npm run test:m022-s03` | marketplace metadata contract (icon, categories, CHANGELOG) |
 | Fast tier | `compile` | `npm run test:m022-s04` | tracked S04 evidence contracts (clean-clone + entrypoint-regression; D069 — does not re-run multi-minute drills) |
+| Fast tier | `compile` | `npm run test:m022-s05` | tracked install-gate evidence + listing credibility + sign-off ledger (D071 — does not re-run multi-minute install) |
 | Host tier | `packaging-gate` | `xvfb-run -a npm run test:packaging` | typed phase: `missing-archive-entry`, `require-failed`, `spawn-failed`, `activation`, `health-unreachable` |
+| Install tier | `packaging-install-gate` | `xvfb-run -a npm run test:m022-s05-install` | typed phase: `package-failed`, `install-rejected`, `host-launch-failed`, `activation-failed`, `bridge-unreachable`, `closure-failed`, `origin-not-installed` |
 
 The `packaging-gate` job always uploads `docs/plans/m022-s01-packaging-gate-evidence.json` via `actions/upload-artifact@v4` with `if: always()`, so a failed hosted run leaves a machine-readable snapshot (`ok`, `mode`, counts, allowlist, entrypoints, marketplaceEntries, activation, bridgePhase) instead of only console output.
+
+The `packaging-install-gate` job always uploads `docs/plans/m022-s05-install-gate-evidence.json` with `if: always()`, recording `installedOrigin`, `activation`, bridge port/status, and `bridgeClosure` so a failed hosted install still leaves a typed snapshot rather than only console output.
+
+### Listing credibility (D071)
+
+Objective machine checks live in `scripts/packaging-listing-credibility.mjs` (icon PNG ≥128×128, required README sections, CHANGELOG heading matching `package.json` version). Human judgement is recorded in `docs/uat/m022-s05/marketplace-listing-signoff.md` with per-item verdicts from `{PASS, FAIL, AWAITING-HUMAN}` and a named reviewer field. Autonomous execution records `AWAITING-HUMAN` rather than fabricating a human PASS — the requirement is that the verdict is explicit and gate-enforced, not silently absent. Both surfaces run under `npm run test:m022-s05`.
 
 CI wiring is guarded by `scripts/source-boundary-smoke.mjs` (plus fixture negatives in `scripts/source-boundary-smoke.test.mjs`) so the steps cannot be silently deleted.
 
