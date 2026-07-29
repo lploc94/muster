@@ -3,15 +3,15 @@
   "schemaVersion": 1,
   "ok": true,
   "installExitCode": 0,
-  "installStderrExcerpt": "Installing extensions... Extension 'muster.vsix' was successfully installed. (node:11612) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilitie",
+  "installStderrExcerpt": "Installing extensions... Extension 'muster.vsix' was successfully installed. (node:22264) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilitie",
   "installedOrigin": "extensions-dir",
   "activation": "ok",
   "bridge": {
-    "port": 56515,
+    "port": 60350,
     "status": "ok"
   },
   "bridgeClosure": {
-    "port": 56515,
+    "port": 60350,
     "trace": "present",
     "bridgeClosed": true,
     "postExitProbe": "refused",
@@ -20,6 +20,6 @@
   "vscodeVersion": "1.130.0",
   "platform": "win32",
   "phase": "ok",
-  "generatedAt": "2026-07-29T05:50:12.807Z",
-  "durationMs": 29987
+  "generatedAt": "2026-07-29T06:09:36.037Z",
+  "durationMs": 34686
 }

@@ -234,15 +234,15 @@
   ],
   "activation": "ok",
   "bridge": {
-    "port": 54579,
+    "port": 62267,
     "status": "ok",
     "generation": 1
   },
   "bridgePhase": "ok",
-  "generatedAt": "2026-07-29T05:44:24.814Z",
-  "durationMs": 36925,
+  "generatedAt": "2026-07-29T06:08:44.990Z",
+  "durationMs": 53341,
   "bridgeClosure": {
-    "port": 54579,
+    "port": 62267,
     "trace": "present",
     "bridgeClosed": true,
     "postExitProbe": "refused",
