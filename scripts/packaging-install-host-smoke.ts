@@ -1,0 +1,602 @@
+/**
+ * M022/S05 install Extension Host smoke.
+ *
+ * Sibling of packaging-gate-extension-host-smoke.ts for real CLI installs.
+ * Loaded via @vscode/test-electron as extensionTestsPath against a host where
+ * Muster was installed by the VS Code CLI into a disposable --extensions-dir
+ * (T03 runner). Unlike S01–S04 host smoke, this path must observe the
+ * *installed* extension — not an extensionDevelopmentPath load — and report
+ * the resolved extensionPath so the install gate can classify origin as
+ * extensions-dir vs development-path.
+ *
+ * Proves (same strength as S04, plus origin input):
+ * - tlelabs.muster is discovered and activates from the install tree
+ * - packaged SQLite worker spawns and answers
+ * - packaged mcp-stdio-proxy require graph loads without MODULE_NOT_FOUND
+ * - production MusterBridgeServer listen is observable via muster.uat.bridgeHealth
+ *   and loopback /health returns status ok with port > 0
+ * - deactivate() closes the MCP bridge: redacted deactivate trace + post-close
+ *   probe (connection refused) — never inferred from Extension Host pid exit zero
+ * - every host result includes extensionPath for installedOrigin classification
+ *
+ * Writes a closed host result to MUSTER_PACKAGING_HOST_RESULT_OUT for the runner.
+ */
+
+import * as assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as http from 'node:http';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import * as vscode from 'vscode';
+
+const HOST_SMOKE_KIND = 'm022-s05-install-host-smoke' as const;
+
+type EntrypointPhase = 'ok' | 'missing-archive-entry' | 'require-failed' | 'spawn-failed';
+
+type EntrypointResult = {
+  path: string;
+  present: boolean;
+  resolved: boolean;
+  phase: EntrypointPhase;
+  detail?: string;
+};
+
+type BridgeHealth = {
+  port: number;
+  status: 'ok' | 'stopping' | 'unavailable';
+  generation: number;
+};
+
+type BridgeClosureTracePresence = 'present' | 'missing';
+type BridgeClosurePostExitProbe = 'refused' | 'still-serving' | 'unknown';
+type BridgeClosurePhase =
+  | 'ok'
+  | 'deactivate-failed'
+  | 'trace-missing'
+  | 'not-closed'
+  | 'still-serving'
+  | 'probe-unknown';
+
+/** Typed observation that deactivate closed the MCP bridge (no tokens/paths/env). */
+type BridgeClosure = {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  phase: BridgeClosurePhase;
+};
+
+type InstallHostSmokeResult = {
+  kind: typeof HOST_SMOKE_KIND;
+  ok: boolean;
+  activation: 'ok' | 'failed';
+  /** Resolved install/dev path — required input for classifyInstalledOrigin. */
+  extensionPath: string | null;
+  bridge: BridgeHealth | null;
+  bridgePhase: 'ok' | 'activation' | 'uat-command-unavailable' | 'health-unreachable';
+  bridgeClosure: BridgeClosure | null;
+  entrypoints: EntrypointResult[];
+  detail?: string;
+};
+
+const REQUIRED = {
+  extension: 'extension/dist/src/extension.js',
+  worker: 'extension/dist/src/task/sqlite/worker.js',
+  stdioProxy: 'extension/dist/src/bridge/mcp-stdio-proxy.js',
+} as const;
+
+interface PackagedDbClient {
+  open(dbPath: string, busyTimeoutMs?: number): Promise<void>;
+  pragma(name: string): Promise<number>;
+  close(): Promise<void>;
+}
+
+interface PackagedClientModule {
+  DbClient: new (options: { workerPath: string }) => PackagedDbClient;
+  resolveWorkerPath(dir?: string): string;
+}
+
+function writeResult(result: InstallHostSmokeResult): void {
+  const outPath = process.env.MUSTER_PACKAGING_HOST_RESULT_OUT;
+  if (!outPath) return;
+  const tmp = `${outPath}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(result, null, 2)}\n`);
+  fs.renameSync(tmp, outPath);
+}
+
+function archivePathFor(extensionPath: string, archiveRelative: string): string {
+  const relative = archiveRelative.replace(/^extension\//, '');
+  return path.join(extensionPath, relative);
+}
+
+function presentResult(
+  archiveRelative: string,
+  extensionPath: string,
+): EntrypointResult {
+  const full = archivePathFor(extensionPath, archiveRelative);
+  if (!fs.existsSync(full)) {
+    return {
+      path: archiveRelative,
+      present: false,
+      resolved: false,
+      phase: 'missing-archive-entry',
+      detail: `missing on disk: ${archiveRelative}`,
+    };
+  }
+  return {
+    path: archiveRelative,
+    present: true,
+    resolved: true,
+    phase: 'ok',
+  };
+}
+
+function failEntrypoint(
+  archiveRelative: string,
+  phase: EntrypointPhase,
+  detail: string,
+  present = true,
+): EntrypointResult {
+  return {
+    path: archiveRelative,
+    present,
+    resolved: false,
+    phase,
+    detail,
+  };
+}
+
+async function fetchBridgeHealth(port: number): Promise<BridgeHealth> {
+  const body = await new Promise<string>((resolve, reject) => {
+    const req = http.get(
+      {
+        host: '127.0.0.1',
+        port,
+        path: '/health',
+        timeout: 5_000,
+        headers: { Accept: 'application/json' },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c) => chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)));
+        res.on('end', () => {
+          if ((res.statusCode ?? 0) >= 400) {
+            reject(new Error(`/health HTTP ${res.statusCode}`));
+            return;
+          }
+          resolve(Buffer.concat(chunks).toString('utf8'));
+        });
+      },
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy(new Error('/health request timed out'));
+    });
+  });
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    throw new Error('/health returned non-JSON body');
+  }
+  const obj = (parsed ?? {}) as Record<string, unknown>;
+  const healthPort =
+    typeof obj.port === 'number' && Number.isFinite(obj.port) ? obj.port : port;
+  const generation =
+    typeof obj.generation === 'number' && Number.isFinite(obj.generation)
+      ? obj.generation
+      : 0;
+  const status =
+    obj.status === 'ok' || obj.status === 'stopping' || obj.status === 'unavailable'
+      ? obj.status
+      : healthPort > 0
+        ? 'ok'
+        : 'unavailable';
+  return { port: healthPort, status, generation };
+}
+
+/**
+ * Extension Host entry — invoked by @vscode/test-electron after a real CLI install.
+ */
+export async function run(): Promise<void> {
+  const entrypoints: EntrypointResult[] = [
+    {
+      path: REQUIRED.extension,
+      present: false,
+      resolved: false,
+      phase: 'missing-archive-entry',
+    },
+    {
+      path: REQUIRED.worker,
+      present: false,
+      resolved: false,
+      phase: 'missing-archive-entry',
+    },
+    {
+      path: REQUIRED.stdioProxy,
+      present: false,
+      resolved: false,
+      phase: 'missing-archive-entry',
+    },
+  ];
+
+  // Captured once the installed extension is resolved; included on every result
+  // so the runner can classify installedOrigin (extensions-dir vs development-path).
+  let extensionPath: string | null = null;
+
+  const fail = (
+    partial: Partial<InstallHostSmokeResult> &
+      Pick<InstallHostSmokeResult, 'bridgePhase' | 'activation'>,
+  ): never => {
+    const result: InstallHostSmokeResult = {
+      kind: HOST_SMOKE_KIND,
+      ok: false,
+      activation: partial.activation,
+      extensionPath: partial.extensionPath !== undefined ? partial.extensionPath : extensionPath,
+      bridge: partial.bridge ?? null,
+      bridgePhase: partial.bridgePhase,
+      bridgeClosure: partial.bridgeClosure ?? null,
+      entrypoints: partial.entrypoints ?? entrypoints,
+      ...(partial.detail ? { detail: partial.detail } : {}),
+    };
+    writeResult(result);
+    throw new Error(partial.detail ?? `install host smoke failed (${partial.bridgePhase})`);
+  };
+
+  if (process.env.MUSTER_UAT_MODE !== '1') {
+    fail({
+      activation: 'failed',
+      bridgePhase: 'uat-command-unavailable',
+      detail: 'MUSTER_UAT_MODE=1 is required for install host smoke',
+    });
+  }
+
+  const extension = vscode.extensions.getExtension('tlelabs.muster');
+  if (!extension) {
+    fail({
+      activation: 'failed',
+      bridgePhase: 'activation',
+      detail: 'installed tlelabs.muster was not discovered',
+    });
+    return; // unreachable; keeps control-flow narrowing for tsc
+  }
+
+  extensionPath = extension.extensionPath;
+  entrypoints[0] = presentResult(REQUIRED.extension, extensionPath);
+  entrypoints[1] = presentResult(REQUIRED.worker, extensionPath);
+  entrypoints[2] = presentResult(REQUIRED.stdioProxy, extensionPath);
+
+  // 1) stdio proxy require graph from the install tree (before activation is fine).
+  const stdioProxyPath = archivePathFor(extensionPath, REQUIRED.stdioProxy);
+  if (entrypoints[2].present) {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const mod = require(stdioProxyPath) as {
+        loadProxyEnvConfig?: unknown;
+        MusterStdioMcpProxy?: unknown;
+      };
+      if (
+        typeof mod.loadProxyEnvConfig !== 'function' &&
+        typeof mod.MusterStdioMcpProxy !== 'function'
+      ) {
+        entrypoints[2] = failEntrypoint(
+          REQUIRED.stdioProxy,
+          'require-failed',
+          'stdio proxy module loaded but expected exports missing',
+        );
+      } else {
+        entrypoints[2] = {
+          path: REQUIRED.stdioProxy,
+          present: true,
+          resolved: true,
+          phase: 'ok',
+        };
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      entrypoints[2] = failEntrypoint(
+        REQUIRED.stdioProxy,
+        'require-failed',
+        message.slice(0, 400),
+      );
+    }
+  }
+
+  // 2) Activate installed extension (production listen() path for the MCP bridge).
+  try {
+    await extension.activate();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    entrypoints[0] = failEntrypoint(REQUIRED.extension, 'require-failed', message.slice(0, 400));
+    fail({
+      activation: 'failed',
+      bridgePhase: 'activation',
+      entrypoints,
+      extensionPath,
+      detail: `activation failed: ${message.slice(0, 400)}`,
+    });
+  }
+
+  if (!extension.isActive) {
+    entrypoints[0] = failEntrypoint(
+      REQUIRED.extension,
+      'require-failed',
+      'extension.isActive !== true after activate()',
+    );
+    fail({
+      activation: 'failed',
+      bridgePhase: 'activation',
+      entrypoints,
+      extensionPath,
+      detail: 'installed extension did not activate',
+    });
+  }
+
+  entrypoints[0] = {
+    path: REQUIRED.extension,
+    present: true,
+    resolved: true,
+    phase: 'ok',
+  };
+
+  // 3) Packaged SQLite worker spawn + answer from the install tree.
+  const sqliteDir = path.join(extensionPath, 'dist', 'src', 'task', 'sqlite');
+  const clientPath = path.join(sqliteDir, 'client.js');
+  const workerPath = path.join(sqliteDir, 'worker.js');
+  if (!fs.existsSync(clientPath) || !fs.existsSync(workerPath)) {
+    entrypoints[1] = failEntrypoint(
+      REQUIRED.worker,
+      'missing-archive-entry',
+      'installed SQLite client/worker missing',
+      false,
+    );
+    fail({
+      activation: 'ok',
+      bridgePhase: 'health-unreachable',
+      entrypoints,
+      extensionPath,
+      detail: 'installed SQLite client/worker missing',
+    });
+  }
+
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-install-host-sqlite-'));
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const packaged = require(clientPath) as PackagedClientModule;
+    assert.equal(packaged.resolveWorkerPath(sqliteDir), workerPath);
+    const client = new packaged.DbClient({ workerPath });
+    const dbPath = path.join(tempDir, 'muster.sqlite3');
+    await client.open(dbPath);
+    assert.equal(await client.pragma('application_id'), 0x4d555354);
+    await client.close();
+    entrypoints[1] = {
+      path: REQUIRED.worker,
+      present: true,
+      resolved: true,
+      phase: 'ok',
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    entrypoints[1] = failEntrypoint(
+      REQUIRED.worker,
+      'spawn-failed',
+      message.slice(0, 400),
+    );
+    fail({
+      activation: 'ok',
+      bridgePhase: 'health-unreachable',
+      entrypoints,
+      extensionPath,
+      detail: `sqlite worker spawn failed: ${message.slice(0, 400)}`,
+    });
+  } finally {
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  }
+
+  // 4) Redacted bridge health via UAT command + loopback /health confirmation.
+  let uatHealthRaw: unknown;
+  try {
+    uatHealthRaw = await vscode.commands.executeCommand('muster.uat.bridgeHealth');
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    fail({
+      activation: 'ok',
+      bridge: null,
+      bridgePhase: 'uat-command-unavailable',
+      entrypoints,
+      extensionPath,
+      detail: `muster.uat.bridgeHealth unavailable: ${message.slice(0, 400)}`,
+    });
+    return;
+  }
+
+  const uatHealthObj = (uatHealthRaw ?? {}) as Partial<BridgeHealth>;
+  const uatPort =
+    typeof uatHealthObj.port === 'number' && Number.isFinite(uatHealthObj.port)
+      ? uatHealthObj.port
+      : 0;
+  const uatGeneration =
+    typeof uatHealthObj.generation === 'number' && Number.isFinite(uatHealthObj.generation)
+      ? uatHealthObj.generation
+      : 0;
+  const uatStatus: BridgeHealth['status'] =
+    uatHealthObj.status === 'ok' ||
+    uatHealthObj.status === 'stopping' ||
+    uatHealthObj.status === 'unavailable'
+      ? uatHealthObj.status
+      : uatPort > 0
+        ? 'ok'
+        : 'unavailable';
+  const uatHealth: BridgeHealth = {
+    port: uatPort,
+    status: uatStatus,
+    generation: uatGeneration,
+  };
+
+  if (uatHealth.port <= 0 || uatHealth.status !== 'ok') {
+    fail({
+      activation: 'ok',
+      bridge: uatHealth,
+      bridgePhase: 'health-unreachable',
+      entrypoints,
+      extensionPath,
+      detail: 'bridgeHealth did not report a listening port with status ok',
+    });
+    return;
+  }
+
+  let httpHealth: BridgeHealth;
+  try {
+    httpHealth = await fetchBridgeHealth(uatHealth.port);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    fail({
+      activation: 'ok',
+      bridge: {
+        port: uatHealth.port,
+        status: 'unavailable',
+        generation: uatHealth.generation,
+      },
+      bridgePhase: 'health-unreachable',
+      entrypoints,
+      extensionPath,
+      detail: `/health unreachable: ${message.slice(0, 400)}`,
+    });
+    return;
+  }
+
+  if (httpHealth.status !== 'ok' || httpHealth.port <= 0) {
+    fail({
+      activation: 'ok',
+      bridge: httpHealth,
+      bridgePhase: 'health-unreachable',
+      entrypoints,
+      extensionPath,
+      detail: '/health did not return status ok with port > 0',
+    });
+    return;
+  }
+
+  // Prefer UAT redacted payload fields (port/status/generation only).
+  const bridge: BridgeHealth = {
+    port: uatHealth.port,
+    status: 'ok',
+    generation: uatHealth.generation || httpHealth.generation,
+  };
+
+  if (entrypoints.some((r) => !r.present || !r.resolved || r.phase !== 'ok')) {
+    fail({
+      activation: 'ok',
+      bridge,
+      bridgePhase: 'ok',
+      entrypoints,
+      extensionPath,
+      detail: 'one or more entrypoints failed require/spawn checks',
+    });
+  }
+
+  // 5) Assert deactivate() actually closed the bridge (S04 proof, not pid-exit).
+  let deactivateFailed = false;
+  let deactivateDetail: string | undefined;
+  let deactivateTraceRaw: unknown;
+  try {
+    deactivateTraceRaw = await vscode.commands.executeCommand('muster.uat.runDeactivate');
+  } catch (err) {
+    deactivateFailed = true;
+    deactivateDetail = err instanceof Error ? err.message : String(err);
+  }
+
+  let tracePresence: BridgeClosureTracePresence = 'missing';
+  let bridgeClosed = false;
+  let tracePort = bridge.port;
+  if (
+    !deactivateFailed &&
+    deactivateTraceRaw &&
+    typeof deactivateTraceRaw === 'object' &&
+    'bridgeClosed' in (deactivateTraceRaw as object)
+  ) {
+    const t = deactivateTraceRaw as { port?: unknown; bridgeClosed?: unknown };
+    tracePresence = 'present';
+    bridgeClosed = t.bridgeClosed === true;
+    if (typeof t.port === 'number' && Number.isFinite(t.port) && t.port > 0) {
+      tracePort = t.port;
+    }
+  }
+
+  let postExitProbe: BridgeClosurePostExitProbe = 'unknown';
+  if (!deactivateFailed && bridge.port > 0) {
+    try {
+      await fetchBridgeHealth(bridge.port);
+      postExitProbe = 'still-serving';
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: unknown }).code ?? '')
+          : '';
+      if (
+        code === 'ECONNREFUSED' ||
+        code === 'ECONNRESET' ||
+        /ECONNREFUSED|ECONNRESET|connect ECONN|socket hang up|EHOSTUNREACH/i.test(message)
+      ) {
+        postExitProbe = 'refused';
+      } else {
+        postExitProbe = 'unknown';
+      }
+    }
+  }
+
+  let phase: BridgeClosurePhase;
+  if (deactivateFailed) {
+    phase = 'deactivate-failed';
+  } else if (tracePresence === 'missing') {
+    phase = 'trace-missing';
+  } else if (!bridgeClosed) {
+    phase = 'not-closed';
+  } else if (postExitProbe === 'still-serving') {
+    phase = 'still-serving';
+  } else if (postExitProbe === 'unknown') {
+    phase = 'probe-unknown';
+  } else {
+    phase = 'ok';
+  }
+
+  const bridgeClosure: BridgeClosure = {
+    port: tracePort > 0 ? tracePort : bridge.port,
+    trace: tracePresence,
+    bridgeClosed,
+    postExitProbe,
+    phase,
+  };
+
+  if (phase !== 'ok') {
+    fail({
+      activation: 'ok',
+      bridge,
+      bridgePhase: 'ok',
+      bridgeClosure,
+      entrypoints,
+      extensionPath,
+      detail: deactivateDetail
+        ? `bridge closure failed (${phase}): ${deactivateDetail.slice(0, 400)}`
+        : `bridge closure failed (${phase}): trace=${tracePresence} bridgeClosed=${bridgeClosed} postExitProbe=${postExitProbe}`,
+    });
+  }
+
+  const result: InstallHostSmokeResult = {
+    kind: HOST_SMOKE_KIND,
+    ok: true,
+    activation: 'ok',
+    extensionPath,
+    bridge,
+    bridgePhase: 'ok',
+    bridgeClosure,
+    entrypoints,
+  };
+  writeResult(result);
+}

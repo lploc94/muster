@@ -377,6 +377,7 @@
     "test:m022-s04-entrypoint-regression-evidence": "node --test scripts/verify-m022-s04-entrypoint-regression-evidence.test.mjs",
     "test:m022-s04": "npm run test:m022-s04-clean-clone-evidence && npm run test:m022-s04-entrypoint-regression-evidence",
     "test:m022-s05-contract": "node --test scripts/packaging-install-result.test.mjs",
+    "test:m022-s05-host-contract": "node --test scripts/packaging-install-host-smoke.test.mjs",
     "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
