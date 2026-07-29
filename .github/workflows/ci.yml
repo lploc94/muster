@@ -3,9 +3,10 @@
 #
 # Behavioral job (`compile`): shared local verifier (`npm test`), M002 quality-gate
 # checks, Settings docs + live-evidence ledger verifiers, then `npm run compile`
-# before packaging fast-tier contracts (`test:m022-s02`, `test:m022-s03`) so the
-# webview bundle assertion sees a real `dist/webview`. Svelte check and the full
-# Playwright webview suite follow on Node 24 LTS.
+# before packaging fast-tier contracts (`test:m022-s02`, `test:m022-s03`,
+# `test:m022-s04`) so the webview bundle assertion sees a real `dist/webview`.
+# S04 validates tracked clean-clone + entrypoint-regression evidence (D069).
+# Svelte check and the full Playwright webview suite follow on Node 24 LTS.
 #
 # SQLite job (`sqlite-extension-host`): packaged Extension Host matrix across
 # minimum/incompatible/stable VS Code versions.
@@ -49,6 +50,7 @@ jobs:
       - run: npm run compile
       - run: npm run test:m022-s02
       - run: npm run test:m022-s03
+      - run: npm run test:m022-s04
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
       - run: npm run test:webview

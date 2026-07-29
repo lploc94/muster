@@ -77,6 +77,7 @@ const validVisualCiWorkflow = [
   '      - run: npm run compile',
   '      - run: npm run test:m022-s02',
   '      - run: npm run test:m022-s03',
+  '      - run: npm run test:m022-s04',
   '      - run: npm run test:webview',
   '  packaging-gate:',
   '    runs-on: ubuntu-latest',
@@ -165,6 +166,7 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   // M022/S03 packaging gate: fast compile-job tier + dedicated host job.
   assert.match(workflow, /run: npm run test:m022-s02/);
   assert.match(workflow, /run: npm run test:m022-s03/);
+  assert.match(workflow, /run: npm run test:m022-s04/);
   // M022/S04: compile must precede fast tier so webview bundle check sees dist/webview.
   const compileIdx = workflow.search(/^\s*-\s*run:\s*npm run compile\s*$/m);
   const s02Idx = workflow.search(/^\s*-\s*run:\s*npm run test:m022-s02\s*$/m);
@@ -297,6 +299,23 @@ test('rejects CI workflow missing packaging fast-tier test:m022-s03', async () =
 
     assert.equal(result.ok, false);
     assert.match(result.failures.join('\n'), /test:m022-s03/);
+  });
+});
+
+test('rejects CI workflow missing packaging S04 evidence aggregate test:m022-s04', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /^\s*- run: npm run test:m022-s04\s*(?:#.*)?\n/m,
+      '',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /test:m022-s04/);
   });
 });
 

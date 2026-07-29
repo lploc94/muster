@@ -218,6 +218,14 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} to run \`npm run test:m022-s03\` as the packaging marketplace-metadata contract.`,
   );
+  // M022/S04: tracked evidence aggregate (clean-clone + entrypoint-regression).
+  // D069 cost split — validates recorded local-drill evidence in seconds; does
+  // not re-run multi-minute clean-clone package or vsce census drills in CI.
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s04\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s04\` as the packaging S04 evidence aggregate (clean-clone + entrypoint-regression).`,
+  );
 
   // M022/S04: fast tier includes a fail-closed webview bundle check that needs
   // dist/webview from `npm run compile`. Running test:m022-s02 before compile

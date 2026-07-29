@@ -50,6 +50,9 @@ Drift between the literal allowlist and the real lockfile production walk is rej
 | `npm run test:m022-s03-regression` | Injected mermaid dependency drill proving the CI-wired fast tier blocks | ~1 min |
 | `npm run test:m022-s04-entrypoint-regression` | Injected `.vscodeignore` exclusion drill proving the census gate blocks a missing archive entrypoint with a typed phase | ~2–4 min |
 | `npm run test:m022-s04-entrypoint-regression-evidence` | Bounds the tracked entrypoint-regression evidence artifact | seconds |
+| `npm run test:m022-s04-clean-clone` | Real clean-clone drill: `git clone` → `npm ci` → documented `npm run package` emits a `.vsix` | multi-minute |
+| `npm run test:m022-s04-clean-clone-evidence` | Bounds the tracked clean-clone package evidence artifact | seconds |
+| `npm run test:m022-s04` | Aggregate S04 evidence contracts (clean-clone + entrypoint-regression) | seconds |
 
 `--census-only` separates a staging regression from a host regression. It does **not** prove activation, bridge listen, or Extension Host behavior — use `npm run test:packaging` for that.
 
@@ -61,6 +64,7 @@ Drift between the literal allowlist and the real lockfile production walk is rej
 |---------|-----|---------|----------------------|
 | Fast tier | `compile` | `npm run test:m022-s02` | `allowlist.violations` / dependency-shape diagnostics (seconds) |
 | Fast tier | `compile` | `npm run test:m022-s03` | marketplace metadata contract (icon, categories, CHANGELOG) |
+| Fast tier | `compile` | `npm run test:m022-s04` | tracked S04 evidence contracts (clean-clone + entrypoint-regression; D069 — does not re-run multi-minute drills) |
 | Host tier | `packaging-gate` | `xvfb-run -a npm run test:packaging` | typed phase: `missing-archive-entry`, `require-failed`, `spawn-failed`, `activation`, `health-unreachable` |
 
 The `packaging-gate` job always uploads `docs/plans/m022-s01-packaging-gate-evidence.json` via `actions/upload-artifact@v4` with `if: always()`, so a failed hosted run leaves a machine-readable snapshot (`ok`, `mode`, counts, allowlist, entrypoints, marketplaceEntries, activation, bridgePhase) instead of only console output.
@@ -74,6 +78,10 @@ CI wiring is guarded by `scripts/source-boundary-smoke.mjs` (plus fixture negati
 ### Entrypoint-resolution regression drill
 
 `npm run test:m022-s04-entrypoint-regression` injects a temporary `.vscodeignore` exclusion for a required archive entrypoint (default `dist/src/task/sqlite/worker.js`), runs `node scripts/run-packaging-gate.mjs --census-only --evidence <temp-evidence>`, requires a non-zero exit that names the broken entry path (`extension/dist/src/task/sqlite/worker.js`) with typed phase `missing-archive-entry`, restores `.vscodeignore` byte-for-byte with matching sha256 before and after, and re-passes the same gate command. Evidence lands in `docs/plans/m022-s04-entrypoint-regression-evidence.json`. The drill always routes gate evidence through a temp `--evidence` path so the tracked packaging-gate artifact is never clobbered. This is a recorded local drill (D069); CI validates the evidence artifact via `npm run test:m022-s04-entrypoint-regression-evidence` rather than re-running vsce package on every push.
+
+### Clean-clone package drill
+
+`npm run test:m022-s04-clean-clone` clones the current repo into a scratch directory (`git clone --local`), installs with `npm ci`, and runs the documented release command `npm run package` (exactly `vsce package` — not the `createVSIX` API the packaging gate wraps). It asserts a `.vsix` was emitted and writes `docs/plans/m022-s04-clean-clone-evidence.json` with the documented command, `npm ci` exit code, package exit code, and the VSIX name plus size. This is a recorded local drill (D069); CI validates the evidence via `npm run test:m022-s04` (which also covers the entrypoint-regression evidence) rather than re-running a multi-minute clean-clone package on every push.
 
 ## Evidence snapshot
 
