@@ -1,7 +1,10 @@
 /**
  * Live two-window UAT command surface.
  *
- * Registered only when MUSTER_UAT_MODE=1 in a non-production Extension Host.
+ * Registered only when MUSTER_UAT_MODE=1 (explicit harness opt-in).
+ * Production ExtensionMode is allowed when the env flag is set so the
+ * M022/S05 real-install gate can observe bridge health/closure from a
+ * CLI-installed copy; marketplace users never set this env var.
  * Handlers operate on the activated host repository / poller / presentation
  * paths — never a parallel DbClient.
  */
@@ -247,10 +250,14 @@ export type UatDurableSurfaces = {
 };
 
 export function isUatModeEnabled(
-  isProductionExtension: boolean,
+  _isProductionExtension: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return !isProductionExtension && env[UAT_MODE_ENV] === '1';
+  // Env flag is the sole opt-in. Production ExtensionMode (CLI-installed VSIX)
+  // must still expose the redacted packaging UAT surface when the install gate
+  // sets MUSTER_UAT_MODE=1; the flag is never set for normal marketplace users.
+  void _isProductionExtension;
+  return env[UAT_MODE_ENV] === '1';
 }
 
 export function makeIso(offsetMs = 0): string {

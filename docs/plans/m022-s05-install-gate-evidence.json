@@ -1,0 +1,25 @@
+{
+  "kind": "m022-s05-install-gate",
+  "schemaVersion": 1,
+  "ok": true,
+  "installExitCode": 0,
+  "installStderrExcerpt": "Installing extensions... Extension 'muster.vsix' was successfully installed. (node:12148) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilitie",
+  "installedOrigin": "extensions-dir",
+  "activation": "ok",
+  "bridge": {
+    "port": 53554,
+    "status": "ok"
+  },
+  "bridgeClosure": {
+    "port": 53554,
+    "trace": "present",
+    "bridgeClosed": true,
+    "postExitProbe": "refused",
+    "phase": "ok"
+  },
+  "vscodeVersion": "1.130.0",
+  "platform": "win32",
+  "phase": "ok",
+  "generatedAt": "2026-07-29T03:57:51.809Z",
+  "durationMs": 29924
+}

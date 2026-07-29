@@ -9,11 +9,11 @@ import {
 } from './uat-commands';
 
 describe('live UAT exposure gate', () => {
-  it('never enables mutation commands in a production Extension Host', () => {
-    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
-  });
-
-  it('requires the explicit env flag in a non-production Extension Host', () => {
+  it('requires the explicit MUSTER_UAT_MODE=1 env flag (sole opt-in, including Production)', () => {
+    // Production ExtensionMode (CLI-installed VSIX) is allowed when the install
+    // gate sets MUSTER_UAT_MODE=1; marketplace users never set this env var.
+    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(true);
+    expect(isUatModeEnabled(true, {})).toBe(false);
     expect(isUatModeEnabled(false, {})).toBe(false);
     expect(isUatModeEnabled(false, { MUSTER_UAT_MODE: '0' })).toBe(false);
     expect(isUatModeEnabled(false, { MUSTER_UAT_MODE: '1' })).toBe(true);
@@ -30,19 +30,18 @@ describe('live UAT exposure gate', () => {
     }
   });
 
-  it('exposes packaging-gate bridgeHealth only under muster.uat.* and only when UAT is enabled', () => {
+  it('exposes packaging-gate bridgeHealth under muster.uat.* when UAT env is set', () => {
     expect(UAT_COMMANDS.bridgeHealth).toBe('muster.uat.bridgeHealth');
     expect(UAT_COMMANDS.bridgeHealth.startsWith('muster.uat.')).toBe(true);
-    // Production host never registers UAT commands even if env is set.
-    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
+    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(true);
   });
 
-  it('exposes packaging-gate runDeactivate + deactivateTrace under muster.uat.* only when UAT is enabled', () => {
+  it('exposes packaging-gate runDeactivate + deactivateTrace under muster.uat.* when UAT env is set', () => {
     expect(UAT_COMMANDS.runDeactivate).toBe('muster.uat.runDeactivate');
     expect(UAT_COMMANDS.deactivateTrace).toBe('muster.uat.deactivateTrace');
     expect(UAT_COMMANDS.runDeactivate.startsWith('muster.uat.')).toBe(true);
     expect(UAT_COMMANDS.deactivateTrace.startsWith('muster.uat.')).toBe(true);
-    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
+    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(true);
   });
 });
 
