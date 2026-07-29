@@ -2,11 +2,17 @@
 # and can also be triggered manually from GitHub Actions → CI → Run workflow.
 #
 # Behavioral job (`compile`): shared local verifier (`npm test`), M002 quality-gate
-# checks, Svelte check, Settings docs + live-evidence ledger verifiers, and the
-# full Playwright webview suite on Node 24 LTS.
+# checks, Svelte check, Settings docs + live-evidence ledger verifiers, packaging
+# fast-tier contracts (`test:m022-s02`, `test:m022-s03`), and the full Playwright
+# webview suite on Node 24 LTS.
 #
 # SQLite job (`sqlite-extension-host`): packaged Extension Host matrix across
 # minimum/incompatible/stable VS Code versions.
+#
+# Packaging job (`packaging-gate`): real `vsce package` + Extension Host activation
+# under xvfb. Always uploads `docs/plans/m022-s01-packaging-gate-evidence.json` so a
+# failed hosted run leaves a machine-readable snapshot (ok, mode, allowlist,
+# entrypoints, activation, bridgePhase).
 #
 # Visual regression (M014) is intentionally not a required CI job for now —
 # goldens need Linux Docker re-authoring after protocol v9; run locally via
@@ -39,6 +45,8 @@ jobs:
       - run: npm run test:source-boundary:fixtures
       - run: npm run test:settings-docs
       - run: npm run test:settings-live-evidence
+      - run: npm run test:m022-s02
+      - run: npm run test:m022-s03
       - run: npm run compile
       - run: npm run check:svelte
       - run: npx playwright install --with-deps chromium
@@ -70,3 +78,25 @@ jobs:
         env:
           MUSTER_VSCODE_VERSION: ${{ matrix.vscode-version }}
           MUSTER_EXPECT_INCOMPATIBLE: ${{ matrix.expect-incompatible }}
+
+  packaging-gate:
+    name: Packaging gate (Extension Host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - run: xvfb-run -a npm run test:packaging
+
+      - name: Upload packaging-gate evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-gate-evidence
+          path: docs/plans/m022-s01-packaging-gate-evidence.json
+          if-no-files-found: warn

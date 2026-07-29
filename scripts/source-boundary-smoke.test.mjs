@@ -74,7 +74,25 @@ const validVisualCiWorkflow = [
   '          cache: npm',
   '      - run: npm ci',
   '      - run: npm test',
+  '      - run: npm run test:m022-s02',
+  '      - run: npm run test:m022-s03',
   '      - run: npm run test:webview',
+  '  packaging-gate:',
+  '    runs-on: ubuntu-latest',
+  '    steps:',
+  '      - uses: actions/checkout@v4',
+  '      - uses: actions/setup-node@v4',
+  '        with:',
+  '          node-version: "24"',
+  '          cache: npm',
+  '      - run: npm ci',
+  '      - run: xvfb-run -a npm run test:packaging',
+  '      - name: Upload packaging-gate evidence',
+  '        if: always()',
+  '        uses: actions/upload-artifact@v4',
+  '        with:',
+  '          name: packaging-gate-evidence',
+  '          path: docs/plans/m022-s01-packaging-gate-evidence.json',
 ].join('\n');
 
 const validFixture = {
@@ -143,6 +161,14 @@ test('repository GitHub Actions workflow runs npm test automatically on main pus
   assert.doesNotMatch(workflow, /node-version:\s*\[/);
   assert.match(workflow, /sqlite-extension-host:/);
   assert.match(workflow, /run: npm run test:webview/);
+  // M022/S03 packaging gate: fast compile-job tier + dedicated host job.
+  assert.match(workflow, /run: npm run test:m022-s02/);
+  assert.match(workflow, /run: npm run test:m022-s03/);
+  assert.match(workflow, /^ {2}packaging-gate:\s*$/m);
+  assert.match(workflow, /xvfb-run -a npm run test:packaging/);
+  assert.match(workflow, /uses: actions\/upload-artifact@v4/);
+  assert.match(workflow, /if: always\(\)/);
+  assert.match(workflow, /docs\/plans\/m022-s01-packaging-gate-evidence\.json/);
   // Visual regression is optional/local for now (not a required CI job).
   assert.doesNotMatch(workflow, /^ {2}visual:\s*$/m);
   assert.doesNotMatch(workflow, /^\s*-\s*run:.*--update-snapshots/m);
@@ -210,6 +236,94 @@ test('rejects GitHub Actions workflow with missing or wrong Node 24 setup', asyn
     assert.match(result.failures.join('\n'), /\.github\/workflows\/ci\.yml/);
     assert.match(result.failures.join('\n'), /node-version/);
     assert.match(result.failures.join('\n'), /Node 24/);
+  });
+});
+
+test('rejects CI workflow missing packaging fast-tier test:m022-s02', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /^\s*- run: npm run test:m022-s02\s*(?:#.*)?\n/m,
+      '',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /test:m022-s02/);
+  });
+});
+
+test('rejects CI workflow missing packaging fast-tier test:m022-s03', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /^\s*- run: npm run test:m022-s03\s*(?:#.*)?\n/m,
+      '',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /test:m022-s03/);
+  });
+});
+
+test('rejects CI workflow missing packaging-gate job', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /\n  packaging-gate:[\s\S]*$/,
+      '\n',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /packaging-gate/);
+  });
+});
+
+test('rejects packaging-gate job without xvfb-run test:packaging', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /xvfb-run -a npm run test:packaging/,
+      'npm run test:packaging',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /xvfb-run -a npm run test:packaging/);
+  });
+});
+
+test('rejects packaging-gate job without always-on evidence upload', async () => {
+  const fixture = {
+    ...validFixture,
+    '.github/workflows/ci.yml': validVisualCiWorkflow.replace(
+      /\n      - name: Upload packaging-gate evidence[\s\S]*$/,
+      '\n',
+    ),
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(
+      result.failures.join('\n'),
+      /upload-artifact@v4|packaging-gate-evidence|if: always\(\)|m022-s01-packaging-gate-evidence/,
+    );
   });
 });
 

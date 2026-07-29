@@ -189,6 +189,48 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} never to pass --update-snapshots or run test:visual:linux:update.`,
   );
+
+  // M022/S03 packaging gate — fast compile-job tier + dedicated host job.
+  // Fast tier localises dependency/allowlist regressions in seconds without packaging.
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s02\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s02\` as the packaging fast-tier dependency/allowlist contract.`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s03\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s03\` as the packaging marketplace-metadata contract.`,
+  );
+
+  const packagingGateBlock = getIndentedYamlBlock(workflowText, 'packaging-gate', 2);
+  expectCondition(
+    packagingGateBlock !== '',
+    failures,
+    `Expected ${workflowPath} to define a dedicated \`packaging-gate\` job for the real Extension Host packaging gate.`,
+  );
+  if (packagingGateBlock !== '') {
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*-?\s*run:\s*xvfb-run -a npm run test:packaging\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to run \`xvfb-run -a npm run test:packaging\` so the host gate has a display on ubuntu-latest.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*if:\s*always\(\)\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to upload evidence with \`if: always()\` so failed hosted runs still leave a machine-readable snapshot.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*-?\s*uses:\s*actions\/upload-artifact@v4\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to use \`actions/upload-artifact@v4\` for packaging-gate evidence upload.`,
+    );
+    expectCondition(
+      packagingGateBlock.includes('docs/plans/m022-s01-packaging-gate-evidence.json'),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to upload \`docs/plans/m022-s01-packaging-gate-evidence.json\` as the packaging-gate evidence artifact.`,
+    );
+  }
 }
 
 async function readText(rootDir, relativePath, failures) {
