@@ -234,11 +234,11 @@
   ],
   "activation": "ok",
   "bridge": {
-    "port": 61537,
+    "port": 62787,
     "status": "ok",
     "generation": 1
   },
   "bridgePhase": "ok",
-  "generatedAt": "2026-07-29T00:28:44.910Z",
-  "durationMs": 30618
+  "generatedAt": "2026-07-29T00:42:35.467Z",
+  "durationMs": 34634
 }
