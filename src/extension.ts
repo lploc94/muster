@@ -42,6 +42,7 @@ import {
   projectWorkspacePatches,
 } from './host/workspace-patch';
 import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
+import { RetentionScheduler } from './host/retention-scheduler';
 import { LatestFocusTransition } from './host/focus-transition';
 import {
   reconcileExternalWorkspaceChanges,
@@ -565,8 +566,6 @@ function getRetentionConfig(): RetentionConfig {
   };
 }
 
-let retentionInFlight: Promise<void> | undefined;
-
 function repositoryWorkspaceId(): string {
   if (!sqliteWorkspaceId) {
     throw new Error('SQLite workspace is not ready');
@@ -587,18 +586,6 @@ async function applyRetentionToRepository(repository: TaskRepository): Promise<v
       maxStoredOutputChars: config.maxStoredOutputChars,
     });
   }
-}
-
-function scheduleRetention(): void {
-  const repository = taskRepository;
-  if (!repository || retentionInFlight) return;
-  retentionInFlight = applyRetentionToRepository(repository)
-    .catch(() => {
-      // Retention is maintenance; a failed pass must not interrupt a user turn.
-    })
-    .finally(() => {
-      retentionInFlight = undefined;
-    });
 }
 
 class MusterChatProvider implements vscode.WebviewViewProvider {
@@ -4358,7 +4345,11 @@ export async function activate(context: vscode.ExtensionContext) {
         return result.presentationStatus;
       },
     });
-    scheduleRetention();
+    const retentionScheduler = new RetentionScheduler({
+      runPass: () => applyRetentionToRepository(taskRepository!),
+    });
+    retentionScheduler.start();
+    context.subscriptions.push(retentionScheduler);
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
         try {
