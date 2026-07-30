@@ -5,6 +5,7 @@
  * production wires showSaveDialog / messages / reload; tests inject fakes.
  */
 import type { BackupResultMeta, ReclaimResultMeta } from '../task/sqlite/rpc';
+import type { ReclaimMode } from '../task/sqlite/reclaim';
 import { safeMessageForCode, isSqliteErrorCode, type SqliteErrorCode } from '../task/sqlite/errors';
 
 export const MUSTER_BACKUP_DATABASE_COMMAND = 'muster.backupDatabase';
@@ -39,6 +40,68 @@ export type CompactStorageCommandResult =
   | { kind: 'noop'; mode: 'noop' }
   | { kind: 'refused'; mode: 'refused'; requiredBytes: number; availableBytes: number }
   | { kind: 'error'; code: string; message: string };
+
+/** Per-pass, path-free retention evidence shown by Muster Storage Report. */
+export type RetentionPassReport = {
+  ordinal: number;
+  tasksVisited: number;
+  entriesStripped: number;
+  toolCallsBytesBefore: number;
+  toolCallsBytesAfter: number;
+  reclaimMode: ReclaimMode;
+  fileBytesBefore: number;
+  fileBytesAfter: number;
+};
+
+export type RetentionReportSnapshot = {
+  completedPasses: number;
+  failedPasses: number;
+  completedPassDetails: readonly RetentionPassReport[];
+};
+
+/** In-memory pass history intentionally resets when the extension host reloads. */
+export class RetentionReport {
+  private readonly completedPassDetails: RetentionPassReport[] = [];
+  private failedPasses = 0;
+
+  recordCompleted(pass: Omit<RetentionPassReport, 'ordinal'> | RetentionPassReport): void {
+    this.completedPassDetails.push({ ...pass, ordinal: this.completedPassDetails.length + 1 });
+  }
+
+  recordFailure(): void {
+    this.failedPasses += 1;
+  }
+
+  snapshot(): RetentionReportSnapshot {
+    return {
+      completedPasses: this.completedPassDetails.length,
+      failedPasses: this.failedPasses,
+      completedPassDetails: [...this.completedPassDetails],
+    };
+  }
+}
+
+/** Stable, path-free report formatter for the user-invoked Storage Report channel. */
+export function formatRetentionReportLines(snapshot: RetentionReportSnapshot): string[] {
+  const lines = [
+    'Muster retention report',
+    `completed_passes: ${snapshot.completedPasses}`,
+    `failed_passes: ${snapshot.failedPasses}`,
+  ];
+  for (const pass of snapshot.completedPassDetails) {
+    lines.push(
+      `retention_pass: ${pass.ordinal}`,
+      `tasks_visited: ${pass.tasksVisited}`,
+      `entries_stripped: ${pass.entriesStripped}`,
+      `tool_calls_bytes_before: ${pass.toolCallsBytesBefore}`,
+      `tool_calls_bytes_after: ${pass.toolCallsBytesAfter}`,
+      `reclaim_mode: ${pass.reclaimMode}`,
+      `file_bytes_before: ${pass.fileBytesBefore}`,
+      `file_bytes_after: ${pass.fileBytesAfter}`,
+    );
+  }
+  return lines;
+}
 
 export type DeveloperResetCommandOptions = {
   withoutBackupOnly?: boolean;

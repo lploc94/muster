@@ -582,6 +582,8 @@ export interface RepositoryCommandResult {
    */
   ok: boolean;
   changed?: boolean;
+  /** Number of retained file-change evidence entries stripped by a retention command. */
+  retentionEntriesStripped?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -10275,6 +10277,7 @@ export class SqliteTaskRepository implements TaskRepository {
       );
       const statements: SqlStatement[] = [];
       const changes: ChangeRecord[] = [];
+      let retentionEntriesStripped = 0;
       for (const tool of await this.listToolCalls(task.id)) {
         if (!agedTurnIds.has(tool.turnId) || !isBoundedToolFileChanges(tool.fileChanges) ||
           tool.fileChanges.every((change) => change.retentionTruncated === true)) continue;
@@ -10289,11 +10292,12 @@ export class SqliteTaskRepository implements TaskRepository {
         }
         if (fileChanges.length !== tool.fileChanges.length) continue;
         statements.push(toolCallStatement(this.workspaceId, { ...tool, fileChanges }));
+        retentionEntriesStripped += fileChanges.length;
         changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
       }
       if (statements.length === 0) return { ok: true, changed: false };
       await this.write(statements, changes, new Date().toISOString());
-      return { ok: true, changed: true };
+      return { ok: true, changed: true, retentionEntriesStripped };
     }
 
     const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));

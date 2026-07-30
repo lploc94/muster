@@ -179,9 +179,12 @@ import {
 import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
 import { quiesceForMaintenance } from './host/sqlite-maintenance-coordinator';
 import {
+  formatRetentionReportLines,
   handleBackupDatabaseCommand,
   handleCompactStorageCommand,
   handleDeveloperResetCommand,
+  RetentionReport,
+  type RetentionPassReport,
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
@@ -237,6 +240,8 @@ let taskRepository: TaskRepository | undefined;
 let workspaceRoot: string | undefined;
 /** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
+/** Process-local retention observations; intentionally reset on host/window reload. */
+const retentionReport = new RetentionReport();
 let sqliteWorkspaceId: string | undefined;
 /** Production chat provider (always tracked; UAT may also alias it). */
 let chatProvider: MusterChatProvider | undefined;
@@ -573,19 +578,37 @@ function repositoryWorkspaceId(): string {
   return sqliteWorkspaceId;
 }
 
-/** Apply retention through named repository commands; never rewrite the host envelope. */
-async function applyRetentionToRepository(repository: TaskRepository): Promise<void> {
+/** Apply retention through named repository commands and capture path-free storage evidence. */
+async function applyRetentionToRepository(
+  repository: TaskRepository,
+): Promise<Omit<RetentionPassReport, 'ordinal'>> {
+  const client = sqliteClient;
+  if (!client) throw new Error('SQLite store is not open');
   const config = getRetentionConfig();
+  const before = await client.storageReport();
   const tasks = await repository.listTasks(repositoryWorkspaceId());
+  let entriesStripped = 0;
   for (const task of tasks) {
-    await repository.execute({
+    const result = await repository.execute({
       kind: 'applyRetentionPolicy',
       workspaceId: repositoryWorkspaceId(),
       taskId: task.id,
       keepLatestTurns: config.maxTurnsPerTask,
       maxStoredOutputChars: config.maxStoredOutputChars,
     });
+    entriesStripped += result.retentionEntriesStripped ?? 0;
   }
+  const after = await client.storageReport();
+  const reclaimed = await client.reclaimStorage();
+  return {
+    tasksVisited: tasks.length,
+    entriesStripped,
+    toolCallsBytesBefore: before.tables.find((table) => table.name === 'tool_calls')?.bytes ?? 0,
+    toolCallsBytesAfter: after.tables.find((table) => table.name === 'tool_calls')?.bytes ?? 0,
+    reclaimMode: reclaimed.mode,
+    fileBytesBefore: reclaimed.fileBytesBefore,
+    fileBytesAfter: reclaimed.fileBytesAfter,
+  };
 }
 
 class MusterChatProvider implements vscode.WebviewViewProvider {
@@ -4347,6 +4370,8 @@ export async function activate(context: vscode.ExtensionContext) {
     });
     const retentionScheduler = new RetentionScheduler({
       runPass: () => applyRetentionToRepository(taskRepository!),
+      onPassCompleted: (pass) => retentionReport.recordCompleted(pass),
+      onPassFailed: () => retentionReport.recordFailure(),
     });
     retentionScheduler.start();
     context.subscriptions.push(retentionScheduler);
@@ -4471,6 +4496,7 @@ function registerStorageReportCommand(
           `page_size: ${report.pageSize}`,
           `auto_vacuum: ${report.autoVacuum}`,
           `table_bytes_source: ${report.tableBytesSource}`,
+          ...formatRetentionReportLines(retentionReport.snapshot()),
           ...report.tables.map((table) => `table: ${table.name} bytes: ${table.bytes}`),
           ...orphans.deadLegacyStores.map((file) => `orphan_legacy: ${file.name} bytes: ${file.bytes}`),
           ...orphans.activeLeases.map((file) => `lease_active: ${file.name} bytes: ${file.bytes}`),

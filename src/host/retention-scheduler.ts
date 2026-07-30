@@ -7,15 +7,21 @@
  */
 export const RETENTION_SCHEDULE_INTERVAL_MS = 30 * 60 * 1_000;
 
-export type RetentionSchedulerOptions = {
-  runPass: () => Promise<void>;
+export type RetentionSchedulerOptions<TPass = void> = {
+  runPass: () => Promise<TPass>;
+  /** Receives completed pass evidence only; errors never cross this boundary. */
+  onPassCompleted?: (pass: TPass) => void;
+  /** Signals a failed pass without exposing raw storage error details. */
+  onPassFailed?: () => void;
   intervalMs?: number;
   schedule?: (fn: () => void, ms: number) => unknown;
   clearSchedule?: (handle: unknown) => void;
 };
 
-export class RetentionScheduler {
-  private readonly runPass: RetentionSchedulerOptions['runPass'];
+export class RetentionScheduler<TPass = void> {
+  private readonly runPass: RetentionSchedulerOptions<TPass>['runPass'];
+  private readonly onPassCompleted: ((pass: TPass) => void) | undefined;
+  private readonly onPassFailed: (() => void) | undefined;
   private readonly intervalMs: number;
   private readonly schedule: (fn: () => void, ms: number) => unknown;
   private readonly clearSchedule: (handle: unknown) => void;
@@ -25,8 +31,10 @@ export class RetentionScheduler {
   private disposed = false;
   private inFlight = false;
 
-  constructor(options: RetentionSchedulerOptions) {
+  constructor(options: RetentionSchedulerOptions<TPass>) {
     this.runPass = options.runPass;
+    this.onPassCompleted = options.onPassCompleted;
+    this.onPassFailed = options.onPassFailed;
     this.intervalMs = options.intervalMs ?? RETENTION_SCHEDULE_INTERVAL_MS;
     this.schedule = options.schedule ?? ((fn, ms) => setInterval(fn, ms));
     this.clearSchedule = options.clearSchedule ?? ((handle) => clearInterval(handle as NodeJS.Timeout));
@@ -51,12 +59,17 @@ export class RetentionScheduler {
   private trigger(): void {
     if (this.disposed || this.inFlight) return;
     this.inFlight = true;
-    void this.runPass()
-      .catch(() => {
-        // Retention is maintenance; a failed pass must not interrupt a user turn.
-      })
-      .finally(() => {
+    void this.runPass().then(
+      (pass) => {
+        this.onPassCompleted?.(pass);
         this.inFlight = false;
-      });
+      },
+      () => {
+        // Retention is maintenance; a failed pass must not interrupt a user turn.
+        // The callback exposes a safe failure count on the storage report channel.
+        this.onPassFailed?.();
+        this.inFlight = false;
+      },
+    );
   }
 }
