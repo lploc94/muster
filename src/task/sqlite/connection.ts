@@ -36,6 +36,8 @@ export interface OpenOptions {
 }
 
 const OPEN_RETRY_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+/** Bound residual WAL retained after checkpoints on every owned connection. */
+export const SQLITE_JOURNAL_SIZE_LIMIT_BYTES = 16 * 1024 * 1024;
 
 function isRetryableOpenLock(error: unknown): boolean {
   const candidate = error as { code?: unknown; message?: unknown };
@@ -155,6 +157,7 @@ function applyConnectionBusyTimeout(db: DatabaseSync, busyTimeoutMs: number): vo
 function applyRuntimePragmas(db: DatabaseSync, busyTimeoutMs: number): void {
   applyConnectionBusyTimeout(db, busyTimeoutMs);
   db.exec('PRAGMA journal_mode = WAL');
+  db.exec(`PRAGMA journal_size_limit = ${SQLITE_JOURNAL_SIZE_LIMIT_BYTES}`);
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA synchronous = NORMAL');
 }
@@ -317,6 +320,11 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
         }
         db = new DatabaseSync(opts.path);
         applyConnectionBusyTimeout(db, busyTimeoutMs);
+        // SQLite ignores auto_vacuum changes inside BEGIN. The prior preflight
+        // established this file was blank; configure it before any schema pages
+        // or WAL exist. Concurrent first-open peers make the same idempotent
+        // choice, then exclusiveOpenDecision revalidates ownership before DDL.
+        db.exec('PRAGMA auto_vacuum = INCREMENTAL');
         exclusiveOpenDecision(db);
       }
       // Writer UDF must be registered before any guarded write on this connection.

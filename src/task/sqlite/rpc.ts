@@ -33,6 +33,9 @@ export const ALLOWED_READ_PRAGMAS = [
   'foreign_keys',
   'synchronous',
   'busy_timeout',
+  // Storage lifecycle measurements: values only, safe to expose to the host.
+  'auto_vacuum',
+  'journal_size_limit',
 ] as const;
 
 export type ReadPragma = (typeof ALLOWED_READ_PRAGMAS)[number];
