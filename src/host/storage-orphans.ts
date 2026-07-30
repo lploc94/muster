@@ -1,4 +1,4 @@
-import { readdir, stat } from 'node:fs/promises';
+import { readdir, rm, stat } from 'node:fs/promises';
 import * as path from 'node:path';
 
 /** A path-free filesystem observation suitable for the storage report surface. */
@@ -23,6 +23,13 @@ export type StorageOrphanReport = {
   deadLegacyStores: StorageFile[];
   activeLeases: StorageFile[];
   staleLeases: StorageFile[];
+};
+
+/** The path-free result of a best-effort orphan removal pass. */
+export type StorageOrphanRemoval = {
+  removed: StorageFile[];
+  bytesReclaimed: number;
+  failedRemovals: number;
 };
 
 const LIVE_STORAGE_FILES = new Set([
@@ -89,4 +96,35 @@ export function classifyStorageOrphans(
   }
 
   return report;
+}
+
+/**
+ * Removes only files the classifier has already identified as reclaimable.
+ * Files that disappear after classification are harmless; other removal errors
+ * are recorded so callers can report partial reclamation without aborting.
+ */
+export async function removeStorageOrphans(
+  directory: string,
+  report: StorageOrphanReport,
+): Promise<StorageOrphanRemoval> {
+  const removed: StorageFile[] = [];
+  let bytesReclaimed = 0;
+  let failedRemovals = 0;
+
+  for (const file of [...report.deadLegacyStores, ...report.staleLeases]) {
+    if (file.name !== path.basename(file.name)) {
+      failedRemovals += 1;
+      continue;
+    }
+
+    try {
+      await rm(path.join(directory, file.name));
+      removed.push(file);
+      bytesReclaimed += file.bytes;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failedRemovals += 1;
+    }
+  }
+
+  return { removed, bytesReclaimed, failedRemovals };
 }
