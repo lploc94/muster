@@ -81,7 +81,13 @@ export async function run(): Promise<void> {
   }
   const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
   assert.ok(nodeMajor >= 22, `Extension Host Node is too old for node:sqlite: ${process.versions.node}`);
-  const sqlite = require('node:sqlite') as { DatabaseSync?: unknown };
+  const sqlite = require('node:sqlite') as {
+    DatabaseSync?: new (p: string, o?: { readOnly?: boolean }) => {
+      exec(sql: string): void;
+      prepare(sql: string): { get: (...a: unknown[]) => unknown; all: (...a: unknown[]) => unknown[] };
+      close(): void;
+    };
+  };
   assert.equal(typeof sqlite.DatabaseSync, 'function', 'Extension Host does not provide node:sqlite DatabaseSync');
 
   const sqliteDir = path.join(extension.extensionPath, 'dist', 'src', 'task', 'sqlite');
@@ -233,6 +239,37 @@ export async function run(): Promise<void> {
       assert.equal(rev.revision, 3);
     } finally {
       artifact.close();
+    }
+
+    // M023/S02: Persist a schema-current store in SQLite's legacy NONE mode,
+    // then reopen it through a second packaged worker. This proves normal open
+    // accepts mixed modes and does not silently rewrite the existing file.
+    const legacyPath = path.join(tempDir, 'legacy-muster.sqlite3');
+    const legacyBootstrap = new packaged.DbClient({ workerPath });
+    await legacyBootstrap.open(legacyPath);
+    await legacyBootstrap.close();
+    const legacyFixture = new sqlite.DatabaseSync!(legacyPath);
+    try {
+      legacyFixture.exec('PRAGMA auto_vacuum = NONE');
+      legacyFixture.exec('VACUUM');
+      const legacyAutoVacuum = legacyFixture.prepare('PRAGMA auto_vacuum').get() as Record<string, number>;
+      assert.equal(Object.values(legacyAutoVacuum)[0], 0, 'legacy fixture must persist auto_vacuum = NONE');
+    } finally {
+      legacyFixture.close();
+    }
+    const legacyClient = new packaged.DbClient({ workerPath });
+    try {
+      await legacyClient.open(legacyPath);
+      assert.equal(await legacyClient.pragma('application_id'), 0x4d555354);
+      assert.equal(await legacyClient.pragma('user_version'), schema.SQLITE_SCHEMA_VERSION);
+      assert.equal(
+        await legacyClient.pragma('auto_vacuum'),
+        0,
+        'opening a legacy store must preserve auto_vacuum = NONE',
+      );
+      assert.equal(await legacyClient.pragma('journal_size_limit'), 16 * 1024 * 1024);
+    } finally {
+      await legacyClient.close();
     }
 
     console.log(
