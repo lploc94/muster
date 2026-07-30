@@ -333,6 +333,36 @@ describe('buildToolDiffView', () => {
     expect(view.files[0].oldText).toBe('old-line');
     expect(view.files[0].newText).toBe('new-line');
   });
+
+  it('renders retention-stripped evidence as a non-expandable line-count summary', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-retained',
+      fileChanges: [
+        {
+          path: 'src/aged.ts',
+          oldText: null,
+          newText: '',
+          retentionTruncated: true,
+          oldLineCount: 3,
+          newLineCount: 5,
+        },
+      ],
+    });
+
+    expect(view.collapsedByDefault).toBe(false);
+    expect(view.files[0]).toMatchObject({
+      path: 'src/aged.ts',
+      retentionTruncated: true,
+      hasDiffBody: false,
+      added: 5,
+      removed: 3,
+      countsPartial: false,
+      countsLabel: `+5 ${MINUS}3 (retention summary)`,
+    });
+    expect(describeDiffFileForScreenReader(view.files[0])).toBe(
+      'src/aged.ts: 5 lines added, 3 lines removed, diff text removed by retention',
+    );
+  });
 });
 
 /** Build a max-side single-change fixture: full retained line budget, one central edit. */
@@ -585,6 +615,8 @@ describe('describeDiffFileForScreenReader', () => {
       countsPartial: false,
       comparisonUnavailable: false,
       outsideWorkspace: false,
+      retentionTruncated: false,
+      hasDiffBody: true,
       bodyId: 'tool-diff-body-x-0',
       toggleId: 'tool-diff-toggle-x-0',
       lines: [],

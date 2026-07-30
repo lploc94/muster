@@ -20,6 +20,11 @@ export type NormalizedEvent =
         truncated?: boolean;
         /** Present only when path resolved outside trusted workspace; never false. */
         outsideWorkspace?: true;
+        /** Present only after retention removes diff text; never false. */
+        retentionTruncated?: true;
+        /** Original logical line counts preserved by retention stripping. */
+        oldLineCount?: number;
+        newLineCount?: number;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
@@ -36,6 +41,11 @@ export type NormalizedEvent =
         truncated?: boolean;
         /** Present only when path resolved outside trusted workspace; never false. */
         outsideWorkspace?: true;
+        /** Present only after retention removes diff text; never false. */
+        retentionTruncated?: true;
+        /** Original logical line counts preserved by retention stripping. */
+        oldLineCount?: number;
+        newLineCount?: number;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;
@@ -54,6 +64,11 @@ export type NormalizedEvent =
         truncated?: boolean;
         /** Present only when path resolved outside trusted workspace; never false. */
         outsideWorkspace?: true;
+        /** Present only after retention removes diff text; never false. */
+        retentionTruncated?: true;
+        /** Original logical line counts preserved by retention stripping. */
+        oldLineCount?: number;
+        newLineCount?: number;
       }>;
       fileChangesOmitted?: number;
       meta?: Record<string, unknown>;

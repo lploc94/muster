@@ -122,7 +122,7 @@
         {@const srSummary = describeDiffFileForScreenReader(file)}
         <div class="tool-card__diff-file">
           <div class="tool-card__diff-summary">
-            {#if diffView.collapsedByDefault}
+            {#if file.hasDiffBody}
               <button
                 id={file.toggleId}
                 type="button"
@@ -153,6 +153,7 @@
             {/if}
           </div>
 
+          {#if file.hasDiffBody}
           <div
             id={file.bodyId}
             class="tool-card__diff-body-panel"
@@ -190,6 +191,7 @@
               {/if}
             </div>
           </div>
+          {/if}
         </div>
       {/each}
       {#if diffView.fileChangesOmitted !== undefined}

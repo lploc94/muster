@@ -37,6 +37,11 @@ export interface ToolDiffFileChangeInput {
   truncated?: boolean;
   /** Present only when path resolved outside trusted workspace; never `false`. */
   outsideWorkspace?: true;
+  /** Present only after retention removes diff text; never `false`. */
+  retentionTruncated?: true;
+  /** Original logical line counts preserved by retention stripping. */
+  oldLineCount?: number;
+  newLineCount?: number;
 }
 
 export interface BuildToolDiffViewInput {
@@ -80,6 +85,9 @@ export interface ToolDiffFileView {
    * `true` when the agent path resolved outside trusted cwd; otherwise false.
    */
   outsideWorkspace: boolean;
+  /** Diff text was removed by retention, so this row has no expandable body. */
+  retentionTruncated: boolean;
+  hasDiffBody: boolean;
   bodyId: string;
   toggleId: string;
   /** Visual short form, e.g. `+2 −1` or `+2 −1 (partial)`. */
@@ -234,7 +242,9 @@ function formatCountsLabel(
   removed: number,
   partial: boolean,
   comparisonUnavailable: boolean,
+  retentionTruncated: boolean,
 ): string {
+  if (retentionTruncated) return `+${added} ${MINUS_SIGN}${removed} (retention summary)`;
   if (comparisonUnavailable) return 'Comparison unavailable';
   const base = `+${added} ${MINUS_SIGN}${removed}`;
   return partial ? `${base} (partial)` : base;
@@ -250,6 +260,9 @@ function evidenceFingerprint(entry: ToolDiffFileChangeInput): string {
     entry.newText,
     entry.truncated ? '1' : '0',
     entry.outsideWorkspace === true ? '1' : '0',
+    entry.retentionTruncated === true ? '1' : '0',
+    String(entry.oldLineCount ?? ''),
+    String(entry.newLineCount ?? ''),
   ]) {
     for (let index = 0; index < value.length; index += 1) {
       hash ^= value.charCodeAt(index);
@@ -285,14 +298,13 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
     const occurrence = evidenceOccurrences.get(fingerprint) ?? 0;
     evidenceOccurrences.set(fingerprint, occurrence + 1);
     const fileIdSeed = `${toolIdSeed}-${sanitizeDomIdPart(entry.path)}-${fingerprint}-${occurrence}`;
-    const { added, removed, comparisonUnavailable } = compareDiffLines(
-      entry.oldText,
-      entry.newText,
-      Math.max(0, deadline - Date.now()),
-      false,
-    );
+    const retentionTruncated = entry.retentionTruncated === true;
+    const comparison = retentionTruncated
+      ? { added: entry.newLineCount ?? 0, removed: entry.oldLineCount ?? 0, comparisonUnavailable: false }
+      : compareDiffLines(entry.oldText, entry.newText, Math.max(0, deadline - Date.now()), false);
+    const { added, removed, comparisonUnavailable } = comparison;
     const truncated = entry.truncated === true;
-    const countsPartial = truncated;
+    const countsPartial = truncated && !retentionTruncated;
     const outsideWorkspace = entry.outsideWorkspace === true;
     totalAdded += added;
     totalRemoved += removed;
@@ -303,7 +315,9 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
       newText: entry.newText,
       get lines() {
         if (lines === undefined) {
-          lines = buildDiffLines(entry.oldText, entry.newText, TOOL_DIFF_TOTAL_TIMEOUT_MS).lines;
+          lines = retentionTruncated
+            ? []
+            : buildDiffLines(entry.oldText, entry.newText, TOOL_DIFF_TOTAL_TIMEOUT_MS).lines;
         }
         return lines;
       },
@@ -313,15 +327,23 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
       countsPartial,
       comparisonUnavailable,
       outsideWorkspace,
+      retentionTruncated,
+      hasDiffBody: !retentionTruncated,
       bodyId: `tool-diff-body-${fileIdSeed}`,
       toggleId: `tool-diff-toggle-${fileIdSeed}`,
-      countsLabel: formatCountsLabel(added, removed, countsPartial, comparisonUnavailable),
+      countsLabel: formatCountsLabel(
+        added,
+        removed,
+        countsPartial,
+        comparisonUnavailable,
+        retentionTruncated,
+      ),
     };
     files.push(file);
   }
 
   const view: ToolDiffView = {
-    collapsedByDefault: true,
+    collapsedByDefault: files.some((file) => file.hasDiffBody),
     totalAdded,
     totalRemoved,
     files,
@@ -347,7 +369,9 @@ export function describeDiffFileForScreenReader(file: ToolDiffFileView): string 
     if (file.outsideWorkspace) prose += ', outside workspace';
     return prose;
   }
-  if (file.countsPartial) {
+  if (file.retentionTruncated) {
+    prose += ', diff text removed by retention';
+  } else if (file.countsPartial) {
     prose += ', counts are partial because this diff was truncated';
   }
   if (file.outsideWorkspace) {
