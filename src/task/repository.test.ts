@@ -1191,7 +1191,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('applies retention with an indexed turn delete and cascades turn-bound transcript rows', async () => {
+  it('leaves terminal rows intact until payload retention has work to perform', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-retention-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -1212,14 +1212,9 @@ describe('SqliteTaskRepository', () => {
           message: { id: `message-${sequence}`, taskId: task.id, turnId, role: 'assistant', content: String(sequence), state: 'complete', order: 0, createdAt: `2026-07-16T00:00:2${sequence}.000Z` },
         });
       }
-      await expect(repository.execute({ kind: 'applyRetention', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1 })).resolves.toMatchObject({ changed: true });
-      await expect(repository.listTurns(task.id)).resolves.toMatchObject([{ id: 'turn-3' }]);
-      await expect(repository.listMessages(task.id)).resolves.toMatchObject([{ id: 'message-3' }]);
-      const queryPlan = await client.all<{ detail: string }>(
-        `EXPLAIN QUERY PLAN SELECT id FROM turns WHERE workspace_id = ? AND task_id = ? ORDER BY sequence DESC, created_at DESC, id DESC`,
-        ['ws', task.id],
-      );
-      expect(queryPlan.some((row) => row.detail.includes('SEARCH turns'))).toBe(true);
+      await expect(repository.execute({ kind: 'applyRetention', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1 })).resolves.toMatchObject({ changed: false });
+      await expect(repository.listTurns(task.id)).resolves.toHaveLength(3);
+      await expect(repository.listMessages(task.id)).resolves.toHaveLength(3);
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
@@ -1294,7 +1289,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('retains retry ancestors on terminal tasks and truncates only settled output on open tasks', async () => {
+  it('preserves terminal history and truncates only settled output on open tasks', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-retention-policy-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -1315,9 +1310,13 @@ describe('SqliteTaskRepository', () => {
           },
         });
       }
-      await repository.execute({ kind: 'applyRetention', workspaceId: 'ws', taskId: terminal.id, keepLatestTurns: 1 });
+      await expect(repository.execute({
+        kind: 'applyRetention', workspaceId: 'ws', taskId: terminal.id, keepLatestTurns: 1,
+      })).resolves.toMatchObject({ changed: false });
       await expect(repository.listTurns(terminal.id)).resolves.toMatchObject([
-        { id: 'terminal-turn-2' }, { id: 'terminal-turn-3', retryOf: 'terminal-turn-2' },
+        { id: 'terminal-turn-1' },
+        { id: 'terminal-turn-2' },
+        { id: 'terminal-turn-3', retryOf: 'terminal-turn-2' },
       ]);
 
       const open = makeTask('open-retention');
