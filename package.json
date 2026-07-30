@@ -55,6 +55,10 @@
       {
         "command": "muster.storageReport",
         "title": "Muster: Show Storage Report"
+      },
+      {
+        "command": "muster.compactStorage",
+        "title": "Muster: Compact Storage"
       }
     ],
     "configuration": {

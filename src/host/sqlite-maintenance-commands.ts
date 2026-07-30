@@ -4,14 +4,16 @@
  * Backup database + developer reset global database. No VS Code imports —
  * production wires showSaveDialog / messages / reload; tests inject fakes.
  */
-import type { BackupResultMeta } from '../task/sqlite/rpc';
+import type { BackupResultMeta, ReclaimResultMeta } from '../task/sqlite/rpc';
 import { safeMessageForCode, isSqliteErrorCode, type SqliteErrorCode } from '../task/sqlite/errors';
 
 export const MUSTER_BACKUP_DATABASE_COMMAND = 'muster.backupDatabase';
 export const MUSTER_DEVELOPER_RESET_COMMAND = 'muster.developerResetGlobalDatabase';
+export const MUSTER_COMPACT_STORAGE_COMMAND = 'muster.compactStorage';
 
 export const MUSTER_BACKUP_COMMAND_TITLE = 'Muster: Back Up Global Database';
 export const MUSTER_RESET_COMMAND_TITLE = 'Muster: Developer Reset Global Database';
+export const MUSTER_COMPACT_STORAGE_COMMAND_TITLE = 'Muster: Compact Storage';
 
 /** Exact modal body for global-scope reset (profile + authority). */
 export const RESET_MODAL_MESSAGE =
@@ -31,6 +33,12 @@ export type ResetCommandResult =
   | { kind: 'cancel' }
   | { kind: 'success' }
   | { kind: 'error'; code: string; message: string; recoveryAction?: string };
+
+export type CompactStorageCommandResult =
+  | { kind: 'success'; mode: 'incremental' | 'full' }
+  | { kind: 'noop'; mode: 'noop' }
+  | { kind: 'refused'; mode: 'refused'; requiredBytes: number; availableBytes: number }
+  | { kind: 'error'; code: string; message: string };
 
 export type DeveloperResetCommandOptions = {
   withoutBackupOnly?: boolean;
@@ -56,6 +64,17 @@ export type BackupCommandDeps = {
   isMaintenanceActive?: () => boolean;
   setMaintenanceActive?: (active: boolean) => void;
   skipMaintenanceGuard?: boolean;
+};
+
+export type CompactStorageCommandDeps = {
+  /** Measured mode is the routing authority; never infer it from store age. */
+  storageReport: () => Promise<Pick<{ autoVacuum: number }, 'autoVacuum'>>;
+  reclaimStorage: () => Promise<ReclaimResultMeta>;
+  /** Muster Storage Report channel; handler emits enum/numeric fields only. */
+  appendLine: (line: string) => void;
+  showErrorMessage: (message: string) => void | PromiseLike<unknown>;
+  isMaintenanceActive: () => boolean;
+  setMaintenanceActive: (active: boolean) => void;
 };
 
 export type ResetCommandDeps = {
@@ -143,6 +162,61 @@ export async function handleBackupDatabaseCommand(
     if (claimGuard) {
       deps.setMaintenanceActive?.(false);
     }
+  }
+}
+
+/**
+ * Muster: Compact Storage. The pre-measured auto_vacuum mode decides whether
+ * the worker may use bounded incremental reclaim (2) or legacy preflight-gated
+ * full compaction (0). FULL mode (1) is intentionally a no-op.
+ */
+export async function handleCompactStorageCommand(
+  deps: CompactStorageCommandDeps,
+): Promise<CompactStorageCommandResult> {
+  if (deps.isMaintenanceActive()) {
+    const message = safeMessageForCode('busy');
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code: 'busy', message };
+  }
+  deps.setMaintenanceActive(true);
+
+  try {
+    const report = await deps.storageReport();
+    if (report.autoVacuum !== 0 && report.autoVacuum !== 2) {
+      deps.appendLine('Muster storage reclamation');
+      deps.appendLine('mode: noop');
+      deps.appendLine(`auto_vacuum: ${report.autoVacuum}`);
+      return { kind: 'noop', mode: 'noop' };
+    }
+
+    const result = await deps.reclaimStorage();
+    deps.appendLine('Muster storage reclamation');
+    deps.appendLine(`mode: ${result.mode}`);
+    deps.appendLine(`file_bytes_before: ${result.fileBytesBefore}`);
+    deps.appendLine(`file_bytes_after: ${result.fileBytesAfter}`);
+    deps.appendLine(`freelist_before: ${result.freelistCountBefore}`);
+    deps.appendLine(`freelist_after: ${result.freelistCountAfter}`);
+    deps.appendLine(`batches_run: ${result.batchesRun}`);
+    deps.appendLine(`wal_checkpoints: ${result.walCheckpoints}`);
+    deps.appendLine(`residual_wal_bytes: ${result.residualWalBytes}`);
+
+    if (result.mode === 'refused') {
+      // The wire contract makes both values mandatory for refused results.
+      const requiredBytes = result.requiredBytes ?? 0;
+      const availableBytes = result.availableBytes ?? 0;
+      deps.appendLine(`required_bytes: ${requiredBytes}`);
+      deps.appendLine(`available_bytes: ${availableBytes}`);
+      return { kind: 'refused', mode: 'refused', requiredBytes, availableBytes };
+    }
+    if (result.mode === 'noop') return { kind: 'noop', mode: 'noop' };
+    return { kind: 'success', mode: result.mode };
+  } catch (error) {
+    const code = errorCodeFromUnknown(error);
+    const message = safeMessageForCode(code);
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code, message };
+  } finally {
+    deps.setMaintenanceActive(false);
   }
 }
 

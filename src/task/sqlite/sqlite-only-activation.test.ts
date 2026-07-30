@@ -24,8 +24,11 @@ describe('SQLite-only activation boundary', () => {
     );
   });
 
-  it('registers the storage report command with redacted output fields', () => {
+  it('registers storage report and user-invocable compaction through the redacted client surface', () => {
     expect(extensionSource).toContain("registerCommand('muster.storageReport'");
+    expect(extensionSource).toContain('registerCommand(MUSTER_COMPACT_STORAGE_COMMAND');
+    expect(extensionSource).toContain('handleCompactStorageCommand({');
+    expect(extensionSource).toContain('reclaimStorage: () => client.reclaimStorage()');
     expect(extensionSource).toContain('sqliteClient.storageReport()');
     expect(extensionSource).toContain('readStorageDirectoryEntries(');
     expect(extensionSource).toContain('classifyStorageOrphans(');

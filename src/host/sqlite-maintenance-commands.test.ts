@@ -4,6 +4,8 @@ import * as path from 'node:path';
 import {
   handleBackupDatabaseCommand,
   handleDeveloperResetCommand,
+  handleCompactStorageCommand,
+  MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
   MUSTER_BACKUP_COMMAND_TITLE,
@@ -36,6 +38,122 @@ describe('sqlite maintenance commands (P5-W5)', () => {
         },
       ]),
     );
+  });
+
+  it('contributes the exact user-invocable storage compaction command', () => {
+    expect(readPackageCommands()).toContainEqual({
+      command: MUSTER_COMPACT_STORAGE_COMMAND,
+      title: 'Muster: Compact Storage',
+    });
+  });
+
+  it('reports bounded incremental reclaim measurements after measuring auto_vacuum', async () => {
+    const appendLine = vi.fn();
+    const reclaimStorage = vi.fn(async () => ({
+      mode: 'incremental' as const,
+      fileBytesBefore: 8192,
+      fileBytesAfter: 4096,
+      freelistCountBefore: 4,
+      freelistCountAfter: 0,
+      batchesRun: 1,
+      walCheckpoints: 3,
+      residualWalBytes: 0,
+    }));
+
+    const result = await handleCompactStorageCommand({
+      storageReport: async () => ({ autoVacuum: 2 }),
+      reclaimStorage,
+      appendLine,
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => false,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(reclaimStorage).toHaveBeenCalledOnce();
+    expect(result).toMatchObject({ kind: 'success', mode: 'incremental' });
+    expect(appendLine.mock.calls.flat().join('\n')).toContain('file_bytes_before: 8192');
+    expect(appendLine.mock.calls.flat().join('\n')).toContain('residual_wal_bytes: 0');
+  });
+
+  it('surfaces legacy low-space refusal diagnostics without throwing', async () => {
+    const appendLine = vi.fn();
+    const result = await handleCompactStorageCommand({
+      storageReport: async () => ({ autoVacuum: 0 }),
+      reclaimStorage: async () => ({
+        mode: 'refused',
+        fileBytesBefore: 8192,
+        fileBytesAfter: 8192,
+        freelistCountBefore: 4,
+        freelistCountAfter: 4,
+        batchesRun: 0,
+        walCheckpoints: 1,
+        residualWalBytes: 0,
+        requiredBytes: 16384,
+        availableBytes: 4096,
+      }),
+      appendLine,
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => false,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ kind: 'refused', requiredBytes: 16384, availableBytes: 4096 });
+    expect(appendLine.mock.calls.flat().join('\n')).toContain('required_bytes: 16384');
+    expect(appendLine.mock.calls.flat().join('\n')).toContain('available_bytes: 4096');
+  });
+
+  it('does not compact an unsupported observed auto_vacuum mode', async () => {
+    const reclaimStorage = vi.fn();
+    const appendLine = vi.fn();
+    const result = await handleCompactStorageCommand({
+      storageReport: async () => ({ autoVacuum: 1 }),
+      reclaimStorage,
+      appendLine,
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => false,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toEqual({ kind: 'noop', mode: 'noop' });
+    expect(reclaimStorage).not.toHaveBeenCalled();
+    expect(appendLine.mock.calls.flat().join('\n')).toContain('mode: noop');
+  });
+
+  it('rejects compaction while another maintenance operation owns the guard', async () => {
+    const storageReport = vi.fn();
+    const reclaimStorage = vi.fn();
+    const showErrorMessage = vi.fn();
+
+    const result = await handleCompactStorageCommand({
+      storageReport,
+      reclaimStorage,
+      appendLine: vi.fn(),
+      showErrorMessage,
+      isMaintenanceActive: () => true,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ kind: 'error', code: 'busy' });
+    expect(storageReport).not.toHaveBeenCalled();
+    expect(reclaimStorage).not.toHaveBeenCalled();
+    expect(JSON.stringify(showErrorMessage.mock.calls)).not.toMatch(/secret|path/i);
+  });
+
+  it('surfaces reclaim failures with the fixed safe error rather than raw SQLite text', async () => {
+    const showErrorMessage = vi.fn();
+    const result = await handleCompactStorageCommand({
+      storageReport: async () => ({ autoVacuum: 2 }),
+      reclaimStorage: async () => {
+        throw Object.assign(new Error('SQLITE_FULL: /secret/muster.sqlite3'), { code: 'full' });
+      },
+      appendLine: vi.fn(),
+      showErrorMessage,
+      isMaintenanceActive: () => false,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ kind: 'error', code: 'full' });
+    expect(JSON.stringify(showErrorMessage.mock.calls)).not.toMatch(/secret|SQLITE_FULL|muster\.sqlite3/i);
   });
 
   it('backup cancel is a strict no-op', async () => {

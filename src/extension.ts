@@ -179,8 +179,10 @@ import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator
 import { quiesceForMaintenance } from './host/sqlite-maintenance-coordinator';
 import {
   handleBackupDatabaseCommand,
+  handleCompactStorageCommand,
   handleDeveloperResetCommand,
   MUSTER_BACKUP_DATABASE_COMMAND,
+  MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
 } from './host/sqlite-maintenance-commands';
 import {
@@ -4487,6 +4489,25 @@ function registerStorageReportCommand(
       } catch {
         channel.appendLine('Storage report unavailable: SQLite storage could not be read.');
       }
+      channel.show(true);
+    }),
+    vscode.commands.registerCommand(MUSTER_COMPACT_STORAGE_COMMAND, async () => {
+      const client = sqliteClient;
+      if (!client) {
+        channel.appendLine('Storage compaction unavailable: SQLite store is not open.');
+        channel.show(true);
+        return;
+      }
+      await handleCompactStorageCommand({
+        storageReport: () => client.storageReport(),
+        reclaimStorage: () => client.reclaimStorage(),
+        appendLine: (line) => channel.appendLine(line),
+        showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+        isMaintenanceActive: () => maintenanceActive,
+        setMaintenanceActive: (active) => {
+          maintenanceActive = active;
+        },
+      });
       channel.show(true);
     }),
   );

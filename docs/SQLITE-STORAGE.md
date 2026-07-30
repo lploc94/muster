@@ -146,8 +146,18 @@ Malformed durable rows remain invariant errors and are **not** silently skipped.
 |---|---|
 | `muster.backupDatabase` | Muster: Back Up Global Database |
 | `muster.developerResetGlobalDatabase` | Muster: Developer Reset Global Database |
+| `muster.compactStorage` | Muster: Compact Storage |
+| `muster.storageReport` | Muster: Show Storage Report |
 
-Both commands remain registered even when storage open fails (fail-closed activation), so recovery
+**Compact Storage** measures `auto_vacuum` from the live store before it reclaims pages. Stores in
+INCREMENTAL mode use bounded incremental vacuum; legacy NONE stores use SQLite full compaction only
+after its free-space preflight. A low-space refusal is reported in the **Muster Storage Report**
+channel as numeric `required_bytes` and `available_bytes` values, not as a thrown command error.
+The same channel reports `mode`, file bytes and freelist before/after, batches, WAL checkpoints, and
+residual WAL bytes. FULL auto-vacuum mode is reported as `noop` rather than triggering a surprise
+rewrite. These output values never include a storage path.
+
+Backup and reset commands remain registered even when storage open fails (fail-closed activation), so recovery
 actions stay available.
 
 ---

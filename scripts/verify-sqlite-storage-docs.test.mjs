@@ -17,6 +17,10 @@ const required = {
     'Muster: Back Up Global Database',
     'muster.developerResetGlobalDatabase',
     'Muster: Developer Reset Global Database',
+    'muster.compactStorage',
+    'Muster: Compact Storage',
+    'required_bytes',
+    'available_bytes',
     'not a backup',
     'no in-product restore/import command',
     'Supported manual restore',
@@ -150,6 +154,7 @@ function validate(files) {
   const byId = Object.fromEntries(commands.map((c) => [c.command, c.title]));
   assert.equal(byId['muster.backupDatabase'], 'Muster: Back Up Global Database');
   assert.equal(byId['muster.developerResetGlobalDatabase'], 'Muster: Developer Reset Global Database');
+  assert.equal(byId['muster.compactStorage'], 'Muster: Compact Storage');
   assert.ok(guide.includes('muster.backupDatabase'));
   assert.ok(guide.includes(byId['muster.backupDatabase']));
   assert.ok(guide.includes('muster.developerResetGlobalDatabase'));
