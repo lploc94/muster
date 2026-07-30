@@ -190,6 +190,10 @@ import {
 } from './host/run-diagnostics-command';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
 import { runDurableHostSend } from './host/durable-send-coordinator';
+import {
+  classifyStorageOrphans,
+  readStorageDirectoryEntries,
+} from './host/storage-orphans';
 
 
 /** Activation fail-closed error: safe message only, no path/SQL/content. */
@@ -3578,6 +3582,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Maintenance commands remain available even when storage open fails (P5-W5).
   registerSqliteMaintenanceCommands(context, dbPath);
+  registerStorageReportCommand(context, context.globalStorageUri.fsPath);
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
@@ -4435,6 +4440,56 @@ async function handlePeerExternalReset(): Promise<void> {
       // best-effort
     }
   }
+}
+
+/**
+ * Emit storage accounting and safe orphan basenames without exposing filesystem paths.
+ * The command remains registered before a store opens so a failed activation produces
+ * an actionable diagnostic instead of an unhandled command rejection.
+ */
+function registerStorageReportCommand(
+  context: vscode.ExtensionContext,
+  storageDirectory: string,
+): void {
+  const channel = vscode.window.createOutputChannel('Muster Storage Report');
+  context.subscriptions.push(
+    channel,
+    vscode.commands.registerCommand('muster.storageReport', async () => {
+      if (!sqliteClient) {
+        channel.appendLine('Storage report unavailable: SQLite store is not open.');
+        channel.show(true);
+        return;
+      }
+
+      try {
+        const report = await sqliteClient.storageReport();
+        const orphans = classifyStorageOrphans(
+          await readStorageDirectoryEntries(storageDirectory),
+          Date.now(),
+          60_000,
+        );
+        const lines = [
+          'Muster storage report',
+          `file_bytes: ${report.fileBytes}`,
+          `wal_bytes: ${report.walBytes}`,
+          `shm_bytes: ${report.shmBytes}`,
+          `page_count: ${report.pageCount}`,
+          `freelist_count: ${report.freelistCount}`,
+          `page_size: ${report.pageSize}`,
+          `auto_vacuum: ${report.autoVacuum}`,
+          `table_bytes_source: ${report.tableBytesSource}`,
+          ...report.tables.map((table) => `table: ${table.name} bytes: ${table.bytes}`),
+          ...orphans.deadLegacyStores.map((file) => `orphan_legacy: ${file.name} bytes: ${file.bytes}`),
+          ...orphans.activeLeases.map((file) => `lease_active: ${file.name} bytes: ${file.bytes}`),
+          ...orphans.staleLeases.map((file) => `lease_stale: ${file.name} bytes: ${file.bytes}`),
+        ];
+        for (const line of lines) channel.appendLine(line);
+      } catch {
+        channel.appendLine('Storage report unavailable: SQLite storage could not be read.');
+      }
+      channel.show(true);
+    }),
+  );
 }
 
 /**

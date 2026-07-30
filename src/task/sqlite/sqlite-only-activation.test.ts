@@ -23,4 +23,23 @@ describe('SQLite-only activation boundary', () => {
       /if \(!sqliteProbe\.available\) \{[\s\S]*showErrorMessage\(message\);[\s\S]*throw new Error\(message\);/,
     );
   });
+
+  it('registers the storage report command with redacted output fields', () => {
+    expect(extensionSource).toContain("registerCommand('muster.storageReport'");
+    expect(extensionSource).toContain('sqliteClient.storageReport()');
+    expect(extensionSource).toContain('readStorageDirectoryEntries(');
+    expect(extensionSource).toContain('classifyStorageOrphans(');
+    for (const field of [
+      'fileBytes',
+      'walBytes',
+      'shmBytes',
+      'pageCount',
+      'freelistCount',
+      'pageSize',
+      'autoVacuum',
+      'tableBytesSource',
+    ]) {
+      expect(extensionSource).toContain(`report.${field}`);
+    }
+  });
 });
