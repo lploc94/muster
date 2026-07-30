@@ -59,6 +59,10 @@
       {
         "command": "muster.compactStorage",
         "title": "Muster: Compact Storage"
+      },
+      {
+        "command": "muster.reclaimOrphanedFiles",
+        "title": "Muster: Reclaim Orphaned Files"
       }
     ],
     "configuration": {
@@ -323,6 +327,7 @@
     "build:webview": "vite build --config webview/vite.config.ts",
     "watch:webview": "vite build --config webview/vite.config.ts --watch",
     "vscode:prepublish": "npm run compile",
+    "vscode:uninstall": "node ./dist/src/uninstall.js",
     "mvp:claude": "tsx scripts/test-claude.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
     "mvp:kiro": "tsx scripts/test-kiro.ts",

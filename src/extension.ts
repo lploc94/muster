@@ -183,11 +183,13 @@ import {
   handleBackupDatabaseCommand,
   handleCompactStorageCommand,
   handleDeveloperResetCommand,
+  handleReclaimOrphanedFilesCommand,
   RetentionReport,
   type RetentionPassReport,
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
+  MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,
 } from './host/sqlite-maintenance-commands';
 import {
   handleRunDiagnosticsCommand,
@@ -199,6 +201,7 @@ import { runDurableHostSend } from './host/durable-send-coordinator';
 import {
   classifyStorageOrphans,
   readStorageDirectoryEntries,
+  removeStorageOrphans,
 } from './host/storage-orphans';
 
 
@@ -4518,6 +4521,21 @@ function registerStorageReportCommand(
       await handleCompactStorageCommand({
         storageReport: () => client.storageReport(),
         reclaimStorage: () => client.reclaimStorage(),
+        appendLine: (line) => channel.appendLine(line),
+        showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+        isMaintenanceActive: () => maintenanceActive,
+        setMaintenanceActive: (active) => {
+          maintenanceActive = active;
+        },
+      });
+      channel.show(true);
+    }),
+    vscode.commands.registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND, async () => {
+      await handleReclaimOrphanedFilesCommand({
+        showWarningMessage: async (message, ...items) => await vscode.window.showWarningMessage(message, { modal: true }, ...items),
+        readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory),
+        classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000),
+        removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report),
         appendLine: (line) => channel.appendLine(line),
         showErrorMessage: (message) => vscode.window.showErrorMessage(message),
         isMaintenanceActive: () => maintenanceActive,

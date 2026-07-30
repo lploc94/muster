@@ -3,6 +3,9 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
+const packageJson = JSON.parse(
+  readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
+) as { contributes: { commands: Array<{ command: string; title: string }> } };
 
 describe('SQLite-only activation boundary', () => {
   it('has no filesystem JSON task-store path or watcher', () => {
@@ -22,6 +25,18 @@ describe('SQLite-only activation boundary', () => {
     expect(extensionSource).toMatch(
       /if \(!sqliteProbe\.available\) \{[\s\S]*showErrorMessage\(message\);[\s\S]*throw new Error\(message\);/,
     );
+  });
+
+  it('registers orphan reclamation through the path-free storage adapters and contributes it to VS Code', () => {
+    expect(extensionSource).toContain('registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND');
+    expect(extensionSource).toContain('handleReclaimOrphanedFilesCommand({');
+    expect(extensionSource).toContain('readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory)');
+    expect(extensionSource).toContain('classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000)');
+    expect(extensionSource).toContain('removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report)');
+    expect(packageJson.contributes.commands).toContainEqual({
+      command: 'muster.reclaimOrphanedFiles',
+      title: 'Muster: Reclaim Orphaned Files',
+    });
   });
 
   it('registers storage report and user-invocable compaction through the redacted client surface', () => {
