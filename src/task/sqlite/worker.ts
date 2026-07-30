@@ -10,6 +10,7 @@
  * is preserved by serializing message handling (one in-flight handle at a time).
  */
 import { parentPort, workerData } from 'node:worker_threads';
+import * as fs from 'node:fs';
 import type { DatabaseSync } from 'node:sqlite';
 import {
   isWorkflowTransactionalCommand,
@@ -25,7 +26,7 @@ import {
   resetOpenDatabase,
   verifyResetCommittedConnection,
 } from './reset';
-import type { DbRequest, DbResponse, RunResult, SqlValue } from './rpc';
+import type { DbRequest, DbResponse, RunResult, SqlValue, StorageReportMeta } from './rpc';
 import { isAllowedReadPragma, serializeError } from './rpc';
 import type { SqliteOperationClass, SqliteWorkerData } from './errors';
 import { MusterInvariantError } from './errors';
@@ -83,6 +84,8 @@ function operationFor(req: DbRequest): SqliteOperationClass {
       return 'transaction';
     case 'backup':
       return 'backup';
+    case 'storageReport':
+      return 'read';
     case 'reset':
       return 'write';
     default: {
@@ -338,6 +341,87 @@ function parseBackupRequest(req: Extract<DbRequest, { kind: 'backup' }>): {
   };
 }
 
+function quoteIdentifier(identifier: string): string {
+  return `"${identifier.replace(/"/g, '""')}"`;
+}
+
+function fileBytes(path: string): number {
+  try {
+    return fs.statSync(path).size;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+}
+
+function tableNames(conn: DatabaseSync): string[] {
+  return (conn.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+  ).all() as Array<{ name: string }>).map((row) => row.name);
+}
+
+function estimatedTableBytes(conn: DatabaseSync, tables: string[]): StorageReportMeta['tables'] {
+  return tables.map((name) => {
+    const columns = conn.prepare(`PRAGMA table_info(${quoteIdentifier(name)})`).all() as Array<{
+      name: string; type: string;
+    }>;
+    const dataColumns = columns.filter((column) => /TEXT|BLOB/i.test(column.type));
+    const bytes = dataColumns.reduce((total, column) => {
+      const row = conn.prepare(
+        `SELECT COALESCE(SUM(LENGTH(${quoteIdentifier(column.name)})), 0) AS bytes FROM ${quoteIdentifier(name)}`,
+      ).get() as { bytes: number | bigint };
+      return total + Number(row.bytes);
+    }, 0);
+    return { name, bytes };
+  });
+}
+
+function storageReport(): StorageReportMeta {
+  const conn = requireDb();
+  if (!openPath) throw new MusterInvariantError('invariant', 'read');
+  const scalar = (pragma: string): number => {
+    const row = conn.prepare(`PRAGMA ${pragma}`).get() as Record<string, number>;
+    return Number(Object.values(row)[0]);
+  };
+  const names = tableNames(conn);
+  let tableBytesSource: StorageReportMeta['tableBytesSource'] = 'dbstat';
+  let tables: StorageReportMeta['tables'];
+  try {
+    if (isFaultCapabilityEnabled() && forceStorageEstimate) throw new Error('forced dbstat unavailable');
+    const indexOwners = new Map(
+      (conn.prepare("SELECT name, tbl_name FROM sqlite_master WHERE type = 'index'").all() as
+        Array<{ name: string; tbl_name: string }>).map((row) => [row.name, row.tbl_name]),
+    );
+    const bytesByTable = new Map(names.map((name) => [name, 0]));
+    for (const row of conn.prepare('SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name').all() as
+      Array<{ name: string; bytes: number }>) {
+      const owner = indexOwners.get(row.name) ?? row.name;
+      if (bytesByTable.has(owner)) bytesByTable.set(owner, (bytesByTable.get(owner) ?? 0) + Number(row.bytes));
+    }
+    tables = names.map((name) => ({ name, bytes: bytesByTable.get(name) ?? 0 }));
+  } catch {
+    tableBytesSource = 'estimated';
+    tables = estimatedTableBytes(conn, names);
+  }
+  tables.sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name));
+  return {
+    fileBytes: fileBytes(openPath), walBytes: fileBytes(`${openPath}-wal`), shmBytes: fileBytes(`${openPath}-shm`),
+    pageCount: scalar('page_count'), freelistCount: scalar('freelist_count'), pageSize: scalar('page_size'),
+    autoVacuum: scalar('auto_vacuum'), tableBytesSource, tables,
+  };
+}
+
+let forceStorageEstimate = false;
+
+function parseStorageReportRequest(req: Extract<DbRequest, { kind: 'storageReport' }>): void {
+  const allowed = new Set(['kind', 'requestId', 'forceTableBytesSource']);
+  if (!Object.keys(req).every((key) => allowed.has(key)) || !Number.isSafeInteger(req.requestId) || req.requestId < 1 ||
+    (req.forceTableBytesSource !== undefined && req.forceTableBytesSource !== 'dbstat' && req.forceTableBytesSource !== 'estimated')) {
+    throw new MusterInvariantError('protocol', 'read');
+  }
+  forceStorageEstimate = isFaultCapabilityEnabled() && req.forceTableBytesSource === 'estimated';
+}
+
 async function handle(req: DbRequest): Promise<DbResponse> {
   switch (req.kind) {
     case 'open': {
@@ -437,6 +521,14 @@ async function handle(req: DbRequest): Promise<DbResponse> {
         | undefined;
       const value = row ? (Object.values(row)[0] as number) : 0;
       return { kind: 'scalar', requestId: req.requestId, value: typeof value === 'number' ? value : 0 };
+    }
+    case 'storageReport': {
+      parseStorageReportRequest(req);
+      try {
+        return { kind: 'storageReport', requestId: req.requestId, result: storageReport() };
+      } finally {
+        forceStorageEstimate = false;
+      }
     }
     case 'backup': {
       const conn = requireDb();

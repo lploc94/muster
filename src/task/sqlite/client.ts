@@ -15,6 +15,7 @@ import type {
   DbResponse,
   ResetResultMeta,
   RunResult,
+  StorageReportMeta,
   SqlStatement,
   SqlValue,
 } from './rpc';
@@ -321,6 +322,22 @@ export class DbClient {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.value;
+  }
+
+  /** Byte accounting metadata for the currently open store; never paths. */
+  async storageReport(
+    options: { forceTableBytesSource?: 'dbstat' | 'estimated' } = {},
+  ): Promise<StorageReportMeta> {
+    const res = await this.send({
+      kind: 'storageReport',
+      ...(this.faultCapability && options.forceTableBytesSource
+        ? { forceTableBytesSource: options.forceTableBytesSource }
+        : {}),
+    });
+    if (res.kind !== 'storageReport') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
   /**
