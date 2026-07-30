@@ -13,6 +13,7 @@ import type {
   BackupResultMeta,
   DbRequest,
   DbResponse,
+  ReclaimResultMeta,
   ResetResultMeta,
   RunResult,
   StorageReportMeta,
@@ -322,6 +323,15 @@ export class DbClient {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.value;
+  }
+
+  /** Reclaims pages from the currently open store; metadata never includes paths. */
+  async reclaimStorage(): Promise<ReclaimResultMeta> {
+    const res = await this.send({ kind: 'reclaim' });
+    if (res.kind !== 'reclaim') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
   /** Byte accounting metadata for the currently open store; never paths. */

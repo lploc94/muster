@@ -15,7 +15,14 @@ import {
   type SqliteErrorCode,
   type SqliteOperationClass,
 } from './errors';
-import type { BackupResultMeta, DbResponse, ResetResultMeta, RunResult, StorageReportMeta } from './rpc';
+import type {
+  BackupResultMeta,
+  DbResponse,
+  ReclaimResultMeta,
+  ResetResultMeta,
+  RunResult,
+  StorageReportMeta,
+} from './rpc';
 import { SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES } from '../content-limits';
 import type { RepositoryCommandResult } from '../repository';
 
@@ -279,6 +286,14 @@ export function parseWireSuccessResponse(input: unknown): {
       }
       return { ok: true, response: { kind: 'scalar', requestId, value: obj.value } };
     }
+    case 'reclaim': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseReclaimResult(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'reclaim', requestId, result } };
+    }
     case 'backup': {
       if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
         return { ok: false, payload: makeProtocolError() };
@@ -306,6 +321,52 @@ export function parseWireSuccessResponse(input: unknown): {
     default:
       return { ok: false, payload: makeProtocolError() };
   }
+}
+
+function parseReclaimResult(value: unknown): ReclaimResultMeta | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const baseKeys = [
+    'mode',
+    'fileBytesBefore',
+    'fileBytesAfter',
+    'freelistCountBefore',
+    'freelistCountAfter',
+    'batchesRun',
+    'walCheckpoints',
+    'residualWalBytes',
+  ];
+  const optionalKeys = ['requiredBytes', 'availableBytes'];
+  if (!Object.keys(obj).every((key) => baseKeys.includes(key) || optionalKeys.includes(key))) {
+    return undefined;
+  }
+  if (!baseKeys.every((key) => Object.prototype.hasOwnProperty.call(obj, key))) return undefined;
+  if (obj.mode !== 'incremental' && obj.mode !== 'full' && obj.mode !== 'refused' && obj.mode !== 'noop') {
+    return undefined;
+  }
+  for (const key of baseKeys.slice(1)) {
+    if (!isSafeNonNegativeInt(obj[key])) return undefined;
+  }
+  const hasRequired = Object.prototype.hasOwnProperty.call(obj, 'requiredBytes');
+  const hasAvailable = Object.prototype.hasOwnProperty.call(obj, 'availableBytes');
+  const requiresCapacityDiagnostic = obj.mode === 'full' || obj.mode === 'refused';
+  if (hasRequired !== hasAvailable || requiresCapacityDiagnostic !== hasRequired) return undefined;
+  if (hasRequired && (!isSafeNonNegativeInt(obj.requiredBytes) || !isSafeNonNegativeInt(obj.availableBytes))) {
+    return undefined;
+  }
+  return {
+    mode: obj.mode,
+    fileBytesBefore: obj.fileBytesBefore as number,
+    fileBytesAfter: obj.fileBytesAfter as number,
+    freelistCountBefore: obj.freelistCountBefore as number,
+    freelistCountAfter: obj.freelistCountAfter as number,
+    batchesRun: obj.batchesRun as number,
+    walCheckpoints: obj.walCheckpoints as number,
+    residualWalBytes: obj.residualWalBytes as number,
+    ...(hasRequired
+      ? { requiredBytes: obj.requiredBytes as number, availableBytes: obj.availableBytes as number }
+      : {}),
+  };
 }
 
 function parseStorageReport(value: unknown): StorageReportMeta | undefined {

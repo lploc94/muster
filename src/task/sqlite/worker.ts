@@ -21,6 +21,7 @@ import {
 } from '../repository';
 import { openStoreDatabase } from './connection';
 import { backupOpenDatabase } from './backup';
+import { reclaimOpenDatabase } from './reclaim';
 import {
   openDatabaseForReset,
   resetOpenDatabase,
@@ -84,6 +85,8 @@ function operationFor(req: DbRequest): SqliteOperationClass {
       return 'transaction';
     case 'backup':
       return 'backup';
+    case 'reclaim':
+      return 'write';
     case 'storageReport':
       return 'read';
     case 'reset':
@@ -413,6 +416,16 @@ function storageReport(): StorageReportMeta {
 
 let forceStorageEstimate = false;
 
+function parseReclaimRequest(req: Extract<DbRequest, { kind: 'reclaim' }>): void {
+  if (
+    !Object.keys(req).every((key) => key === 'kind' || key === 'requestId') ||
+    !Number.isSafeInteger(req.requestId) ||
+    req.requestId < 1
+  ) {
+    throw new MusterInvariantError('protocol', 'write');
+  }
+}
+
 function parseStorageReportRequest(req: Extract<DbRequest, { kind: 'storageReport' }>): void {
   const allowed = new Set(['kind', 'requestId', 'forceTableBytesSource']);
   if (!Object.keys(req).every((key) => allowed.has(key)) || !Number.isSafeInteger(req.requestId) || req.requestId < 1 ||
@@ -521,6 +534,12 @@ async function handle(req: DbRequest): Promise<DbResponse> {
         | undefined;
       const value = row ? (Object.values(row)[0] as number) : 0;
       return { kind: 'scalar', requestId: req.requestId, value: typeof value === 'number' ? value : 0 };
+    }
+    case 'reclaim': {
+      parseReclaimRequest(req);
+      const conn = requireDb();
+      if (!openPath) throw new MusterInvariantError('invariant', 'write');
+      return { kind: 'reclaim', requestId: req.requestId, result: reclaimOpenDatabase(conn, openPath) };
     }
     case 'storageReport': {
       parseStorageReportRequest(req);

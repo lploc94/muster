@@ -10,6 +10,7 @@
  */
 
 import type { RepositoryCommandResult, WorkflowTransactionalCommand } from '../repository';
+import type { ReclaimResult } from './reclaim';
 
 /** Bound parameter value. No content/path is ever interpolated into SQL (plan §3.4). */
 export type SqlValue = string | number | bigint | null | Uint8Array;
@@ -77,6 +78,12 @@ export type StorageTableBytes = {
  * following the {@link BackupResultMeta} precedent: no path, `fsPath`, `dbPath`
  * or `uri` field ever crosses this boundary, so callers can log the whole report.
  */
+/**
+ * Page reclamation measurements from the worker-owned live store. Numeric and
+ * enum data only: the worker's database path must never cross this boundary.
+ */
+export type ReclaimResultMeta = ReclaimResult;
+
 export type StorageReportMeta = {
   /** Size of the main database file. */
   fileBytes: number;
@@ -146,6 +153,7 @@ export type DbRequest =
        */
       forceTableBytesSource?: StorageTableBytesSource;
     }
+  | { kind: 'reclaim'; requestId: number }
   | {
       /**
        * SQLite-aware live backup (P5-W4). Destination path stays on the worker;
@@ -202,6 +210,7 @@ export type DbResponse =
   | { kind: 'transaction'; requestId: number; results: RunResult[] }
   | { kind: 'workflowMutation'; requestId: number; result: RepositoryCommandResult }
   | { kind: 'scalar'; requestId: number; value: number }
+  | { kind: 'reclaim'; requestId: number; result: ReclaimResultMeta }
   | { kind: 'backup'; requestId: number; result: BackupResultMeta }
   | { kind: 'storageReport'; requestId: number; result: StorageReportMeta }
   | { kind: 'reset'; requestId: number; result: ResetResultMeta }
