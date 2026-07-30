@@ -88,6 +88,10 @@ import {
 } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
 import {
+  isBoundedToolFileChanges,
+  stripToolFileChangeEvidenceForRetention,
+} from '../shared/tool-file-change-contract';
+import {
   PRESENTATION_MARKDOWN_MAX_CHARS,
   TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
@@ -10260,8 +10264,37 @@ export class SqliteTaskRepository implements TaskRepository {
     if (!task) return { ok: true, changed: false };
     // Retention is payload-only: terminal task history remains addressable so
     // transcripts, operation replays, and workflow evidence retain stable IDs.
-    // T03 applies the file-change payload transform to aged terminal turns.
-    if (isTerminalLifecycle(task.lifecycle)) return { ok: true, changed: false };
+    if (isTerminalLifecycle(task.lifecycle)) {
+      const turns = await this.listTurns(task.id);
+      const keep = Math.max(0, Math.floor(command.keepLatestTurns));
+      const agedTurnIds = new Set(
+        [...turns]
+          .sort((left, right) => right.sequence - left.sequence || right.id.localeCompare(left.id))
+          .slice(keep)
+          .map((turn) => turn.id),
+      );
+      const statements: SqlStatement[] = [];
+      const changes: ChangeRecord[] = [];
+      for (const tool of await this.listToolCalls(task.id)) {
+        if (!agedTurnIds.has(tool.turnId) || !isBoundedToolFileChanges(tool.fileChanges) ||
+          tool.fileChanges.every((change) => change.retentionTruncated === true)) continue;
+        const fileChanges = [] as NonNullable<typeof tool.fileChanges>;
+        for (const change of tool.fileChanges) {
+          const stripped = stripToolFileChangeEvidenceForRetention(change);
+          if (!stripped) {
+            fileChanges.length = 0;
+            break;
+          }
+          fileChanges.push(stripped);
+        }
+        if (fileChanges.length !== tool.fileChanges.length) continue;
+        statements.push(toolCallStatement(this.workspaceId, { ...tool, fileChanges }));
+        changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
+      }
+      if (statements.length === 0) return { ok: true, changed: false };
+      await this.write(statements, changes, new Date().toISOString());
+      return { ok: true, changed: true };
+    }
 
     const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));
     // An open task may have a live turn while retention runs in another
