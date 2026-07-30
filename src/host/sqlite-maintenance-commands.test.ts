@@ -5,6 +5,7 @@ import {
   handleBackupDatabaseCommand,
   handleDeveloperResetCommand,
   handleCompactStorageCommand,
+  handleReclaimOrphanedFilesCommand,
   MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_BACKUP_DATABASE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
@@ -13,6 +14,8 @@ import {
   RESET_CHOICE_BACKUP,
   RESET_CHOICE_WITHOUT_BACKUP,
   RESET_MODAL_MESSAGE,
+  RECLAIM_ORPHANED_FILES_CHOICE,
+  RECLAIM_ORPHANED_FILES_MODAL_MESSAGE,
 } from './sqlite-maintenance-commands';
 import { SQLITE_SCHEMA_VERSION } from '../task/sqlite/schema';
 
@@ -154,6 +157,110 @@ describe('sqlite maintenance commands (P5-W5)', () => {
 
     expect(result).toMatchObject({ kind: 'error', code: 'full' });
     expect(JSON.stringify(showErrorMessage.mock.calls)).not.toMatch(/secret|SQLITE_FULL|muster\.sqlite3/i);
+  });
+
+  it('reclaims classifier-selected files only after confirming legacy-history risk and emits path-free facts', async () => {
+    const appendLine = vi.fn();
+    const removeStorageOrphans = vi.fn(async () => ({
+      removed: [
+        { name: '.muster-tasks.json', bytes: 120 },
+        { name: '.lease.turn%3Astale', bytes: 30 },
+      ],
+      bytesReclaimed: 150,
+      failedRemovals: 1,
+    }));
+    let active = false;
+
+    const result = await handleReclaimOrphanedFilesCommand({
+      showWarningMessage: async (message, ...items) => {
+        expect(message).toBe(RECLAIM_ORPHANED_FILES_MODAL_MESSAGE);
+        expect(message).toMatch(/unmigrated legacy history/i);
+        expect(items).toEqual([RECLAIM_ORPHANED_FILES_CHOICE]);
+        return RECLAIM_ORPHANED_FILES_CHOICE;
+      },
+      readStorageDirectoryEntries: async () => [],
+      classifyStorageOrphans: () => ({
+        live: [],
+        deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
+        activeLeases: [],
+        staleLeases: [{ name: '.lease.turn%3Astale', bytes: 30 }],
+      }),
+      removeStorageOrphans,
+      appendLine,
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => active,
+      setMaintenanceActive: (value) => { active = value; },
+    });
+
+    expect(result).toEqual({ kind: 'success', removedFiles: 2, bytesReclaimed: 150, failedRemovals: 1 });
+    expect(removeStorageOrphans).toHaveBeenCalledOnce();
+    const report = appendLine.mock.calls.flat().join('\n');
+    expect(report).toContain('removed_files: 2');
+    expect(report).toContain('bytes_reclaimed: 150');
+    expect(report).toContain('failed_removals: 1');
+    expect(report).toContain('removed: .muster-tasks.json (120 bytes)');
+    expect(report).not.toMatch(/[A-Z]:\\|\//);
+    expect(active).toBe(false);
+  });
+
+  it('reclaim decline is a strict no-op and releases the guard', async () => {
+    const readStorageDirectoryEntries = vi.fn();
+    const removeStorageOrphans = vi.fn();
+    let active = false;
+
+    const result = await handleReclaimOrphanedFilesCommand({
+      showWarningMessage: async () => undefined,
+      readStorageDirectoryEntries,
+      classifyStorageOrphans: vi.fn(),
+      removeStorageOrphans,
+      appendLine: vi.fn(),
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => active,
+      setMaintenanceActive: (value) => { active = value; },
+    });
+
+    expect(result).toEqual({ kind: 'cancel' });
+    expect(readStorageDirectoryEntries).not.toHaveBeenCalled();
+    expect(removeStorageOrphans).not.toHaveBeenCalled();
+    expect(active).toBe(false);
+  });
+
+  it('reclaim rejects while maintenance is active without touching the filesystem', async () => {
+    const readStorageDirectoryEntries = vi.fn();
+    const showErrorMessage = vi.fn();
+    const result = await handleReclaimOrphanedFilesCommand({
+      showWarningMessage: vi.fn(),
+      readStorageDirectoryEntries,
+      classifyStorageOrphans: vi.fn(),
+      removeStorageOrphans: vi.fn(),
+      appendLine: vi.fn(),
+      showErrorMessage,
+      isMaintenanceActive: () => true,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toMatchObject({ kind: 'error', code: 'busy' });
+    expect(readStorageDirectoryEntries).not.toHaveBeenCalled();
+    expect(JSON.stringify(showErrorMessage.mock.calls)).not.toMatch(/path|secret/i);
+  });
+
+  it('reclaim maps classifier failures to a safe error and releases the guard', async () => {
+    let active = false;
+    const showErrorMessage = vi.fn();
+    const result = await handleReclaimOrphanedFilesCommand({
+      showWarningMessage: async () => RECLAIM_ORPHANED_FILES_CHOICE,
+      readStorageDirectoryEntries: async () => { throw new Error('EACCES: /secret/storage'); },
+      classifyStorageOrphans: vi.fn(),
+      removeStorageOrphans: vi.fn(),
+      appendLine: vi.fn(),
+      showErrorMessage,
+      isMaintenanceActive: () => active,
+      setMaintenanceActive: (value) => { active = value; },
+    });
+
+    expect(result).toMatchObject({ kind: 'error', code: 'unknown' });
+    expect(JSON.stringify(showErrorMessage.mock.calls)).not.toMatch(/secret|EACCES/i);
+    expect(active).toBe(false);
   });
 
   it('backup cancel is a strict no-op', async () => {

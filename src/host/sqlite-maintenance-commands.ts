@@ -7,14 +7,25 @@
 import type { BackupResultMeta, ReclaimResultMeta } from '../task/sqlite/rpc';
 import type { ReclaimMode } from '../task/sqlite/reclaim';
 import { safeMessageForCode, isSqliteErrorCode, type SqliteErrorCode } from '../task/sqlite/errors';
+import type {
+  StorageDirectoryEntry,
+  StorageOrphanRemoval,
+  StorageOrphanReport,
+} from './storage-orphans';
 
 export const MUSTER_BACKUP_DATABASE_COMMAND = 'muster.backupDatabase';
 export const MUSTER_DEVELOPER_RESET_COMMAND = 'muster.developerResetGlobalDatabase';
 export const MUSTER_COMPACT_STORAGE_COMMAND = 'muster.compactStorage';
+export const MUSTER_RECLAIM_ORPHANED_FILES_COMMAND = 'muster.reclaimOrphanedFiles';
 
 export const MUSTER_BACKUP_COMMAND_TITLE = 'Muster: Back Up Global Database';
 export const MUSTER_RESET_COMMAND_TITLE = 'Muster: Developer Reset Global Database';
 export const MUSTER_COMPACT_STORAGE_COMMAND_TITLE = 'Muster: Compact Storage';
+export const MUSTER_RECLAIM_ORPHANED_FILES_COMMAND_TITLE = 'Muster: Reclaim Orphaned Files';
+
+export const RECLAIM_ORPHANED_FILES_MODAL_MESSAGE =
+  'This permanently removes stale lease files and unmigrated legacy history from Muster storage. This cannot be undone.';
+export const RECLAIM_ORPHANED_FILES_CHOICE = 'Reclaim Orphaned Files';
 
 /** Exact modal body for global-scope reset (profile + authority). */
 export const RESET_MODAL_MESSAGE =
@@ -134,6 +145,24 @@ export type CompactStorageCommandDeps = {
   storageReport: () => Promise<Pick<{ autoVacuum: number }, 'autoVacuum'>>;
   reclaimStorage: () => Promise<ReclaimResultMeta>;
   /** Muster Storage Report channel; handler emits enum/numeric fields only. */
+  appendLine: (line: string) => void;
+  showErrorMessage: (message: string) => void | PromiseLike<unknown>;
+  isMaintenanceActive: () => boolean;
+  setMaintenanceActive: (active: boolean) => void;
+};
+
+export type ReclaimOrphanedFilesCommandResult =
+  | { kind: 'cancel' }
+  | { kind: 'success'; removedFiles: number; bytesReclaimed: number; failedRemovals: number }
+  | { kind: 'error'; code: string; message: string };
+
+export type ReclaimOrphanedFilesCommandDeps = {
+  showWarningMessage: (message: string, ...items: string[]) => Promise<string | undefined>;
+  /** The production adapter reads its global storage directory but exposes no path. */
+  readStorageDirectoryEntries: () => Promise<readonly StorageDirectoryEntry[]>;
+  classifyStorageOrphans: (entries: readonly StorageDirectoryEntry[]) => StorageOrphanReport;
+  removeStorageOrphans: (report: StorageOrphanReport) => Promise<StorageOrphanRemoval>;
+  /** Muster Storage Report channel; path-free enum, numeric, and basename values only. */
   appendLine: (line: string) => void;
   showErrorMessage: (message: string) => void | PromiseLike<unknown>;
   isMaintenanceActive: () => boolean;
@@ -273,6 +302,57 @@ export async function handleCompactStorageCommand(
     }
     if (result.mode === 'noop') return { kind: 'noop', mode: 'noop' };
     return { kind: 'success', mode: result.mode };
+  } catch (error) {
+    const code = errorCodeFromUnknown(error);
+    const message = safeMessageForCode(code);
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code, message };
+  } finally {
+    deps.setMaintenanceActive(false);
+  }
+}
+
+/**
+ * Muster: Reclaim Orphaned Files. The injected classifier is the sole authority
+ * for candidates; this handler never receives or emits a filesystem path.
+ */
+export async function handleReclaimOrphanedFilesCommand(
+  deps: ReclaimOrphanedFilesCommandDeps,
+): Promise<ReclaimOrphanedFilesCommandResult> {
+  if (deps.isMaintenanceActive()) {
+    const message = safeMessageForCode('busy');
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code: 'busy', message };
+  }
+  deps.setMaintenanceActive(true);
+
+  try {
+    let choice: string | undefined;
+    try {
+      choice = await deps.showWarningMessage(
+        RECLAIM_ORPHANED_FILES_MODAL_MESSAGE,
+        RECLAIM_ORPHANED_FILES_CHOICE,
+      );
+    } catch {
+      return { kind: 'cancel' };
+    }
+    if (choice !== RECLAIM_ORPHANED_FILES_CHOICE) return { kind: 'cancel' };
+
+    const report = deps.classifyStorageOrphans(await deps.readStorageDirectoryEntries());
+    const result = await deps.removeStorageOrphans(report);
+    deps.appendLine('Muster orphan reclamation');
+    deps.appendLine(`removed_files: ${result.removed.length}`);
+    deps.appendLine(`bytes_reclaimed: ${result.bytesReclaimed}`);
+    deps.appendLine(`failed_removals: ${result.failedRemovals}`);
+    for (const file of result.removed) {
+      deps.appendLine(`removed: ${file.name} (${file.bytes} bytes)`);
+    }
+    return {
+      kind: 'success',
+      removedFiles: result.removed.length,
+      bytesReclaimed: result.bytesReclaimed,
+      failedRemovals: result.failedRemovals,
+    };
   } catch (error) {
     const code = errorCodeFromUnknown(error);
     const message = safeMessageForCode(code);
