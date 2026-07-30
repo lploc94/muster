@@ -147,7 +147,35 @@ Malformed durable rows remain invariant errors and are **not** silently skipped.
 | `muster.backupDatabase` | Muster: Back Up Global Database |
 | `muster.developerResetGlobalDatabase` | Muster: Developer Reset Global Database |
 | `muster.compactStorage` | Muster: Compact Storage |
+| `muster.reclaimOrphanedFiles` | Muster: Reclaim Orphaned Files |
 | `muster.storageReport` | Muster: Show Storage Report |
+
+### Reclaim orphaned files
+
+Use Command Palette: **Muster: Reclaim Orphaned Files**
+(`muster.reclaimOrphanedFiles`) to remove only classifier-identified, obsolete
+storage files: the legacy JSON store and stale lease files. It never removes the
+live SQLite trio or active leases. Before it makes changes, the confirmation
+states that **unmigrated legacy history** is permanently removed; dismissing or
+declining it is a strict no-op.
+
+The **Muster Storage Report** channel records a path-free result for every
+confirmed pass: numeric `removed_files`, `bytes_reclaimed`, and
+`failed_removals` fields, plus one basename-only `removed:` record per deleted
+file. A clean directory reports zero removed files and zero reclaimed bytes.
+A failed removal is counted without cancelling removal of other eligible files.
+If another maintenance command is in progress, reclamation reports the shared
+busy outcome and does not begin.
+
+### VS Code uninstall
+
+The `vscode:uninstall` lifecycle hook runs the compiled `dist/src/uninstall.js`
+entrypoint after Muster is removed. It clears the extension's global storage
+only when the resolved directory basename is exactly `tlelabs.muster`; a
+mis-resolved directory is refused rather than removed. The hook prints one
+single-line diagnostic: reclaimed bytes after removal, or an explicit `absent`
+or `refused` reason. It always exits 0, including when the directory is already
+absent or cleanup encounters a storage error, so uninstall is never wedged.
 
 **Compact Storage** measures `auto_vacuum` from the live store before it reclaims pages. Stores in
 INCREMENTAL mode use bounded incremental vacuum; legacy NONE stores use SQLite full compaction only
