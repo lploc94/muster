@@ -54,6 +54,46 @@ export type ResetResultMeta = {
   schemaVersion: number;
 };
 
+/**
+ * Where per-table byte figures came from (D078). `dbstat` is page-accurate;
+ * `estimated` is a `SUM(LENGTH(col))` degradation used when the `dbstat` virtual
+ * table is not compiled into the host's SQLite build. The label is part of the
+ * contract so downstream reclamation claims never silently compare a page-accurate
+ * measurement against an estimate.
+ */
+export type StorageTableBytesSource = 'dbstat' | 'estimated';
+
+/** One table's byte footprint. Table name only — never a filesystem path. */
+export type StorageTableBytes = {
+  name: string;
+  bytes: number;
+};
+
+/**
+ * Byte accounting for the live store (M023/S01). Numbers and table names only,
+ * following the {@link BackupResultMeta} precedent: no path, `fsPath`, `dbPath`
+ * or `uri` field ever crosses this boundary, so callers can log the whole report.
+ */
+export type StorageReportMeta = {
+  /** Size of the main database file. */
+  fileBytes: number;
+  /** Size of the `-wal` sidecar, 0 when absent. */
+  walBytes: number;
+  /** Size of the `-shm` sidecar, 0 when absent. */
+  shmBytes: number;
+  pageCount: number;
+  freelistCount: number;
+  pageSize: number;
+  /** `PRAGMA auto_vacuum`: 0 none, 1 full, 2 incremental. */
+  autoVacuum: number;
+  tableBytesSource: StorageTableBytesSource;
+  /** Descending by bytes. Indexes roll up into their owning table. */
+  tables: StorageTableBytes[];
+};
+
+/** Upper bound on reported tables, so a pathological schema cannot flood the host. */
+export const STORAGE_REPORT_MAX_TABLES = 4096;
+
 export type DbRequest =
   | { kind: 'open'; requestId: number; path: string; busyTimeoutMs?: number }
   | { kind: 'all'; requestId: number; sql: string; params?: SqlValue[] }
@@ -88,6 +128,21 @@ export type DbRequest =
       changeFeedRetainRevisions: number;
     }
   | { kind: 'pragma'; requestId: number; pragma: string }
+  | {
+      /**
+       * Byte accounting for the open store (M023/S01). All filesystem stats and
+       * SQLite aggregation happen on the worker; the host receives numbers and
+       * table names only.
+       */
+      kind: 'storageReport';
+      requestId: number;
+      /**
+       * Test-only forcing of the degraded estimate path so the `dbstat`-unavailable
+       * branch is provable on builds where `dbstat` does resolve. Ignored without
+       * fault capability.
+       */
+      forceTableBytesSource?: StorageTableBytesSource;
+    }
   | {
       /**
        * SQLite-aware live backup (P5-W4). Destination path stays on the worker;
@@ -145,6 +200,7 @@ export type DbResponse =
   | { kind: 'workflowMutation'; requestId: number; result: RepositoryCommandResult }
   | { kind: 'scalar'; requestId: number; value: number }
   | { kind: 'backup'; requestId: number; result: BackupResultMeta }
+  | { kind: 'storageReport'; requestId: number; result: StorageReportMeta }
   | { kind: 'reset'; requestId: number; result: ResetResultMeta }
   | {
       kind: 'error';
