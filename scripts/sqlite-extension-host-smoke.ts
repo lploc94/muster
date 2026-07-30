@@ -4,12 +4,25 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
+interface PackagedStorageReport {
+  fileBytes: number;
+  walBytes: number;
+  shmBytes: number;
+  pageCount: number;
+  freelistCount: number;
+  pageSize: number;
+  autoVacuum: number;
+  tables: Array<{ name: string; bytes: number }>;
+  tableBytesSource: 'dbstat' | 'estimated';
+}
+
 interface PackagedDbClient {
   open(dbPath: string, busyTimeoutMs?: number): Promise<void>;
   get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
   run(sql: string, params?: unknown[]): Promise<{ changes: number; lastInsertRowid: number }>;
   pragma(name: string): Promise<number>;
+  storageReport(): Promise<PackagedStorageReport>;
   backup(
     destinationPath: string,
     options?: { overwrite?: boolean },
@@ -130,6 +143,21 @@ export async function run(): Promise<void> {
       `INSERT INTO workspace_revisions (workspace_id, revision) VALUES (?, ?)`,
       ['ws-smoke', 3],
     );
+
+    // M023/S01: this must execute through the packaged worker inside Electron,
+    // not merely pass through local Node's node:sqlite implementation.
+    const storageReport = await client.storageReport();
+    assert.ok(storageReport.fileBytes > 0, 'storage report must include database bytes');
+    assert.ok(storageReport.pageCount > 0, 'storage report must include a positive page count');
+    assert.ok(storageReport.pageSize > 0, 'storage report must include a positive page size');
+    assert.ok(
+      storageReport.tables.every((table) => table.bytes >= 0 && table.bytes <= storageReport.pageCount * storageReport.pageSize),
+      'each table byte count must be bounded by the database page capacity',
+    );
+    assert.ok(
+      storageReport.tableBytesSource === 'dbstat' || storageReport.tableBytesSource === 'estimated',
+      `unexpected storage report byte source: ${String(storageReport.tableBytesSource)}`,
+    );
     const backupPath = path.join(tempDir, 'muster-backup.sqlite3');
     const backupMeta = await client.backup(backupPath, { overwrite: false });
     assert.ok(
@@ -177,7 +205,8 @@ export async function run(): Promise<void> {
 
     console.log(
       `[muster-sqlite-host-smoke] ok vscode=${vscode.version} node=${process.versions.node} ` +
-        `remote=${vscode.env.remoteName ?? 'desktop'} backup=${backupMeta.mechanism}`,
+        `remote=${vscode.env.remoteName ?? 'desktop'} backup=${backupMeta.mechanism} ` +
+        `tableBytesSource=${storageReport.tableBytesSource}`,
     );
   } finally {
     await client.close();
