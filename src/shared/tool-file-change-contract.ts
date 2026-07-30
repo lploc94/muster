@@ -55,6 +55,15 @@ export interface ToolFileChangeEvidenceShape {
    * workspace. Always `true` when set — never `false`.
    */
   outsideWorkspace?: true;
+  /**
+   * Present only after retention removes diff text. Always `true` when set;
+   * oldText is null and newText is empty so consumers never mistake this for
+   * engine-side byte-bound clipping.
+   */
+  retentionTruncated?: true;
+  /** Original logical line counts retained as a summary after stripping. */
+  oldLineCount?: number;
+  newLineCount?: number;
 }
 
 export function toolFileChangeRetainedBytes(change: ToolFileChangeEvidenceShape): number {
@@ -71,7 +80,17 @@ export function isBoundedToolFileChange(change: unknown): change is ToolFileChan
   const keys = Object.keys(value);
   if (
     keys.some(
-      (key) => !['path', 'oldText', 'newText', 'truncated', 'outsideWorkspace'].includes(key),
+      (key) =>
+        ![
+          'path',
+          'oldText',
+          'newText',
+          'truncated',
+          'outsideWorkspace',
+          'retentionTruncated',
+          'oldLineCount',
+          'newLineCount',
+        ].includes(key),
     )
   ) {
     return false;
@@ -81,12 +100,47 @@ export function isBoundedToolFileChange(change: unknown): change is ToolFileChan
   if (typeof value.newText !== 'string') return false;
   if (value.truncated !== undefined && value.truncated !== true) return false;
   if (value.outsideWorkspace !== undefined && value.outsideWorkspace !== true) return false;
+  const retentionTruncated = value.retentionTruncated === true;
+  if (value.retentionTruncated !== undefined && !retentionTruncated) return false;
+  const hasRetentionSummary = value.oldLineCount !== undefined || value.newLineCount !== undefined;
+  if (retentionTruncated !== hasRetentionSummary) return false;
+  if (retentionTruncated) {
+    if (value.oldText !== null || value.newText !== '') return false;
+    for (const lineCount of [value.oldLineCount, value.newLineCount]) {
+      if (typeof lineCount !== 'number' || !Number.isSafeInteger(lineCount) || lineCount < 0) {
+        return false;
+      }
+    }
+  }
   for (const side of [value.oldText, value.newText]) {
     if (typeof side !== 'string') continue;
     if (utf8ByteLength(side) > TOOL_FILE_CHANGE_SIDE_MAX_BYTES) return false;
     if (logicalLineCount(side) > TOOL_FILE_CHANGE_SIDE_MAX_LINES) return false;
   }
   return true;
+}
+
+/**
+ * Remove file diff bytes while keeping a path and line-count summary for
+ * retention. Invalid values are rejected so persistence cannot manufacture a
+ * trusted retention marker from arbitrary JSON.
+ */
+export function stripToolFileChangeEvidenceForRetention(
+  change: unknown,
+): ToolFileChangeEvidenceShape | undefined {
+  if (!isBoundedToolFileChange(change)) return undefined;
+  if (change.retentionTruncated === true) return { ...change };
+
+  return {
+    path: change.path,
+    oldText: null,
+    newText: '',
+    oldLineCount: change.oldText === null ? 0 : logicalLineCount(change.oldText),
+    newLineCount: logicalLineCount(change.newText),
+    retentionTruncated: true,
+    ...(change.truncated === true ? { truncated: true } : {}),
+    ...(change.outsideWorkspace === true ? { outsideWorkspace: true } : {}),
+  };
 }
 
 export function isBoundedToolFileChanges(value: unknown): value is ToolFileChangeEvidenceShape[] {
