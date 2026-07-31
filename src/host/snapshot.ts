@@ -100,6 +100,11 @@ export interface ToolFileChange {
    * Path is already basename-only when set; never `false`.
    */
   outsideWorkspace?: true;
+  /** Present only after retention removes diff text; never false. */
+  retentionTruncated?: true;
+  /** Original logical line counts preserved by retention stripping. */
+  oldLineCount?: number;
+  newLineCount?: number;
 }
 
 export interface ToolTranscriptContent {

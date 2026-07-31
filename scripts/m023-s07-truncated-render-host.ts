@@ -30,15 +30,31 @@ async function command<T>(id: string, args?: unknown): Promise<T> {
   return (await vscode.commands.executeCommand(id, args)) as T;
 }
 
-async function waitFor<T>(label: string, read: () => Promise<T>, predicate: (value: T) => boolean): Promise<T> {
+async function waitFor<T>(
+  label: string,
+  read: () => Promise<T>,
+  predicate: (value: T) => boolean,
+  describeLast?: (value: T | undefined) => string,
+): Promise<T> {
   const deadline = Date.now() + 30_000;
-  let last: T;
+  let last: T | undefined;
   for (;;) {
     last = await read();
     if (predicate(last)) return last;
-    if (Date.now() >= deadline) throw new Error(`timeout waiting for ${label}`);
+    if (Date.now() >= deadline) {
+      throw new Error(`timeout waiting for ${label}${describeLast ? `; ${describeLast(last)}` : ''}`);
+    }
     await sleep(POLL_MS);
   }
+}
+
+function describeRenderProbeObservation(observation: RenderProbeObservation | undefined): string {
+  if (!observation) return 'last observation: unavailable';
+  const retentionFiles = observation.files.filter((file) => file.retentionTruncated).length;
+  const liveFilesWithDiff = observation.files.filter(
+    (file) => !file.retentionTruncated && file.hasDiffBody,
+  ).length;
+  return `last observation: files=${observation.files.length}, groups=${observation.fileChangeGroups.length}, retentionFiles=${retentionFiles}, liveFilesWithDiff=${liveFilesWithDiff}`;
 }
 
 function writeResult(result: TruncatedRenderHostResult): void {
@@ -69,6 +85,9 @@ export async function run(): Promise<void> {
     () => command(UAT_COMMANDS.storageLifecycleState),
     (state) => state.retentionTruncatedEntries >= 4 && state.retention.failedPasses === seeded.retention.failedPasses,
   );
+  // Force a production focus transition so snapshot hydration carries the
+  // rewritten retained payloads into the real webview before DOM collection.
+  await command(UAT_COMMANDS.focusTask, { taskId: null });
   await command(UAT_COMMANDS.focusTask, { taskId: ACTIVE_TASK_ID });
 
   const observation = await waitFor<RenderProbeObservation>(
@@ -76,6 +95,7 @@ export async function run(): Promise<void> {
     () => command(UAT_COMMANDS.renderProbe),
     (candidate) => candidate.files.some((file) => file.retentionTruncated) &&
       candidate.files.some((file) => !file.retentionTruncated && file.hasDiffBody),
+    describeRenderProbeObservation,
   );
   const result: TruncatedRenderHostResult = {
     ok: true,

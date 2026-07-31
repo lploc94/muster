@@ -53,7 +53,14 @@ async function main() {
     const extensionDevelopmentPath = path.join(extractedRoot, 'extension');
     const workspacePath = path.join(tempDir, 'workspace');
     const userDataDir = path.join(tempDir, 'user-data');
-    fs.mkdirSync(workspacePath, { recursive: true });
+    fs.mkdirSync(path.join(workspacePath, '.vscode'), { recursive: true });
+    // The fixture has four aged settled turns plus one live turn. Use the normal
+    // workspace configuration surface so the production retention pass retains
+    // only the live turn and strips the four aged file-change payloads.
+    fs.writeFileSync(
+      path.join(workspacePath, '.vscode', 'settings.json'),
+      `${JSON.stringify({ 'muster.retention.maxRetainedTurnsPerTask': 1 })}\n`,
+    );
     fs.mkdirSync(userDataDir, { recursive: true });
 
     await runTests({
