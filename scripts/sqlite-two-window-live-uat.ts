@@ -137,10 +137,19 @@ async function waitForStorageLifecycleState(
   timeoutMs = 30_000,
 ): Promise<StorageLifecycleState> {
   const start = Date.now();
+  let lastState: StorageLifecycleState | undefined;
   for (;;) {
     const state = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
     if (predicate(state)) return state;
-    if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for ${label}`);
+    lastState = state;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `timeout waiting for ${label}; ` +
+        `completedPasses=${lastState.retention.completedPasses} ` +
+        `failedPasses=${lastState.retention.failedPasses} ` +
+        `truncatedEntries=${lastState.retentionTruncatedEntries}`,
+      );
+    }
     await sleep(POLL_MS);
   }
 }
@@ -539,9 +548,12 @@ async function runOrchestratorA(): Promise<void> {
     120_000,
   );
   const identityB2 = await peer<DbIdentity>(UAT_COMMANDS.identity);
+  // A fresh production host recovers the pending fixture during activation.
+  // Its failed replay stays durably visible as rejected; the independently
+  // rejected record and presentation must also survive the fresh host.
   const hasExpectedDurableSurfaces = (value: DurableSurfaces): boolean =>
     value.sendOutbox.some((entry) =>
-      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'pending') &&
+      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected') &&
     value.sendOutbox.some((entry) =>
       entry.clientRequestId === 'uat-outbox-reject' && entry.status === 'rejected') &&
     value.presentation?.presentationId === 'uat-plan' &&
@@ -552,6 +564,7 @@ async function runOrchestratorA(): Promise<void> {
     timeoutMs = 30_000,
   ): Promise<{ durable: DurableSurfaces; state: UatHostState }> => {
     const start = Date.now();
+    let lastDurable: DurableSurfaces | undefined;
     for (;;) {
       // `peer` advances a shared mailbox cursor, so requests to the same
       // Extension Host must remain ordered. Parallel local/peer work elsewhere
@@ -561,7 +574,14 @@ async function runOrchestratorA(): Promise<void> {
       });
       const state = await peer<UatHostState>(UAT_COMMANDS.hostState);
       if (hasExpectedDurableSurfaces(durable)) return { durable, state };
-      if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for peer ${label}`);
+      lastDurable = durable;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(
+          `timeout waiting for peer ${label}; ` +
+          `outboxCount=${lastDurable.sendOutbox.length} ` +
+          `presentationPresent=${lastDurable.presentation !== undefined}`, 
+        );
+      }
       await sleep(POLL_MS);
     }
   };
@@ -582,7 +602,7 @@ async function runOrchestratorA(): Promise<void> {
   record(
     'H',
     durableOk && identityOk && tasksOk,
-    `peer restarted generation=${readyB2.generation}; pending entry persisted; explicit rejection persisted; durable surfaces restored; durableOk=${durableOk} identityOk=${identityOk} tasksOk=${tasksOk}`,
+    `peer restarted generation=${readyB2.generation}; recovered pending entry was rejected; explicit rejection persisted; durable surfaces restored; durableOk=${durableOk} identityOk=${identityOk} tasksOk=${tasksOk}`, 
   );
 
   // I — two SQLite writers start at the same time, then both projections converge.
