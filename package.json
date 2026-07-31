@@ -395,6 +395,7 @@
     "test:sqlite-phase6-evidence": "node --test scripts/sqlite-phase6-evidence-schema.test.mjs scripts/verify-sqlite-phase6-evidence.test.mjs",
     "test:m023-s05-storage-evidence": "node --test scripts/m023-s05-storage-lifecycle-evidence-schema.test.mjs scripts/verify-m023-s05-storage-lifecycle-evidence.test.mjs",
     "test:m023-s05-storage-lifecycle-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
+    "test:m023-s07-render-schema": "node --test scripts/m023-s07-truncated-render-evidence-schema.test.mjs",
     "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts",
     "test:webview:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-webview.visual.spec.ts",
     "test:webview:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-webview.visual.spec.ts",
