@@ -43,6 +43,8 @@ export const UAT_COMMANDS = {
   seedStorageWorkload: 'muster.uat.seedStorageWorkload',
   storageLifecycleState: 'muster.uat.storageLifecycleState',
   runRetentionPass: 'muster.uat.runRetentionPass',
+  /** M023/S07 read-only webview DOM observation; registered only in UAT mode. */
+  renderProbe: 'muster.uat.renderProbe',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];

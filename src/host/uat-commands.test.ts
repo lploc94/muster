@@ -35,6 +35,7 @@ describe('live UAT exposure gate', () => {
     expect(UAT_COMMANDS.seedStorageWorkload).toBe('muster.uat.seedStorageWorkload');
     expect(UAT_COMMANDS.storageLifecycleState).toBe('muster.uat.storageLifecycleState');
     expect(UAT_COMMANDS.runRetentionPass).toBe('muster.uat.runRetentionPass');
+    expect(UAT_COMMANDS.renderProbe).toBe('muster.uat.renderProbe');
   });
 
   it('seeds bounded terminal tool-call evidence through named production repository commands', async () => {
