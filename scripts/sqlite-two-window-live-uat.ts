@@ -8,7 +8,11 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { UAT_COMMANDS, type UatHostState } from '../src/host/uat-commands';
+import {
+  UAT_COMMANDS,
+  type StorageLifecycleState,
+  type UatHostState,
+} from '../src/host/uat-commands';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -61,6 +65,14 @@ const CONTROL_DIR = process.env.MUSTER_UAT_CONTROL_DIR ?? '';
 const PEER_GENERATION = Number.parseInt(process.env.MUSTER_UAT_PEER_GENERATION ?? '1', 10);
 const POLL_MS = 75;
 const DEFAULT_TIMEOUT_MS = 90_000;
+
+// Keep literal IDs here for source-boundary review; calls still resolve through
+// the activated UAT command map so renamed command IDs fail at compile time.
+const STORAGE_LIFECYCLE_COMMAND_IDS = {
+  seed: 'muster.uat.seedStorageWorkload',
+  state: 'muster.uat.storageLifecycleState',
+  retention: 'muster.uat.runRetentionPass',
+} as const;
 
 function controlPath(...parts: string[]): string {
   return path.join(CONTROL_DIR, ...parts);
@@ -115,6 +127,20 @@ async function waitForLocalHostState(
     const state = await cmd<UatHostState>(UAT_COMMANDS.hostState);
     if (predicate(state)) return state;
     if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for local ${label}`);
+    await sleep(POLL_MS);
+  }
+}
+
+async function waitForStorageLifecycleState(
+  label: string,
+  predicate: (state: StorageLifecycleState) => boolean,
+  timeoutMs = 30_000,
+): Promise<StorageLifecycleState> {
+  const start = Date.now();
+  for (;;) {
+    const state = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+    if (predicate(state)) return state;
+    if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for ${label}`);
     await sleep(POLL_MS);
   }
 }
@@ -597,6 +623,52 @@ async function runOrchestratorA(): Promise<void> {
     `simultaneous writers converged rev=${finalA.appliedWorkspaceRevision} tasks=${finalA.taskIds.length}`,
   );
 
+  // M023/S05 — preserve the original A–I protocol while observing the storage
+  // lifecycle through the activated production repository in both hosts.
+  progress('storage-lifecycle');
+  assert.equal(UAT_COMMANDS.seedStorageWorkload, STORAGE_LIFECYCLE_COMMAND_IDS.seed);
+  assert.equal(UAT_COMMANDS.storageLifecycleState, STORAGE_LIFECYCLE_COMMAND_IDS.state);
+  assert.equal(UAT_COMMANDS.runRetentionPass, STORAGE_LIFECYCLE_COMMAND_IDS.retention);
+  const lifecycleBefore = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+  await cmd(UAT_COMMANDS.seedStorageWorkload);
+  const lifecycleAfterSeed = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+  const scheduledPassTarget = lifecycleAfterSeed.retention.completedPasses + 2;
+  const lifecycleAfterScheduledPasses = await waitForStorageLifecycleState(
+    'two scheduled retention passes',
+    (state) =>
+      state.retention.completedPasses >= scheduledPassTarget &&
+      state.retention.failedPasses === 0 &&
+      state.retentionTruncatedEntries === 4,
+    90_000,
+  );
+  // The command shares the scheduler's production retention/reclamation path;
+  // this explicit seam makes its completion observable without a parallel DB.
+  await cmd(UAT_COMMANDS.runRetentionPass);
+  const lifecycleAfterRetention = await cmd<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.equal(
+    lifecycleAfterRetention.retention.completedPasses,
+    lifecycleAfterScheduledPasses.retention.completedPasses,
+    'direct UAT pass must not fabricate scheduler completion evidence',
+  );
+  const lifecyclePeerAfterRetention = await peer<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.ok(
+    lifecycleAfterSeed.storage.fileBytes > lifecycleBefore.storage.fileBytes,
+    'seeded workload did not grow database bytes',
+  );
+  assert.ok(
+    lifecycleAfterRetention.storage.fileBytes < lifecycleAfterSeed.storage.fileBytes,
+    'retention did not shrink database bytes',
+  );
+  assert.equal(
+    lifecyclePeerAfterRetention.storage.fileBytes,
+    lifecycleAfterRetention.storage.fileBytes,
+    'peer storage report did not converge after reclamation',
+  );
+
   writeJson(controlPath('result.json'), {
     ok: scenarios.every((scenario) => scenario.verdict === 'PASS'),
     kind: 'live-two-window-extension-host',
@@ -623,6 +695,12 @@ async function runOrchestratorA(): Promise<void> {
     finalRevision: finalA.appliedWorkspaceRevision,
     finalTaskCount: finalA.taskIds.length,
     scenarios,
+    storageLifecycle: {
+      before: lifecycleBefore,
+      afterSeed: lifecycleAfterSeed,
+      afterRetention: lifecycleAfterRetention,
+      peerAfterRetention: lifecyclePeerAfterRetention,
+    },
   });
   writeJson(controlPath('done.json'), { stop: true });
 }

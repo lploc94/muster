@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import AdmZip from 'adm-zip';
 import { downloadAndUnzipVSCode } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
+import { validateStorageLifecycleEvidence } from './m023-s05-storage-lifecycle-evidence-schema.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
@@ -23,7 +24,7 @@ const downloadTimeout = Number.parseInt(
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm2w-'));
 const evidenceOut =
   process.env.MUSTER_UAT_EVIDENCE_OUT ||
-  path.join(root, 'docs', 'plans', 'sqlite-phase4-two-window-live-uat-evidence.json');
+  path.join(root, 'docs', 'plans', 'm023-s05-storage-lifecycle-evidence.json');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -85,6 +86,8 @@ function spawnWindow({
     MUSTER_UAT_ROLE: role,
     MUSTER_UAT_PEER_GENERATION: String(generation),
     MUSTER_UAT_CONTROL_DIR: controlDir,
+    // UAT-only: production keeps its fixed thirty-minute cadence.
+    MUSTER_RETENTION_INTERVAL_MS: '1000',
   };
   const label = role === 'B' ? `B${generation}` : role;
   const logStream = fs.createWriteStream(logPath, { flags: appendLog ? 'a' : 'w' });
@@ -172,6 +175,28 @@ function validateSuccessResult(result) {
   if (!Number.isSafeInteger(result.finalRevision) || result.finalRevision < 1) {
     throw new Error('invalid final revision');
   }
+  if (!result.storageLifecycle || typeof result.storageLifecycle !== 'object') {
+    throw new Error('UAT did not return storage lifecycle observations');
+  }
+}
+
+function buildStorageLifecycleEvidence(result) {
+  return {
+    ok: true,
+    kind: 'm023-s05-storage-lifecycle-live-uat',
+    schemaVersion: 1,
+    before: result.storageLifecycle.before,
+    afterSeed: result.storageLifecycle.afterSeed,
+    afterRetention: result.storageLifecycle.afterRetention,
+    peerAfterRetention: result.storageLifecycle.peerAfterRetention,
+    contentSafety: {
+      absolutePathsStoredInEvidence: false,
+      messageBodiesStoredInEvidence: false,
+      sessionIdsStoredInEvidence: false,
+      canaryStoredInEvidence: false,
+    },
+    generatedAt: new Date().toISOString(),
+  };
 }
 
 function buildEvidence(result, exitA, peerExits) {
@@ -339,7 +364,11 @@ async function main() {
       throw new Error(`invalid Extension Host exits: A=${exitA.code} B=${peerExits.map((e) => e.code).join(',')}`);
     }
     validateSuccessResult(result);
-    const evidence = buildEvidence(result, exitA, peerExits);
+    const evidence = buildStorageLifecycleEvidence(result);
+    const evidenceFailures = validateStorageLifecycleEvidence(evidence, { requirePass: true });
+    if (evidenceFailures.length > 0) {
+      throw new Error(`storage lifecycle evidence invalid: ${evidenceFailures.join('; ')}`);
+    }
     const serialized = JSON.stringify(evidence);
     const forbidden = [
       tempDir,
