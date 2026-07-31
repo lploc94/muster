@@ -1,10 +1,12 @@
 /**
  * Live two-window UAT command surface.
  *
- * Registered only when MUSTER_UAT_MODE=1 (explicit harness opt-in).
- * Production ExtensionMode is allowed when the env flag is set so the
- * M022/S05 real-install gate can observe bridge health/closure from a
- * CLI-installed copy; marketplace users never set this env var.
+ * Registered only when MUSTER_UAT_MODE=1 (explicit harness opt-in), and then
+ * only up to the tier {@link resolveUatSurface} allows: a Production
+ * ExtensionMode (CLI-installed VSIX) is capped at the redacted bridge
+ * health/closure observers the M022/S05 install gate needs, so no mutable
+ * harness command ships reachable in a marketplace build. The full surface
+ * requires a non-production Extension Host.
  * Handlers operate on the activated host repository / poller / presentation
  * paths — never a parallel DbClient.
  */
@@ -249,15 +251,68 @@ export type UatDurableSurfaces = {
   workspaceRevision: number;
 };
 
+/**
+ * Exposure tier for the live UAT command surface.
+ *
+ * - `none` — nothing is registered. This is every marketplace install, because
+ *   `MUSTER_UAT_MODE` is only ever set by our own release gates.
+ * - `packaging` — Production ExtensionMode (a CLI-installed VSIX) with
+ *   `MUSTER_UAT_MODE=1`. Only the redacted bridge observers the packaging and
+ *   install gates need. No command in this tier touches persisted task rows,
+ *   messages, follow-up turns, the send outbox, or presentations.
+ * - `full` — non-production Extension Host with `MUSTER_UAT_MODE=1`. The whole
+ *   harness surface, including the store-mutating commands.
+ */
+export type UatSurfaceTier = 'none' | 'packaging' | 'full';
+
+/**
+ * The only UAT commands allowed to be reachable from a Production VSIX.
+ *
+ * Deliberately minimal: redacted bridge listen state plus the deactivate trace
+ * that proves the MCP bridge actually closes (M022/S05 real-install gate,
+ * D073). `runDeactivate` tears down this extension instance and its own bridge
+ * listener; it never creates, edits, or deletes stored data.
+ */
+export const PACKAGING_UAT_COMMAND_IDS: readonly UatCommandId[] = Object.freeze([
+  UAT_COMMANDS.bridgeHealth,
+  UAT_COMMANDS.runDeactivate,
+  UAT_COMMANDS.deactivateTrace,
+]);
+
+/**
+ * Resolve which UAT surface may be registered.
+ *
+ * The env flag is a necessary opt-in but not a sufficient one: a Production
+ * extension host is capped at the redacted packaging tier so a marketplace
+ * build can never expose mutable harness commands, even with the flag set.
+ */
+export function resolveUatSurface(
+  isProductionExtension: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): UatSurfaceTier {
+  if (env[UAT_MODE_ENV] !== '1') {
+    return 'none';
+  }
+  return isProductionExtension ? 'packaging' : 'full';
+}
+
+/** True when `id` may be registered under `tier`. */
+export function isUatCommandAllowed(tier: UatSurfaceTier, id: UatCommandId): boolean {
+  if (tier === 'full') {
+    return true;
+  }
+  if (tier === 'packaging') {
+    return PACKAGING_UAT_COMMAND_IDS.includes(id);
+  }
+  return false;
+}
+
+/** True when any UAT command surface is registered at all. */
 export function isUatModeEnabled(
-  _isProductionExtension: boolean,
+  isProductionExtension: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  // Env flag is the sole opt-in. Production ExtensionMode (CLI-installed VSIX)
-  // must still expose the redacted packaging UAT surface when the install gate
-  // sets MUSTER_UAT_MODE=1; the flag is never set for normal marketplace users.
-  void _isProductionExtension;
-  return env[UAT_MODE_ENV] === '1';
+  return resolveUatSurface(isProductionExtension, env) !== 'none';
 }
 
 export function makeIso(offsetMs = 0): string {
