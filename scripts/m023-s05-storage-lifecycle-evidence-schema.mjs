@@ -145,8 +145,8 @@ export function validateStorageLifecycleEvidence(evidence, opts = {}) {
   if (retained?.retention?.failedPasses !== 0) failures.push('afterRetention.retention.failedPasses must be 0');
   if (retained?.retentionTruncatedEntries !== 4) failures.push('afterRetention.retentionTruncatedEntries must be 4');
   for (const rows of ROW_KEYS) {
-    if (Number.isSafeInteger(before?.durableRows?.[rows]) && Number.isSafeInteger(retained?.durableRows?.[rows]) && before.durableRows[rows] !== retained.durableRows[rows]) {
-      failures.push(`durableRows.${rows} must be unchanged before to afterRetention`);
+    if (Number.isSafeInteger(seeded?.durableRows?.[rows]) && Number.isSafeInteger(retained?.durableRows?.[rows]) && seeded.durableRows[rows] !== retained.durableRows[rows]) {
+      failures.push(`durableRows.${rows} must be unchanged afterSeed to afterRetention`);
     }
   }
   if (Number.isSafeInteger(retained?.storage?.fileBytes) && Number.isSafeInteger(peer?.storage?.fileBytes) && peer.storage.fileBytes !== retained.storage.fileBytes) {

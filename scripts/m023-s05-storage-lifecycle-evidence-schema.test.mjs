@@ -29,14 +29,15 @@ function lifecycle(rows = { tasks: 2, turns: 4, messages: 0, operations: 4 }) {
 }
 
 function completeEvidence() {
+  const seededRows = { tasks: 3, turns: 5, messages: 0, operations: 8 };
   return {
     ok: true,
     kind: 'm023-s05-storage-lifecycle-live-uat',
     schemaVersion: 1,
     before: lifecycle(),
-    afterSeed: { ...lifecycle(), storage: report(2000) },
-    afterRetention: lifecycle(),
-    peerAfterRetention: lifecycle(),
+    afterSeed: { ...lifecycle(seededRows), storage: report(2000) },
+    afterRetention: lifecycle(seededRows),
+    peerAfterRetention: lifecycle(seededRows),
     contentSafety: {
       absolutePathsStoredInEvidence: false,
       messageBodiesStoredInEvidence: false,
@@ -75,7 +76,10 @@ test('rejects lifecycle evidence that misses its byte, pass, row, or peer invari
   }
   {
     const evidence = completeEvidence();
-    evidence.afterRetention.durableRows.turns++;
+    evidence.afterRetention.durableRows = {
+      ...evidence.afterRetention.durableRows,
+      turns: evidence.afterRetention.durableRows.turns + 1,
+    };
     assert.ok(validateStorageLifecycleEvidence(evidence).some((failure) => /durableRows\.turns/.test(failure)));
   }
   {
