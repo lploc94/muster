@@ -11,7 +11,9 @@ import type {
   SendOutboxEntry,
   TaskRepository,
 } from '../task/repository';
+import type { StorageReportMeta } from '../task/sqlite/rpc';
 import type { MusterTask, TaskMessage, TaskTurn } from '../task/types';
+import type { RetentionReportSnapshot } from './sqlite-maintenance-commands';
 
 export const UAT_MODE_ENV = 'MUSTER_UAT_MODE';
 
@@ -37,6 +39,10 @@ export const UAT_COMMANDS = {
   runDoctor: 'muster.uat.runDoctor',
   acceptFirstTask: 'muster.uat.acceptFirstTask',
   nativeFirstRunCleanup: 'muster.uat.nativeFirstRunCleanup',
+  /** M023/S05 storage lifecycle observations (production-path delegates). */
+  seedStorageWorkload: 'muster.uat.seedStorageWorkload',
+  storageLifecycleState: 'muster.uat.storageLifecycleState',
+  runRetentionPass: 'muster.uat.runRetentionPass',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];
@@ -425,6 +431,125 @@ export async function putPresentation(
     presentationId: args.presentationId,
     workspaceRevision: await repository.getWorkspaceRevision(),
   };
+}
+
+export type StorageLifecycleSeedResult = {
+  seededTasks: number;
+  seededTurns: number;
+  seededToolCalls: number;
+};
+
+const STORAGE_SEED_TASK_ID = 'uat-storage-seed-terminal';
+const STORAGE_SEED_ACTIVE_TASK_ID = 'uat-storage-seed-active';
+const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(120 * 1024);
+
+/**
+ * Creates a bounded, retention-eligible production workload plus one live turn.
+ * The caller owns UAT gating; this helper never opens a parallel database client.
+ */
+export async function seedStorageWorkload(
+  repository: Pick<TaskRepository, 'execute'>,
+  workspaceId: string,
+): Promise<StorageLifecycleSeedResult> {
+  const terminalTask = { ...makeTask(STORAGE_SEED_TASK_ID, 'UAT storage lifecycle terminal workload'), lifecycle: 'succeeded' as const };
+  const activeTask = makeTask(STORAGE_SEED_ACTIVE_TASK_ID, 'UAT storage lifecycle active workload');
+  await repository.execute({ kind: 'createTask', workspaceId, task: terminalTask });
+  await repository.execute({ kind: 'createTask', workspaceId, task: activeTask });
+
+  const settledTurns: TaskTurn[] = [1, 2, 3].map((sequence) => ({
+    id: `${STORAGE_SEED_TASK_ID}-turn-${sequence}`,
+    taskId: terminalTask.id,
+    sequence,
+    status: 'succeeded' as const,
+    trigger: 'user' as const,
+    inputs: [],
+    createdAt: makeIso(sequence * 1_000),
+    finishedAt: makeIso(sequence * 1_000 + 500),
+  }));
+  for (const turn of settledTurns) {
+    await repository.execute({ kind: 'createTurn', workspaceId, turn });
+  }
+  const activeTurn: TaskTurn = {
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-1`, taskId: activeTask.id, sequence: 1,
+    status: 'running', trigger: 'user', inputs: [], createdAt: makeIso(5_000), startedAt: makeIso(5_100),
+  };
+  await repository.execute({ kind: 'createTurn', workspaceId, turn: activeTurn });
+
+  await repository.execute({
+    kind: 'appendTranscriptBatch', workspaceId, taskId: terminalTask.id,
+    toolCalls: settledTurns.map((turn, index) => ({
+      id: `${turn.id}:edit`, taskId: terminalTask.id, turnId: turn.id, toolCallId: 'edit', order: 0,
+      name: 'edit_file', kind: 'builtin' as const, status: 'success' as const,
+      fileChanges: index < 2
+        ? [0, 1].map((part) => ({
+          path: `src/retained-${index}-${part}.ts`, oldText: STORAGE_SEED_LARGE_DIFF, newText: STORAGE_SEED_LARGE_DIFF,
+        }))
+        : [{ path: 'src/current.ts', oldText: 'before', newText: 'after' }],
+      createdAt: makeIso(6_000 + index), updatedAt: makeIso(6_000 + index),
+    })),
+  });
+  await repository.execute({
+    kind: 'appendTranscriptBatch', workspaceId, taskId: activeTask.id,
+    toolCalls: [{
+      id: `${activeTurn.id}:edit`, taskId: activeTask.id, turnId: activeTurn.id, toolCallId: 'edit', order: 0,
+      name: 'edit_file', kind: 'builtin', status: 'success',
+      fileChanges: [{ path: 'src/live.ts', oldText: 'live-before', newText: 'live-after' }],
+      createdAt: makeIso(7_000), updatedAt: makeIso(7_000),
+    }],
+  });
+  return { seededTasks: 2, seededTurns: 4, seededToolCalls: 4 };
+}
+
+type LifecycleDbProbe = {
+  storageReport(): Promise<StorageReportMeta>;
+  get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
+};
+
+type LifecycleRetentionReport = { snapshot(): RetentionReportSnapshot };
+
+export type StorageLifecycleState = {
+  storage: StorageReportMeta;
+  retention: { completedPasses: number; failedPasses: number; latestPassOrdinal: number };
+  durableRows: { tasks: number; turns: number; messages: number; operations: number };
+  retentionTruncatedEntries: number;
+};
+
+/** Numeric-and-enum-only storage lifecycle observation for the live UAT runner. */
+export async function readStorageLifecycleState(deps: {
+  repository: Pick<TaskRepository, 'listTasks' | 'listToolCalls'>;
+  sqliteClient: LifecycleDbProbe;
+  retentionReport: LifecycleRetentionReport;
+  workspaceId: string;
+}): Promise<StorageLifecycleState> {
+  const tables = ['tasks', 'turns', 'messages', 'operations'] as const;
+  const [storage, snapshot, rows, tasks] = await Promise.all([
+    deps.sqliteClient.storageReport(),
+    Promise.resolve(deps.retentionReport.snapshot()),
+    Promise.all(tables.map(async (table) => {
+      const row = await deps.sqliteClient.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM ${table} WHERE workspace_id = ?`, [deps.workspaceId],
+      );
+      return [table, row?.count ?? 0] as const;
+    })),
+    deps.repository.listTasks(deps.workspaceId),
+  ]);
+  const toolCalls = await Promise.all(tasks.map((task) => deps.repository.listToolCalls(task.id)));
+  const retentionTruncatedEntries = toolCalls.flat(2).reduce(
+    (count, tool) => count + (tool.fileChanges ?? []).filter((change) => change.retentionTruncated === true).length,
+    0,
+  );
+  const latestPassOrdinal = snapshot.completedPassDetails.at(-1)?.ordinal ?? 0;
+  return {
+    storage,
+    retention: { completedPasses: snapshot.completedPasses, failedPasses: snapshot.failedPasses, latestPassOrdinal },
+    durableRows: Object.fromEntries(rows) as StorageLifecycleState['durableRows'],
+    retentionTruncatedEntries,
+  };
+}
+
+/** Preserves production retention failure semantics while giving UAT a direct pass seam. */
+export async function runRetentionPass<T>(runPass: () => Promise<T>): Promise<T> {
+  return runPass();
 }
 
 export async function readDurableSurfaces(

@@ -1,6 +1,12 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { NATIVE_FIRST_RUN_UAT_COMMANDS } from './m019-s05-native-first-run';
-import { isUatModeEnabled, UAT_COMMANDS } from './uat-commands';
+import {
+  isUatModeEnabled,
+  readStorageLifecycleState,
+  runRetentionPass,
+  seedStorageWorkload,
+  UAT_COMMANDS,
+} from './uat-commands';
 
 describe('live UAT exposure gate', () => {
   it('never enables mutation commands in a production Extension Host', () => {
@@ -22,5 +28,74 @@ describe('live UAT exposure gate', () => {
     for (const id of Object.values(NATIVE_FIRST_RUN_UAT_COMMANDS)) {
       expect(id.startsWith('muster.uat.')).toBe(true);
     }
+  });
+
+  it('names the storage lifecycle commands only in the UAT namespace', () => {
+    expect(UAT_COMMANDS.seedStorageWorkload).toBe('muster.uat.seedStorageWorkload');
+    expect(UAT_COMMANDS.storageLifecycleState).toBe('muster.uat.storageLifecycleState');
+    expect(UAT_COMMANDS.runRetentionPass).toBe('muster.uat.runRetentionPass');
+  });
+
+  it('seeds bounded terminal tool-call evidence through named production repository commands', async () => {
+    const execute = vi.fn().mockResolvedValue({ ok: true, changed: true });
+    const result = await seedStorageWorkload({ execute } as never, 'ws');
+
+    expect(result).toEqual({ seededTasks: 2, seededTurns: 4, seededToolCalls: 4 });
+    expect(execute).toHaveBeenCalledTimes(8);
+    expect(execute.mock.calls.flat().map((command) => command.kind)).toEqual([
+      'createTask', 'createTask', 'createTurn', 'createTurn', 'createTurn', 'createTurn',
+      'appendTranscriptBatch', 'appendTranscriptBatch',
+    ]);
+    const terminalTranscript = execute.mock.calls[6]![0];
+    expect(terminalTranscript.toolCalls).toHaveLength(3);
+    expect(terminalTranscript.toolCalls.slice(0, 2).flatMap((call: { fileChanges: unknown[] }) => call.fileChanges))
+      .toHaveLength(4);
+    const activeTranscript = execute.mock.calls[7]![0];
+    expect(activeTranscript.toolCalls[0].turnId).toContain('active');
+    expect(activeTranscript.toolCalls[0].fileChanges[0]).toMatchObject({ oldText: 'live-before', newText: 'live-after' });
+  });
+
+  it('returns numeric-and-enum-only lifecycle state from injected production surfaces', async () => {
+    const state = await readStorageLifecycleState({
+      repository: {
+        listTasks: async () => [{ id: 'seeded-task' }],
+        listToolCalls: async () => [
+          { fileChanges: [{ retentionTruncated: true }, { retentionTruncated: true }] },
+          { fileChanges: [{ retentionTruncated: true }] },
+          { fileChanges: [{ retentionTruncated: false }] },
+        ],
+      } as never,
+      sqliteClient: {
+        storageReport: async () => ({
+          fileBytes: 2048, walBytes: 32, shmBytes: 16, pageCount: 8, freelistCount: 2,
+          pageSize: 4096, autoVacuum: 2, tableBytesSource: 'dbstat', tables: [{ name: 'tool_calls', bytes: 1024 }],
+        }),
+        get: async (sql: string) => ({ count: { tasks: 1, turns: 4, messages: 5, operations: 6 }[sql.match(/FROM (\w+)/)?.[1] ?? ''] ?? 0 }),
+      } as never,
+      retentionReport: {
+        snapshot: () => ({
+          completedPasses: 2, failedPasses: 1,
+          completedPassDetails: [{ ordinal: 1 }, { ordinal: 2 }],
+        }),
+      },
+      workspaceId: 'ws',
+    });
+
+    expect(state).toEqual({
+      storage: {
+        fileBytes: 2048, walBytes: 32, shmBytes: 16, pageCount: 8, freelistCount: 2,
+        pageSize: 4096, autoVacuum: 2, tableBytesSource: 'dbstat', tables: [{ name: 'tool_calls', bytes: 1024 }],
+      },
+      retention: { completedPasses: 2, failedPasses: 1, latestPassOrdinal: 2 },
+      durableRows: { tasks: 1, turns: 4, messages: 5, operations: 6 },
+      retentionTruncatedEntries: 3,
+    });
+    expect(Object.values(state).flatMap((value) => typeof value === 'string' ? [value] : [])).toEqual([]);
+  });
+
+  it('bubbles a direct retention failure so the command caller can record it', async () => {
+    await expect(runRetentionPass(async () => {
+      throw new Error('storage unavailable');
+    })).rejects.toThrow('storage unavailable');
   });
 });
