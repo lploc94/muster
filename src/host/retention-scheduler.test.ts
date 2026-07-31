@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
-import { RetentionScheduler } from './retention-scheduler';
+import {
+  RETENTION_SCHEDULE_INTERVAL_MS,
+  resolveRetentionScheduleIntervalMs,
+  RetentionScheduler,
+} from './retention-scheduler';
 
 function createFakeInterval() {
   let callback: (() => void) | undefined;
@@ -23,6 +27,23 @@ function createFakeInterval() {
 }
 
 describe('RetentionScheduler', () => {
+  it('uses the UAT retention interval override when UAT mode is enabled', () => {
+    expect(
+      resolveRetentionScheduleIntervalMs(true, { MUSTER_RETENTION_INTERVAL_MS: '60000' }),
+    ).toBe(60_000);
+  });
+
+  it('preserves production cadence and rejects malformed UAT interval overrides', () => {
+    expect(
+      resolveRetentionScheduleIntervalMs(false, { MUSTER_RETENTION_INTERVAL_MS: '60000' }),
+    ).toBe(RETENTION_SCHEDULE_INTERVAL_MS);
+
+    for (const value of [undefined, '0', '-1', '1.5', 'not-a-number']) {
+      expect(resolveRetentionScheduleIntervalMs(true, { MUSTER_RETENTION_INTERVAL_MS: value }))
+        .toBe(RETENTION_SCHEDULE_INTERVAL_MS);
+    }
+  });
+
   it('runs an initial pass and a second injected interval pass without restart', async () => {
     const timer = createFakeInterval();
     const runPass = vi.fn(async () => undefined);

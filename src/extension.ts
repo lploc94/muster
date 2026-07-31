@@ -42,7 +42,10 @@ import {
   projectWorkspacePatches,
 } from './host/workspace-patch';
 import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
-import { RetentionScheduler } from './host/retention-scheduler';
+import {
+  resolveRetentionScheduleIntervalMs,
+  RetentionScheduler,
+} from './host/retention-scheduler';
 import { LatestFocusTransition } from './host/focus-transition';
 import {
   reconcileExternalWorkspaceChanges,
@@ -4372,6 +4375,7 @@ export async function activate(context: vscode.ExtensionContext) {
       },
     });
     const retentionScheduler = new RetentionScheduler({
+      intervalMs: resolveRetentionScheduleIntervalMs(liveUatEnabled),
       runPass: () => applyRetentionToRepository(taskRepository!),
       onPassCompleted: (pass) => retentionReport.recordCompleted(pass),
       onPassFailed: () => retentionReport.recordFailure(),

@@ -6,6 +6,22 @@
  * maintenance is running is skipped rather than overlapping repository writes.
  */
 export const RETENTION_SCHEDULE_INTERVAL_MS = 30 * 60 * 1_000;
+export const RETENTION_INTERVAL_ENV = 'MUSTER_RETENTION_INTERVAL_MS';
+
+/**
+ * Allows live UAT to observe recurring maintenance without changing the
+ * production cadence. Invalid environment values deliberately fail closed.
+ */
+export function resolveRetentionScheduleIntervalMs(
+  uatModeEnabled: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): number {
+  if (!uatModeEnabled) return RETENTION_SCHEDULE_INTERVAL_MS;
+  const configured = Number(env[RETENTION_INTERVAL_ENV]);
+  return Number.isSafeInteger(configured) && configured > 0
+    ? configured
+    : RETENTION_SCHEDULE_INTERVAL_MS;
+}
 
 export type RetentionSchedulerOptions<TPass = void> = {
   runPass: () => Promise<TPass>;
