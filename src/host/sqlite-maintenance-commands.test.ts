@@ -161,6 +161,12 @@ describe('sqlite maintenance commands (P5-W5)', () => {
 
   it('reclaims classifier-selected files only after confirming legacy-history risk and emits path-free facts', async () => {
     const appendLine = vi.fn();
+    const snapshot = {
+      live: [],
+      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
+      activeLeases: [],
+      staleLeases: [{ name: '.lease.turn%3Astale', bytes: 30 }],
+    };
     const removeStorageOrphans = vi.fn(async () => ({
       removed: [
         { name: '.muster-tasks.json', bytes: 120 },
@@ -173,18 +179,13 @@ describe('sqlite maintenance commands (P5-W5)', () => {
 
     const result = await handleReclaimOrphanedFilesCommand({
       showWarningMessage: async (message, ...items) => {
-        expect(message).toBe(RECLAIM_ORPHANED_FILES_MODAL_MESSAGE);
-        expect(message).toMatch(/unmigrated legacy history/i);
+        expect(message).toBe(`${RECLAIM_ORPHANED_FILES_MODAL_MESSAGE}\n\n2 files (150 bytes) will be permanently removed. Live SQLite data and active leases are not selected.`);
+        expect(message).toMatch(/legacy history that may not have been migrated/i);
         expect(items).toEqual([RECLAIM_ORPHANED_FILES_CHOICE]);
         return RECLAIM_ORPHANED_FILES_CHOICE;
       },
       readStorageDirectoryEntries: async () => [],
-      classifyStorageOrphans: () => ({
-        live: [],
-        deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
-        activeLeases: [],
-        staleLeases: [{ name: '.lease.turn%3Astale', bytes: 30 }],
-      }),
+      classifyStorageOrphans: () => snapshot,
       removeStorageOrphans,
       appendLine,
       showErrorMessage: vi.fn(),
@@ -194,6 +195,7 @@ describe('sqlite maintenance commands (P5-W5)', () => {
 
     expect(result).toEqual({ kind: 'success', removedFiles: 2, bytesReclaimed: 150, failedRemovals: 1 });
     expect(removeStorageOrphans).toHaveBeenCalledOnce();
+    expect(removeStorageOrphans).toHaveBeenCalledWith(snapshot);
     const report = appendLine.mock.calls.flat().join('\n');
     expect(report).toContain('removed_files: 2');
     expect(report).toContain('bytes_reclaimed: 150');
@@ -203,26 +205,67 @@ describe('sqlite maintenance commands (P5-W5)', () => {
     expect(active).toBe(false);
   });
 
-  it('reclaim decline is a strict no-op and releases the guard', async () => {
-    const readStorageDirectoryEntries = vi.fn();
+  it('reclaim decline is a strict removal-free no-op and releases the guard', async () => {
+    const readStorageDirectoryEntries = vi.fn(async () => []);
+    const classifyStorageOrphans = vi.fn(() => ({
+      live: [],
+      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
+      activeLeases: [],
+      staleLeases: [],
+    }));
     const removeStorageOrphans = vi.fn();
+    const appendLine = vi.fn();
     let active = false;
 
     const result = await handleReclaimOrphanedFilesCommand({
       showWarningMessage: async () => undefined,
       readStorageDirectoryEntries,
-      classifyStorageOrphans: vi.fn(),
+      classifyStorageOrphans,
       removeStorageOrphans,
-      appendLine: vi.fn(),
+      appendLine,
       showErrorMessage: vi.fn(),
       isMaintenanceActive: () => active,
       setMaintenanceActive: (value) => { active = value; },
     });
 
     expect(result).toEqual({ kind: 'cancel' });
-    expect(readStorageDirectoryEntries).not.toHaveBeenCalled();
+    expect(readStorageDirectoryEntries).toHaveBeenCalledOnce();
+    expect(classifyStorageOrphans).toHaveBeenCalledOnce();
     expect(removeStorageOrphans).not.toHaveBeenCalled();
+    expect(appendLine).not.toHaveBeenCalled();
     expect(active).toBe(false);
+  });
+
+  it('reports an empty removable snapshot without prompting or removing', async () => {
+    const showWarningMessage = vi.fn();
+    const removeStorageOrphans = vi.fn();
+    const appendLine = vi.fn();
+
+    const result = await handleReclaimOrphanedFilesCommand({
+      showWarningMessage,
+      readStorageDirectoryEntries: async () => [],
+      classifyStorageOrphans: () => ({
+        live: [{ name: 'muster.sqlite3', bytes: 100 }],
+        deadLegacyStores: [],
+        activeLeases: [{ name: '.lease.turn%3Alive', bytes: 20 }],
+        staleLeases: [],
+      }),
+      removeStorageOrphans,
+      appendLine,
+      showErrorMessage: vi.fn(),
+      isMaintenanceActive: () => false,
+      setMaintenanceActive: vi.fn(),
+    });
+
+    expect(result).toEqual({ kind: 'success', removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0 });
+    expect(showWarningMessage).not.toHaveBeenCalled();
+    expect(removeStorageOrphans).not.toHaveBeenCalled();
+    expect(appendLine.mock.calls.flat()).toEqual([
+      'Muster orphan reclamation',
+      'removed_files: 0',
+      'bytes_reclaimed: 0',
+      'failed_removals: 0',
+    ]);
   });
 
   it('reclaim rejects while maintenance is active without touching the filesystem', async () => {

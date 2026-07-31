@@ -24,8 +24,14 @@ export const MUSTER_COMPACT_STORAGE_COMMAND_TITLE = 'Muster: Compact Storage';
 export const MUSTER_RECLAIM_ORPHANED_FILES_COMMAND_TITLE = 'Muster: Reclaim Orphaned Files';
 
 export const RECLAIM_ORPHANED_FILES_MODAL_MESSAGE =
-  'This permanently removes stale lease files and unmigrated legacy history from Muster storage. This cannot be undone.';
+  'This permanently removes stale lease files and legacy history that may not have been migrated from Muster storage. This cannot be undone.';
 export const RECLAIM_ORPHANED_FILES_CHOICE = 'Reclaim Orphaned Files';
+
+function formatReclaimOrphanedFilesModalMessage(report: StorageOrphanReport): string {
+  const removable = [...report.deadLegacyStores, ...report.staleLeases];
+  const bytes = removable.reduce((total, file) => total + file.bytes, 0);
+  return `${RECLAIM_ORPHANED_FILES_MODAL_MESSAGE}\n\n${removable.length} files (${bytes} bytes) will be permanently removed. Live SQLite data and active leases are not selected.`;
+}
 
 /** Exact modal body for global-scope reset (profile + authority). */
 export const RESET_MODAL_MESSAGE =
@@ -327,10 +333,20 @@ export async function handleReclaimOrphanedFilesCommand(
   deps.setMaintenanceActive(true);
 
   try {
+    const report = deps.classifyStorageOrphans(await deps.readStorageDirectoryEntries());
+    const removableFiles = report.deadLegacyStores.length + report.staleLeases.length;
+    if (removableFiles === 0) {
+      deps.appendLine('Muster orphan reclamation');
+      deps.appendLine('removed_files: 0');
+      deps.appendLine('bytes_reclaimed: 0');
+      deps.appendLine('failed_removals: 0');
+      return { kind: 'success', removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0 };
+    }
+
     let choice: string | undefined;
     try {
       choice = await deps.showWarningMessage(
-        RECLAIM_ORPHANED_FILES_MODAL_MESSAGE,
+        formatReclaimOrphanedFilesModalMessage(report),
         RECLAIM_ORPHANED_FILES_CHOICE,
       );
     } catch {
@@ -338,7 +354,6 @@ export async function handleReclaimOrphanedFilesCommand(
     }
     if (choice !== RECLAIM_ORPHANED_FILES_CHOICE) return { kind: 'cancel' };
 
-    const report = deps.classifyStorageOrphans(await deps.readStorageDirectoryEntries());
     const result = await deps.removeStorageOrphans(report);
     deps.appendLine('Muster orphan reclamation');
     deps.appendLine(`removed_files: ${result.removed.length}`);

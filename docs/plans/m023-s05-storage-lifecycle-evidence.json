@@ -184,9 +184,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 15,
+      "completedPasses": 18,
       "failedPasses": 0,
-      "latestPassOrdinal": 15
+      "latestPassOrdinal": 18
     },
     "durableRows": {
       "tasks": 6,
@@ -378,9 +378,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 15,
+      "completedPasses": 18,
       "failedPasses": 0,
-      "latestPassOrdinal": 15
+      "latestPassOrdinal": 18
     },
     "durableRows": {
       "tasks": 8,
@@ -572,9 +572,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 17,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 17
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 8,
@@ -784,5 +784,5 @@
     "sessionIdsStoredInEvidence": false,
     "canaryStoredInEvidence": false
   },
-  "generatedAt": "2026-07-31T04:18:06.983Z"
+  "generatedAt": "2026-07-31T05:12:41.035Z"
 }
