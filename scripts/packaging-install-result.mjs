@@ -400,7 +400,15 @@ export function buildInstallGateEvidence(args = {}) {
         c.postExitProbe === 'unknown'
           ? c.postExitProbe
           : 'unknown';
-      const cPhase = typeof c.phase === 'string' ? c.phase : 'trace-missing';
+      const cPhase =
+        c.phase === 'ok' ||
+        c.phase === 'deactivate-failed' ||
+        c.phase === 'trace-missing' ||
+        c.phase === 'not-closed' ||
+        c.phase === 'still-serving' ||
+        c.phase === 'probe-unknown'
+          ? c.phase
+          : 'trace-missing';
       bridgeClosure = {
         port: cPort,
         trace: cTrace,
@@ -441,7 +449,17 @@ export function buildInstallGateEvidence(args = {}) {
   const installStderrExcerpt = redactInstallDetail(args.installDetail);
 
   const bridgeOk = bridge !== null && bridge.status === 'ok' && bridge.port > 0;
-  const bridgeClosureOk = bridgeClosure !== null && bridgeClosure.phase === 'ok';
+  // phase === 'ok' alone is not proof: a caller can hand us a self-inconsistent
+  // closure such as { bridgeClosed: false, postExitProbe: 'still-serving',
+  // phase: 'ok' }. Recompute from the observed fields so contradictory input
+  // fails closed instead of minting evidence.ok === true.
+  const bridgeClosureOk =
+    bridgeClosure !== null &&
+    bridgeClosure.phase === 'ok' &&
+    bridgeClosure.trace === 'present' &&
+    bridgeClosure.bridgeClosed === true &&
+    bridgeClosure.postExitProbe === 'refused' &&
+    bridgeClosure.port > 0;
 
   const ok =
     installExitCode === 0 &&
