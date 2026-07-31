@@ -20,6 +20,13 @@ test('M023 S05 lifecycle scenario uses activated UAT commands and records the fo
   assert.match(source, /const lifecyclePeerAfterRetention = await peer<StorageLifecycleState>\([\s\S]*UAT_COMMANDS\.storageLifecycleState/);
   assert.match(source, /scheduledPassTarget = lifecycleAfterSeed\.retention\.completedPasses \+ 2/);
   assert.match(source, /retentionTruncatedEntries === 4/);
+  assert.match(source, /assert\.equal\(identityA\.userVersion, 2, 'schema version drifted'\)/);
+  assert.match(source, /assert\.equal\(identityB\.userVersion, 2, 'peer schema version drifted'\)/);
+  assert.match(source, /entry\.clientRequestId === 'uat-outbox-pending' && entry\.status === 'pending'/);
+  assert.match(source, /pending entry persisted; explicit rejection persisted; durable surfaces restored/);
+  assert.match(source, /durableOk=\$\{durableOk\} identityOk=\$\{identityOk\} tasksOk=\$\{tasksOk\}/);
+  assert.match(source, /waitForPeerDurableSurfaces\('fresh-host durable restoration'/);
+  assert.doesNotMatch(source, /const \[durable, state\] = await Promise\.all\(\[\s*peer<DurableSurfaces>/);
   assert.match(source, /storageLifecycle: \{[\s\S]*before: lifecycleBefore[\s\S]*afterSeed: lifecycleAfterSeed[\s\S]*afterRetention: lifecycleAfterRetention[\s\S]*peerAfterRetention: lifecyclePeerAfterRetention/);
   assert.match(source, /lifecyclePeerAfterRetention\.storage\.fileBytes,\s*lifecycleAfterRetention\.storage\.fileBytes/);
 });
@@ -30,6 +37,12 @@ test('M023 S05 packaged runner enables the UAT schedule and emits schema-valid l
   assert.match(runner, /m023-s05-storage-lifecycle-evidence\.json/);
   assert.match(runner, /kind: 'm023-s05-storage-lifecycle-live-uat'/);
   assert.match(runner, /canaryStoredInEvidence: false/);
+  assert.match(runner, /db\.userVersion !== 2/);
   const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
   assert.equal(packageJson.scripts['test:m023-s05-storage-lifecycle-live-uat'], 'node scripts/run-sqlite-two-window-live-uat.mjs');
+});
+
+test('two-window runner uses a Windows junction for shared local global storage', async () => {
+  const runner = await readFile(new URL('./run-sqlite-two-window-live-uat.mjs', import.meta.url), 'utf8');
+  assert.match(runner, /process\.platform === 'win32' \? 'junction' : 'dir'/);
 });

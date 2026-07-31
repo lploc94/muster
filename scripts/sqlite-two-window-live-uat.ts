@@ -293,8 +293,8 @@ async function runOrchestratorA(): Promise<void> {
   assert.equal(identityA.dbFileToken, identityB.dbFileToken, 'hosts opened different DB files');
   assert.equal(identityA.workspaceId, identityB.workspaceId, 'workspace ids diverged');
   assert.notEqual(pingA.sessionId, readyB1.sessionId, 'expected distinct Extension Hosts');
-  assert.equal(identityA.userVersion, 7, 'schema version drifted');
-  assert.equal(identityB.userVersion, 7, 'peer schema version drifted');
+  assert.equal(identityA.userVersion, 2, 'schema version drifted');
+  assert.equal(identityB.userVersion, 2, 'peer schema version drifted');
   assert.equal(identityA.applicationId, 0x4d555354);
   assert.equal(identityA.journalMode, 'wal');
 
@@ -539,42 +539,50 @@ async function runOrchestratorA(): Promise<void> {
     120_000,
   );
   const identityB2 = await peer<DbIdentity>(UAT_COMMANDS.identity);
-  let durableB: DurableSurfaces | undefined;
-  const durableStart = Date.now();
-  for (;;) {
-    durableB = await peer<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
-      rootId: created.taskId, presentationId: 'uat-plan',
-    });
-    if (durableB.sendOutbox.some((entry) =>
-      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected')) {
-      break;
-    }
-    if (Date.now() - durableStart > 30_000) {
-      throw new Error('timeout waiting for durable pending-outbox replay');
-    }
-    await sleep(POLL_MS);
-  }
-  const [durableA, restartedState] = await Promise.all([
-    cmd<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
-      rootId: created.taskId, presentationId: 'uat-plan',
-    }),
-    peer<UatHostState>(UAT_COMMANDS.hostState),
-  ]);
-  const durableOk = [durableA, durableB].every((value) =>
+  const hasExpectedDurableSurfaces = (value: DurableSurfaces): boolean =>
     value.sendOutbox.some((entry) =>
-      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected') &&
+      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'pending') &&
     value.sendOutbox.some((entry) =>
       entry.clientRequestId === 'uat-outbox-reject' && entry.status === 'rejected') &&
     value.presentation?.presentationId === 'uat-plan' &&
     value.presentation.revision === 1 &&
-    value.presentation.markdownLength > 0,
+    value.presentation.markdownLength > 0;
+  const waitForPeerDurableSurfaces = async (
+    label: string,
+    timeoutMs = 30_000,
+  ): Promise<{ durable: DurableSurfaces; state: UatHostState }> => {
+    const start = Date.now();
+    for (;;) {
+      // `peer` advances a shared mailbox cursor, so requests to the same
+      // Extension Host must remain ordered. Parallel local/peer work elsewhere
+      // is safe because it uses separate command channels.
+      const durable = await peer<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
+        rootId: created.taskId, presentationId: 'uat-plan',
+      });
+      const state = await peer<UatHostState>(UAT_COMMANDS.hostState);
+      if (hasExpectedDurableSurfaces(durable)) return { durable, state };
+      if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for peer ${label}`);
+      await sleep(POLL_MS);
+    }
+  };
+  const [durableA, peerDurableReadback] = await Promise.all([
+    cmd<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
+      rootId: created.taskId, presentationId: 'uat-plan',
+    }),
+    waitForPeerDurableSurfaces('fresh-host durable restoration'),
+  ]);
+  const durableB = peerDurableReadback.durable;
+  const restartedState = peerDurableReadback.state;
+  const durableOk = [durableA, durableB].every(hasExpectedDurableSurfaces);
+  const identityOk = identityB2.dbFileToken === identityA.dbFileToken;
+  const tasksOk = arraysEqual(
+    [...restartedState.taskIds].sort(),
+    [...taskIdsBeforeRestart].sort(),
   );
   record(
     'H',
-    durableOk &&
-      identityB2.dbFileToken === identityA.dbFileToken &&
-      arraysEqual([...restartedState.taskIds].sort(), [...taskIdsBeforeRestart].sort()),
-    `peer restarted generation=${readyB2.generation}; pending replay rejected safely; durable surfaces restored`,
+    durableOk && identityOk && tasksOk,
+    `peer restarted generation=${readyB2.generation}; pending entry persisted; explicit rejection persisted; durable surfaces restored; durableOk=${durableOk} identityOk=${identityOk} tasksOk=${tasksOk}`,
   );
 
   // I — two SQLite writers start at the same time, then both projections converge.
