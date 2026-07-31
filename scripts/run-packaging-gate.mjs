@@ -32,6 +32,7 @@ import {
   findMissingEntrypoints,
   formatCensusReport,
 } from './packaging-archive-census.mjs';
+import { redactInstallDetail } from './packaging-install-result.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
@@ -153,9 +154,22 @@ export function buildPackagingGateEvidence({
   const activationOk = activation === 'ok';
   const ok = packagingOk && (!hostRequired || (activationOk && bridgeOk === true));
 
+  /** @type {PackagingGatePhase} */
+  let phase;
+  if (ok) {
+    phase = 'ok';
+  } else if (!packagingOk) {
+    phase = 'archive-invalid';
+  } else if (!activationOk) {
+    phase = 'activation-failed';
+  } else {
+    phase = 'bridge-unreachable';
+  }
+
   return {
     kind: 'm022-s01-packaging-gate',
     ok,
+    phase,
     mode,
     totalEntries: census?.totalEntries ?? 0,
     nodeModulesEntryCount: census?.nodeModulesEntries ?? 0,
@@ -176,6 +190,81 @@ export function buildPackagingGateEvidence({
     bridgePhase,
     generatedAt,
     durationMs,
+  };
+}
+
+/**
+ * Typed packaging-gate phases. `ok` is the only passing value; every other
+ * value names where the gate stopped.
+ *
+ * @typedef {'ok'
+ *   | 'gate-incomplete'
+ *   | 'package-failed'
+ *   | 'archive-invalid'
+ *   | 'host-launch-failed'
+ *   | 'activation-failed'
+ *   | 'bridge-unreachable'
+ *   | 'closure-failed'} PackagingGatePhase
+ */
+
+/**
+ * Strip machine paths and secret-like tokens from a failure detail before it
+ * reaches tracked evidence. Shares the S05 redactor so both gates redact the
+ * same classes instead of drifting apart.
+ *
+ * @param {unknown} detail
+ * @param {number} [maxLen]
+ */
+export function redactGateDetail(detail, maxLen = 300) {
+  return redactInstallDetail(typeof detail === 'string' ? detail : '', maxLen);
+}
+
+/**
+ * Build fail-closed evidence for a run that produced no archive census.
+ *
+ * The tracked evidence artifact is uploaded by CI with `if: always()`, so it
+ * must never survive a failed run still describing an earlier successful one.
+ * The runner writes this shape before `createVSIX()` and re-writes it with the
+ * failure detail on the way out, which also covers a hard kill or timeout that
+ * never reaches a catch block.
+ *
+ * @param {{
+ *   phase?: PackagingGatePhase,
+ *   detail?: string,
+ *   mode?: string,
+ *   generatedAt?: string,
+ *   durationMs?: number,
+ * }} args
+ */
+export function buildFailClosedEvidence({
+  phase = 'gate-incomplete',
+  detail = '',
+  mode = 'census-only',
+  generatedAt = new Date().toISOString(),
+  durationMs = 0,
+} = {}) {
+  const evidence = buildPackagingGateEvidence({
+    // No archive was produced, so there is nothing to census. Empty inputs make
+    // buildPackagingGateEvidence compute ok:false by construction.
+    census: null,
+    allowlistResult: null,
+    missingEntrypoints: [],
+    entrypoints: [],
+    marketplaceEntries: [],
+    mode,
+    activation: 'failed',
+    bridge: null,
+    bridgePhase: null,
+    generatedAt,
+    durationMs,
+  });
+
+  const redacted = redactGateDetail(detail);
+  return {
+    ...evidence,
+    ok: false,
+    phase,
+    ...(redacted ? { failureDetail: redacted } : {}),
   };
 }
 
@@ -374,9 +463,28 @@ export function applyHostStageToEvidence(evidence, host) {
     bridgePhaseOk &&
     bridgeClosureOk;
 
+  // The packaging stage already stamped a phase for the archive-only verdict.
+  // Recompute it here or a passing packaging stage would leave `phase: 'ok'`
+  // sitting next to `ok: false` after the host stage fails.
+  /** @type {PackagingGatePhase} */
+  let phase;
+  if (ok) {
+    phase = 'ok';
+  } else if (!activationOk) {
+    phase = 'activation-failed';
+  } else if (!(bridgeOk && bridgePhaseOk)) {
+    phase = 'bridge-unreachable';
+  } else if (!bridgeClosureOk) {
+    phase = 'closure-failed';
+  } else {
+    // Fields all check out but host.ok was not true — a forged or truncated result.
+    phase = 'gate-incomplete';
+  }
+
   return {
     ...evidence,
     mode: 'full',
+    phase,
     entrypoints,
     activation: host.activation,
     bridge,
@@ -405,6 +513,22 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
   const started = Date.now();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-packaging-gate-'));
   const vsixPath = path.join(tempDir, 'muster.vsix');
+  const stageMode = censusOnly ? 'census-only' : 'packaging';
+  /** @type {ReturnType<typeof buildPackagingGateEvidence> | null} */
+  let censusEvidence = null;
+
+  // CI uploads the tracked evidence with `if: always()`. Stamp it fail-closed
+  // before the first fallible step so a run that dies inside createVSIX — or is
+  // hard-killed before any catch runs — can never leave the previous run's
+  // `ok: true` on disk for release diagnostics to misread.
+  writeEvidence(
+    evidencePath,
+    buildFailClosedEvidence({
+      phase: 'gate-incomplete',
+      mode: stageMode,
+      detail: 'packaging gate started; no stage has completed yet',
+    }),
+  );
 
   try {
     // createVSIX runs vscode:prepublish, so the gate always tests a fresh build.
@@ -498,7 +622,15 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
       durationMs: Date.now() - started,
     });
 
-    writeEvidence(evidencePath, evidence);
+    censusEvidence = evidence;
+    // A full run still owes host observations. Persist the census payload for
+    // diagnostics but withhold the passing verdict until the host stage writes
+    // its merged result, so a host-stage crash or hard kill cannot leave
+    // `ok: true` on disk. --census-only has no host stage, so its verdict is final.
+    writeEvidence(
+      evidencePath,
+      censusOnly ? evidence : { ...evidence, ok: false, phase: 'gate-incomplete' },
+    );
     console.log(
       `[packaging-gate] wrote evidence ${path.relative(root, evidencePath)} ` +
         `(totalEntries=${evidence.totalEntries}, nodeModulesEntryCount=${evidence.nodeModulesEntryCount})`,
@@ -538,6 +670,25 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
       packagingOk: true,
     };
   } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    // Evidence must describe *this* run. Keep the census when we have one — it is
+    // the diagnostic payload — but never leave a passing verdict behind.
+    try {
+      const failed = censusEvidence
+        ? {
+            ...censusEvidence,
+            ok: false,
+            phase: censusEvidence.phase === 'ok' ? 'gate-incomplete' : censusEvidence.phase,
+          }
+        : buildFailClosedEvidence({ phase: 'package-failed', mode: stageMode });
+      writeEvidence(evidencePath, {
+        ...failed,
+        failureDetail: redactGateDetail(detail),
+        durationMs: Date.now() - started,
+      });
+    } catch {
+      // ignore evidence write errors; the original failure is rethrown below
+    }
     // Best-effort cleanup on failure; success path also cleans in finally of main.
     try {
       fs.rmSync(tempDir, { recursive: true, force: true });
@@ -562,9 +713,20 @@ async function runPackagingStage({ censusOnly, evidencePath }) {
 async function runHostStage({ extensionRoot, tempDir, evidence, evidencePath, started }) {
   const compiledTest = path.join(root, 'dist', 'scripts', 'packaging-gate-extension-host-smoke.js');
   if (!fs.existsSync(compiledTest)) {
-    throw new Error(
-      'vscode:prepublish did not produce dist/scripts/packaging-gate-extension-host-smoke.js',
+    const detail =
+      'vscode:prepublish did not produce dist/scripts/packaging-gate-extension-host-smoke.js';
+    // Nothing downstream will write evidence for this run, so stamp the failure
+    // here rather than leaving the packaging-stage payload as the last word.
+    writeEvidence(
+      evidencePath,
+      buildFailClosedEvidence({
+        phase: 'host-launch-failed',
+        mode: 'full',
+        detail,
+        durationMs: Date.now() - started,
+      }),
     );
+    throw new Error(detail);
   }
 
   const hostResultPath = path.join(tempDir, 'packaging-host-smoke-result.json');

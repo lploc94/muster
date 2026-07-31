@@ -22,8 +22,10 @@ import {
 import {
   applyHostStageToEvidence,
   buildEntrypointResults,
+  buildFailClosedEvidence,
   buildPackagingGateEvidence,
   parseHostSmokeResult,
+  redactGateDetail,
 } from './run-packaging-gate.mjs';
 
 const FIXTURE_ENTRIES = [
@@ -424,3 +426,108 @@ test('host smoke ok requires bridgeClosure proof (not pid-exit inference)', () =
   assert.equal(forged.bridgeClosure, null);
 });
 
+// --- Evidence must always describe *this* run (CI uploads it with if: always()) ---
+
+test('buildFailClosedEvidence never yields a passing verdict', () => {
+  const evidence = buildFailClosedEvidence({
+    phase: 'package-failed',
+    detail: String.raw`createVSIX failed at C:\Users\dev\muster token sk-abc123`,
+    mode: 'packaging',
+    durationMs: 42,
+  });
+
+  assert.equal(evidence.kind, 'm022-s01-packaging-gate');
+  assert.equal(evidence.ok, false);
+  assert.equal(evidence.phase, 'package-failed');
+  assert.equal(evidence.activation, 'failed');
+  assert.equal(evidence.bridge, null);
+  assert.equal(evidence.totalEntries, 0);
+  // The detail reaches tracked evidence, so machine paths and tokens are stripped.
+  assert.match(evidence.failureDetail, /\[redacted\]/);
+  assert.ok(
+    !/Users|sk-abc123/.test(JSON.stringify(evidence)),
+    'fail-closed evidence must not leak machine paths or tokens',
+  );
+});
+
+test('buildFailClosedEvidence defaults to a typed incomplete phase', () => {
+  const evidence = buildFailClosedEvidence();
+  assert.equal(evidence.ok, false);
+  assert.equal(evidence.phase, 'gate-incomplete');
+});
+
+test('redactGateDetail strips POSIX runner paths and bearer tokens', () => {
+  const out = redactGateDetail('boom in /home/runner/work/muster and Bearer abc.def');
+  assert.ok(!out.includes('/home/runner'), 'POSIX runner path must be redacted');
+  assert.ok(!out.includes('abc.def'), 'bearer token must be redacted');
+});
+
+test('buildPackagingGateEvidence stamps a typed phase next to ok', () => {
+  // mode 'full' with no host observations yet: packaging passed, host did not run.
+  const base = packagingBaseEvidence();
+  assert.equal(base.ok, false);
+  assert.equal(base.phase, 'activation-failed');
+});
+
+test('applyHostStageToEvidence never leaves phase ok next to ok false', () => {
+  const base = packagingBaseEvidence();
+  const merged = applyHostStageToEvidence(
+    base,
+    parseHostSmokeResult({
+      kind: 'm022-s01-packaging-host-smoke',
+      ok: false,
+      activation: 'ok',
+      bridge: { port: 0, status: 'unavailable', generation: 0 },
+      bridgePhase: 'health-unreachable',
+      entrypoints: base.entrypoints,
+    }),
+  );
+
+  assert.equal(merged.ok, false);
+  assert.notEqual(merged.phase, 'ok', 'a failed run must not report phase ok');
+  assert.equal(merged.phase, 'bridge-unreachable');
+});
+
+test('applyHostStageToEvidence rejects a self-contradictory bridge closure', () => {
+  const base = packagingBaseEvidence();
+  const merged = applyHostStageToEvidence(base, {
+    kind: 'm022-s01-packaging-host-smoke',
+    ok: true,
+    activation: 'ok',
+    bridgePhase: 'ok',
+    bridge: { port: 4321, status: 'ok', generation: 1 },
+    // Claims phase ok while the observations say the bridge never stopped serving.
+    bridgeClosure: {
+      port: 4321,
+      trace: 'present',
+      bridgeClosed: false,
+      postExitProbe: 'still-serving',
+      phase: 'ok',
+    },
+    entrypoints: base.entrypoints.map((r) => ({
+      ...r,
+      present: true,
+      resolved: true,
+      phase: 'ok',
+    })),
+  });
+
+  assert.equal(merged.ok, false, 'phase ok alone must not mint a passing verdict');
+  assert.equal(merged.phase, 'closure-failed');
+});
+
+test('packaging stage stamps fail-closed evidence before the first fallible step', () => {
+  const src = fs.readFileSync(path.join(import.meta.dirname, 'run-packaging-gate.mjs'), 'utf8');
+  const stageStart = src.indexOf('async function runPackagingStage');
+  assert.ok(stageStart > -1, 'runPackagingStage must exist');
+
+  const stage = src.slice(stageStart);
+  const preStamp = stage.indexOf('buildFailClosedEvidence');
+  const createVsix = stage.indexOf('await createVSIX(');
+  assert.ok(preStamp > -1, 'packaging stage must stamp fail-closed evidence');
+  assert.ok(createVsix > -1, 'packaging stage must call createVSIX');
+  assert.ok(
+    preStamp < createVsix,
+    'fail-closed evidence must be written before createVSIX, or a crash leaves the previous run\u2019s passing verdict on disk',
+  );
+});
