@@ -39,7 +39,7 @@ test('M023 S05 lifecycle scenario uses activated UAT commands and records the fo
 
 test('M023 S05 packaged runner enables the UAT schedule and emits schema-valid lifecycle evidence', async () => {
   const runner = await readFile(new URL('./run-sqlite-two-window-live-uat.mjs', import.meta.url), 'utf8');
-  assert.match(runner, /MUSTER_RETENTION_INTERVAL_MS: '1000'/);
+  assert.match(runner, /MUSTER_RETENTION_INTERVAL_MS: role === 'A' \? '1000' : '300000'/);
   assert.match(runner, /m023-s05-storage-lifecycle-evidence\.json/);
   assert.match(runner, /kind: 'm023-s05-storage-lifecycle-live-uat'/);
   assert.match(runner, /canaryStoredInEvidence: false/);

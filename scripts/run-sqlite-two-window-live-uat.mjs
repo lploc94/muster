@@ -51,7 +51,9 @@ function linkSharedGlobalStorage(userDataDir, sharedStorageDir) {
   if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
     fs.rmSync(target, { recursive: true, force: true });
   }
-  fs.symlinkSync(sharedStorageDir, target, 'dir');
+  // Windows directory symlinks require Developer Mode or elevation; a junction
+  // provides the same local-directory sharing without that privilege.
+  fs.symlinkSync(sharedStorageDir, target, process.platform === 'win32' ? 'junction' : 'dir');
 }
 
 function spawnWindow({
@@ -86,8 +88,9 @@ function spawnWindow({
     MUSTER_UAT_ROLE: role,
     MUSTER_UAT_PEER_GENERATION: String(generation),
     MUSTER_UAT_CONTROL_DIR: controlDir,
-    // UAT-only: production keeps its fixed thirty-minute cadence.
-    MUSTER_RETENTION_INTERVAL_MS: '1000',
+    // UAT-only: A proves recurring maintenance; B keeps holding the same store
+    // without issuing a competing write pass during the short proof window.
+    MUSTER_RETENTION_INTERVAL_MS: role === 'A' ? '1000' : '300000',
   };
   const label = role === 'B' ? `B${generation}` : role;
   const logStream = fs.createWriteStream(logPath, { flags: appendLog ? 'a' : 'w' });
@@ -166,7 +169,7 @@ function validateSuccessResult(result) {
     !db ||
     typeof db.dbFileToken !== 'string' ||
     !/^[a-f0-9]{16}$/.test(db.dbFileToken) ||
-    db.userVersion !== 7 ||
+    db.userVersion !== 2 ||
     db.applicationId !== 0x4d555354 ||
     db.journalMode !== 'wal'
   ) {

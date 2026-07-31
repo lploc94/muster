@@ -441,7 +441,14 @@ export type StorageLifecycleSeedResult = {
 
 const STORAGE_SEED_TASK_ID = 'uat-storage-seed-terminal';
 const STORAGE_SEED_ACTIVE_TASK_ID = 'uat-storage-seed-active';
-const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(120 * 1024);
+// Exceeds the production 256 KiB retained-output cap for exactly four old entries.
+const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(300 * 1024);
+const STORAGE_SEED_AGE_MS = 366 * 24 * 60 * 60 * 1_000;
+
+/** Keeps the live fixture eligible as wall time advances without changing production retention policy. */
+function makeStorageSeedIso(offsetMs = 0): string {
+  return new Date(Date.now() - STORAGE_SEED_AGE_MS + offsetMs).toISOString();
+}
 
 /**
  * Creates a bounded, retention-eligible production workload plus one live turn.
@@ -456,36 +463,38 @@ export async function seedStorageWorkload(
   await repository.execute({ kind: 'createTask', workspaceId, task: terminalTask });
   await repository.execute({ kind: 'createTask', workspaceId, task: activeTask });
 
-  const settledTurns: TaskTurn[] = [1, 2, 3].map((sequence) => ({
-    id: `${STORAGE_SEED_TASK_ID}-turn-${sequence}`,
-    taskId: terminalTask.id,
+  // SQLite retention preserves durable rows, but truncates oversized payloads
+  // on settled turns belonging to an otherwise open task.
+  const settledTurns: TaskTurn[] = Array.from({ length: 4 }, (_, index) => index + 1).map((sequence) => ({
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-settled-${sequence}`,
+    taskId: activeTask.id,
     sequence,
     status: 'succeeded' as const,
     trigger: 'user' as const,
     inputs: [],
-    createdAt: makeIso(sequence * 1_000),
-    finishedAt: makeIso(sequence * 1_000 + 500),
+    createdAt: makeStorageSeedIso(sequence * 1_000),
+    finishedAt: makeStorageSeedIso(sequence * 1_000 + 500),
   }));
   for (const turn of settledTurns) {
     await repository.execute({ kind: 'createTurn', workspaceId, turn });
   }
   const activeTurn: TaskTurn = {
-    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-1`, taskId: activeTask.id, sequence: 1,
-    status: 'running', trigger: 'user', inputs: [], createdAt: makeIso(5_000), startedAt: makeIso(5_100),
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-5`, taskId: activeTask.id, sequence: 5,
+    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(5_000), startedAt: makeStorageSeedIso(5_100),
   };
   await repository.execute({ kind: 'createTurn', workspaceId, turn: activeTurn });
 
   await repository.execute({
-    kind: 'appendTranscriptBatch', workspaceId, taskId: terminalTask.id,
+    kind: 'appendTranscriptBatch', workspaceId, taskId: activeTask.id,
     toolCalls: settledTurns.map((turn, index) => ({
-      id: `${turn.id}:edit`, taskId: terminalTask.id, turnId: turn.id, toolCallId: 'edit', order: 0,
+      id: `${turn.id}:edit`, taskId: activeTask.id, turnId: turn.id, toolCallId: 'edit', order: 0,
       name: 'edit_file', kind: 'builtin' as const, status: 'success' as const,
-      fileChanges: index < 2
-        ? [0, 1].map((part) => ({
-          path: `src/retained-${index}-${part}.ts`, oldText: STORAGE_SEED_LARGE_DIFF, newText: STORAGE_SEED_LARGE_DIFF,
-        }))
+      fileChanges: index < 4
+        ? [{
+          path: `src/retained-${index}.ts`, oldText: STORAGE_SEED_LARGE_DIFF, newText: STORAGE_SEED_LARGE_DIFF,
+        }]
         : [{ path: 'src/current.ts', oldText: 'before', newText: 'after' }],
-      createdAt: makeIso(6_000 + index), updatedAt: makeIso(6_000 + index),
+      createdAt: makeStorageSeedIso(6_000 + index), updatedAt: makeStorageSeedIso(6_000 + index),
     })),
   });
   await repository.execute({
@@ -494,10 +503,10 @@ export async function seedStorageWorkload(
       id: `${activeTurn.id}:edit`, taskId: activeTask.id, turnId: activeTurn.id, toolCallId: 'edit', order: 0,
       name: 'edit_file', kind: 'builtin', status: 'success',
       fileChanges: [{ path: 'src/live.ts', oldText: 'live-before', newText: 'live-after' }],
-      createdAt: makeIso(7_000), updatedAt: makeIso(7_000),
+      createdAt: makeStorageSeedIso(7_000), updatedAt: makeStorageSeedIso(7_000),
     }],
   });
-  return { seededTasks: 2, seededTurns: 4, seededToolCalls: 4 };
+  return { seededTasks: 2, seededTurns: settledTurns.length + 1, seededToolCalls: settledTurns.length + 1 };
 }
 
 type LifecycleDbProbe = {

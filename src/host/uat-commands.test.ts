@@ -40,19 +40,26 @@ describe('live UAT exposure gate', () => {
     const execute = vi.fn().mockResolvedValue({ ok: true, changed: true });
     const result = await seedStorageWorkload({ execute } as never, 'ws');
 
-    expect(result).toEqual({ seededTasks: 2, seededTurns: 4, seededToolCalls: 4 });
-    expect(execute).toHaveBeenCalledTimes(8);
+    expect(result).toEqual({ seededTasks: 2, seededTurns: 5, seededToolCalls: 5 });
+    expect(execute).toHaveBeenCalledTimes(9);
     expect(execute.mock.calls.flat().map((command) => command.kind)).toEqual([
-      'createTask', 'createTask', 'createTurn', 'createTurn', 'createTurn', 'createTurn',
+      'createTask', 'createTask', ...Array(5).fill('createTurn'),
       'appendTranscriptBatch', 'appendTranscriptBatch',
     ]);
-    const terminalTranscript = execute.mock.calls[6]![0];
-    expect(terminalTranscript.toolCalls).toHaveLength(3);
-    expect(terminalTranscript.toolCalls.slice(0, 2).flatMap((call: { fileChanges: unknown[] }) => call.fileChanges))
-      .toHaveLength(4);
-    const activeTranscript = execute.mock.calls[7]![0];
+    const settledTranscript = execute.mock.calls[7]![0];
+    expect(Date.parse(settledTranscript.toolCalls[0].createdAt)).toBeLessThan(
+      Date.now() - 365 * 24 * 60 * 60 * 1_000,
+    );
+    expect(settledTranscript.toolCalls).toHaveLength(4);
+    const retainedChanges = settledTranscript.toolCalls
+      .flatMap((call: { fileChanges: Array<{ oldText: string; newText: string }> }) => call.fileChanges);
+    expect(retainedChanges).toHaveLength(4);
+    expect(retainedChanges.every((change) => change.oldText.length > 262_144 && change.newText.length > 262_144))
+      .toBe(true);
+    const activeTranscript = execute.mock.calls[8]![0];
     expect(activeTranscript.toolCalls[0].turnId).toContain('active');
     expect(activeTranscript.toolCalls[0].fileChanges[0]).toMatchObject({ oldText: 'live-before', newText: 'live-after' });
+    expect(settledTranscript.taskId).toBe('uat-storage-seed-active');
   });
 
   it('returns numeric-and-enum-only lifecycle state from injected production surfaces', async () => {
