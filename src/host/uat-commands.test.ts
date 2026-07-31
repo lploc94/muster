@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { NATIVE_FIRST_RUN_UAT_COMMANDS } from './m019-s05-native-first-run';
 import { isBoundedToolFileChange } from '../shared/tool-file-change-contract';
@@ -36,6 +37,16 @@ describe('live UAT exposure gate', () => {
     expect(UAT_COMMANDS.storageLifecycleState).toBe('muster.uat.storageLifecycleState');
     expect(UAT_COMMANDS.runRetentionPass).toBe('muster.uat.runRetentionPass');
     expect(UAT_COMMANDS.renderProbe).toBe('muster.uat.renderProbe');
+  });
+
+  it('registers the DOM render probe only through the live UAT command surface', () => {
+    const extensionSource = readFileSync(new URL('../extension.ts', import.meta.url), 'utf8');
+    const appSource = readFileSync(new URL('../../webview/src/App.svelte', import.meta.url), 'utf8');
+    expect(extensionSource).toContain('vscode.commands.registerCommand(UAT_COMMANDS.renderProbe');
+    expect(extensionSource).toContain('return uatChatProvider.requestRenderProbeForUat();');
+    expect(appSource).toContain("type === 'renderProbeRequest'");
+    expect(appSource).toContain("type: 'renderProbeResponse'");
+    expect(appSource).toContain('collectToolCardRenderObservations(document)');
   });
 
   it('seeds bounded terminal tool-call evidence through named production repository commands', async () => {

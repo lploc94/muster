@@ -70,6 +70,10 @@ import {
   type UatHostState,
 } from './host/uat-commands';
 import {
+  createWebviewRenderProbeCoordinator,
+  type WebviewRenderProbeCoordinator,
+} from './host/webview-render-probe';
+import {
   NATIVE_FIRST_RUN_UAT_PROMPT,
   isNativeFirstRunProviderId,
   observeNativeCleanup,
@@ -648,9 +652,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   /** Polling starts only after the current view/focus has an authoritative snapshot. */
   private pollingReady = false;
   private windowStateSub: vscode.Disposable | undefined;
+  /** UAT-only DOM observation bridge, created for the current resolved webview. */
+  private renderProbeCoordinator: WebviewRenderProbeCoordinator | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
+    private readonly uatRenderProbeEnabled = false,
   ) {}
 
   /** Optional non-production interceptor used by native first-run UAT accept. */
@@ -667,6 +674,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     } catch {
       // best-effort
     }
+  }
+
+  /** Requests a read-only DOM observation; command registration supplies the UAT gate. */
+  requestRenderProbeForUat() {
+    if (!this.renderProbeCoordinator) {
+      throw new Error('UAT render probe webview unavailable');
+    }
+    return this.renderProbeCoordinator.request();
   }
 
   /**
@@ -2763,7 +2778,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken,
   ) {
+    this.renderProbeCoordinator?.dispose();
     this._view = webviewView;
+    if (this.uatRenderProbeEnabled) {
+      this.renderProbeCoordinator = createWebviewRenderProbeCoordinator({
+        postMessage: (message) => webviewView.webview.postMessage(message),
+        createRequestId: () => randomUUID(),
+      });
+    }
     this.windowFocused = vscode.window.state.focused;
     this.pollingReady = false;
 
@@ -2799,6 +2821,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     // Abort in-flight Test Connection probes when this webview instance is disposed.
     webviewView.onDidDispose(() => {
+      this.renderProbeCoordinator?.dispose();
+      this.renderProbeCoordinator = undefined;
       try {
         backendProbeService?.disposeAll();
       } catch {
@@ -2807,6 +2831,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (this.renderProbeCoordinator?.accept(data)) {
+        return;
+      }
       if (maintenanceActive && data?.type !== 'debugLog' && data?.type !== 'ready') {
         this.postCommandError('Muster storage maintenance is in progress. Try again after reload.');
         return;
@@ -3693,7 +3720,7 @@ export async function activate(context: vscode.ExtensionContext) {
     return;
   }
 
-  const provider = new MusterChatProvider(context.extensionUri);
+  const provider = new MusterChatProvider(context.extensionUri, liveUatEnabled);
   chatProvider = provider;
   if (liveUatEnabled) {
     uatChatProvider = provider;
@@ -4855,6 +4882,10 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(UAT_COMMANDS.runRetentionPass, async () => {
       const { repository } = requireRepo();
       return runRetentionPass(() => applyRetentionToRepository(repository));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.renderProbe, async () => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.requestRenderProbeForUat();
     }),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
