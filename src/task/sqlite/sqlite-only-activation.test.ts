@@ -39,6 +39,21 @@ describe('SQLite-only activation boundary', () => {
     });
   });
 
+  it('keeps orphan reclamation explicit-command-only with no automatic lifecycle caller', () => {
+    const reclaimHandlerReferences = extensionSource.match(/handleReclaimOrphanedFilesCommand/g) ?? [];
+
+    // One import and one direct invocation in the Command Palette registration are
+    // the complete production topology. A timer, watcher, activation hook, or
+    // retention path must not gain another call site.
+    expect(reclaimHandlerReferences).toHaveLength(2);
+    expect(extensionSource).toMatch(
+      /registerCommand\(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,[\s\S]*?handleReclaimOrphanedFilesCommand\(\{[\s\S]*?\}\),/,
+    );
+    expect(extensionSource).not.toMatch(
+      /(?:setInterval|setTimeout|createFileSystemWatcher|applyRetentionToRepository|runRetentionPass)[\s\S]{0,800}handleReclaimOrphanedFilesCommand/,
+    );
+  });
+
   it('registers storage report and user-invocable compaction through the redacted client surface', () => {
     expect(extensionSource).toContain("registerCommand('muster.storageReport'");
     expect(extensionSource).toContain('registerCommand(MUSTER_COMPACT_STORAGE_COMMAND');

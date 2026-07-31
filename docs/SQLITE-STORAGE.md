@@ -154,18 +154,19 @@ Malformed durable rows remain invariant errors and are **not** silently skipped.
 
 Use Command Palette: **Muster: Reclaim Orphaned Files**
 (`muster.reclaimOrphanedFiles`) to remove only classifier-identified, obsolete
-storage files: the legacy JSON store and stale lease files. It never removes the
+storage files: the legacy JSON store and stale lease files. Orphan reclamation
+runs only from the explicit Command Palette command. No timer, watcher, scheduled scan, or automatic sweep invokes orphan reclamation. It never removes the
 live SQLite trio or active leases. Before it makes changes, the confirmation
 states that **unmigrated legacy history** is permanently removed; dismissing or
-declining it is a strict no-op.
+declining it is a strict no-op. Cancellation emits no reclamation result.
 
 The **Muster Storage Report** channel records a path-free result for every
 confirmed pass: numeric `removed_files`, `bytes_reclaimed`, and
 `failed_removals` fields, plus one basename-only `removed:` record per deleted
-file. A clean directory reports zero removed files and zero reclaimed bytes.
-A failed removal is counted without cancelling removal of other eligible files.
-If another maintenance command is in progress, reclamation reports the shared
-busy outcome and does not begin.
+file. An empty classification emits zero values without prompting. A failed
+removal is counted without cancelling removal of other eligible files. If
+another maintenance command is in progress, reclamation reports the shared busy
+outcome and does not begin.
 
 ### VS Code uninstall
 
