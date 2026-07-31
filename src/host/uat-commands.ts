@@ -1,7 +1,12 @@
 /**
  * Live two-window UAT command surface.
  *
- * Registered only when MUSTER_UAT_MODE=1 in a non-production Extension Host.
+ * Registered only when MUSTER_UAT_MODE=1 (explicit harness opt-in), and then
+ * only up to the tier {@link resolveUatSurface} allows: a Production
+ * ExtensionMode (CLI-installed VSIX) is capped at the redacted bridge
+ * health/closure observers the M022/S05 install gate needs, so no mutable
+ * harness command ships reachable in a marketplace build. The full surface
+ * requires a non-production Extension Host.
  * Handlers operate on the activated host repository / poller / presentation
  * paths — never a parallel DbClient.
  */
@@ -31,6 +36,21 @@ export const UAT_COMMANDS = {
   loadOlderTranscript: 'muster.uat.loadOlderTranscript',
   readDurableSurfaces: 'muster.uat.readDurableSurfaces',
   focusTask: 'muster.uat.focusTask',
+  /**
+   * Packaging-gate observation: redacted MCP bridge listen state.
+   * Returns only `{ port, status, generation }` — never tokens/paths.
+   */
+  bridgeHealth: 'muster.uat.bridgeHealth',
+  /**
+   * Packaging-gate: run production `deactivate()` and return the redacted
+   * deactivate trace (`{ port, bridgeClosed }` only).
+   */
+  runDeactivate: 'muster.uat.runDeactivate',
+  /**
+   * Packaging-gate observation: last redacted deactivate trace, or null when
+   * deactivate has not run yet. Booleans + port only — never tokens/paths/env.
+   */
+  deactivateTrace: 'muster.uat.deactivateTrace',
   /** M019/S05 native first-run observations (production-path delegates). */
   refreshReadiness: 'muster.uat.refreshReadiness',
   probeBackend: 'muster.uat.probeBackend',
@@ -72,6 +92,148 @@ export type UatHostState = {
   focusGateOverridden: boolean;
 };
 
+/** Redacted MCP bridge listen observation for packaging-gate /health proof. */
+export type UatBridgeHealthStatus = 'ok' | 'stopping' | 'unavailable';
+
+export type UatBridgeHealth = {
+  port: number;
+  status: UatBridgeHealthStatus;
+  generation: number;
+};
+
+/**
+ * Project a bridge health snapshot to the packaging-gate allowlist of fields.
+ * Strips bearer tokens, credential ids, workspace/db paths, and any other extras.
+ * Does not start or stop the bridge — pure observation.
+ */
+export function readRedactedBridgeHealth(
+  source:
+    | {
+        port?: number | null;
+        status?: string | null;
+        generation?: number | null;
+        [key: string]: unknown;
+      }
+    | null
+    | undefined,
+): UatBridgeHealth {
+  if (!source) {
+    return { port: 0, status: 'unavailable', generation: 0 };
+  }
+
+  const port =
+    typeof source.port === 'number' && Number.isFinite(source.port) ? source.port : 0;
+  const generation =
+    typeof source.generation === 'number' && Number.isFinite(source.generation)
+      ? source.generation
+      : 0;
+
+  let status: UatBridgeHealthStatus;
+  if (source.status === 'ok' || source.status === 'stopping') {
+    // Explicit bridge status wins, but a non-listening port cannot claim ok.
+    status = source.status === 'ok' && port <= 0 ? 'unavailable' : source.status;
+  } else if (port > 0) {
+    status = 'ok';
+  } else {
+    status = 'unavailable';
+  }
+
+  return { port, status, generation };
+}
+
+/** Redacted deactivate observation for packaging-gate bridge-closure proof. */
+export type UatDeactivateTrace = {
+  port: number;
+  bridgeClosed: boolean;
+};
+
+/**
+ * Project a deactivate observation to the packaging-gate allowlist of fields.
+ * Strips bearer tokens, credential ids, workspace/db paths, env values, and any extras.
+ * Pure projection — does not start or stop the bridge.
+ */
+export function readRedactedDeactivateTrace(
+  source:
+    | {
+        port?: number | null;
+        bridgeClosed?: boolean | null;
+        [key: string]: unknown;
+      }
+    | null
+    | undefined,
+): UatDeactivateTrace {
+  if (!source) {
+    return { port: 0, bridgeClosed: false };
+  }
+
+  const port =
+    typeof source.port === 'number' && Number.isFinite(source.port) ? source.port : 0;
+  const bridgeClosed = source.bridgeClosed === true;
+
+  return { port, bridgeClosed };
+}
+
+/** Typed packaging-gate observation that deactivate closed the MCP bridge. */
+export type BridgeClosureTracePresence = 'present' | 'missing';
+export type BridgeClosurePostExitProbe = 'refused' | 'still-serving' | 'unknown';
+export type BridgeClosurePhase =
+  | 'ok'
+  | 'deactivate-failed'
+  | 'trace-missing'
+  | 'not-closed'
+  | 'still-serving'
+  | 'probe-unknown';
+
+export type BridgeClosureObservation = {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  phase: BridgeClosurePhase;
+};
+
+/**
+ * Build the packaging-gate `bridgeClosure` observation from redacted inputs.
+ * Pure — never carries tokens, workspace paths, or env values.
+ */
+export function buildBridgeClosureObservation(input: {
+  port: number;
+  trace: BridgeClosureTracePresence;
+  bridgeClosed: boolean;
+  postExitProbe: BridgeClosurePostExitProbe;
+  deactivateFailed?: boolean;
+}): BridgeClosureObservation {
+  const port =
+    typeof input.port === 'number' && Number.isFinite(input.port) && input.port > 0
+      ? input.port
+      : 0;
+  const bridgeClosed = input.bridgeClosed === true;
+  const trace: BridgeClosureTracePresence = input.trace === 'present' ? 'present' : 'missing';
+  const postExitProbe: BridgeClosurePostExitProbe =
+    input.postExitProbe === 'refused' ||
+    input.postExitProbe === 'still-serving' ||
+    input.postExitProbe === 'unknown'
+      ? input.postExitProbe
+      : 'unknown';
+
+  let phase: BridgeClosurePhase;
+  if (input.deactivateFailed) {
+    phase = 'deactivate-failed';
+  } else if (trace === 'missing') {
+    phase = 'trace-missing';
+  } else if (!bridgeClosed) {
+    phase = 'not-closed';
+  } else if (postExitProbe === 'still-serving') {
+    phase = 'still-serving';
+  } else if (postExitProbe === 'unknown') {
+    phase = 'probe-unknown';
+  } else {
+    phase = 'ok';
+  }
+
+  return { port, trace, bridgeClosed, postExitProbe, phase };
+}
+
 export type UatDurableSurfaces = {
   sendOutbox: Array<{
     clientRequestId: string;
@@ -89,11 +251,68 @@ export type UatDurableSurfaces = {
   workspaceRevision: number;
 };
 
+/**
+ * Exposure tier for the live UAT command surface.
+ *
+ * - `none` — nothing is registered. This is every marketplace install, because
+ *   `MUSTER_UAT_MODE` is only ever set by our own release gates.
+ * - `packaging` — Production ExtensionMode (a CLI-installed VSIX) with
+ *   `MUSTER_UAT_MODE=1`. Only the redacted bridge observers the packaging and
+ *   install gates need. No command in this tier touches persisted task rows,
+ *   messages, follow-up turns, the send outbox, or presentations.
+ * - `full` — non-production Extension Host with `MUSTER_UAT_MODE=1`. The whole
+ *   harness surface, including the store-mutating commands.
+ */
+export type UatSurfaceTier = 'none' | 'packaging' | 'full';
+
+/**
+ * The only UAT commands allowed to be reachable from a Production VSIX.
+ *
+ * Deliberately minimal: redacted bridge listen state plus the deactivate trace
+ * that proves the MCP bridge actually closes (M022/S05 real-install gate,
+ * D073). `runDeactivate` tears down this extension instance and its own bridge
+ * listener; it never creates, edits, or deletes stored data.
+ */
+export const PACKAGING_UAT_COMMAND_IDS: readonly UatCommandId[] = Object.freeze([
+  UAT_COMMANDS.bridgeHealth,
+  UAT_COMMANDS.runDeactivate,
+  UAT_COMMANDS.deactivateTrace,
+]);
+
+/**
+ * Resolve which UAT surface may be registered.
+ *
+ * The env flag is a necessary opt-in but not a sufficient one: a Production
+ * extension host is capped at the redacted packaging tier so a marketplace
+ * build can never expose mutable harness commands, even with the flag set.
+ */
+export function resolveUatSurface(
+  isProductionExtension: boolean,
+  env: NodeJS.ProcessEnv = process.env,
+): UatSurfaceTier {
+  if (env[UAT_MODE_ENV] !== '1') {
+    return 'none';
+  }
+  return isProductionExtension ? 'packaging' : 'full';
+}
+
+/** True when `id` may be registered under `tier`. */
+export function isUatCommandAllowed(tier: UatSurfaceTier, id: UatCommandId): boolean {
+  if (tier === 'full') {
+    return true;
+  }
+  if (tier === 'packaging') {
+    return PACKAGING_UAT_COMMAND_IDS.includes(id);
+  }
+  return false;
+}
+
+/** True when any UAT command surface is registered at all. */
 export function isUatModeEnabled(
   isProductionExtension: boolean,
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return !isProductionExtension && env[UAT_MODE_ENV] === '1';
+  return resolveUatSurface(isProductionExtension, env) !== 'none';
 }
 
 export function makeIso(offsetMs = 0): string {

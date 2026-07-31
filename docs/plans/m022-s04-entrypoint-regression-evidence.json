@@ -1,0 +1,19 @@
+{
+  "kind": "m022-s04-entrypoint-regression",
+  "ok": true,
+  "command": "node scripts/run-packaging-gate.mjs --census-only --evidence <temp-evidence>",
+  "mutatedFile": ".vscodeignore",
+  "injectedExclusion": "dist/src/task/sqlite/worker.js",
+  "entryPath": "extension/dist/src/task/sqlite/worker.js",
+  "typedPhase": "missing-archive-entry",
+  "regressionExitCode": 1,
+  "regressionNamedEntryPath": true,
+  "regressionNamedPhase": true,
+  "sha256Before": "558b0b92d860eaf73f9b0dfa5aa7215f8c3a6f6a63ee588c05f611affdf43d3c",
+  "sha256After": "558b0b92d860eaf73f9b0dfa5aa7215f8c3a6f6a63ee588c05f611affdf43d3c",
+  "restored": true,
+  "restoredByteForByte": true,
+  "restoredExitCode": 0,
+  "generatedAt": "2026-07-29T03:11:55.899Z",
+  "durationMs": 49351
+}

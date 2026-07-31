@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "publisher": "tlelabs",
   "license": "MIT",
-  "description": "Muster \u2014 an open-source coordinator for multiple AI CLIs (Claude, Grok, Codex, Antigravity) with streaming and session resume",
+  "description": "Muster — an open-source coordinator for multiple AI CLIs (Claude, Grok, Kiro, Codex, OpenCode) with streaming and session resume",
   "repository": {
     "type": "git",
     "url": "https://github.com/lploc94/muster.git"
@@ -17,14 +17,16 @@
     "vscode-extension",
     "claude",
     "grok",
+    "kiro",
     "codex",
-    "antigravity",
+    "opencode",
     "mcp",
     "ai-cli",
     "coordinator"
   ],
   "categories": [
-    "Other"
+    "AI",
+    "Chat"
   ],
   "engines": {
     "vscode": "^1.101.0"
@@ -224,7 +226,7 @@
             }
           },
           "scope": "resource",
-          "description": "Named task type presets (id \u2192 { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
+          "description": "Named task type presets (id → { backend, model?, role?, briefKind?, description? }). Muster ships defaults (no model pins); edit in Settings or VS Code settings.json. Explicit empty map fails closed for create/delegate.",
           "additionalProperties": {
             "type": "object",
             "required": [
@@ -364,6 +366,25 @@
     "test:task-export-docs": "node --test scripts/verify-task-export-docs.test.mjs",
     "test:task-export-live-evidence": "node --test scripts/verify-task-export-live-host-evidence.test.mjs",
     "test:live-inject-smoke": "node --test scripts/verify-live-inject-smoke.test.mjs",
+    "package": "vsce package",
+    "test:m022-s02": "node --test scripts/packaging-dependency-shape.test.mjs scripts/packaging-allowlist-closure.test.mjs scripts/run-packaging-gate.test.mjs scripts/packaging-webview-bundle.test.mjs",
+    "test:m022-s02-archive": "node --test scripts/verify-m022-s02-prune-evidence.test.mjs",
+    "test:m022-s03": "node --test scripts/packaging-marketplace-metadata.test.mjs",
+    "test:m022-s03-regression": "node scripts/run-m022-s03-injected-regression.mjs",
+    "test:m022-s03-regression-evidence": "node --test scripts/verify-m022-s03-injected-regression-evidence.test.mjs",
+    "test:m022-s04-clean-clone": "node scripts/run-m022-s04-clean-clone-package.mjs",
+    "test:m022-s04-clean-clone-evidence": "node --test scripts/verify-m022-s04-clean-clone-evidence.test.mjs",
+    "test:m022-s04-entrypoint-regression": "node scripts/run-m022-s04-entrypoint-regression.mjs",
+    "test:m022-s04-entrypoint-regression-evidence": "node --test scripts/verify-m022-s04-entrypoint-regression-evidence.test.mjs",
+    "test:m022-s04": "npm run test:m022-s04-clean-clone-evidence && npm run test:m022-s04-entrypoint-regression-evidence",
+    "test:m022-s05-contract": "node --test scripts/packaging-install-result.test.mjs",
+    "test:m022-s05-host-contract": "node --test scripts/packaging-install-host-smoke.test.mjs",
+    "test:m022-s05-install": "node scripts/run-m022-s05-install-gate.mjs",
+    "test:m022-s05-install-negative": "node scripts/run-m022-s05-install-negative.mjs",
+    "test:m022-s05-install-evidence": "node --test scripts/verify-m022-s05-install-evidence.test.mjs",
+    "test:m022-s05-listing": "node --test scripts/packaging-listing-credibility.test.mjs scripts/verify-m022-s05-listing-signoff.test.mjs",
+    "test:m022-s05": "npm run test:m022-s05-install-evidence && npm run test:m022-s05-listing",
+    "test:packaging": "node scripts/run-packaging-gate.mjs",
     "test:sqlite-extension-host": "node scripts/run-sqlite-extension-host-smoke.mjs",
     "test:sqlite-two-window-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
     "test:watch": "vitest",
@@ -389,14 +410,24 @@
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tailwindcss/typography": "^0.5.20",
     "@tailwindcss/vite": "^4.3.2",
+    "@tanstack/svelte-virtual": "3.13.32",
+    "@tanstack/virtual-core": "3.17.4",
     "@types/adm-zip": "^0.5.8",
     "@types/node": "^26.1.0",
     "@types/vscode": "^1.101.0",
+    "@vscode-elements/elements": "^2.5.1",
     "@vscode/test-electron": "^3.0.0",
     "@vscode/vsce": "^3.9.2",
     "adm-zip": "^0.6.0",
+    "diff": "^9.0.0",
+    "dompurify": "^3.4.11",
+    "github-markdown-css": "^5.9.0",
+    "highlight.js": "^11.11.1",
     "jsdom": "^29.1.1",
+    "marked": "^15.0.12",
+    "mermaid": "^11.16.0",
     "svelte": "^5.56.4",
     "svelte-check": "^4.7.2",
     "tailwindcss": "^4.3.2",
@@ -406,16 +437,7 @@
     "vitest": "4.1.10"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "@tailwindcss/typography": "^0.5.20",
-    "@tanstack/svelte-virtual": "3.13.32",
-    "@tanstack/virtual-core": "3.17.4",
-    "@vscode-elements/elements": "^2.5.1",
-    "diff": "^9.0.0",
-    "dompurify": "^3.4.11",
-    "github-markdown-css": "^5.9.0",
-    "highlight.js": "^11.11.1",
-    "marked": "^15.0.12",
-    "mermaid": "^11.16.0"
-  }
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "icon": "resources/icon.png"
 }

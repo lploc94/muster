@@ -68,7 +68,7 @@ function fixedNow(): Date {
 }
 
 describe('M019 S05 native first-run adapter (T01)', () => {
-  it('exports allowlisted UAT command ids under muster.uat.* and gate stays non-production', () => {
+  it('exports allowlisted UAT command ids under muster.uat.* and env flag is sole opt-in', () => {
     expect(NATIVE_FIRST_RUN_UAT_COMMANDS.refreshReadiness).toBe(
       'muster.uat.refreshReadiness',
     );
@@ -86,8 +86,11 @@ describe('M019 S05 native first-run adapter (T01)', () => {
     expect(UAT_COMMANDS.acceptFirstTask).toBe(NATIVE_FIRST_RUN_UAT_COMMANDS.acceptFirstTask);
     expect(UAT_COMMANDS.nativeFirstRunCleanup).toBe(NATIVE_FIRST_RUN_UAT_COMMANDS.cleanup);
 
-    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(false);
+    // MUSTER_UAT_MODE=1 enables UAT even under Production ExtensionMode so the
+    // M022/S05 install gate can observe bridge health from a CLI-installed VSIX.
+    expect(isUatModeEnabled(true, { MUSTER_UAT_MODE: '1' })).toBe(true);
     expect(isUatModeEnabled(false, { MUSTER_UAT_MODE: '1' })).toBe(true);
+    expect(isUatModeEnabled(true, {})).toBe(false);
   });
 
   it('accepts only allowlisted provider ids', () => {

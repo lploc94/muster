@@ -3748,7 +3748,7 @@ export class TaskEngine {
     // false idle window and duplicate schedules cannot start the same turn.
     const promise = this.runScheduledTurn(turnId);
     this.turnPromises.set(turnId, promise);
-    void promise.finally(async () => {
+    const settlement = promise.finally(async () => {
       this.turnPromises.delete(turnId);
       // Terminal storage: zero repository / reschedule after latch.
       if (this.storageTerminal || this.shuttingDown) return;
@@ -3774,7 +3774,30 @@ export class TaskEngine {
         if (canPromoteTurn(this.store.getFile(), queuedTurn.id, this.getResourceLimits()).ok) void this.scheduleTurn(queuedTurn.id);
       }
     });
+    // Most callers use `void this.scheduleTurn(...)`, and a hard quiesce clears
+    // `turnPromises` while a turn is still in flight. A store closed under such a
+    // detached turn must fail closed, not surface as an unhandled rejection.
+    this.sinkTurnRejection(settlement, turnId);
     return promise;
+  }
+
+  /**
+   * Rejection sink for intentionally fire-and-forget turn schedules.
+   *
+   * Attaching a handler to the derived settlement chain never changes what
+   * awaiting callers observe: {@link whenIdle} and `await this.scheduleTurn(...)`
+   * still see the original rejection. Teardown rejections (store closed under a
+   * detached turn) are expected and stay silent; anything else is logged so a
+   * genuine scheduling failure is never swallowed.
+   */
+  private sinkTurnRejection(promise: Promise<unknown>, turnId: string): void {
+    void promise.catch((error: unknown) => {
+      if (this.shuttingDown || this.storageTerminal) return;
+      this.logLifecycle('turn.schedule.rejected', {
+        turnId,
+        error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+      }, 'error');
+    });
   }
 
   private scheduleWorkflowResumeTurn(turnId: string): void {

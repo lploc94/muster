@@ -1,0 +1,13 @@
+{
+  "kind": "m022-s04-clean-clone",
+  "ok": true,
+  "command": "npm run package",
+  "installCommand": "npm ci",
+  "npmCiExitCode": 0,
+  "packageExitCode": 0,
+  "vsixName": "muster-0.1.0.vsix",
+  "vsixSizeBytes": 6806265,
+  "cloneMethod": "git-clone-local",
+  "generatedAt": "2026-07-29T03:10:20.838Z",
+  "durationMs": 52865
+}

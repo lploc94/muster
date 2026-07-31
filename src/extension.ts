@@ -53,14 +53,20 @@ import {
   createTaskWithMessage,
   deleteMessage,
   enqueueFollowUp,
-  isUatModeEnabled,
+  isUatCommandAllowed,
   markSendOutboxRejected,
   promoteFollowUp,
   putPresentation,
   putSendOutbox,
   readDurableSurfaces,
+  readRedactedBridgeHealth,
   readRedactedDbIdentity,
+  readRedactedDeactivateTrace,
+  resolveUatSurface,
+  type UatCommandId,
+  type UatDeactivateTrace,
   type UatHostState,
+  type UatSurfaceTier,
 } from './host/uat-commands';
 import {
   NATIVE_FIRST_RUN_UAT_PROMPT,
@@ -224,6 +230,8 @@ let musterDebugChannel: vscode.OutputChannel | undefined;
 let credentialRegistry: CredentialRegistry | undefined;
 let mcpReadiness: McpReadinessSupervisor | undefined;
 let bridgeServer: MusterBridgeServer | undefined;
+/** Last redacted deactivate observation for packaging-gate bridge-closure proof. */
+let lastUatDeactivateTrace: UatDeactivateTrace | null = null;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskReadPort | undefined;
 let taskRepository: TaskRepository | undefined;
@@ -3557,9 +3565,13 @@ function resolveCurrentWorkspaceIdentity(context: vscode.ExtensionContext) {
 }
 
 export async function activate(context: vscode.ExtensionContext) {
-  const liveUatEnabled = isUatModeEnabled(
+  // A Production VSIX is capped at the redacted packaging tier even with the env
+  // flag set, so no store-mutating harness command is reachable in a
+  // marketplace install. See resolveUatSurface for the tier contract.
+  const uatSurface = resolveUatSurface(
     context.extensionMode === vscode.ExtensionMode.Production,
   );
+  const liveUatEnabled = uatSurface !== 'none';
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
@@ -3936,7 +3948,7 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   if (liveUatEnabled) {
-    registerLiveUatCommands(context);
+    registerLiveUatCommands(context, uatSurface);
   }
 
   try {
@@ -4364,7 +4376,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push({
       dispose: () => {
-        void bridgeServer?.close();
         askBridge?.cancelAll('deactivate');
         elicitationBridge?.cancelAll();
         setPermissionController(null);
@@ -4595,10 +4606,60 @@ function registerSqliteMaintenanceCommands(
 }
 
 /**
- * Live two-window UAT command surface. activate() calls this only for a
- * non-production Extension Host with MUSTER_UAT_MODE=1.
+ * Live UAT command surface, registered up to the resolved exposure tier.
+ *
+ * `packaging` (Production VSIX + MUSTER_UAT_MODE=1) gets only the redacted
+ * bridge observers the M022/S05 install gate needs. The store-mutating harness
+ * commands live behind an early return, so a marketplace build cannot reach
+ * them even if the env flag is set.
  */
-function registerLiveUatCommands(context: vscode.ExtensionContext): void {
+function registerLiveUatCommands(
+  context: vscode.ExtensionContext,
+  tier: UatSurfaceTier,
+): void {
+  // PACKAGING_UAT_COMMAND_IDS in uat-commands.ts is the single source of truth
+  // for what a Production host may expose; this helper just honours it.
+  const register = (
+    id: UatCommandId,
+    handler: Parameters<typeof vscode.commands.registerCommand>[1],
+  ): void => {
+    if (!isUatCommandAllowed(tier, id)) {
+      return;
+    }
+    context.subscriptions.push(vscode.commands.registerCommand(id, handler));
+  };
+
+  // Packaging-gate observation: redacted MCP bridge listen state only.
+  // Does not start/stop the bridge; production activation already owns listen().
+  register(UAT_COMMANDS.bridgeHealth, () => {
+    if (!bridgeServer) {
+      return readRedactedBridgeHealth(null);
+    }
+    const port = bridgeServer.getPort();
+    return readRedactedBridgeHealth({
+      port,
+      generation: bridgeServer.getGeneration(),
+      // port > 0 means the production listen() path bound successfully.
+      // Packaging gate only needs ok + port > 0 after activation.
+      status: port > 0 ? 'ok' : 'unavailable',
+    });
+  });
+  // Packaging-gate: invoke production deactivate() on this module instance and
+  // return the redacted bridge-close observation (port + bridgeClosed only).
+  // Tears down this instance; never creates, edits, or deletes stored data.
+  register(UAT_COMMANDS.runDeactivate, async () => {
+    await deactivate();
+    return lastUatDeactivateTrace ?? readRedactedDeactivateTrace(null);
+  });
+  register(UAT_COMMANDS.deactivateTrace, () => lastUatDeactivateTrace);
+
+  // Everything past this point reads or mutates the task store, the send
+  // outbox, presentations, or live host state. The packaging tier stops here so
+  // that surface is structurally absent from a Production VSIX.
+  if (tier !== 'full') {
+    return;
+  }
+
   const requireRepo = (): { repository: TaskRepository; workspaceId: string } => {
     if (!taskRepository || !sqliteWorkspaceId) {
       throw new Error('UAT repository unavailable');
@@ -4770,8 +4831,29 @@ export async function deactivate(): Promise<void> {
   setAcpDebugLogger(null);
   permissionBridge?.cancelAll();
   credentialRegistry?.revokeAll();
-  void bridgeServer?.close();
-  try {
+
+  // Await bridge close and record a redacted deactivate trace (port + boolean only).
+  // Packaging-gate host smoke asserts this instead of inferring closure from pid exit.
+  const bridgePortBeforeClose = bridgeServer?.getPort() ?? 0;
+  let bridgeClosed = false;
+  if (bridgeServer) {
+    try {
+      await bridgeServer.close();
+      bridgeClosed = true;
+    } catch {
+      bridgeClosed = false;
+    }
+    bridgeServer = undefined;
+  } else {
+    // No live server — treat as already closed (nothing left serving).
+    bridgeClosed = true;
+  }
+  lastUatDeactivateTrace = readRedactedDeactivateTrace({
+    port: bridgePortBeforeClose,
+    bridgeClosed,
+  });
+
+try {
     backendProbeService?.disposeAll();
   } catch {
     // best-effort probe teardown

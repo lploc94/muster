@@ -1,0 +1,14 @@
+{
+  "kind": "m022-s03-injected-regression",
+  "ok": true,
+  "command": "npm run test:m022-s02",
+  "injectedPackage": "mermaid",
+  "injectedVersion": "^11.16.0",
+  "regressionExitCode": 1,
+  "regressionNamedPackage": true,
+  "restored": true,
+  "packageJsonRestoredByteForByte": true,
+  "restoredExitCode": 0,
+  "generatedAt": "2026-07-29T01:40:18.493Z",
+  "durationMs": 3078
+}

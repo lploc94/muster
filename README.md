@@ -34,7 +34,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 ## Prerequisites
 
 - **Node.js** 20+ (CI and the M002 quality gate target Node 24 LTS)
-- **VS Code** 1.94+
+- **VS Code** 1.101+ (matches `engines.vscode` in `package.json`; 1.100 and older are rejected — the task engine needs `node:sqlite` in the extension host)
 - The CLI for whichever backend you use, on `PATH` and logged in:
   - **Claude Code** (`claude`) — Claude backend
   - **Grok CLI** (`grok`) — Grok backend
