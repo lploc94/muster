@@ -60,4 +60,20 @@ describe('SQLite-only activation boundary', () => {
       expect(extensionSource).toContain(`report.${field}`);
     }
   });
+
+  it('wires storage lifecycle UAT commands to activated repository, SQLite client, and retention report singletons', () => {
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.seedStorageWorkload');
+    expect(extensionSource).toContain('seedStorageWorkload(repository, workspaceId)');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.storageLifecycleState');
+    expect(extensionSource).toContain('readStorageLifecycleState({');
+    expect(extensionSource).toContain('repository,');
+    expect(extensionSource).toContain('sqliteClient: requireClient(),');
+    expect(extensionSource).toContain('retentionReport,');
+    expect(extensionSource).toContain('workspaceId,');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.runRetentionPass');
+    expect(extensionSource).toContain('runRetentionPass(() => applyRetentionToRepository(repository))');
+    expect(packageJson.contributes.commands).not.toContainEqual(
+      expect.objectContaining({ command: 'muster.uat.storageLifecycleState' }),
+    );
+  });
 });

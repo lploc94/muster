@@ -64,6 +64,9 @@ import {
   putSendOutbox,
   readDurableSurfaces,
   readRedactedDbIdentity,
+  readStorageLifecycleState,
+  runRetentionPass,
+  seedStorageWorkload,
   type UatHostState,
 } from './host/uat-commands';
 import {
@@ -4834,6 +4837,24 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
         rootId: String(args.rootId),
         presentationId: String(args.presentationId),
       });
+    }),
+    // M023/S05 storage lifecycle observations — activated production delegates only.
+    vscode.commands.registerCommand(UAT_COMMANDS.seedStorageWorkload, async () => {
+      const { repository, workspaceId } = requireRepo();
+      return seedStorageWorkload(repository, workspaceId);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.storageLifecycleState, async () => {
+      const { repository, workspaceId } = requireRepo();
+      return readStorageLifecycleState({
+        repository,
+        sqliteClient: requireClient(),
+        retentionReport,
+        workspaceId,
+      });
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.runRetentionPass, async () => {
+      const { repository } = requireRepo();
+      return runRetentionPass(() => applyRetentionToRepository(repository));
     }),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
