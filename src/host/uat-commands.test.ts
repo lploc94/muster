@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { NATIVE_FIRST_RUN_UAT_COMMANDS } from './m019-s05-native-first-run';
+import { isBoundedToolFileChange } from '../shared/tool-file-change-contract';
 import {
   isUatModeEnabled,
   readStorageLifecycleState,
@@ -54,8 +55,12 @@ describe('live UAT exposure gate', () => {
     const retainedChanges = settledTranscript.toolCalls
       .flatMap((call: { fileChanges: Array<{ oldText: string; newText: string }> }) => call.fileChanges);
     expect(retainedChanges).toHaveLength(4);
-    expect(retainedChanges.every((change) => change.oldText.length > 262_144 && change.newText.length > 262_144))
-      .toBe(true);
+    expect(retainedChanges.every((change) =>
+      isBoundedToolFileChange({ path: 'src/fixture.ts', oldText: change.oldText, newText: change.newText }),
+    )).toBe(true);
+    expect(settledTranscript.toolCalls.every((call: { output?: string }) =>
+      typeof call.output === 'string' && call.output.length > 1_000_000,
+    )).toBe(true);
     const activeTranscript = execute.mock.calls[8]![0];
     expect(activeTranscript.toolCalls[0].turnId).toContain('active');
     expect(activeTranscript.toolCalls[0].fileChanges[0]).toMatchObject({ oldText: 'live-before', newText: 'live-after' });

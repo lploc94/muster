@@ -10312,6 +10312,39 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
+    let retentionEntriesStripped = 0;
+    for (const tool of await this.listToolCalls(task.id)) {
+      if (!settledTurnIds.has(tool.turnId)) continue;
+      let retainedTool = tool;
+      let changed = false;
+      if (isBoundedToolFileChanges(tool.fileChanges) &&
+        !tool.fileChanges.every((change) => change.retentionTruncated === true)) {
+        const fileChanges = [] as NonNullable<typeof tool.fileChanges>;
+        for (const change of tool.fileChanges) {
+          const stripped = stripToolFileChangeEvidenceForRetention(change);
+          if (!stripped) {
+            fileChanges.length = 0;
+            break;
+          }
+          fileChanges.push(stripped);
+        }
+        if (fileChanges.length === tool.fileChanges.length) {
+          retainedTool = { ...retainedTool, fileChanges };
+          retentionEntriesStripped += fileChanges.length;
+          changed = true;
+        }
+      }
+      if (typeof tool.output === 'string') {
+        const output = truncateRetentionContent(tool.output, maxChars);
+        if (output !== tool.output) {
+          retainedTool = { ...retainedTool, output };
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+      statements.push(toolCallStatement(this.workspaceId, retainedTool));
+      changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
+    }
     for (const message of await this.listMessages(task.id)) {
       if (message.role !== 'assistant' || message.state !== 'complete' ||
         !message.turnId || !settledTurnIds.has(message.turnId)) continue;
@@ -10322,13 +10355,6 @@ export class SqliteTaskRepository implements TaskRepository {
         params: [content, this.workspaceId, message.id, message.content],
       });
       changes.push({ kind: 'message', id: message.id, taskId: task.id, change: 'truncate' });
-    }
-    for (const tool of await this.listToolCalls(task.id)) {
-      if (!settledTurnIds.has(tool.turnId) || typeof tool.output !== 'string') continue;
-      const output = truncateRetentionContent(tool.output, maxChars);
-      if (output === tool.output) continue;
-      statements.push(toolCallStatement(this.workspaceId, { ...tool, output }));
-      changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
     }
     for (const reasoning of await this.listReasoning(task.id)) {
       if (!settledTurnIds.has(reasoning.turnId)) continue;
@@ -10342,7 +10368,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     if (statements.length === 0) return { ok: true, changed: false };
     await this.write(statements, changes, new Date().toISOString());
-    return { ok: true, changed: true };
+    return { ok: true, changed: true, retentionEntriesStripped };
   }
 }
 

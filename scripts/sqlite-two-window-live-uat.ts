@@ -548,9 +548,23 @@ async function runOrchestratorA(): Promise<void> {
     120_000,
   );
   const identityB2 = await peer<DbIdentity>(UAT_COMMANDS.identity);
-  // A fresh production host recovers the pending fixture during activation.
-  // Its failed replay stays durably visible as rejected; the independently
-  // rejected record and presentation must also survive the fresh host.
+  // VS Code can restore the sidebar as host-visible before the fresh webview
+  // renderer mounts. Force a real hide/reveal cycle so the production webview
+  // receives outboxSnapshot before snapshot and replays the pending send.
+  await peer('workbench.action.closeSidebar');
+  await waitForPeerHostState(
+    'fresh-host hidden view',
+    (state) => !state.viewVisible && !state.pollingReady,
+  );
+  await peer('muster.openChat');
+  await peer(UAT_COMMANDS.forcePollingActive);
+  await waitForPeerHostState(
+    'fresh-host webview hydration',
+    (state) => state.viewResolved && state.viewVisible && state.pollingReady,
+  );
+  // A fresh production webview recovers the pending fixture after compatible
+  // snapshot hydration. Its failed replay stays durably visible as rejected;
+  // the independently rejected record and presentation must also survive.
   const hasExpectedDurableSurfaces = (value: DurableSurfaces): boolean =>
     value.sendOutbox.some((entry) =>
       entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected') &&

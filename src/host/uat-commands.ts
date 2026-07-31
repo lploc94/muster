@@ -441,8 +441,13 @@ export type StorageLifecycleSeedResult = {
 
 const STORAGE_SEED_TASK_ID = 'uat-storage-seed-terminal';
 const STORAGE_SEED_ACTIVE_TASK_ID = 'uat-storage-seed-active';
-// Exceeds the production 256 KiB retained-output cap for exactly four old entries.
-const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(300 * 1024);
+// Remains inside the shared 128 KiB per-side file-change boundary while
+// contributing four substantial, retention-eligible diff payloads.
+const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(120 * 1024);
+// Uses the established open-task tool-output retention branch to ensure the
+// seed exceeds pages already allocated by scenarios A-I; it is not returned
+// by the numeric lifecycle observation surface.
+const STORAGE_SEED_LARGE_OUTPUT = 'y'.repeat(1_250 * 1024);
 const STORAGE_SEED_AGE_MS = 366 * 24 * 60 * 60 * 1_000;
 
 /** Keeps the live fixture eligible as wall time advances without changing production retention policy. */
@@ -489,6 +494,7 @@ export async function seedStorageWorkload(
     toolCalls: settledTurns.map((turn, index) => ({
       id: `${turn.id}:edit`, taskId: activeTask.id, turnId: turn.id, toolCallId: 'edit', order: 0,
       name: 'edit_file', kind: 'builtin' as const, status: 'success' as const,
+      output: STORAGE_SEED_LARGE_OUTPUT,
       fileChanges: index < 4
         ? [{
           path: `src/retained-${index}.ts`, oldText: STORAGE_SEED_LARGE_DIFF, newText: STORAGE_SEED_LARGE_DIFF,

@@ -31,7 +31,10 @@ test('M023 S05 lifecycle scenario uses activated UAT commands and records the fo
   assert.match(source, /durableOk=\$\{durableOk\} identityOk=\$\{identityOk\} tasksOk=\$\{tasksOk\}/);
   assert.match(source, /outboxCount=\$\{lastDurable\.sendOutbox\.length\}/);
   assert.match(source, /presentationPresent=\$\{lastDurable\.presentation !== undefined\}/);
-  assert.match(source, /waitForPeerDurableSurfaces\('fresh-host durable restoration'/);
+  assert.match(
+    source,
+    /const identityB2 = await peer<DbIdentity>\(UAT_COMMANDS\.identity\);[\s\S]*await peer\('muster\.openChat'\);[\s\S]*waitForPeerDurableSurfaces\('fresh-host durable restoration'/,
+  );
   assert.doesNotMatch(source, /const \[durable, state\] = await Promise\.all\(\[\s*peer<DurableSurfaces>/);
   assert.match(source, /storageLifecycle: \{[\s\S]*before: lifecycleBefore[\s\S]*afterSeed: lifecycleAfterSeed[\s\S]*afterRetention: lifecycleAfterRetention[\s\S]*peerAfterRetention: lifecyclePeerAfterRetention/);
   assert.match(source, /lifecyclePeerAfterRetention\.storage\.fileBytes,\s*lifecycleAfterRetention\.storage\.fileBytes/);
