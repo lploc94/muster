@@ -340,12 +340,20 @@ describe('MusterBridgeServer auth', () => {
     expect(defineTool?.inputSchema.properties).not.toHaveProperty('opId');
     expect(defineTool?.inputSchema.properties).not.toHaveProperty('workflowKey');
      const startTool = workflowTools.find((tool) => tool.name === 'start_workflow');
-     expect(startTool?.description).toContain('exactly one value for every input');
+     expect(startTool?.description).toContain('exactly one literal value or prior-run result reference for every input');
      expect(startTool?.description).toContain('resumes the caller exactly once');
     expect(startTool?.inputSchema).toMatchObject({
       properties: { workflow: { pattern: WORKFLOW_REF_PATTERN } },
     });
     expect(startTool?.inputSchema.properties?.inputs?.description).toContain('exactly match');
+    expect(startTool?.inputSchema.properties?.inputs).toMatchObject({
+      items: {
+        oneOf: [
+          { required: ['node', 'input', 'value'], additionalProperties: false },
+          { required: ['node', 'input', 'fromRun'], additionalProperties: false },
+        ],
+      },
+    });
     expect(startTool?.inputSchema.properties).not.toHaveProperty('instanceKey');
 
     const defined = await session.request('tools/call', {

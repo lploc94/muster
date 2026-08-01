@@ -142,13 +142,25 @@ export interface DefineWorkflowInput {
   createdAt: string;
 }
 
-/** Caller-authored value bound to one exact entry contract at start. */
-export interface StartWorkflowEntryInput {
+/** Caller-authored literal value bound to one exact entry contract at start. */
+export interface StartWorkflowEntryLiteralInput {
   entryNodeId: string;
   inputRef: string;
   kind: string;
   value: string;
 }
+
+/** Caller-authorized reference to a prior workflow run's terminal result. */
+export interface StartWorkflowEntryRunReferenceInput {
+  entryNodeId: string;
+  inputRef: string;
+  fromRun: string;
+}
+
+/** Exactly one literal value or prior-run result reference for an entry contract. */
+export type StartWorkflowEntryInput =
+  | StartWorkflowEntryLiteralInput
+  | StartWorkflowEntryRunReferenceInput;
 
 /**
  * Input for startWorkflowRun. Agents never supply writable run/task/turn/gate IDs;

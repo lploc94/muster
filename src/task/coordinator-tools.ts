@@ -464,14 +464,26 @@ function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] 
   const seen = new Set<string>();
   for (const raw of value) {
     if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['node', 'input', 'value'].includes(key))) return undefined;
+    if (Object.keys(raw).some((key) => !['node', 'input', 'value', 'fromRun'].includes(key))) return undefined;
     const entryNodeId = requireString(raw, 'node');
     const inputRef = requireString(raw, 'input');
-    if (!entryNodeId || !inputRef || typeof raw.value !== 'string') return undefined;
+    const hasLiteralValue = Object.prototype.hasOwnProperty.call(raw, 'value');
+    const literalValue = typeof raw.value === 'string' ? raw.value : undefined;
+    const fromRun = requireString(raw, 'fromRun');
+    if (
+      !entryNodeId ||
+      !inputRef ||
+      hasLiteralValue === Boolean(fromRun) ||
+      (hasLiteralValue && literalValue === undefined)
+    ) return undefined;
     const key = `${entryNodeId}\0${inputRef}`;
     if (seen.has(key)) return undefined;
     seen.add(key);
-    inputs.push({ entryNodeId, inputRef, kind: 'workflow_input', value: raw.value });
+    inputs.push(
+      hasLiteralValue
+        ? { entryNodeId, inputRef, kind: 'workflow_input', value: literalValue! }
+        : { entryNodeId, inputRef, fromRun: fromRun! },
+    );
   }
   return inputs;
 }
