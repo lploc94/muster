@@ -531,8 +531,13 @@ describe('M018 S07 bounded workflow status projection', () => {
         workspaceId: 'ws',
         taskId: p1.taskId,
         keepLatestTurns: 0,
-      })).resolves.toMatchObject({ ok: true, changed: true });
-      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeUndefined();
+      })).resolves.toMatchObject({ ok: true, changed: false });
+      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeDefined();
+
+      await expect(ctx.repository.execute({
+        kind: 'reclaimTerminalWorkflowMetadata',
+        workspaceId: 'ws',
+      })).resolves.toMatchObject({ ok: true, changed: true, reclaimedWorkflowRuns: 1 });
       await expect(ctx.client.get(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         ['ws', data.runId],
