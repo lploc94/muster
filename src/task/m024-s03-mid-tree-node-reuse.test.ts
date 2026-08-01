@@ -206,38 +206,66 @@ describe('start_workflow mid-tree node reuse', () => {
         ['ws', consumer.runId],
       )).resolves.toEqual([
         { node_id: 'middle', task_id: null, status: 'reused' },
-        { node_id: 'sink', task_id: null, status: 'pending' },
+        { node_id: 'sink', task_id: expect.any(String), status: 'active' },
         { node_id: 'source', task_id: null, status: 'reused' },
       ]);
       await expect(client.get(
         `SELECT workflow_turns_reserved FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         ['ws', consumer.runId],
-      )).resolves.toEqual({ workflow_turns_reserved: 0 });
+      )).resolves.toEqual({ workflow_turns_reserved: 1 });
       await expect(client.all(
         `SELECT node.task_id
            FROM workflow_nodes node
            JOIN tasks task ON task.workspace_id = node.workspace_id AND task.id = node.task_id
-          WHERE node.workspace_id = ? AND node.run_id = ?`,
+          WHERE node.workspace_id = ? AND node.run_id = ? AND node.status = 'reused'`,
         ['ws', consumer.runId],
       )).resolves.toEqual([]);
       await expect(client.all(
         `SELECT turn.id
            FROM workflow_nodes node
            JOIN turns turn ON turn.workspace_id = node.workspace_id AND turn.task_id = node.task_id
-          WHERE node.workspace_id = ? AND node.run_id = ?`,
+          WHERE node.workspace_id = ? AND node.run_id = ? AND node.status = 'reused'`,
         ['ws', consumer.runId],
       )).resolves.toEqual([]);
       await expect(client.all(
         `SELECT message.id
            FROM workflow_nodes node
            JOIN messages message ON message.workspace_id = node.workspace_id AND message.task_id = node.task_id
-          WHERE node.workspace_id = ? AND node.run_id = ?`,
+          WHERE node.workspace_id = ? AND node.run_id = ? AND node.status = 'reused'`,
         ['ws', consumer.runId],
       )).resolves.toEqual([]);
-      await expect(client.all(
-        `SELECT activation_id FROM workflow_activations WHERE workspace_id = ? AND run_id = ?`,
-        ['ws', consumer.runId],
-      )).resolves.toEqual([]);
+      await expect(client.get(
+        `SELECT binding.required_kind, fill.artifact_run_id, fill.artifact_id, fill.artifact_revision
+           FROM workflow_gate_bindings binding
+           JOIN workflow_gate_fills fill
+             ON fill.workspace_id = binding.workspace_id
+            AND fill.run_id = binding.run_id
+            AND fill.gate_id = binding.gate_id
+            AND fill.input_ref = binding.input_ref
+          WHERE binding.workspace_id = ? AND binding.run_id = ?
+            AND binding.producer_node_id = ? AND binding.input_ref = ?`,
+        ['ws', consumer.runId, 'middle', 'middle_result'],
+      )).resolves.toMatchObject({
+        required_kind: 'next_result', artifact_run_id: prior.runId,
+        artifact_id: expect.any(String), artifact_revision: 1,
+      });
+      await expect(client.get(
+        `SELECT node.task_id, node.status, gate.status AS gate_status,
+                activation.status AS activation_status, turn.status AS turn_status
+           FROM workflow_nodes node
+           JOIN workflow_dependency_gates gate
+             ON gate.workspace_id = node.workspace_id AND gate.run_id = node.run_id
+            AND gate.consumer_node_id = node.node_id
+           JOIN workflow_activations activation
+             ON activation.workspace_id = node.workspace_id AND activation.run_id = node.run_id
+            AND activation.node_id = node.node_id
+           JOIN turns turn ON turn.workspace_id = activation.workspace_id AND turn.id = activation.execution_turn_id
+          WHERE node.workspace_id = ? AND node.run_id = ? AND node.node_id = ?`,
+        ['ws', consumer.runId, 'sink'],
+      )).resolves.toMatchObject({
+        task_id: expect.any(String), status: 'active', gate_status: 'satisfied',
+        activation_status: 'queued', turn_status: 'queued',
+      });
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
