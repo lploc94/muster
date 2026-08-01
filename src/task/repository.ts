@@ -75,6 +75,7 @@ import {
 } from './workflow';
 import type {
   StartWorkflowEntryInput,
+  StartWorkflowNodeReuse,
   WorkflowRunCompletionProjection,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
@@ -464,6 +465,7 @@ export type RepositoryCommand =
       goal?: string;
       backend?: string;
       entryInputs?: readonly StartWorkflowEntryInput[];
+      reuse?: readonly StartWorkflowNodeReuse[];
       ownerRootTaskId?: string;
       callerTaskId?: string;
       callerTurnId?: string;
@@ -5110,6 +5112,7 @@ export class SqliteTaskRepository implements TaskRepository {
       goal,
       backend: command.backend,
       entryInputs: command.entryInputs,
+      reuse: command.reuse,
       entryContracts: storedDefinition.definition.entryContracts,
       policy: effectivePolicy,
       ownerRootTaskId: command.ownerRootTaskId,

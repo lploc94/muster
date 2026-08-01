@@ -162,6 +162,12 @@ export type StartWorkflowEntryInput =
   | StartWorkflowEntryLiteralInput
   | StartWorkflowEntryRunReferenceInput;
 
+/** Caller-authorized reuse of a prior run's result for one graph node. */
+export interface StartWorkflowNodeReuse {
+  nodeId: string;
+  fromRun: string;
+}
+
 /**
  * Input for startWorkflowRun. Agents never supply writable run/task/turn/gate IDs;
  * those are derived deterministically from the start idempotency key + definition.
@@ -192,6 +198,8 @@ export interface StartWorkflowInput {
   backend?: string;
   /** Exact caller values for every declared entry contract. */
   entryInputs?: readonly StartWorkflowEntryInput[];
+  /** Prior-run references for graph nodes reused by this start. */
+  reuse?: readonly StartWorkflowNodeReuse[];
   /** Frozen definition contracts loaded by the repository. */
   entryContracts?: readonly WorkflowEntryContractV1[];
   /** Caller/root authority included in fingerprint and identity derivation. */

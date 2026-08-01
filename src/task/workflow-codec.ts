@@ -14,6 +14,7 @@ import {
   type GraphTopologyV1,
   type OneNodeTopologyV1,
   type StartWorkflowEntryInput,
+  type StartWorkflowNodeReuse,
   type WorkflowDefinitionV1,
   type WorkflowDependencyEdgeV1,
   type WorkflowEntryContractV1,
@@ -109,6 +110,14 @@ export function fingerprintStartEntryInputs(
           fromRun: entryInput.fromRun,
         }
   ));
+}
+
+export function fingerprintStartNodeReuse(
+  reuse: readonly StartWorkflowNodeReuse[],
+): readonly { nodeId: string; fromRun: string }[] {
+  return [...reuse]
+    .map(({ nodeId, fromRun }) => ({ nodeId, fromRun }))
+    .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
 }
 
 export function formatWorkflowEntryAggregate(

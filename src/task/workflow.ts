@@ -12,6 +12,7 @@ import {
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
   fingerprintStartEntryInputs,
+  fingerprintStartNodeReuse,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
@@ -21,6 +22,7 @@ import type {
   DefineWorkflowResult,
   GraphTopologyV1,
   StartWorkflowEntryInput,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -49,6 +51,7 @@ export type {
   DefineWorkflowResult,
   GraphTopologyV1,
   OneNodeTopologyV1,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -823,6 +826,7 @@ export function fingerprintStartWorkflow(input: {
   callerTaskId?: string;
   callerTurnId?: string;
   entryInputs?: readonly StartWorkflowEntryInput[];
+  reuse?: readonly StartWorkflowNodeReuse[];
   policy?: WorkflowPolicyV1;
 }): string {
   const payload = JSON.stringify({
@@ -835,6 +839,7 @@ export function fingerprintStartWorkflow(input: {
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
     entryInputs: fingerprintStartEntryInputs(input.entryInputs ?? []),
+    reuse: fingerprintStartNodeReuse(input.reuse ?? []),
     policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
@@ -857,6 +862,7 @@ export function validateStartWorkflow(
       goal: string;
       backend: string;
       entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
+      reuse: readonly StartWorkflowNodeReuse[];
       entryContracts: readonly WorkflowEntryContractV1[];
       policy: WorkflowPolicyV1;
       ownerRootTaskId?: string;
@@ -919,6 +925,18 @@ export function validateStartWorkflow(
   }
   const contracts = input.entryContracts ?? [];
   const entryInputs = input.entryInputs ?? [];
+  const reuse = input.reuse ?? [];
+  const reuseNodeIds = new Set<string>();
+  for (const item of reuse) {
+    if (
+      !isNonEmptyBounded(item.nodeId, 128) ||
+      !isNonEmptyBounded(item.fromRun, 128) ||
+      reuseNodeIds.has(item.nodeId)
+    ) {
+      return { ok: false, reason: 'invalid reuse' };
+    }
+    reuseNodeIds.add(item.nodeId);
+  }
   const contractByKey = new Map<string, WorkflowEntryContractV1>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
   );
@@ -990,6 +1008,7 @@ export function validateStartWorkflow(
     ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
     ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
     entryInputs: orderedEntryInputs,
+    reuse,
     policy,
   });
   return {
@@ -1002,6 +1021,7 @@ export function validateStartWorkflow(
     goal,
     backend,
     entryInputs: orderedEntryInputs,
+    reuse,
     entryContracts: contracts,
     policy,
     ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
@@ -1069,7 +1089,7 @@ export function startWorkflowConflict(
 
 /** Shape a start validation / missing-definition failure. */
 export function startWorkflowInvalid(
-  reason: 'definition not found' | 'invalid start' | 'invalid identity',
+  reason: 'definition not found' | 'invalid start' | 'invalid identity' | 'entry input reference unresolved',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {
