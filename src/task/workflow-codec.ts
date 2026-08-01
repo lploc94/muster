@@ -13,6 +13,7 @@ import {
   type DefineWorkflowInput,
   type GraphTopologyV1,
   type OneNodeTopologyV1,
+  type StartWorkflowEntryInput,
   type WorkflowDefinitionV1,
   type WorkflowDependencyEdgeV1,
   type WorkflowEntryContractV1,
@@ -74,6 +75,41 @@ function isNonEmptyString(value: unknown, max: number): value is string {
 }
 
 const WORKFLOW_ENTRY_AGGREGATE_PREFIX = '[workflow-entry]';
+
+export function fingerprintStartEntryInputs(
+  entryInputs: readonly StartWorkflowEntryInput[],
+): readonly (
+  | {
+      type: 'literal';
+      entryNodeId: string;
+      inputRef: string;
+      kind: string;
+      valueSha256: string;
+    }
+  | {
+      type: 'prior_run_result';
+      entryNodeId: string;
+      inputRef: string;
+      fromRun: string;
+    }
+)[] {
+  return entryInputs.map((entryInput) => (
+    'value' in entryInput
+      ? {
+          type: 'literal',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          kind: entryInput.kind,
+          valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
+        }
+      : {
+          type: 'prior_run_result',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          fromRun: entryInput.fromRun,
+        }
+  ));
+}
 
 export function formatWorkflowEntryAggregate(
   inputs: readonly { inputRef: string; value: string }[],

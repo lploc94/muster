@@ -11,6 +11,7 @@ import {
   DEFAULT_WORKFLOW_POLICY,
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
+  fingerprintStartEntryInputs,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
@@ -19,6 +20,7 @@ import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
   GraphTopologyV1,
+  StartWorkflowEntryInput,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -820,7 +822,7 @@ export function fingerprintStartWorkflow(input: {
   ownerRootTaskId?: string;
   callerTaskId?: string;
   callerTurnId?: string;
-  entryInputs?: readonly { entryNodeId: string; inputRef: string; kind: string; value: string }[];
+  entryInputs?: readonly StartWorkflowEntryInput[];
   policy?: WorkflowPolicyV1;
 }): string {
   const payload = JSON.stringify({
@@ -832,12 +834,7 @@ export function fingerprintStartWorkflow(input: {
     backend: input.backend,
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
-    entryInputs: (input.entryInputs ?? []).map((entryInput) => ({
-      entryNodeId: entryInput.entryNodeId,
-      inputRef: entryInput.inputRef,
-      kind: entryInput.kind,
-      valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
-    })),
+    entryInputs: fingerprintStartEntryInputs(input.entryInputs ?? []),
     policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
@@ -929,20 +926,27 @@ export function validateStartWorkflow(
   for (const entryInput of entryInputs) {
     if (
       !isNonEmptyBounded(entryInput.entryNodeId, 128) ||
-      !isNonEmptyBounded(entryInput.inputRef, 128) ||
-      !isNonEmptyBounded(entryInput.kind, 128) ||
-      typeof entryInput.value !== 'string'
+      !isNonEmptyBounded(entryInput.inputRef, 128)
     ) {
       return { ok: false, reason: 'invalid entry input' };
     }
     const key = `${entryInput.entryNodeId}\0${entryInput.inputRef}`;
     if (inputByKey.has(key)) return { ok: false, reason: 'duplicate entry input' };
     const contract = contractByKey.get(key);
-    if (!contract || contract.expectedArtifactKind !== entryInput.kind) {
-      return { ok: false, reason: 'entry input contract mismatch' };
-    }
-    if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
-      return { ok: false, reason: 'entry artifact too large' };
+    if (!contract) return { ok: false, reason: 'entry input contract mismatch' };
+    if ('value' in entryInput) {
+      if (
+        !isNonEmptyBounded(entryInput.kind, 128) ||
+        typeof entryInput.value !== 'string' ||
+        contract.expectedArtifactKind !== entryInput.kind
+      ) {
+        return { ok: false, reason: 'entry input contract mismatch' };
+      }
+      if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
+        return { ok: false, reason: 'entry artifact too large' };
+      }
+    } else if (!isNonEmptyBounded(entryInput.fromRun, 128)) {
+      return { ok: false, reason: 'invalid entry input' };
     }
     inputByKey.set(key, entryInput);
   }

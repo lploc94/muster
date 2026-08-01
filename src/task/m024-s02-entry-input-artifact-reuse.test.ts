@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
+import { fingerprintStartWorkflow, validateStartWorkflow } from './workflow';
 
 function ctx(): CredentialContext {
   return {
@@ -38,6 +39,49 @@ describe('start_workflow entry input artifact reuse', () => {
         }],
       },
     });
+  });
+
+  it('accepts a structurally valid prior-run reference and fingerprints it distinctly from a literal', () => {
+    const base = {
+      definitionId: 'workflow-definition',
+      version: 1,
+      startIdempotencyKey: 'start-key',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      entryNodeId: 'entry',
+      entryContracts: [{
+        entryNodeId: 'entry',
+        inputRef: 'request',
+        expectedArtifactKind: 'workflow_input',
+      }],
+      ownerRootTaskId: 'root-1',
+      callerTaskId: 'task-1',
+      callerTurnId: 'turn-1',
+    };
+    const reference = validateStartWorkflow({
+      ...base,
+      entryInputs: [{ entryNodeId: 'entry', inputRef: 'request', fromRun: 'run-prior' }],
+    });
+    const literal = fingerprintStartWorkflow({
+      definitionId: base.definitionId,
+      version: base.version,
+      startIdempotencyKey: base.startIdempotencyKey,
+      entryNodeId: base.entryNodeId,
+      goal: base.definitionId,
+      backend: 'grok',
+      ownerRootTaskId: base.ownerRootTaskId,
+      callerTaskId: base.callerTaskId,
+      callerTurnId: base.callerTurnId,
+      entryInputs: [{
+        entryNodeId: 'entry', inputRef: 'request', kind: 'workflow_input', value: 'run-prior',
+      }],
+    });
+
+    expect(reference.ok).toBe(true);
+    if (!reference.ok) return;
+    expect(reference.entryInputs).toEqual([
+      { entryNodeId: 'entry', inputRef: 'request', fromRun: 'run-prior' },
+    ]);
+    expect(reference.fingerprint).not.toBe(literal);
   });
 
   it.each([
