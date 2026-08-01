@@ -5,12 +5,11 @@
  * `schema-fingerprint.ts` between the runtime golden manifest and the trigger
  * text physically stored in a user's database. A token-order change there is
  * reported as `trigger_mismatch`, which `connection.ts` escalates to
- * `IncompatibleSchemaError` — forcing a store reset and breaking the M023
- * promise that existing users keep their data.
+ * `IncompatibleSchemaError`. This reset-only development store deliberately
+ * requires an explicit reset after predicate changes.
  *
- * These assertions pin the normalized fingerprint so the S09 predicate
- * extraction is provably behavior-preserving, and so any future edit to that
- * trigger fails loudly here instead of silently invalidating stores in the field.
+ * These assertions pin the normalized fingerprint and guard inventory so any
+ * future edit is accompanied by the required reset-only schema-version decision.
  */
 import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
@@ -20,10 +19,10 @@ import { normalizeSchemaSql } from './schema-fingerprint';
 
 const TRIGGER_NAME = 'trg_terminal_workflow_history_prune_before_turn_delete';
 
-/** Captured from source immediately before the S09 extraction. */
-const PINNED_NORMALIZED_LENGTH = 2209;
+/** Captured from the M024 cross-run artifact pin safety predicate. */
+const PINNED_NORMALIZED_LENGTH = 2732;
 const PINNED_NORMALIZED_SHA256 =
-  'd7d2baddb185b957b631f4efcdbc1dc87d8631fa0045a38699c2a5a909f12711';
+  '5890228060541eab3d10a31f9937f22d8041907a49ca0adeca4bace1461f794a';
 const PINNED_TRIGGER_COUNT = 138;
 
 function openCurrentSchema(): DatabaseSync {
@@ -41,7 +40,7 @@ function storedTriggerSql(db: DatabaseSync, name: string): string {
 }
 
 describe('terminal workflow prune trigger fingerprint', () => {
-  it('preserves the normalized trigger SQL so existing stores stay compatible', () => {
+  it('pins the normalized trigger SQL for the current reset-only schema', () => {
     const db = openCurrentSchema();
     try {
       const normalized = normalizeSchemaSql(storedTriggerSql(db, TRIGGER_NAME));
@@ -77,9 +76,9 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
     expect(predicate).not.toContain('workflow_runs.run_id');
   });
 
-  it('emits all seven liveness guards', () => {
+  it('emits all seven liveness and two cross-run artifact-pin guards', () => {
     const predicate = terminalWorkflowRunSafetyPredicate('run');
-    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(7);
+    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(9);
     for (const table of [
       'workflow_runs child',
       'workflow_nodes node',
@@ -88,6 +87,8 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
       'workflow_activations activation',
       'workflow_continuations continuation',
       'workflow_return_gates return_gate',
+      'workflow_gate_fills gate_fill',
+      'workflow_return_gates return_gate_artifact',
     ]) {
       expect(predicate).toContain(table);
     }
