@@ -553,4 +553,35 @@ describe('M018 S07 bounded workflow status projection', () => {
       await ctx.close();
     }
   }, 30_000);
+
+  it('projects host-only workflow graph topology and lifecycle for a task-bound run', async () => {
+    const ctx = await openRepo('host-graph');
+    try {
+      expect(await ctx.repository.getWorkflowGraphForTask('not-a-workflow-task')).toBeUndefined();
+      const createdAt = '2026-08-01T00:00:00.000Z';
+      const data = await defineAndStartFanIn(ctx.repository, createdAt, 's04-host-graph-1');
+      const p1 = data.entries.find((entry) => entry.nodeId === 'p1')!;
+
+      const graph = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(graph).toMatchObject({
+        runId: data.runId,
+        nodes: expect.arrayContaining([
+          { nodeId: 'p1', status: 'active' },
+          { nodeId: 'p2', status: 'active' },
+          { nodeId: 'consumer', status: 'pending' },
+        ]),
+        edges: expect.arrayContaining([
+          { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
+          { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
+        ]),
+        activeGate: expect.objectContaining({ gateId: p1.gateId, status: 'satisfied' }),
+        feedbackRounds: [],
+        childRuns: [],
+        reuse: { nodeCount: 0, edgeCount: 0 },
+        diagnostics: [],
+      });
+    } finally {
+      await ctx.close();
+    }
+  }, 30_000);
 });

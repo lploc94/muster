@@ -397,6 +397,47 @@ export interface WorkflowTaskStatusProjection {
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }
 
+/** Host-only bounded workflow graph node state. Never exposed through agent tools. */
+export interface WorkflowGraphNodeProjection {
+  nodeId: string;
+  status: string;
+}
+
+/** Host-only durable definition edge for an instantiated workflow run. */
+export interface WorkflowGraphEdgeProjection {
+  fromNodeId: string;
+  toNodeId: string;
+  inputRef: string;
+}
+
+/** Direct nested workflow run visible from a host graph read. */
+export interface WorkflowGraphChildRunProjection {
+  runId: string;
+  status: string;
+}
+
+/** Reuse density derived from the bounded run graph. */
+export interface WorkflowGraphReuseProjection {
+  nodeCount: number;
+  edgeCount: number;
+}
+
+/**
+ * Host-only bounded workflow graph for the run containing a task.
+ * Unlike agent-facing workflow status projections, this intentionally exposes
+ * durable node topology but never prompts, artifact bodies, secrets, or paths.
+ */
+export interface WorkflowGraphProjection {
+  runId: string;
+  nodes: readonly WorkflowGraphNodeProjection[];
+  edges: readonly WorkflowGraphEdgeProjection[];
+  activeGate?: WorkflowGateStatusProjection;
+  feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
+  childRuns: readonly WorkflowGraphChildRunProjection[];
+  reuse: WorkflowGraphReuseProjection;
+  diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
+}
+
 export interface WorkflowRunNodeInspectionProjection {
   nodeId: string;
   status: string;

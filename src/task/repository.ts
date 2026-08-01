@@ -77,6 +77,7 @@ import {
 import type {
   StartWorkflowEntryInput,
   StartWorkflowNodeReuse,
+  WorkflowGraphProjection,
   WorkflowRunCompletionProjection,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
@@ -790,6 +791,8 @@ export interface TaskRepository {
    * Never includes topology, prompts, artifact bodies, secrets, or absolute paths.
    */
   getWorkflowStatusForTask(taskId: string): Promise<WorkflowTaskStatusProjection | undefined>;
+  /** Host-only bounded topology and lifecycle graph for the run containing taskId. */
+  getWorkflowGraphForTask(taskId: string): Promise<WorkflowGraphProjection | undefined>;
   /** Bounded public diagnostic projection for a workflow run owned by the caller root. */
   inspectWorkflowRun(
     runId: string,
@@ -2548,6 +2551,132 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
     return projection;
+  }
+
+  /**
+   * Host-only graph read. This intentionally exposes durable topology while
+   * remaining bounded and excluding all artifact/prompt/body fields.
+   */
+  async getWorkflowGraphForTask(taskId: string): Promise<WorkflowGraphProjection | undefined> {
+    if (typeof taskId !== 'string' || taskId.length === 0) return undefined;
+
+    const run = await this.db.get<{
+      run_id: string;
+      node_id: string;
+      definition_id: string;
+      definition_version: number;
+      topology_json: string;
+    }>(
+      `SELECT node.run_id, node.node_id, run.definition_id, run.definition_version,
+              definition.topology_json
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
+         JOIN workflow_definitions definition
+           ON definition.workspace_id = run.workspace_id
+          AND definition.definition_id = run.definition_id
+          AND definition.version = run.definition_version
+        WHERE node.workspace_id = ? AND node.task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    if (!run) return undefined;
+
+    const [nodeRows, edgeRows, gateRows, roundRows, childRows] = await Promise.all([
+      this.db.all<{ node_id: string; status: string }>(
+        `SELECT node_id, status FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id LIMIT 65`,
+        [this.workspaceId, run.run_id],
+      ),
+      this.db.all<{ source_node_id: string; destination_node_id: string; destination_input_ref: string }>(
+        `SELECT source_node_id, destination_node_id, destination_input_ref
+           FROM workflow_definition_edges
+          WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
+          ORDER BY ordinal, source_node_id LIMIT 129`,
+        [this.workspaceId, run.definition_id, run.definition_version],
+      ),
+      this.db.all<{ gate_id: string; status: string; required: number; satisfied: number }>(
+        `SELECT gate.gate_id, gate.status,
+                (SELECT COUNT(*) FROM workflow_gate_bindings binding
+                  WHERE binding.workspace_id = gate.workspace_id AND binding.run_id = gate.run_id
+                    AND binding.gate_id = gate.gate_id) AS required,
+                (SELECT COUNT(DISTINCT fill.input_ref) FROM workflow_gate_fills fill
+                  WHERE fill.workspace_id = gate.workspace_id AND fill.run_id = gate.run_id
+                    AND fill.gate_id = gate.gate_id) AS satisfied
+           FROM workflow_dependency_gates gate
+          WHERE gate.workspace_id = ? AND gate.run_id = ? AND gate.consumer_node_id = ?
+          ORDER BY gate.gate_id LIMIT 2`,
+        [this.workspaceId, run.run_id, run.node_id],
+      ),
+      this.db.all<{
+        round_id: string; requester_node_id: string; status: string; join_mode: string;
+        required: number; responded: number;
+      }>(
+        `SELECT round.round_id, round.requester_node_id, round.status, round.join_mode,
+                (SELECT COUNT(*) FROM workflow_feedback_targets target
+                  WHERE target.workspace_id = round.workspace_id AND target.run_id = round.run_id
+                    AND target.round_id = round.round_id) AS required,
+                (SELECT COUNT(*) FROM workflow_feedback_targets target
+                  WHERE target.workspace_id = round.workspace_id AND target.run_id = round.run_id
+                    AND target.round_id = round.round_id AND target.status = 'responded') AS responded
+           FROM workflow_feedback_rounds round
+          WHERE round.workspace_id = ? AND round.run_id = ? AND round.status IN ('open', 'satisfied')
+          ORDER BY round.created_at, round.round_id LIMIT 33`,
+        [this.workspaceId, run.run_id],
+      ),
+      this.db.all<{ run_id: string; status: string }>(
+        `SELECT run_id, status FROM workflow_runs
+          WHERE workspace_id = ? AND parent_run_id = ? ORDER BY created_at, run_id LIMIT 65`,
+        [this.workspaceId, run.run_id],
+      ),
+    ]);
+
+    const diagnostics: Array<{ code: string }> = [];
+    try {
+      const topology = JSON.parse(run.topology_json) as { kind?: unknown };
+      if (topology.kind !== 'one_node_v1' && topology.kind !== 'graph_v1') {
+        diagnostics.push({ code: 'workflow_graph_topology_undecodable' });
+      }
+    } catch {
+      diagnostics.push({ code: 'workflow_graph_topology_undecodable' });
+    }
+    if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_graph_nodes_truncated' });
+    if (edgeRows.length > 128) diagnostics.push({ code: 'workflow_graph_edges_truncated' });
+    if (childRows.length > 64) diagnostics.push({ code: 'workflow_graph_child_runs_truncated' });
+
+    const nodes = nodeRows.slice(0, 64).map((node) => ({ nodeId: node.node_id, status: node.status }));
+    const edges = edgeRows.slice(0, 128).map((edge) => ({
+      fromNodeId: edge.source_node_id,
+      toNodeId: edge.destination_node_id,
+      inputRef: edge.destination_input_ref,
+    }));
+    const reusedNodeIds = new Set(nodes.filter((node) => node.status === 'reused').map((node) => node.nodeId));
+    const activeGateRow = gateRows.find((gate) => gate.status === 'open' || gate.status === 'satisfied');
+
+    return {
+      runId: run.run_id,
+      nodes,
+      edges,
+      ...(activeGateRow ? { activeGate: {
+        gateId: activeGateRow.gate_id,
+        status: activeGateRow.status,
+        required: Number(activeGateRow.required) || 0,
+        satisfied: Number(activeGateRow.satisfied) || 0,
+      } } : {}),
+      feedbackRounds: roundRows.slice(0, 32).map((round) => ({
+        roundId: round.round_id,
+        requesterNodeId: round.requester_node_id,
+        status: round.status,
+        joinMode: round.join_mode,
+        required: Number(round.required) || 0,
+        responded: Number(round.responded) || 0,
+      })),
+      childRuns: childRows.slice(0, 64).map((child) => ({ runId: child.run_id, status: child.status })),
+      reuse: {
+        nodeCount: reusedNodeIds.size,
+        edgeCount: edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId)).length,
+      },
+      diagnostics: diagnostics.slice(0, 8),
+    };
   }
 
   async inspectWorkflowRun(
