@@ -400,6 +400,7 @@
     "test:m023-s07-render-evidence": "node --test scripts/verify-m023-s07-truncated-render-evidence.test.mjs",
     "test:m023-s07-truncated-render-live-uat": "node scripts/run-m023-s07-truncated-render-uat.mjs",
     "test:m023-s08-orphan-evidence": "node --test scripts/verify-m023-s08-orphan-lifecycle-evidence.test.mjs",
+    "test:m023-requirement-evidence": "node --test scripts/verify-m023-requirement-evidence.test.mjs",
     "test:m023-s08-orphan-lifecycle-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs", 
     "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts",
     "test:webview:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-webview.visual.spec.ts",
