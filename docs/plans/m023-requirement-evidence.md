@@ -18,7 +18,7 @@ This map synchronizes the M023 storage requirements to the two tracked packaged 
 
 - Evidence: `docs/plans/m023-s05-storage-lifecycle-evidence.json`
 - Verification: `npm run test:m023-s05-storage-evidence`
-- Within one continuous host session and without a restart, `retention.completedPasses` advances by at least two between the pre-seed and post-retention snapshots, with `failedPasses` staying 0 and `latestPassOrdinal` tracking `completedPasses`; the peer host remains attached and observes the post-retention state. Stated as an invariant rather than fixed ordinals because pass counts increment on every regenerated ledger.
+- Within one continuous host session and without a restart, `retention.completedPasses` advances from 18 before seeding to 20 after retention, with `failedPasses` staying 0 and `latestPassOrdinal` tracking `completedPasses`; the peer host remains attached and observes the post-retention state.
 
 ## R043
 
