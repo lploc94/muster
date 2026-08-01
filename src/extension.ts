@@ -616,6 +616,10 @@ async function applyRetentionToRepository(
     });
     entriesStripped += result.retentionEntriesStripped ?? 0;
   }
+  const workflowReclamation = await repository.execute({
+    kind: 'reclaimTerminalWorkflowMetadata',
+    workspaceId: repositoryWorkspaceId(),
+  });
   const after = await client.storageReport();
   const reclaimed = await client.reclaimStorage();
   return {
@@ -626,6 +630,7 @@ async function applyRetentionToRepository(
     reclaimMode: reclaimed.mode,
     fileBytesBefore: reclaimed.fileBytesBefore,
     fileBytesAfter: reclaimed.fileBytesAfter,
+    reclaimedWorkflowRuns: workflowReclamation.reclaimedWorkflowRuns ?? 0,
   };
 }
 

@@ -68,6 +68,7 @@ export type RetentionPassReport = {
   reclaimMode: ReclaimMode;
   fileBytesBefore: number;
   fileBytesAfter: number;
+  reclaimedWorkflowRuns: number;
 };
 
 export type RetentionReportSnapshot = {
@@ -115,6 +116,7 @@ export function formatRetentionReportLines(snapshot: RetentionReportSnapshot): s
       `reclaim_mode: ${pass.reclaimMode}`,
       `file_bytes_before: ${pass.fileBytesBefore}`,
       `file_bytes_after: ${pass.fileBytesAfter}`,
+      `reclaimed_workflow_runs: ${pass.reclaimedWorkflowRuns}`,
     );
   }
   return lines;

@@ -21,6 +21,7 @@ describe('retention storage report', () => {
         reclaimMode: 'incremental',
         fileBytesBefore: 16384,
         fileBytesAfter: 8192,
+        reclaimedWorkflowRuns: 5,
       }),
       onPassCompleted: (pass) => report.recordCompleted(pass),
       schedule: vi.fn(() => 1),
@@ -42,6 +43,7 @@ describe('retention storage report', () => {
       'reclaim_mode: incremental',
       'file_bytes_before: 16384',
       'file_bytes_after: 8192',
+      'reclaimed_workflow_runs: 5',
     ]);
     expect(formatRetentionReportLines(report.snapshot()).join('\n')).not.toMatch(/[\\/]|secret|sqlite/i);
     scheduler.dispose();
@@ -51,11 +53,11 @@ describe('retention storage report', () => {
     const report = new RetentionReport();
     report.recordCompleted({
       tasksVisited: 1, entriesStripped: 2, toolCallsBytesBefore: 8, toolCallsBytesAfter: 4,
-      reclaimMode: 'noop', fileBytesBefore: 16, fileBytesAfter: 16,
+      reclaimMode: 'noop', fileBytesBefore: 16, fileBytesAfter: 16, reclaimedWorkflowRuns: 0,
     });
     report.recordCompleted({
       tasksVisited: 3, entriesStripped: 4, toolCallsBytesBefore: 12, toolCallsBytesAfter: 6,
-      reclaimMode: 'incremental', fileBytesBefore: 32, fileBytesAfter: 16,
+      reclaimMode: 'incremental', fileBytesBefore: 32, fileBytesAfter: 16, reclaimedWorkflowRuns: 2,
     });
 
     expect(formatRetentionReportLines(report.snapshot())).toEqual(expect.arrayContaining([
