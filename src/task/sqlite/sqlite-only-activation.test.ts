@@ -101,7 +101,7 @@ describe('SQLite-only activation boundary', () => {
     expect(extensionSource).toContain('seedOrphanLifecycleFixtures(storageDirectory)');
     expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.reclaimOrphanedFiles');
     expect(extensionSource).toMatch(
-      /registerLiveUatCommands\(\s*context,\s*context\.globalStorageUri\.fsPath,\s*reclaimOrphanedFilesForUat,\s*\)/,
+      /registerLiveUatCommands\(\s*context,\s*uatSurface,\s*context\.globalStorageUri\.fsPath,\s*reclaimOrphanedFilesForUat,\s*\)/,
     );
     expect(extensionSource).toContain('return reclaimOrphanedFilesForUat()');
     expect(extensionSource).toContain('const cleanup = await reclaimOrphanedFiles(true)');

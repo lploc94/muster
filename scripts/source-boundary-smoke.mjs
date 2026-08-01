@@ -82,6 +82,22 @@ function hasYamlLine(text, pattern) {
   return normalizeLines(text).some((line) => !/^\s*#/.test(line) && pattern.test(line));
 }
 
+/**
+ * Index of the first non-comment YAML step line whose `run:` value matches pattern.
+ * Returns -1 when absent. Used to assert step ordering (e.g. compile before fast tier).
+ */
+function findYamlRunStepIndex(text, runPattern) {
+  const lines = normalizeLines(text);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (/^\s*#/.test(line)) continue;
+    if (!/^\s*-?\s*run:\s*/.test(line)) continue;
+    const runValue = line.replace(/^\s*-?\s*run:\s*/, '').replace(/\s*(?:#.*)?$/, '');
+    if (runPattern.test(runValue)) return i;
+  }
+  return -1;
+}
+
 function getTopLevelYamlBlock(text, key) {
   const lines = normalizeLines(text);
   const startIndex = lines.findIndex((line) => new RegExp(`^${key}:\\s*(?:#.*)?$`).test(line));
@@ -189,6 +205,108 @@ function expectCiWorkflowContract(workflowText, failures) {
     failures,
     `Expected ${workflowPath} never to pass --update-snapshots or run test:visual:linux:update.`,
   );
+
+  // M022/S03 packaging gate — fast compile-job tier + dedicated host job.
+  // Fast tier localises dependency/allowlist regressions in seconds without packaging.
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s02\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s02\` as the packaging fast-tier dependency/allowlist contract.`,
+  );
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s03\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s03\` as the packaging marketplace-metadata contract.`,
+  );
+  // M022/S04: tracked evidence aggregate (clean-clone + entrypoint-regression).
+  // D069 cost split — validates recorded local-drill evidence in seconds; does
+  // not re-run multi-minute clean-clone package or vsce census drills in CI.
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s04\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s04\` as the packaging S04 evidence aggregate (clean-clone + entrypoint-regression).`,
+  );
+
+  // M022/S05: fast-tier install-evidence + listing credibility + sign-off ledger.
+  // Seconds-tier only — does not re-run the multi-minute real install gate.
+  expectCondition(
+    hasYamlLine(workflowText, /^\s*-?\s*run:\s*npm run test:m022-s05\s*(?:#.*)?$/),
+    failures,
+    `Expected ${workflowPath} to run \`npm run test:m022-s05\` as the packaging S05 install-evidence + listing credibility aggregate.`,
+  );
+
+  // M022/S04: fast tier includes a fail-closed webview bundle check that needs
+  // dist/webview from `npm run compile`. Running test:m022-s02 before compile
+  // would always see a missing bundle in a clean CI checkout.
+  const compileStepIndex = findYamlRunStepIndex(workflowText, /npm run compile/);
+  const m022S02StepIndex = findYamlRunStepIndex(workflowText, /npm run test:m022-s02/);
+  expectCondition(
+    compileStepIndex !== -1 && m022S02StepIndex !== -1 && compileStepIndex < m022S02StepIndex,
+    failures,
+    `Expected ${workflowPath} to run \`npm run compile\` before \`npm run test:m022-s02\` so the packaging fast tier sees a built dist/webview (fail-closed webview bundle check).`,
+  );
+
+  const packagingGateBlock = getIndentedYamlBlock(workflowText, 'packaging-gate', 2);
+  expectCondition(
+    packagingGateBlock !== '',
+    failures,
+    `Expected ${workflowPath} to define a dedicated \`packaging-gate\` job for the real Extension Host packaging gate.`,
+  );
+  if (packagingGateBlock !== '') {
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*-?\s*run:\s*xvfb-run -a npm run test:packaging\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to run \`xvfb-run -a npm run test:packaging\` so the host gate has a display on ubuntu-latest.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*if:\s*always\(\)\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to upload evidence with \`if: always()\` so failed hosted runs still leave a machine-readable snapshot.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingGateBlock, /^\s*-?\s*uses:\s*actions\/upload-artifact@v4\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to use \`actions/upload-artifact@v4\` for packaging-gate evidence upload.`,
+    );
+    expectCondition(
+      packagingGateBlock.includes('docs/plans/m022-s01-packaging-gate-evidence.json'),
+      failures,
+      `Expected ${workflowPath} packaging-gate job to upload \`docs/plans/m022-s01-packaging-gate-evidence.json\` as the packaging-gate evidence artifact.`,
+    );
+  }
+
+  // M022/S05: dedicated real-install job under xvfb (D070/D071).
+  const packagingInstallGateBlock = getIndentedYamlBlock(workflowText, 'packaging-install-gate', 2);
+  expectCondition(
+    packagingInstallGateBlock !== '',
+    failures,
+    `Expected ${workflowPath} to define a dedicated \`packaging-install-gate\` job for the real CLI install gate.`,
+  );
+  if (packagingInstallGateBlock !== '') {
+    expectCondition(
+      hasYamlLine(
+        packagingInstallGateBlock,
+        /^\s*-?\s*run:\s*xvfb-run -a npm run test:m022-s05-install\s*(?:#.*)?$/,
+      ),
+      failures,
+      `Expected ${workflowPath} packaging-install-gate job to run \`xvfb-run -a npm run test:m022-s05-install\` so the install gate has a display on ubuntu-latest.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingInstallGateBlock, /^\s*if:\s*always\(\)\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-install-gate job to upload evidence with \`if: always()\` so failed hosted runs still leave a machine-readable install snapshot.`,
+    );
+    expectCondition(
+      hasYamlLine(packagingInstallGateBlock, /^\s*-?\s*uses:\s*actions\/upload-artifact@v4\s*(?:#.*)?$/),
+      failures,
+      `Expected ${workflowPath} packaging-install-gate job to use \`actions/upload-artifact@v4\` for install-gate evidence upload.`,
+    );
+    expectCondition(
+      packagingInstallGateBlock.includes('docs/plans/m022-s05-install-gate-evidence.json'),
+      failures,
+      `Expected ${workflowPath} packaging-install-gate job to upload \`docs/plans/m022-s05-install-gate-evidence.json\` as the install-gate evidence artifact.`,
+    );
+  }
 }
 
 async function readText(rootDir, relativePath, failures) {

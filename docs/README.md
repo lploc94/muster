@@ -27,6 +27,7 @@ Read in this order when onboarding:
 | [SQLITE-STORAGE.md](SQLITE-STORAGE.md) | SQLite global storage: location/scope, WAL, backup vs export, manual restore, developer reset, recovery, privacy |
 | [UI-VISUAL-REGRESSION.md](UI-VISUAL-REGRESSION.md) | Pinned Linux visual regression operations: compare vs explicit update, CI artifact download, troubleshooting, Playwright upgrades, browser-versus-native proof boundary |
 | [UI-IMPROVEMENT-ROADMAP.md](UI-IMPROVEMENT-ROADMAP.md) | Deferred prioritized UI roadmap (search/rename a11y, hit targets, reduced motion, theme/zoom, long-conversation benchmarks, task-profile density, primitives) — not implemented in M014 |
+| [PACKAGING.md](PACKAGING.md) | VSIX release path (`npm run package`), sdk-closure-only allowlist, packaging gates, and post-prune evidence contract |
 
 Operational evidence:
 

@@ -1,0 +1,12 @@
+{
+  "kind": "m022-s05-install-negative",
+  "ok": true,
+  "corruption": "removed-extension-entry",
+  "removedEntry": "extension/dist/src/extension.js",
+  "gateExitCode": 1,
+  "gatePhase": "activation-failed",
+  "trackedFilesMutated": 0,
+  "evidenceTarget": "temp",
+  "generatedAt": "2026-07-29T05:47:39.155Z",
+  "durationMs": 31248
+}
