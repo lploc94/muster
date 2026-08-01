@@ -588,6 +588,8 @@ export interface RepositoryCommandResult {
   retentionEntriesStripped?: number;
   /** Number of safely terminal workflow metadata rows reclaimed by maintenance. */
   reclaimedWorkflowRuns?: number;
+  /** Number of terminal runs retained because another run pins one of their artifacts. */
+  skippedPinnedWorkflowRuns?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -10264,15 +10266,51 @@ export class SqliteTaskRepository implements TaskRepository {
 
 
   private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
-    const result = await this.db.run(
-      `DELETE FROM workflow_runs
+    const terminalRunIds = await this.db.all<{ run_id: string }>(
+      `SELECT run_id FROM workflow_runs
         WHERE workspace_id = ?
           AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
           ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
       [this.workspaceId],
     );
-    const reclaimedWorkflowRuns = result.changes ?? 0;
-    return { ok: true, changed: reclaimedWorkflowRuns > 0, reclaimedWorkflowRuns };
+    const pinned = await this.db.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workflow_runs run
+        WHERE run.workspace_id = ?
+          AND run.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+          AND (
+            EXISTS (
+              SELECT 1 FROM workflow_gate_fills gate_fill
+               WHERE gate_fill.workspace_id = run.workspace_id
+                 AND COALESCE(gate_fill.artifact_run_id, gate_fill.run_id) = run.run_id
+                 AND gate_fill.run_id <> run.run_id
+            )
+            OR EXISTS (
+              SELECT 1 FROM workflow_return_gates return_gate_artifact
+               WHERE return_gate_artifact.workspace_id = run.workspace_id
+                 AND return_gate_artifact.result_run_id = run.run_id
+                 AND return_gate_artifact.continuation_run_id <> run.run_id
+            )
+          )`,
+      [this.workspaceId],
+    );
+    let reclaimedWorkflowRuns = 0;
+    for (const { run_id } of terminalRunIds) {
+      const result = await this.db.run(
+        `DELETE FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?
+            AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+            ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
+        [this.workspaceId, run_id],
+      );
+      reclaimedWorkflowRuns += result.changes ?? 0;
+    }
+    const skippedPinnedWorkflowRuns = pinned?.count ?? 0;
+    return {
+      ok: true,
+      changed: reclaimedWorkflowRuns > 0,
+      reclaimedWorkflowRuns,
+      skippedPinnedWorkflowRuns,
+    };
   }
 
   private async applyRetention(

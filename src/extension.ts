@@ -639,6 +639,7 @@ async function applyRetentionToRepository(
     fileBytesBefore: reclaimed.fileBytesBefore,
     fileBytesAfter: reclaimed.fileBytesAfter,
     reclaimedWorkflowRuns: workflowReclamation.reclaimedWorkflowRuns ?? 0,
+    skippedPinnedWorkflowRuns: workflowReclamation.skippedPinnedWorkflowRuns ?? 0,
   };
 }
 

@@ -69,6 +69,7 @@ export type RetentionPassReport = {
   fileBytesBefore: number;
   fileBytesAfter: number;
   reclaimedWorkflowRuns: number;
+  skippedPinnedWorkflowRuns: number;
 };
 
 export type RetentionReportSnapshot = {
@@ -117,6 +118,7 @@ export function formatRetentionReportLines(snapshot: RetentionReportSnapshot): s
       `file_bytes_before: ${pass.fileBytesBefore}`,
       `file_bytes_after: ${pass.fileBytesAfter}`,
       `reclaimed_workflow_runs: ${pass.reclaimedWorkflowRuns}`,
+      `skipped_pinned_workflow_runs: ${pass.skippedPinnedWorkflowRuns}`,
     );
   }
   return lines;
