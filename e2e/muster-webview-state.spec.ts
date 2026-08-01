@@ -10393,9 +10393,13 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(
       card.locator('.tool-card__diff-line--added').filter({ hasText: 'a-unique-body' }),
     ).toBeVisible();
-    const expandedBox = await firstBody.boundingBox();
-    expect(expandedBox).toBeTruthy();
-    expect(expandedBox!.height).toBeGreaterThan(1);
+    // The panel expands via a `grid-template-rows` transition, so the row is
+    // still animating when `data-collapsed` flips. A single boundingBox() sample
+    // does not retry and can land mid-animation on a loaded CI runner (observed
+    // height 0). Poll until the row settles instead.
+    await expect
+      .poll(async () => (await firstBody.boundingBox())?.height ?? 0)
+      .toBeGreaterThan(1);
 
     await toggles.first().click();
     await expect(toggles.first()).toHaveAttribute('aria-expanded', 'false');
