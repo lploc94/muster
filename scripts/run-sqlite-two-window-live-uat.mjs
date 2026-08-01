@@ -11,6 +11,7 @@ import AdmZip from 'adm-zip';
 import { downloadAndUnzipVSCode } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
 import { validateStorageLifecycleEvidence } from './m023-s05-storage-lifecycle-evidence-schema.mjs';
+import { validateOrphanLifecycleEvidence } from './m023-s08-orphan-lifecycle-evidence-schema.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
@@ -25,6 +26,9 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm2w-'));
 const evidenceOut =
   process.env.MUSTER_UAT_EVIDENCE_OUT ||
   path.join(root, 'docs', 'plans', 'm023-s05-storage-lifecycle-evidence.json');
+const orphanEvidenceOut =
+  process.env.MUSTER_S08_ORPHAN_EVIDENCE_OUT ||
+  path.join(root, 'docs', 'plans', 'm023-s08-orphan-lifecycle-evidence.json');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -192,6 +196,29 @@ function buildStorageLifecycleEvidence(result) {
     afterSeed: result.storageLifecycle.afterSeed,
     afterRetention: result.storageLifecycle.afterRetention,
     peerAfterRetention: result.storageLifecycle.peerAfterRetention,
+    contentSafety: {
+      absolutePathsStoredInEvidence: false,
+      messageBodiesStoredInEvidence: false,
+      sessionIdsStoredInEvidence: false,
+      canaryStoredInEvidence: false,
+    },
+    generatedAt: new Date().toISOString(),
+  };
+}
+
+function buildOrphanLifecycleEvidence(result) {
+  return {
+    ok: true,
+    kind: 'm023-s08-orphan-lifecycle-live-uat',
+    schemaVersion: 1,
+    before: result.storageLifecycle.before,
+    afterSeed: result.storageLifecycle.afterSeed,
+    afterRetention: result.storageLifecycle.afterRetention,
+    peerAfterRetention: result.storageLifecycle.peerAfterRetention,
+    orphanBeforeCleanup: result.storageLifecycle.orphanBeforeCleanup,
+    orphanCleanup: result.storageLifecycle.orphanCleanup,
+    afterOrphanCleanup: result.storageLifecycle.afterOrphanCleanup,
+    peerAfterOrphanCleanup: result.storageLifecycle.peerAfterOrphanCleanup,
     contentSafety: {
       absolutePathsStoredInEvidence: false,
       messageBodiesStoredInEvidence: false,
@@ -388,11 +415,22 @@ async function main() {
 
     ensureDir(path.dirname(evidenceOut));
     writeJson(evidenceOut, evidence);
+    const orphanEvidence = buildOrphanLifecycleEvidence(result);
+    const orphanEvidenceFailures = validateOrphanLifecycleEvidence(orphanEvidence, { requirePass: true });
+    if (orphanEvidenceFailures.length > 0) {
+      throw new Error(`orphan lifecycle evidence invalid: ${orphanEvidenceFailures.join('; ')}`);
+    }
+    const orphanSerialized = JSON.stringify(orphanEvidence);
+    const orphanLeaked = forbidden.find((value) => orphanSerialized.includes(value));
+    if (orphanLeaked) throw new Error('orphan evidence contains a forbidden path or synthetic body');
+    ensureDir(path.dirname(orphanEvidenceOut));
+    writeJson(orphanEvidenceOut, orphanEvidence);
     console.log(
       `[muster-two-window-live-uat] PASS scenarios=${result.scenarios.map((s) => s.id).join(',')} ` +
         `finalRevision=${result.finalRevision} vscode=${result.vscodeVersion} node=${result.nodeVersion}`,
     );
     console.log(`[muster-two-window-live-uat] evidence=${evidenceOut}`);
+    console.log(`[muster-two-window-live-uat] orphanEvidence=${orphanEvidenceOut}`);
   } finally {
     if (!keepTemp) {
       try {

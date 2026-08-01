@@ -104,7 +104,8 @@ describe('SQLite-only activation boundary', () => {
       /registerLiveUatCommands\(\s*context,\s*context\.globalStorageUri\.fsPath,\s*reclaimOrphanedFilesForUat,\s*\)/,
     );
     expect(extensionSource).toContain('return reclaimOrphanedFilesForUat()');
-    expect(extensionSource).toContain('return async () => reclaimOrphanedFiles(true)');
+    expect(extensionSource).toContain('const cleanup = await reclaimOrphanedFiles(true)');
+    expect(extensionSource).toContain('const verified = verifyOrphanCleanup(before, cleanup, after)');
     expect(extensionSource).toContain('showWarningMessage: confirmForUat');
     expect(extensionSource).toContain('? async (_message, ...items) => items[0]');
 

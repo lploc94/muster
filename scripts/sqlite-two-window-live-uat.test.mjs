@@ -51,6 +51,24 @@ test('M023 S05 packaged runner enables the UAT schedule and emits schema-valid l
   assert.equal(packageJson.scripts['test:m023-s05-storage-lifecycle-live-uat'], 'node scripts/run-sqlite-two-window-live-uat.mjs');
 });
 
+test('M023 S08 lifecycle seeds and reclaims classified orphans after retention, then emits separate evidence', async () => {
+  assert.match(source, /orphanFixture: 'muster\.uat\.seedOrphanLifecycleFixtures'/);
+  assert.match(source, /orphanReclaim: 'muster\.uat\.reclaimOrphanedFiles'/);
+  assert.match(source, /await cmd\(UAT_COMMANDS\.seedOrphanLifecycleFixtures\)/);
+  assert.match(source, /const orphanLifecycle = await cmd<OrphanLifecycleResult>\(UAT_COMMANDS\.reclaimOrphanedFiles\)/);
+  assert.match(source, /orphanBeforeCleanup: orphanLifecycle\.before/);
+  assert.match(source, /orphanCleanup: orphanLifecycle\.cleanup/);
+  assert.match(source, /afterOrphanCleanup: \{[\s\S]*classification: orphanLifecycle\.after/);
+  assert.match(source, /peerAfterOrphanCleanup: lifecyclePeerAfterOrphanCleanup/);
+
+  const runner = await readFile(new URL('./run-sqlite-two-window-live-uat.mjs', import.meta.url), 'utf8');
+  assert.match(runner, /m023-s08-orphan-lifecycle-evidence\.json/);
+  assert.match(runner, /validateOrphanLifecycleEvidence/);
+  assert.match(runner, /buildOrphanLifecycleEvidence\(result\)/);
+  const packageJson = JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(packageJson.scripts['test:m023-s08-orphan-lifecycle-live-uat'], 'node scripts/run-sqlite-two-window-live-uat.mjs');
+});
+
 test('two-window runner uses a Windows junction for shared local global storage', async () => {
   const runner = await readFile(new URL('./run-sqlite-two-window-live-uat.mjs', import.meta.url), 'utf8');
   assert.match(runner, /process\.platform === 'win32' \? 'junction' : 'dir'/);

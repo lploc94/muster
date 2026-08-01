@@ -214,6 +214,10 @@ import {
   readStorageDirectoryEntries,
   removeStorageOrphans,
 } from './host/storage-orphans';
+import {
+  observeOrphanLifecycle,
+  verifyOrphanCleanup,
+} from './host/uat-orphan-lifecycle';
 
 
 /** Activation fail-closed error: safe message only, no path/SQL/content. */
@@ -4595,7 +4599,29 @@ function registerStorageReportCommand(
     });
   }
 
-  return async () => reclaimOrphanedFiles(true);
+  return async () => {
+    const before = classifyStorageOrphans(
+      await readStorageDirectoryEntries(storageDirectory),
+      Date.now(),
+      60_000,
+    );
+    const cleanup = await reclaimOrphanedFiles(true);
+    const after = classifyStorageOrphans(
+      await readStorageDirectoryEntries(storageDirectory),
+      Date.now(),
+      60_000,
+    );
+    const verified = verifyOrphanCleanup(before, cleanup, after);
+    return {
+      before: observeOrphanLifecycle(before),
+      cleanup: {
+        removedFiles: verified.removedFiles,
+        bytesReclaimed: verified.bytesReclaimed,
+        failedRemovals: verified.failedRemovals,
+      },
+      after: verified.postCleanup,
+    };
+  };
 }
 
 /**

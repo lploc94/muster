@@ -60,6 +60,19 @@ type DurableSurfaces = {
   presentation?: { presentationId: string; revision: number; markdownLength: number };
 };
 
+type OrphanBucket = { count: number; bytes: number };
+type OrphanLifecycleObservation = {
+  deadLegacyStores: OrphanBucket;
+  staleLeases: OrphanBucket;
+  removable: OrphanBucket;
+  liveFiles: { sqlite: boolean; wal: boolean; shm: boolean; activeLeaseCount: number };
+};
+type OrphanLifecycleResult = {
+  before: OrphanLifecycleObservation;
+  cleanup: { removedFiles: number; bytesReclaimed: number; failedRemovals: number };
+  after: OrphanLifecycleObservation;
+};
+
 const ROLE = process.env.MUSTER_UAT_ROLE ?? '';
 const CONTROL_DIR = process.env.MUSTER_UAT_CONTROL_DIR ?? '';
 const PEER_GENERATION = Number.parseInt(process.env.MUSTER_UAT_PEER_GENERATION ?? '1', 10);
@@ -72,6 +85,8 @@ const STORAGE_LIFECYCLE_COMMAND_IDS = {
   seed: 'muster.uat.seedStorageWorkload',
   state: 'muster.uat.storageLifecycleState',
   retention: 'muster.uat.runRetentionPass',
+  orphanFixture: 'muster.uat.seedOrphanLifecycleFixtures',
+  orphanReclaim: 'muster.uat.reclaimOrphanedFiles',
 } as const;
 
 function controlPath(...parts: string[]): string {
@@ -711,6 +726,27 @@ async function runOrchestratorA(): Promise<void> {
     'peer storage report did not converge after reclamation',
   );
 
+  // M023/S08 — seed classifier-recognized fixtures only after retention, then
+  // use the UAT-gated delegate which exercises the sole production reclaim handler.
+  progress('orphan-lifecycle');
+  assert.equal(UAT_COMMANDS.seedOrphanLifecycleFixtures, STORAGE_LIFECYCLE_COMMAND_IDS.orphanFixture);
+  assert.equal(UAT_COMMANDS.reclaimOrphanedFiles, STORAGE_LIFECYCLE_COMMAND_IDS.orphanReclaim);
+  await cmd(UAT_COMMANDS.seedOrphanLifecycleFixtures);
+  const orphanLifecycle = await cmd<OrphanLifecycleResult>(UAT_COMMANDS.reclaimOrphanedFiles);
+  const lifecycleAfterOrphanCleanup = await cmd<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  const lifecyclePeerAfterOrphanCleanup = await peer<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.ok(orphanLifecycle.before.removable.count > 0, 'orphan fixture was not classified');
+  assert.equal(orphanLifecycle.cleanup.removedFiles, orphanLifecycle.before.removable.count);
+  assert.equal(orphanLifecycle.cleanup.bytesReclaimed, orphanLifecycle.before.removable.bytes);
+  assert.equal(orphanLifecycle.cleanup.failedRemovals, 0);
+  assert.equal(orphanLifecycle.after.removable.count, 0);
+  assert.equal(orphanLifecycle.after.removable.bytes, 0);
+  assert.equal(lifecyclePeerAfterOrphanCleanup.storage.fileBytes, lifecycleAfterOrphanCleanup.storage.fileBytes);
+
   writeJson(controlPath('result.json'), {
     ok: scenarios.every((scenario) => scenario.verdict === 'PASS'),
     kind: 'live-two-window-extension-host',
@@ -742,6 +778,13 @@ async function runOrchestratorA(): Promise<void> {
       afterSeed: lifecycleAfterSeed,
       afterRetention: lifecycleAfterRetention,
       peerAfterRetention: lifecyclePeerAfterRetention,
+      orphanBeforeCleanup: orphanLifecycle.before,
+      orphanCleanup: orphanLifecycle.cleanup,
+      afterOrphanCleanup: {
+        state: lifecycleAfterOrphanCleanup,
+        classification: orphanLifecycle.after,
+      },
+      peerAfterOrphanCleanup: lifecyclePeerAfterOrphanCleanup,
     },
   });
   writeJson(controlPath('done.json'), { stop: true });
