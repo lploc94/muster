@@ -230,6 +230,35 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
   return topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
 }
 
+/**
+ * Node ids that can be skipped when these graph nodes are reused: each declared
+ * node plus every predecessor reachable over frozen reverse edges.
+ */
+export function ancestorNodeClosure(
+  topology: WorkflowTopologyV1,
+  nodeIds: readonly string[],
+): ReadonlySet<string> {
+  const closure = new Set(nodeIds);
+  if (topology.kind !== 'graph_v1') return closure;
+  const predecessors = new Map<string, string[]>();
+  for (const edge of topology.edges) {
+    const current = predecessors.get(edge.toNodeId) ?? [];
+    current.push(edge.fromNodeId);
+    predecessors.set(edge.toNodeId, current);
+  }
+  const pending = [...closure];
+  while (pending.length > 0) {
+    const nodeId = pending.pop()!;
+    for (const predecessor of predecessors.get(nodeId) ?? []) {
+      if (!closure.has(predecessor)) {
+        closure.add(predecessor);
+        pending.push(predecessor);
+      }
+    }
+  }
+  return closure;
+}
+
 /** Return the sole terminal for callers that explicitly require a single-sink topology. */
 export function terminalNodeId(topology: WorkflowTopologyV1): string {
   const terminals = terminalNodeIds(topology);

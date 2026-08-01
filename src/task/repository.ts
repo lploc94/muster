@@ -53,6 +53,7 @@ import {
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
+  ancestorNodeClosure,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
   deriveChildReturnFenceId,
@@ -5234,7 +5235,12 @@ export class SqliteTaskRepository implements TaskRepository {
         return invalidStart('node reuse reference unresolved');
       }
     }
-    if (identities.entries.length > validated.policy.maxWorkflowTurnsPerRun) {
+    const reusedNodeIds = ancestorNodeClosure(
+      topo,
+      validated.reuse.map((reuse) => reuse.nodeId),
+    );
+    const executableEntries = identities.entries.filter((entry) => !reusedNodeIds.has(entry.nodeId));
+    if (executableEntries.length > validated.policy.maxWorkflowTurnsPerRun) {
       return invalidStart('invalid start');
     }
     const resultPayload = startWorkflowCreated(validated);
@@ -5352,9 +5358,9 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const nodeById = new Map(topo.nodes.map((node) => [node.nodeId, node] as const));
-    const entryByNode = new Map(identities.entries.map((e) => [e.nodeId, e]));
+    const entryByNode = new Map(executableEntries.map((e) => [e.nodeId, e]));
     const gateByNode = new Map(identities.nodeGates.map((g) => [g.nodeId, g.gateId]));
-    const entryNodeSet = new Set(identities.entries.map((e) => e.nodeId));
+    const entryNodeSet = new Set(executableEntries.map((e) => e.nodeId));
     const inputByKey = new Map<string, (typeof validated.entryInputs)[number]>(
       validated.entryInputs.map((input) => [`${input.entryNodeId}\0${input.inputRef}`, input] as const),
     );
@@ -5475,7 +5481,7 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.policy.maxConcurrency,
           validated.policy.maxAggregateBytes,
           0,
-          identities.entries.length,
+          executableEntries.length,
           0,
           validated.createdAt,
           deadlineAt,
@@ -5536,7 +5542,7 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     }
 
-    for (const entry of identities.entries) {
+    for (const entry of executableEntries) {
       const node = nodeById.get(entry.nodeId)!;
       const task: MusterTask = {
         id: entry.taskId,
@@ -5593,12 +5599,12 @@ export class SqliteTaskRepository implements TaskRepository {
           identities.runId,
           nodeGate.nodeId,
           isEntry && entry ? entry.taskId : null,
-          isEntry ? 'active' : 'pending',
+          reusedNodeIds.has(nodeGate.nodeId) ? 'reused' : isEntry ? 'active' : 'pending',
         ],
       });
     }
 
-    for (const entry of identities.entries) {
+    for (const entry of executableEntries) {
       const contracts = validated.entryContracts.filter((contract) => contract.entryNodeId === entry.nodeId);
       const bindings = contracts.length > 0
         ? contracts

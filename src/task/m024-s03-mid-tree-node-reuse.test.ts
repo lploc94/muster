@@ -7,6 +7,8 @@ import { dispatch } from './coordinator-tools';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import { fingerprintStartWorkflow } from './workflow';
+import { stageDispositionForSettlement } from './m018-test-helpers';
+import type { MusterTask } from './types';
 
 function ctx(): CredentialContext {
   return {
@@ -21,6 +23,15 @@ function ctx(): CredentialContext {
 }
 
 const workflow = `workflow-${'a'.repeat(32)}@3`;
+
+function rootTask(createdAt: string): MusterTask {
+  return {
+    id: 'root-1', role: 'coordinator', lifecycle: 'open', releaseState: 'released',
+    goal: 'coordinate workflow reuse', parentId: null, prerequisites: [], backend: 'grok', capabilities: [],
+    executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 }, revision: 0,
+    createdAt, updatedAt: createdAt, releasedAt: createdAt,
+  };
+}
 
 const fingerprintBase = {
   definitionId: 'workflow-definition',
@@ -109,6 +120,123 @@ describe('start_workflow mid-tree node reuse', () => {
       )).resolves.toEqual([]);
       await expect(client.all(
         "SELECT ledger_key FROM operations WHERE workspace_id = ? AND ledger_key LIKE 'start_workflow:%'", ['ws'],
+      )).resolves.toEqual([]);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it('persists the declared node and its reversed-edge ancestors as reused without execution rows', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-reuse-closure-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const createdAt = '2026-08-01T00:00:00.000Z';
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+        ['ws', 'm024-s03-closure', 'M024 S03 closure', createdAt, createdAt],
+      );
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: rootTask(createdAt) });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: 'ws',
+        turn: {
+          id: 'turn-1', taskId: 'root-1', sequence: 1, status: 'running', trigger: 'user',
+          inputs: [], createdAt, startedAt: createdAt,
+        },
+      });
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-producer', version: 1,
+        name: 'producer', topology: {
+          kind: 'one_node_v1', nodes: [{ nodeId: 'middle' }], entryNodeId: 'middle',
+        }, createdAt,
+      });
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
+        name: 'graph', topology: {
+          kind: 'graph_v1',
+          nodes: [{ nodeId: 'source' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'source_result' },
+            { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result' },
+          ],
+        }, createdAt,
+      });
+      const priorStart = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-producer', version: 1,
+        startIdempotencyKey: 'prior', createdAt, ownerRootTaskId: 'root-1',
+        callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      });
+      expect(priorStart).toMatchObject({ ok: true, changed: true });
+      const prior = priorStart.operation!.result.data as {
+        runId: string; entryTaskId: string; activationTurnId: string;
+      };
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+        ['2026-08-01T00:00:00.500Z', 'ws', prior.activationTurnId],
+      );
+      const priorTurn = await repository.getTurn(prior.activationTurnId);
+      const priorTask = await repository.getTask(prior.entryTaskId);
+      const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result: 'reused middle' };
+      await stageDispositionForSettlement(repository, priorTurn!, disposition);
+      await expect(repository.execute({
+        kind: 'settleTurnAndApplyEffects', workspaceId: 'ws', expectedTaskRevision: priorTask!.revision,
+        task: { ...priorTask!, lifecycle: 'succeeded', updatedAt: '2026-08-01T00:00:00.750Z' },
+        turn: { ...priorTurn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:00.750Z', disposition },
+        expectedStatuses: ['running'], relatedTurns: [], messages: [],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+
+      const started = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
+        startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:01.000Z',
+        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      });
+      expect(started).toMatchObject({ ok: true, changed: true });
+      const consumer = started.operation!.result.data as { runId: string };
+
+      await expect(client.all(
+        `SELECT node_id, task_id, status FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual([
+        { node_id: 'middle', task_id: null, status: 'reused' },
+        { node_id: 'sink', task_id: null, status: 'pending' },
+        { node_id: 'source', task_id: null, status: 'reused' },
+      ]);
+      await expect(client.get(
+        `SELECT workflow_turns_reserved FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual({ workflow_turns_reserved: 0 });
+      await expect(client.all(
+        `SELECT node.task_id
+           FROM workflow_nodes node
+           JOIN tasks task ON task.workspace_id = node.workspace_id AND task.id = node.task_id
+          WHERE node.workspace_id = ? AND node.run_id = ?`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual([]);
+      await expect(client.all(
+        `SELECT turn.id
+           FROM workflow_nodes node
+           JOIN turns turn ON turn.workspace_id = node.workspace_id AND turn.task_id = node.task_id
+          WHERE node.workspace_id = ? AND node.run_id = ?`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual([]);
+      await expect(client.all(
+        `SELECT message.id
+           FROM workflow_nodes node
+           JOIN messages message ON message.workspace_id = node.workspace_id AND message.task_id = node.task_id
+          WHERE node.workspace_id = ? AND node.run_id = ?`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual([]);
+      await expect(client.all(
+        `SELECT activation_id FROM workflow_activations WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', consumer.runId],
       )).resolves.toEqual([]);
     } finally {
       await client.close();
