@@ -4,8 +4,8 @@
   "schemaVersion": 1,
   "before": {
     "storage": {
-      "fileBytes": 684032,
-      "walBytes": 271952,
+      "fileBytes": 692224,
+      "walBytes": 0,
       "shmBytes": 32768,
       "pageCount": 169,
       "freelistCount": 0,
@@ -184,9 +184,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 15,
+      "completedPasses": 18,
       "failedPasses": 0,
-      "latestPassOrdinal": 15
+      "latestPassOrdinal": 18
     },
     "durableRows": {
       "tasks": 6,
@@ -199,7 +199,7 @@
   "afterSeed": {
     "storage": {
       "fileBytes": 6811648,
-      "walBytes": 6736232,
+      "walBytes": 6464312,
       "shmBytes": 32768,
       "pageCount": 1664,
       "freelistCount": 0,
@@ -378,9 +378,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 15,
+      "completedPasses": 18,
       "failedPasses": 0,
-      "latestPassOrdinal": 15
+      "latestPassOrdinal": 18
     },
     "durableRows": {
       "tasks": 8,
@@ -572,9 +572,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 17,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 17
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 8,
@@ -986,9 +986,9 @@
         ]
       },
       "retention": {
-        "completedPasses": 17,
+        "completedPasses": 20,
         "failedPasses": 0,
-        "latestPassOrdinal": 17
+        "latestPassOrdinal": 20
       },
       "durableRows": {
         "tasks": 8,
@@ -1219,5 +1219,5 @@
     "sessionIdsStoredInEvidence": false,
     "canaryStoredInEvidence": false
   },
-  "generatedAt": "2026-08-01T00:45:18.483Z"
+  "generatedAt": "2026-08-01T02:06:15.609Z"
 }

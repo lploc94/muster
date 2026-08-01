@@ -994,6 +994,73 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
 /**
  * Section 20 conformance columns and integrity guards.
  */
+/**
+ * Liveness guard shared by every terminal-workflow reclamation path.
+ *
+ * A terminal `workflow_runs` row may only be removed when nothing still depends
+ * on it: no child run, no non-terminal node task, and no open gate, round,
+ * activation, continuation, or return gate. The turn-delete trigger and the
+ * workspace-wide reclamation command both build their predicate here so a guard
+ * change can never apply to one path and silently miss the other.
+ *
+ * `alias` is the correlated outer reference to `workflow_runs`. Callers that
+ * delete from the table unaliased pass 'workflow_runs'.
+ *
+ * Token order is load-bearing: `schema-fingerprint.ts` compares the normalized
+ * trigger SQL of a stored database against this source, so reordering tokens
+ * would reject existing stores as incompatible. Whitespace is normalized away
+ * and may change freely.
+ */
+export function terminalWorkflowRunSafetyPredicate(alias: string): string {
+  return `AND NOT EXISTS (
+            SELECT 1 FROM workflow_runs child
+             WHERE child.workspace_id = ${alias}.workspace_id
+               AND child.parent_run_id = ${alias}.run_id
+          )
+          AND NOT EXISTS (
+            SELECT 1
+              FROM workflow_nodes node
+              JOIN tasks task
+                ON task.workspace_id = node.workspace_id
+               AND task.id = node.task_id
+             WHERE node.workspace_id = ${alias}.workspace_id
+               AND node.run_id = ${alias}.run_id
+               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_dependency_gates gate_row
+             WHERE gate_row.workspace_id = ${alias}.workspace_id
+               AND gate_row.run_id = ${alias}.run_id
+               AND gate_row.status IN ('open', 'satisfied')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_feedback_rounds round_row
+             WHERE round_row.workspace_id = ${alias}.workspace_id
+               AND round_row.run_id = ${alias}.run_id
+               AND round_row.status IN ('open', 'satisfied')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_activations activation
+             WHERE activation.workspace_id = ${alias}.workspace_id
+               AND activation.run_id = ${alias}.run_id
+               AND activation.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_continuations continuation
+             WHERE continuation.workspace_id = ${alias}.workspace_id
+               AND (continuation.run_id = ${alias}.run_id
+                 OR continuation.child_run_id = ${alias}.run_id)
+               AND continuation.status IN ('pending', 'resolved')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_return_gates return_gate
+             WHERE return_gate.workspace_id = ${alias}.workspace_id
+               AND (return_gate.continuation_run_id = ${alias}.run_id
+                 OR return_gate.child_run_id = ${alias}.run_id)
+               AND return_gate.status IN ('open', 'satisfied')
+          )`;
+}
+
 const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE UNIQUE INDEX IF NOT EXISTS uq_workflow_artifact_lineage
      ON workflow_artifacts(workspace_id, artifact_id, revision)`,
@@ -1183,53 +1250,7 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
              WHERE source.workspace_id = OLD.workspace_id
                AND (source.producing_turn_id = OLD.id OR source.caller_turn_id = OLD.id)
           )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_runs child
-             WHERE child.workspace_id = workflow_runs.workspace_id
-               AND child.parent_run_id = workflow_runs.run_id
-          )
-          AND NOT EXISTS (
-            SELECT 1
-              FROM workflow_nodes node
-              JOIN tasks task
-                ON task.workspace_id = node.workspace_id
-               AND task.id = node.task_id
-             WHERE node.workspace_id = workflow_runs.workspace_id
-               AND node.run_id = workflow_runs.run_id
-               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_dependency_gates gate_row
-             WHERE gate_row.workspace_id = workflow_runs.workspace_id
-               AND gate_row.run_id = workflow_runs.run_id
-               AND gate_row.status IN ('open', 'satisfied')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_feedback_rounds round_row
-             WHERE round_row.workspace_id = workflow_runs.workspace_id
-               AND round_row.run_id = workflow_runs.run_id
-               AND round_row.status IN ('open', 'satisfied')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_activations activation
-             WHERE activation.workspace_id = workflow_runs.workspace_id
-               AND activation.run_id = workflow_runs.run_id
-               AND activation.status IN ('queued', 'running')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_continuations continuation
-             WHERE continuation.workspace_id = workflow_runs.workspace_id
-               AND (continuation.run_id = workflow_runs.run_id
-                 OR continuation.child_run_id = workflow_runs.run_id)
-               AND continuation.status IN ('pending', 'resolved')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_return_gates return_gate
-             WHERE return_gate.workspace_id = workflow_runs.workspace_id
-               AND (return_gate.continuation_run_id = workflow_runs.run_id
-                 OR return_gate.child_run_id = workflow_runs.run_id)
-               AND return_gate.status IN ('open', 'satisfied')
-          );
+          ${terminalWorkflowRunSafetyPredicate('workflow_runs')};
      END`,
 ];
 

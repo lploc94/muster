@@ -98,7 +98,7 @@ import {
   truncateUtf8Bytes,
 } from './content-limits';
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
-import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
+import { CHANGE_FEED_RETAIN_REVISIONS, terminalWorkflowRunSafetyPredicate } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
@@ -554,6 +554,8 @@ export type RepositoryCommand =
       kind: 'applyRetention'; workspaceId: string; taskId: string; keepLatestTurns: number;
       maxStoredOutputChars?: number;
     }
+  /** Deletes only safely terminal workflow metadata; durable transcript rows are untouched. */
+  | { kind: 'reclaimTerminalWorkflowMetadata'; workspaceId: string }
   /** Stable host-facing name for the retention policy command. */
   | {
       kind: 'applyRetentionPolicy'; workspaceId: string; taskId: string; keepLatestTurns: number;
@@ -584,6 +586,8 @@ export interface RepositoryCommandResult {
   changed?: boolean;
   /** Number of retained file-change evidence entries stripped by a retention command. */
   retentionEntriesStripped?: number;
+  /** Number of safely terminal workflow metadata rows reclaimed by maintenance. */
+  reclaimedWorkflowRuns?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -3842,6 +3846,8 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'applyRetention':
       case 'applyRetentionPolicy':
         return this.applyRetention(command);
+      case 'reclaimTerminalWorkflowMetadata':
+        return this.reclaimTerminalWorkflowMetadata();
       default: {
         const _exhaustive: never = command;
         return _exhaustive;
@@ -10256,6 +10262,18 @@ export class SqliteTaskRepository implements TaskRepository {
     return { statements, changes };
   }
 
+
+  private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
+    const result = await this.db.run(
+      `DELETE FROM workflow_runs
+        WHERE workspace_id = ?
+          AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+          ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
+      [this.workspaceId],
+    );
+    const reclaimedWorkflowRuns = result.changes ?? 0;
+    return { ok: true, changed: reclaimedWorkflowRuns > 0, reclaimedWorkflowRuns };
+  }
 
   private async applyRetention(
     command:
