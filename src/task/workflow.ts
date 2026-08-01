@@ -1089,7 +1089,13 @@ export function startWorkflowConflict(
 
 /** Shape a start validation / missing-definition failure. */
 export function startWorkflowInvalid(
-  reason: 'definition not found' | 'invalid start' | 'invalid identity' | 'entry input reference unresolved',
+  reason:
+    | 'definition not found'
+    | 'invalid start'
+    | 'invalid identity'
+    | 'entry input reference unresolved'
+    | 'terminal node cannot be reused'
+    | 'node reuse reference unresolved',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {

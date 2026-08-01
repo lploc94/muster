@@ -290,6 +290,8 @@ export type StartWorkflowResult =
         | 'definition not found'
         | 'invalid start'
         | 'entry input reference unresolved'
+        | 'terminal node cannot be reused'
+        | 'node reuse reference unresolved'
         | 'start fingerprint conflict'
         | 'invalid identity';
       definitionId?: string;

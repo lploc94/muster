@@ -4968,7 +4968,13 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const invalidStart = (
-      reason: 'definition not found' | 'invalid start' | 'invalid identity' | 'entry input reference unresolved',
+      reason:
+        | 'definition not found'
+        | 'invalid start'
+        | 'invalid identity'
+        | 'entry input reference unresolved'
+        | 'terminal node cannot be reused'
+        | 'node reuse reference unresolved',
     ): RepositoryCommandResult => {
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
       return {
@@ -5192,6 +5198,41 @@ export class SqliteTaskRepository implements TaskRepository {
         artifactId: referenced.terminal_result_artifact_id,
         artifactRevision: Number(referenced.terminal_result_artifact_revision),
       });
+    }
+    const terminalNodeIdSet = new Set(terminalNodeIds(topo));
+    for (const reuse of validated.reuse) {
+      if (terminalNodeIdSet.has(reuse.nodeId)) {
+        return invalidStart('terminal node cannot be reused');
+      }
+      const referenced = await this.db.get<{
+        run_id?: string;
+        artifact_id?: string;
+        revision?: number;
+        kind?: string;
+      }>(
+        `SELECT artifact.run_id, artifact.artifact_id, artifact.revision, artifact.kind
+           FROM workflow_artifacts artifact
+           JOIN workflow_runs run
+             ON run.workspace_id = artifact.workspace_id
+            AND run.run_id = artifact.run_id
+          WHERE artifact.workspace_id = ? AND artifact.run_id = ?
+            AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'
+            AND run.owner_root_task_id = ?
+            AND run.status IN ('succeeded', 'failed', 'cancelled')
+          ORDER BY artifact.revision DESC
+          LIMIT 1`,
+        [this.workspaceId, reuse.fromRun, reuse.nodeId, validated.ownerRootTaskId ?? null],
+      );
+      if (
+        !referenced ||
+        typeof referenced.run_id !== 'string' ||
+        typeof referenced.artifact_id !== 'string' ||
+        !Number.isInteger(referenced.revision) ||
+        Number(referenced.revision) < 1 ||
+        referenced.kind !== 'next_result'
+      ) {
+        return invalidStart('node reuse reference unresolved');
+      }
     }
     if (identities.entries.length > validated.policy.maxWorkflowTurnsPerRun) {
       return invalidStart('invalid start');

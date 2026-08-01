@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
+import { SqliteTaskRepository } from './repository';
+import { DbClient } from './sqlite/client';
 import { fingerprintStartWorkflow } from './workflow';
 
 function ctx(): CredentialContext {
@@ -69,4 +74,45 @@ describe('start_workflow mid-tree node reuse', () => {
       toolError: 'invalid start_workflow reuse',
     });
   });
+
+  it.each([
+    ['a terminal target', { nodeId: 'sink', fromRun: 'prior-run' }, 'terminal node cannot be reused'],
+    ['a missing producer result', { nodeId: 'middle', fromRun: 'prior-run' }, 'node reuse reference unresolved'],
+  ])('rejects %s before it claims a consumer run', async (_caseName, reuse, reason) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-reuse-reject-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
+        name: 'graph', topology: {
+          kind: 'graph_v1',
+          nodes: [{ nodeId: 'source' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'source_result' },
+            { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result' },
+          ],
+        }, createdAt: '2026-08-01T00:00:00.000Z',
+      });
+
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
+        startIdempotencyKey: `reject-${reuse.nodeId}`, createdAt: '2026-08-01T00:00:00.000Z',
+        reuse: [reuse], ownerRootTaskId: 'root-1', callerTaskId: 'caller-1', callerTurnId: 'turn-1',
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason });
+      await expect(client.all(
+        'SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'],
+      )).resolves.toEqual([]);
+      await expect(client.all(
+        "SELECT ledger_key FROM operations WHERE workspace_id = ? AND ledger_key LIKE 'start_workflow:%'", ['ws'],
+      )).resolves.toEqual([]);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
