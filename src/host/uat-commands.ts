@@ -6,6 +6,8 @@
  * paths — never a parallel DbClient.
  */
 
+import { utimes, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   PresentationRecord,
   SendOutboxEntry,
@@ -43,6 +45,9 @@ export const UAT_COMMANDS = {
   seedStorageWorkload: 'muster.uat.seedStorageWorkload',
   storageLifecycleState: 'muster.uat.storageLifecycleState',
   runRetentionPass: 'muster.uat.runRetentionPass',
+  /** M023/S08 orphan lifecycle delegates; registered only in live UAT mode. */
+  seedOrphanLifecycleFixtures: 'muster.uat.seedOrphanLifecycleFixtures',
+  reclaimOrphanedFiles: 'muster.uat.reclaimOrphanedFiles',
   /** M023/S07 read-only webview DOM observation; registered only in UAT mode. */
   renderProbe: 'muster.uat.renderProbe',
 } as const;
@@ -567,6 +572,22 @@ export async function readStorageLifecycleState(deps: {
 /** Preserves production retention failure semantics while giving UAT a direct pass seam. */
 export async function runRetentionPass<T>(runPass: () => Promise<T>): Promise<T> {
   return runPass();
+}
+
+/**
+ * Creates only classifier-recognized orphan fixtures beside the activated store.
+ * Results deliberately expose numeric totals, never filenames or filesystem paths.
+ */
+export async function seedOrphanLifecycleFixtures(
+  storageDirectory: string,
+): Promise<{ deadLegacyStores: number; staleLeases: number; activeLeases: number }> {
+  const now = new Date();
+  const stale = new Date(now.getTime() - 61_000);
+  await writeFile(join(storageDirectory, '.muster-tasks.json'), '{}', 'utf8');
+  await writeFile(join(storageDirectory, '.lease.turn%3Aorphan-uat'), 'stale', 'utf8');
+  await writeFile(join(storageDirectory, '.lease.turn%3Aactive-uat'), 'active', 'utf8');
+  await utimes(join(storageDirectory, '.lease.turn%3Aorphan-uat'), stale, stale);
+  return { deadLegacyStores: 1, staleLeases: 1, activeLeases: 1 };
 }
 
 export async function readDurableSurfaces(

@@ -66,6 +66,7 @@ import {
   readRedactedDbIdentity,
   readStorageLifecycleState,
   runRetentionPass,
+  seedOrphanLifecycleFixtures,
   seedStorageWorkload,
   type UatHostState,
 } from './host/uat-commands';
@@ -3630,7 +3631,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // Maintenance commands remain available even when storage open fails (P5-W5).
   registerSqliteMaintenanceCommands(context, dbPath);
-  registerStorageReportCommand(context, context.globalStorageUri.fsPath);
+  const reclaimOrphanedFilesForUat = registerStorageReportCommand(
+    context,
+    context.globalStorageUri.fsPath,
+  );
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
@@ -3989,7 +3993,11 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   if (liveUatEnabled) {
-    registerLiveUatCommands(context);
+    registerLiveUatCommands(
+    context,
+    context.globalStorageUri.fsPath,
+    reclaimOrphanedFilesForUat,
+  );
   }
 
   try {
@@ -4505,7 +4513,7 @@ async function handlePeerExternalReset(): Promise<void> {
 function registerStorageReportCommand(
   context: vscode.ExtensionContext,
   storageDirectory: string,
-): void {
+): () => Promise<unknown> {
   const channel = vscode.window.createOutputChannel('Muster Storage Report');
   context.subscriptions.push(
     channel,
@@ -4565,21 +4573,29 @@ function registerStorageReportCommand(
       channel.show(true);
     }),
     vscode.commands.registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND, async () => {
-      await handleReclaimOrphanedFilesCommand({
-        showWarningMessage: async (message, ...items) => await vscode.window.showWarningMessage(message, { modal: true }, ...items),
-        readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory),
-        classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000),
-        removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report),
-        appendLine: (line) => channel.appendLine(line),
-        showErrorMessage: (message) => vscode.window.showErrorMessage(message),
-        isMaintenanceActive: () => maintenanceActive,
-        setMaintenanceActive: (active) => {
-          maintenanceActive = active;
-        },
-      });
+      await reclaimOrphanedFiles(false);
       channel.show(true);
     }),
   );
+
+  async function reclaimOrphanedFiles(confirmForUat: boolean) {
+    return handleReclaimOrphanedFilesCommand({
+      showWarningMessage: confirmForUat
+        ? async (_message, ...items) => items[0]
+        : async (message, ...items) => await vscode.window.showWarningMessage(message, { modal: true }, ...items),
+      readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory),
+      classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000),
+      removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report),
+      appendLine: (line) => channel.appendLine(line),
+      showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+      isMaintenanceActive: () => maintenanceActive,
+      setMaintenanceActive: (active) => {
+        maintenanceActive = active;
+      },
+    });
+  }
+
+  return async () => reclaimOrphanedFiles(true);
 }
 
 /**
@@ -4743,7 +4759,11 @@ function registerSqliteMaintenanceCommands(
  * Live two-window UAT command surface. activate() calls this only for a
  * non-production Extension Host with MUSTER_UAT_MODE=1.
  */
-function registerLiveUatCommands(context: vscode.ExtensionContext): void {
+function registerLiveUatCommands(
+  context: vscode.ExtensionContext,
+  storageDirectory: string,
+  reclaimOrphanedFilesForUat: () => Promise<unknown>,
+): void {
   const requireRepo = (): { repository: TaskRepository; workspaceId: string } => {
     if (!taskRepository || !sqliteWorkspaceId) {
       throw new Error('UAT repository unavailable');
@@ -4882,6 +4902,12 @@ function registerLiveUatCommands(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(UAT_COMMANDS.runRetentionPass, async () => {
       const { repository } = requireRepo();
       return runRetentionPass(() => applyRetentionToRepository(repository));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.seedOrphanLifecycleFixtures, async () => {
+      return seedOrphanLifecycleFixtures(storageDirectory);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.reclaimOrphanedFiles, async () => {
+      return reclaimOrphanedFilesForUat();
     }),
     vscode.commands.registerCommand(UAT_COMMANDS.renderProbe, async () => {
       if (!uatChatProvider) throw new Error('UAT chat provider unavailable');

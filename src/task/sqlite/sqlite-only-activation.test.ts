@@ -29,6 +29,7 @@ describe('SQLite-only activation boundary', () => {
 
   it('registers orphan reclamation through the path-free storage adapters and contributes it to VS Code', () => {
     expect(extensionSource).toContain('registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND');
+    expect(extensionSource).toContain('await reclaimOrphanedFiles(false)');
     expect(extensionSource).toContain('handleReclaimOrphanedFilesCommand({');
     expect(extensionSource).toContain('readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory)');
     expect(extensionSource).toContain('classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000)');
@@ -42,12 +43,15 @@ describe('SQLite-only activation boundary', () => {
   it('keeps orphan reclamation explicit-command-only with no automatic lifecycle caller', () => {
     const reclaimHandlerReferences = extensionSource.match(/handleReclaimOrphanedFilesCommand/g) ?? [];
 
-    // One import and one direct invocation in the Command Palette registration are
-    // the complete production topology. A timer, watcher, activation hook, or
-    // retention path must not gain another call site.
+    // One import and one shared production invocation back both the normal
+    // explicit command and the live-UAT delegate. A timer, watcher, activation
+    // hook, or retention path must not gain another call site.
     expect(reclaimHandlerReferences).toHaveLength(2);
     expect(extensionSource).toMatch(
-      /registerCommand\(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,[\s\S]*?handleReclaimOrphanedFilesCommand\(\{[\s\S]*?\}\),/,
+      /registerCommand\(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,[\s\S]*?await reclaimOrphanedFiles\(false\)/,
+    );
+    expect(extensionSource).toMatch(
+      /async function reclaimOrphanedFiles\(confirmForUat: boolean\)[\s\S]*?handleReclaimOrphanedFilesCommand\(\{/,
     );
     expect(extensionSource).not.toMatch(
       /(?:setInterval|setTimeout|createFileSystemWatcher|applyRetentionToRepository|runRetentionPass)[\s\S]{0,800}handleReclaimOrphanedFilesCommand/,
@@ -90,5 +94,27 @@ describe('SQLite-only activation boundary', () => {
     expect(packageJson.contributes.commands).not.toContainEqual(
       expect.objectContaining({ command: 'muster.uat.storageLifecycleState' }),
     );
+  });
+
+  it('keeps orphan lifecycle fixture and production-handler delegates live-UAT-only', () => {
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.seedOrphanLifecycleFixtures');
+    expect(extensionSource).toContain('seedOrphanLifecycleFixtures(storageDirectory)');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.reclaimOrphanedFiles');
+    expect(extensionSource).toMatch(
+      /registerLiveUatCommands\(\s*context,\s*context\.globalStorageUri\.fsPath,\s*reclaimOrphanedFilesForUat,\s*\)/,
+    );
+    expect(extensionSource).toContain('return reclaimOrphanedFilesForUat()');
+    expect(extensionSource).toContain('return async () => reclaimOrphanedFiles(true)');
+    expect(extensionSource).toContain('showWarningMessage: confirmForUat');
+    expect(extensionSource).toContain('? async (_message, ...items) => items[0]');
+
+    for (const command of [
+      'muster.uat.seedOrphanLifecycleFixtures',
+      'muster.uat.reclaimOrphanedFiles',
+    ]) {
+      expect(packageJson.contributes.commands).not.toContainEqual(
+        expect.objectContaining({ command }),
+      );
+    }
   });
 });
