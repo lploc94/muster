@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
+import { SqliteTaskRepository } from './repository';
+import { DbClient } from './sqlite/client';
 import { fingerprintStartWorkflow, validateStartWorkflow } from './workflow';
 
 function ctx(): CredentialContext {
@@ -83,6 +88,42 @@ describe('start_workflow entry input artifact reuse', () => {
     ]);
     expect(reference.fingerprint).not.toBe(literal);
   });
+
+  it('rejects an unresolved referenced result before it claims a workflow run', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s02-unresolved-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
+        name: 'consumer', topology: {
+          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
+        },
+        entryContracts: [{
+          entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'workflow_input',
+        }],
+        createdAt: '2026-08-01T00:00:00.000Z',
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
+        startIdempotencyKey: 'unresolved-reference', createdAt: '2026-08-01T00:00:00.000Z',
+        entryInputs: [{ entryNodeId: 'entry', inputRef: 'request', fromRun: 'missing-run' }],
+        ownerRootTaskId: 'root-1', callerTaskId: 'caller-1', callerTurnId: 'turn-1',
+      })).resolves.toMatchObject({
+        ok: false, conflict: true, reason: 'entry input reference unresolved',
+      });
+      await expect(client.all(
+        'SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'],
+      )).resolves.toEqual([]);
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it.each([
     ['both value and fromRun', { node: 'entry', input: 'request', value: 'literal', fromRun: 'run-prior' }],

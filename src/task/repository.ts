@@ -74,6 +74,7 @@ import {
   type WorkflowPolicyV1,
 } from './workflow';
 import type {
+  StartWorkflowEntryInput,
   WorkflowRunCompletionProjection,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
@@ -462,12 +463,7 @@ export type RepositoryCommand =
       createdAt: string;
       goal?: string;
       backend?: string;
-      entryInputs?: readonly {
-        entryNodeId: string;
-        inputRef: string;
-        kind: string;
-        value: string;
-      }[];
+      entryInputs?: readonly StartWorkflowEntryInput[];
       ownerRootTaskId?: string;
       callerTaskId?: string;
       callerTurnId?: string;
@@ -4970,7 +4966,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const invalidStart = (
-      reason: 'definition not found' | 'invalid start' | 'invalid identity',
+      reason: 'definition not found' | 'invalid start' | 'invalid identity' | 'entry input reference unresolved',
     ): RepositoryCommandResult => {
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
       return {
@@ -5133,6 +5129,67 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const { identities, fingerprint } = validated;
+    const resolvedInputByKey = new Map<string, {
+      value: string;
+      artifactKind: string;
+      artifactRunId?: string;
+      artifactId?: string;
+      artifactRevision?: number;
+    }>();
+    for (const input of validated.entryInputs) {
+      const key = `${input.entryNodeId}\0${input.inputRef}`;
+      if ('value' in input) {
+        resolvedInputByKey.set(key, { value: input.value, artifactKind: input.kind });
+        continue;
+      }
+      if (!validated.ownerRootTaskId) return invalidStart('entry input reference unresolved');
+      const referenced = await this.db.get<{
+        terminal_result_run_id?: string | null;
+        terminal_result_artifact_id?: string | null;
+        terminal_result_artifact_revision?: number | null;
+        artifact_kind?: string | null;
+        artifact_payload_json?: string | null;
+      }>(
+        `SELECT run.terminal_result_run_id, run.terminal_result_artifact_id,
+                run.terminal_result_artifact_revision, artifact.kind AS artifact_kind,
+                artifact.payload_json AS artifact_payload_json
+           FROM workflow_runs run
+           JOIN workflow_artifacts artifact
+             ON artifact.workspace_id = run.workspace_id
+            AND artifact.run_id = run.terminal_result_run_id
+            AND artifact.artifact_id = run.terminal_result_artifact_id
+            AND artifact.revision = run.terminal_result_artifact_revision
+          WHERE run.workspace_id = ? AND run.run_id = ?
+            AND run.owner_root_task_id = ?
+            AND run.status IN ('succeeded', 'failed', 'cancelled')`,
+        [this.workspaceId, input.fromRun, validated.ownerRootTaskId],
+      );
+      if (
+        !referenced ||
+        typeof referenced.terminal_result_run_id !== 'string' ||
+        typeof referenced.terminal_result_artifact_id !== 'string' ||
+        !Number.isInteger(referenced.terminal_result_artifact_revision) ||
+        Number(referenced.terminal_result_artifact_revision) < 1 ||
+        typeof referenced.artifact_kind !== 'string' ||
+        typeof referenced.artifact_payload_json !== 'string'
+      ) return invalidStart('entry input reference unresolved');
+      let value: unknown;
+      try {
+        value = (JSON.parse(referenced.artifact_payload_json) as Record<string, unknown>).result;
+      } catch {
+        return invalidStart('entry input reference unresolved');
+      }
+      if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > validated.policy.maxArtifactBytes) {
+        return invalidStart('entry input reference unresolved');
+      }
+      resolvedInputByKey.set(key, {
+        value,
+        artifactKind: referenced.artifact_kind,
+        artifactRunId: referenced.terminal_result_run_id,
+        artifactId: referenced.terminal_result_artifact_id,
+        artifactRevision: Number(referenced.terminal_result_artifact_revision),
+      });
+    }
     if (identities.entries.length > validated.policy.maxWorkflowTurnsPerRun) {
       return invalidStart('invalid start');
     }
@@ -5271,7 +5328,7 @@ export class SqliteTaskRepository implements TaskRepository {
       const contracts = validated.entryContracts.filter((contract) => contract.entryNodeId === entry.nodeId);
       const aggregate = formatWorkflowEntryAggregate(contracts.map((contract) => ({
         inputRef: contract.inputRef,
-        value: inputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
+        value: resolvedInputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
       })));
       if (Buffer.byteLength(aggregate, 'utf8') > validated.policy.maxAggregateBytes) {
         return invalidStart('invalid start');
@@ -5504,7 +5561,7 @@ export class SqliteTaskRepository implements TaskRepository {
         : [{ entryNodeId: entry.nodeId, inputRef: 'engine_start', expectedArtifactKind: 'engine_start' }];
       const aggregateContent = formatWorkflowEntryAggregate(contracts.map((contract) => ({
         inputRef: contract.inputRef,
-        value: inputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
+        value: resolvedInputByKey.get(`${entry.nodeId}\0${contract.inputRef}`)!.value,
       })));
       const message: TaskMessage = {
         id: entry.messageId,
@@ -5528,78 +5585,64 @@ export class SqliteTaskRepository implements TaskRepository {
         const key = `${entry.nodeId}\0${binding.inputRef}`;
         const artifact = artifactByKey.get(key)!;
         const input = inputByKey.get(key);
+        const resolvedInput = resolvedInputByKey.get(key);
+        if (input && !resolvedInput) return invalidStart('invalid start');
+        if (!resolvedInput?.artifactRunId) {
+          rest.push(
+            {
+              sql: `INSERT INTO workflow_artifacts (
+                      workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                      revision, kind, payload_json, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT DO NOTHING`,
+              params: [
+                this.workspaceId, identities.runId, artifact.artifactId, null, binding.inputRef, 1,
+                binding.expectedArtifactKind,
+                input ? encodePayload({ value: resolvedInput!.value }) : encodePayload({ kind: 'engine_start', schema: 1 }),
+                validated.createdAt,
+              ],
+            },
+            {
+              sql: `INSERT INTO workflow_artifact_sources (
+                      workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                      producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                      producing_activation_id, caller_task_id, caller_turn_id,
+                      engine_start_operation_key
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
+              params: [
+                this.workspaceId, identities.runId, artifact.artifactId, 1,
+                input ? 'caller_turn' : 'engine_start', null, null, null, null, null,
+                input ? validated.callerTaskId ?? null : null,
+                input ? validated.callerTurnId ?? null : null,
+                input ? null : ledgerKey,
+              ],
+            },
+          );
+        }
         rest.push(
-          {
-            sql: `INSERT INTO workflow_artifacts (
-                    workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-                    revision, kind, payload_json, created_at
-                  ) VALUES (?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT DO NOTHING`,
-            params: [
-              this.workspaceId,
-              identities.runId,
-              artifact.artifactId,
-              null,
-              binding.inputRef,
-              1,
-              binding.expectedArtifactKind,
-              input
-                ? encodePayload({ value: input.value })
-                : encodePayload({ kind: 'engine_start', schema: 1 }),
-              validated.createdAt,
-            ],
-          },
-          {
-            sql: `INSERT INTO workflow_artifact_sources (
-                    workspace_id, run_id, artifact_id, artifact_revision, source_kind,
-                    producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
-                    producing_activation_id, caller_task_id, caller_turn_id,
-                    engine_start_operation_key
-                  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
-            params: [
-              this.workspaceId,
-              identities.runId,
-              artifact.artifactId,
-              1,
-              input ? 'caller_turn' : 'engine_start',
-              null,
-              null,
-              null,
-              null,
-              null,
-              input ? validated.callerTaskId ?? null : null,
-              input ? validated.callerTurnId ?? null : null,
-              input ? null : ledgerKey,
-            ],
-          },
           {
             sql: `INSERT INTO workflow_gate_bindings (
                     workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
                   ) VALUES (?,?,?,?,?,?)
                   ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
             params: [
-              this.workspaceId,
-              identities.runId,
-              entry.gateId,
-              binding.inputRef,
-              null,
-              binding.expectedArtifactKind,
+              this.workspaceId, identities.runId, entry.gateId, binding.inputRef, null,
+              resolvedInput?.artifactKind ?? binding.expectedArtifactKind,
             ],
           },
           {
             sql: `INSERT INTO workflow_gate_fills (
-                    workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
-                  ) VALUES (?,?,?,?,?,?,?)
+                    workspace_id, run_id, gate_id, input_ref, artifact_run_id,
+                    artifact_id, artifact_revision, filled_at
+                  ) VALUES (?,?,?,?,?,?,?,?)
                   ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
                   DO NOTHING`,
             params: [
-              this.workspaceId,
-              identities.runId,
-              entry.gateId,
-              binding.inputRef,
-              artifact.artifactId,
-              1,
+              this.workspaceId, identities.runId, entry.gateId, binding.inputRef,
+              resolvedInput?.artifactRunId ?? null,
+              resolvedInput?.artifactId ?? artifact.artifactId,
+              resolvedInput?.artifactRevision ?? 1,
               validated.createdAt,
             ],
           },

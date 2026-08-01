@@ -281,6 +281,7 @@ export type StartWorkflowResult =
       reason:
         | 'definition not found'
         | 'invalid start'
+        | 'entry input reference unresolved'
         | 'start fingerprint conflict'
         | 'invalid identity';
       definitionId?: string;
