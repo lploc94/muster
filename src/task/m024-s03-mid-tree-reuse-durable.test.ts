@@ -107,19 +107,26 @@ describe('M024 S03 durable mid-tree reuse', () => {
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
+      // Reuse suppresses topology entry `one` and materializes consumer `five`
+      // through its prefilled boundary gate. That exact task must be reported so
+      // the in-memory projection and scheduler can see it without a full reload.
       const consumer = consumerStart.operation!.result.data as { runId: string };
 
-      await expect(client.all(
+      const nodes = await client.all<{ node_id: string; task_id: string | null; status: string }>(
         `SELECT node_id, task_id, status FROM workflow_nodes
          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
-      )).resolves.toEqual([
+      );
+      expect(nodes).toEqual([
         { node_id: 'five', task_id: expect.any(String), status: 'active' },
         { node_id: 'four', task_id: null, status: 'reused' },
         { node_id: 'one', task_id: null, status: 'reused' },
         { node_id: 'three', task_id: null, status: 'reused' },
         { node_id: 'two', task_id: null, status: 'reused' },
       ]);
+      const liveFive = nodes.find((node) => node.node_id === 'five');
+      expect(liveFive?.task_id).toEqual(expect.any(String));
+      expect(consumerStart.affectedTaskIds).toEqual([liveFive!.task_id!]);
       await expect(client.get(
         `SELECT workflow_turns_reserved FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         [WORKSPACE_ID, consumer.runId],

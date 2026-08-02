@@ -160,6 +160,11 @@ import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { routeLoadTranscriptPage } from './host/transcript-page-route';
 import { routeRequestWorkflowGraph } from './host/workflow-graph-route';
+import {
+  createWorkflowGraphProbeCoordinator,
+  type WorkflowGraphProbeCoordinator,
+} from './host/workflow-graph-probe';
+import { seedWorkflowGraphFixture } from './host/workflow-graph-uat-fixture';
 import { buildWorkflowGraphView } from './host/workflow-graph';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
@@ -675,6 +680,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private windowStateSub: vscode.Disposable | undefined;
   /** UAT-only DOM observation bridge, created for the current resolved webview. */
   private renderProbeCoordinator: WebviewRenderProbeCoordinator | undefined;
+  /** UAT-only workflow graph round-trip observer for the current resolved webview. */
+  private workflowGraphProbeCoordinator: WorkflowGraphProbeCoordinator | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -689,6 +696,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.uatPostInterceptor?.(message);
     } catch {
       // UAT interceptor must never break production post path
+    }
+    try {
+      // Observes the genuine outbound workflowGraphResult on the real post path.
+      this.workflowGraphProbeCoordinator?.noteResult(message);
+    } catch {
+      // UAT graph probe must never break production post path
     }
     try {
       this._view?.webview.postMessage(message);
@@ -2097,6 +2110,32 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * M024/S06: observe one real webview-initiated workflow graph round trip.
+   *
+   * Arms the expectation *before* touching focus, because the webview posts its
+   * own `requestWorkflowGraph` as soon as focus changes; arming afterwards would
+   * race the very message we must observe. The null hop forces a genuine focus
+   * transition even when the task is already focused.
+   */
+  async observeWorkflowGraphRoundTripForUat(taskId: string) {
+    const coordinator = this.workflowGraphProbeCoordinator;
+    if (!coordinator) {
+      throw new Error('UAT workflow graph probe webview unavailable');
+    }
+    const observed = coordinator.expect(taskId);
+    try {
+      await this.transitionFocus(undefined);
+      await this.transitionFocus(taskId);
+    } catch (error) {
+      // Keep the pending observation from surfacing as an unhandled rejection;
+      // it settles on its own timeout.
+      void observed.catch(() => {});
+      throw error;
+    }
+    return observed;
+  }
+
+  /**
    * M019/S05: non-production native first-run observations.
    * Each method delegates to the production refresh/probe/Doctor/send path and
    * returns only bounded sanitized fields (no prompt, task body, path, or secret).
@@ -2820,12 +2859,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     _token: vscode.CancellationToken,
   ) {
     this.renderProbeCoordinator?.dispose();
+    this.workflowGraphProbeCoordinator?.dispose();
     this._view = webviewView;
     if (this.uatRenderProbeEnabled) {
       this.renderProbeCoordinator = createWebviewRenderProbeCoordinator({
         postMessage: (message) => webviewView.webview.postMessage(message),
         createRequestId: () => randomUUID(),
       });
+      this.workflowGraphProbeCoordinator = createWorkflowGraphProbeCoordinator();
     }
     this.windowFocused = vscode.window.state.focused;
     this.pollingReady = false;
@@ -2875,6 +2916,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (this.renderProbeCoordinator?.accept(data)) {
         return;
       }
+      // Read-only tap: records the webview's own graph request id, then falls
+      // through so the production dispatcher still serves the request.
+      this.workflowGraphProbeCoordinator?.noteRequest(data);
       if (maintenanceActive && data?.type !== 'debugLog' && data?.type !== 'ready') {
         this.postCommandError('Muster storage maintenance is in progress. Try again after reload.');
         return;
@@ -5034,6 +5078,20 @@ function registerLiveUatCommands(
       if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
       return uatChatProvider.requestRenderProbeForUat();
     }),
+    // M024/S06 workflow graph native-host evidence: real reuse seed + round trip.
+    vscode.commands.registerCommand(UAT_COMMANDS.seedWorkflowGraphFixture, async () => {
+      const { repository, workspaceId } = requireRepo();
+      return seedWorkflowGraphFixture(repository, requireClient(), workspaceId);
+    }),
+    vscode.commands.registerCommand(
+      UAT_COMMANDS.observeWorkflowGraphRoundTrip,
+      async (args) => {
+        if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+        const taskId = String(args?.taskId ?? '');
+        if (!taskId) throw new Error('UAT workflow graph taskId is required');
+        return uatChatProvider.observeWorkflowGraphRoundTripForUat(taskId);
+      },
+    ),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
       if (!uatChatProvider) throw new Error('UAT chat provider unavailable');

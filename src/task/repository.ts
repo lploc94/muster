@@ -5603,6 +5603,13 @@ export class SqliteTaskRepository implements TaskRepository {
         ]
       : [domainClaim];
 
+    /**
+     * Tasks created as dependency-gate consumers of reused nodes are not
+     * topology entries, so `StartWorkflowIdentities.entries` cannot describe
+     * them. Track them explicitly for projection and targeted scheduler rescan
+     * after this transaction commits.
+     */
+    const materializedBoundaryTaskIds: string[] = [];
     const rest: SqlStatement[] = [
       {
         sql: `INSERT INTO workflow_runs (
@@ -5945,6 +5952,7 @@ export class SqliteTaskRepository implements TaskRepository {
         const aggregate = `[workflow-aggregate] ${incoming.map((edge) =>
           `${edge.inputRef}=${resolvedReuseByNode.get(edge.fromNodeId)!.value}`,
         ).join(' ')}`;
+        materializedBoundaryTaskIds.push(activation.taskId);
         const task: MusterTask = {
           id: activation.taskId, role: node.role ?? 'worker', lifecycle: 'open', releaseState: 'released',
           goal: workflowNodeTaskGoal(node, validated.goal), parentId: validated.callerTaskId ?? null,
@@ -6028,6 +6036,10 @@ export class SqliteTaskRepository implements TaskRepository {
       return {
         ok: true,
         changed: true,
+        affectedTaskIds: [...new Set([
+          ...executableEntries.map((entry) => entry.taskId),
+          ...materializedBoundaryTaskIds,
+        ])].sort(),
         operation: {
           fingerprint,
           result: { ok: true, data: resultPayload },

@@ -70,6 +70,14 @@ export const UAT_COMMANDS = {
   reclaimOrphanedFiles: 'muster.uat.reclaimOrphanedFiles',
   /** M023/S07 read-only webview DOM observation; registered only in UAT mode. */
   renderProbe: 'muster.uat.renderProbe',
+  /**
+   * M024/S06 workflow graph native-host evidence; registered only in UAT mode.
+   * The seeder writes a real reuse run through the repository; the observer
+   * watches one genuine webview-initiated request/result round trip and returns
+   * only bounded counts and statuses.
+   */
+  seedWorkflowGraphFixture: 'muster.uat.seedWorkflowGraphFixture',
+  observeWorkflowGraphRoundTrip: 'muster.uat.observeWorkflowGraphRoundTrip',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];
