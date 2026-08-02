@@ -55,9 +55,17 @@ async function readRegistry(filePath = registryPath()): Promise<StorageRegistry>
 async function writeRegistry(registry: StorageRegistry, filePath = registryPath()): Promise<void> {
   const directory = path.dirname(filePath);
   await mkdir(directory, { recursive: true });
-  const temporary = `${filePath}.${process.pid}.tmp`;
+  const temporary = `${filePath}.${process.pid}.${Math.random().toString(16).slice(2)}.tmp`;
   await writeFile(temporary, `${JSON.stringify(registry)}\n`, { encoding: 'utf8', mode: 0o600 });
-  await rename(temporary, filePath);
+  try {
+    await rename(temporary, filePath);
+  } catch (error: unknown) {
+    // Windows may reject replacement while another Extension Host briefly reads
+    // or registers the same installation. A registry miss must never prevent
+    // activation; leave the prior safe target intact and clean the temp best-effort.
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 /** Records the exact profile/authority-resolved global storage path for this installation. */

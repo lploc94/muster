@@ -3657,7 +3657,10 @@ export async function activate(context: vscode.ExtensionContext) {
   // vscode:uninstall has no ExtensionContext. Register this installation's
   // profile/authority-resolved path now rather than guessing a Stable-Code path
   // later and risking another installation's storage.
-  await registerUninstallStorageTarget(context.extensionPath, context.globalStorageUri.fsPath);
+  // Uninstall discovery is best-effort support metadata; a transient registry
+  // lock must never prevent the primary extension runtime from activating.
+  await registerUninstallStorageTarget(context.extensionPath, context.globalStorageUri.fsPath)
+    .catch(() => undefined);
 
   // Maintenance commands remain available even when storage open fails (P5-W5).
   registerSqliteMaintenanceCommands(context, dbPath);
