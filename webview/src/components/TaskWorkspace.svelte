@@ -11,6 +11,7 @@
   import ChatThread from './ChatThread.svelte';
   import Composer from './Composer.svelte';
   import AskCard from './AskCard.svelte';
+  import WorkflowGraphPanel from './WorkflowGraphPanel.svelte';
   import { tasks } from '../lib/tasks.svelte';
   import { threadStore } from '../lib/thread.svelte';
   import { effectiveRuntimeActivity, post } from '../lib/protocol';
@@ -19,6 +20,7 @@
     getTaskPresentation,
   } from '../lib/task-status';
   import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
+  import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
   import {
@@ -39,11 +41,18 @@
   interface Props {
     pendingAsk: PendingAsk | null;
     activeTurnId: string | null;
+    workflowGraph?: WorkflowGraphWireGraph | null;
     submissionError?: string;
     submissionVersion?: number;
   }
 
-  let { pendingAsk = null, activeTurnId = null, submissionError, submissionVersion = 0 }: Props = $props();
+  let {
+    pendingAsk = null,
+    activeTurnId = null,
+    workflowGraph = null,
+    submissionError,
+    submissionVersion = 0,
+  }: Props = $props();
 
   let retryInstruction = $state('');
   let continueMessage = $state('');
@@ -695,6 +704,10 @@
     </div>
 
     <ChatThread />
+
+    {#if workflowGraph}
+      <WorkflowGraphPanel graph={workflowGraph} />
+    {/if}
 
     {#if queuedTurnControls.length > 0}
       <div
