@@ -306,6 +306,14 @@ async function main() {
     const sharedStorage = path.join(tempDir, 'gs');
     const controlDir = path.join(tempDir, 'ctl');
     for (const dir of [workspacePath, userDataA, userDataB, sharedStorage, controlDir]) ensureDir(dir);
+    // The storage fixture creates five settled turns and one live turn. Keep one
+    // settled turn so the production scheduler must truncate exactly four older
+    // payloads; without this workspace setting, the default 200 retains all.
+    ensureDir(path.join(workspacePath, '.vscode'));
+    fs.writeFileSync(
+      path.join(workspacePath, '.vscode', 'settings.json'),
+      `${JSON.stringify({ 'muster.retention.maxRetainedTurnsPerTask': 1 })}\n`,
+    );
     linkSharedGlobalStorage(userDataA, sharedStorage);
     linkSharedGlobalStorage(userDataB, sharedStorage);
 
