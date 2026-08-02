@@ -16,7 +16,7 @@ const TABLE_KEYS = new Set(['name', 'bytes']);
 const CLASSIFICATION_KEYS = new Set(['deadLegacyStores', 'staleLeases', 'removable', 'liveFiles']);
 const BUCKET_KEYS = new Set(['count', 'bytes']);
 const LIVE_FILES_KEYS = new Set(['sqlite', 'wal', 'shm', 'activeLeaseCount']);
-const CLEANUP_KEYS = new Set(['removedFiles', 'bytesReclaimed', 'failedRemovals']);
+const CLEANUP_KEYS = new Set(['removedFiles', 'bytesReclaimed', 'failedRemovals', 'skippedRemovals']);
 const AFTER_CLEANUP_KEYS = new Set(['state', 'classification']);
 const CONTENT_SAFETY_KEYS = ['absolutePathsStoredInEvidence', 'messageBodiesStoredInEvidence', 'sessionIdsStoredInEvidence', 'canaryStoredInEvidence'];
 const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
@@ -111,7 +111,7 @@ export function validateOrphanLifecycleEvidence(evidence, opts = {}) {
   if (Number.isSafeInteger(retained?.storage?.fileBytes) && retained.storage.fileBytes !== peer?.storage?.fileBytes) failures.push('peerAfterRetention.storage.fileBytes must equal afterRetention.storage.fileBytes');
   if (classified?.removable?.count < 1 || classified?.removable?.bytes < 1) failures.push('orphanBeforeCleanup.removable must prove non-empty orphan reclamation');
   if (classified?.removable?.count !== (classified?.deadLegacyStores?.count ?? NaN) + (classified?.staleLeases?.count ?? NaN) || classified?.removable?.bytes !== (classified?.deadLegacyStores?.bytes ?? NaN) + (classified?.staleLeases?.bytes ?? NaN)) failures.push('orphanBeforeCleanup.removable must equal classified bucket totals');
-  if (cleanup?.removedFiles !== classified?.removable?.count || cleanup?.bytesReclaimed !== classified?.removable?.bytes || cleanup?.failedRemovals !== 0) failures.push('orphanCleanup totals must exactly equal classified removables with no failed removals');
+  if (cleanup?.removedFiles !== classified?.removable?.count || cleanup?.bytesReclaimed !== classified?.removable?.bytes || cleanup?.failedRemovals !== 0 || cleanup?.skippedRemovals !== 0) failures.push('orphanCleanup totals must exactly equal classified removables with no failed or skipped removals');
   if (after?.classification?.removable?.count !== 0 || after?.classification?.removable?.bytes !== 0 || after?.classification?.deadLegacyStores?.count !== 0 || after?.classification?.staleLeases?.count !== 0) failures.push('afterOrphanCleanup classification must contain no removable orphans');
   const live = after?.classification?.liveFiles;
   if (live?.sqlite !== true || live?.wal !== true || live?.shm !== true || live?.activeLeaseCount < 1) failures.push('afterOrphanCleanup must prove SQLite trio and active lease survival');
