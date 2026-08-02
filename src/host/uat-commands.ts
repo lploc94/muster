@@ -682,7 +682,8 @@ function makeStorageSeedIso(offsetMs = 0): string {
 }
 
 /**
- * Creates a bounded, retention-eligible production workload plus one live turn.
+ * Creates five settled turns plus one live turn. With keepLatestTurns=1, the
+ * newest small settled turn survives and the four older large diffs are eligible.
  * The caller owns UAT gating; this helper never opens a parallel database client.
  */
 export async function seedStorageWorkload(
@@ -696,7 +697,7 @@ export async function seedStorageWorkload(
 
   // SQLite retention preserves durable rows, but truncates oversized payloads
   // on settled turns belonging to an otherwise open task.
-  const settledTurns: TaskTurn[] = Array.from({ length: 4 }, (_, index) => index + 1).map((sequence) => ({
+  const settledTurns: TaskTurn[] = Array.from({ length: 5 }, (_, index) => index + 1).map((sequence) => ({
     id: `${STORAGE_SEED_ACTIVE_TASK_ID}-settled-${sequence}`,
     taskId: activeTask.id,
     sequence,
@@ -710,8 +711,8 @@ export async function seedStorageWorkload(
     await repository.execute({ kind: 'createTurn', workspaceId, turn });
   }
   const activeTurn: TaskTurn = {
-    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-5`, taskId: activeTask.id, sequence: 5,
-    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(5_000), startedAt: makeStorageSeedIso(5_100),
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-6`, taskId: activeTask.id, sequence: 6,
+    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(6_000), startedAt: makeStorageSeedIso(6_100),
   };
   await repository.execute({ kind: 'createTurn', workspaceId, turn: activeTurn });
 
