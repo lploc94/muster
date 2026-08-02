@@ -159,6 +159,8 @@ import {
 import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { routeLoadTranscriptPage } from './host/transcript-page-route';
+import { routeRequestWorkflowGraph } from './host/workflow-graph-route';
+import { buildWorkflowGraphView } from './host/workflow-graph';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
 import {
@@ -2389,6 +2391,26 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Serve the bounded host-only workflow topology for the currently focused
+   * task. The pure route validates before accessing the repository and emits
+   * only its shared, fixed response shape.
+   */
+  private async handleRequestWorkflowGraph(data: unknown): Promise<void> {
+    const repository = taskRepository;
+    const outcome = await routeRequestWorkflowGraph(data, {
+      getFocused: () => ({
+        taskId: this.focusedTaskId,
+        generation: this.snapshotGeneration,
+      }),
+      buildWorkflowGraph: async (taskId: string) => {
+        if (!repository) throw new Error('task repository not ready');
+        return buildWorkflowGraphView(repository, taskId);
+      },
+    });
+    if (outcome.kind === 'message') this.post(outcome.message);
+  }
+
+  /**
    * Export one task as Markdown via native Save As. Read-only store access;
    * never mutates task-store state. Cancel is intentionally silent.
    */
@@ -3407,6 +3429,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'loadTranscriptPage':
           await this.handleLoadTranscriptPage(data);
+          break;
+        case 'requestWorkflowGraph':
+          await this.handleRequestWorkflowGraph(data);
           break;
         case 'requestWorkspaceRecovery':
           this.handleRequestWorkspaceRecovery(data);
