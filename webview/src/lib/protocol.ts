@@ -25,6 +25,11 @@ import {
   TOOL_FILE_CHANGES_MAX_FILES,
   isBoundedToolFileChanges,
 } from '../../../src/shared/tool-file-change-contract';
+import {
+  parseWorkflowGraphResult,
+  type RequestWorkflowGraph,
+  type WorkflowGraphResult,
+} from '../../../src/shared/workflow-graph-wire';
 
 export const PROTOCOL_VERSION = 12;
 
@@ -563,6 +568,11 @@ export type ExtMessage =
    */
   | TranscriptPageResultMessage
   /**
+   * Correlated workflow topology response (M024/S05). Parsed through the
+   * shared fail-closed contract before any webview consumer can inspect it.
+   */
+  | WorkflowGraphResult
+  /**
    * Host response to `requestFileMentionSuggestions`.
    * Success returns relative suggestion items only (never absolute paths, cwd,
    * or file contents). Failures use bounded codes with no free-form message.
@@ -633,6 +643,8 @@ export type OutMessage =
     }
   | { type: 'focusTask'; taskId: string }
   | { type: 'hydrateSubtree'; taskId: string }
+  /** Correlated bounded workflow topology request (M024/S05). */
+  | RequestWorkflowGraph
   /**
    * Request one bounded older transcript page for the focused task (introduced in v7).
    * Host replies with `transcriptPageResult` (typed success or fixed error code).
@@ -1701,6 +1713,9 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'transcriptPageResult':
       return isTranscriptPageResultMessage(data);
+
+    case 'workflowGraphResult':
+      return parseWorkflowGraphResult(data) !== null;
 
     case 'askPending':
       return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);
