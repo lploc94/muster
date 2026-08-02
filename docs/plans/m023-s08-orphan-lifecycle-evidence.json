@@ -5,7 +5,7 @@
   "before": {
     "storage": {
       "fileBytes": 684032,
-      "walBytes": 271952,
+      "walBytes": 177192,
       "shmBytes": 32768,
       "pageCount": 169,
       "freelistCount": 0,
@@ -184,9 +184,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 17,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 17
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 6,
@@ -199,29 +199,29 @@
   "afterSeed": {
     "storage": {
       "fileBytes": 8093696,
-      "walBytes": 8066992,
+      "walBytes": 7972232,
       "shmBytes": 32768,
-      "pageCount": 2024,
-      "freelistCount": 1342,
+      "pageCount": 1976,
+      "freelistCount": 0,
       "pageSize": 4096,
       "autoVacuum": 2,
       "tableBytesSource": "dbstat",
       "tables": [
         {
           "name": "tool_calls",
-          "bytes": 2097152
+          "bytes": 7405568
         },
         {
           "name": "workflow_runs",
           "bytes": 32768
         },
         {
-          "name": "change_log",
-          "bytes": 28672
-        },
-        {
           "name": "turns",
           "bytes": 24576
+        },
+        {
+          "name": "change_log",
+          "bytes": 20480
         },
         {
           "name": "task_session_bindings",
@@ -378,9 +378,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 17,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 17
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 8,
@@ -388,7 +388,7 @@
       "messages": 14,
       "operations": 0
     },
-    "retentionTruncatedEntries": 4
+    "retentionTruncatedEntries": 0
   },
   "afterRetention": {
     "storage": {
@@ -572,9 +572,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 19,
+      "completedPasses": 22,
       "failedPasses": 0,
-      "latestPassOrdinal": 19
+      "latestPassOrdinal": 22
     },
     "durableRows": {
       "tasks": 8,
@@ -987,9 +987,9 @@
         ]
       },
       "retention": {
-        "completedPasses": 19,
+        "completedPasses": 22,
         "failedPasses": 0,
-        "latestPassOrdinal": 19
+        "latestPassOrdinal": 22
       },
       "durableRows": {
         "tasks": 8,
@@ -1220,6 +1220,6 @@
     "sessionIdsStoredInEvidence": false,
     "canaryStoredInEvidence": false
   },
-  "generatedAt": "2026-08-02T02:12:02.820Z",
-  "commitSha": "d4c8cb03003fd8072184752b0fa5e08c4755885d"
+  "generatedAt": "2026-08-02T02:19:24.309Z",
+  "commitSha": "03e6e84fad4faf44d2874214efa5fb3e51ed6151"
 }
