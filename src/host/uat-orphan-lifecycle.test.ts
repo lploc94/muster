@@ -4,15 +4,21 @@ import {
   verifyOrphanCleanup,
 } from './uat-orphan-lifecycle';
 
+const NOW = Date.parse('2026-07-30T12:00:00.000Z');
+
 const initialReport = {
   live: [
-    { name: 'muster.sqlite3', bytes: 100 },
-    { name: 'muster.sqlite3-wal', bytes: 20 },
-    { name: 'muster.sqlite3-shm', bytes: 10 },
+    { name: 'muster.sqlite3', bytes: 100, modifiedAtMs: NOW },
+    { name: 'muster.sqlite3-wal', bytes: 20, modifiedAtMs: NOW },
+    { name: 'muster.sqlite3-shm', bytes: 10, modifiedAtMs: NOW },
   ],
-  deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 40 }],
-  activeLeases: [{ name: '.lease.turn%3Alive', bytes: 30 }],
-  staleLeases: [{ name: '.lease.turn%3Aexpired', bytes: 50 }],
+  deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 40, modifiedAtMs: NOW }],
+  activeLeases: [
+    { name: '.muster-tasks.json.lease.turn%3Alive', bytes: 30, modifiedAtMs: NOW },
+  ],
+  staleLeases: [
+    { name: '.muster-tasks.json.lease.turn%3Aexpired', bytes: 50, modifiedAtMs: NOW - 61_000 },
+  ],
 };
 
 describe('live UAT orphan lifecycle observations', () => {
@@ -35,7 +41,7 @@ describe('live UAT orphan lifecycle observations', () => {
 
   it('accepts exact removal totals only when post-cleanup classifications are empty and live files survive', () => {
     expect(verifyOrphanCleanup(initialReport, {
-      kind: 'success', removedFiles: 2, bytesReclaimed: 90, failedRemovals: 0,
+      kind: 'success', removedFiles: 2, bytesReclaimed: 90, failedRemovals: 0, skippedRemovals: 0,
     }, {
       live: initialReport.live,
       deadLegacyStores: [],
@@ -45,6 +51,7 @@ describe('live UAT orphan lifecycle observations', () => {
       removedFiles: 2,
       bytesReclaimed: 90,
       failedRemovals: 0,
+      skippedRemovals: 0,
       postCleanup: {
         deadLegacyStores: { count: 0, bytes: 0 },
         staleLeases: { count: 0, bytes: 0 },
@@ -58,15 +65,28 @@ describe('live UAT orphan lifecycle observations', () => {
     expect(() => verifyOrphanCleanup(initialReport, { kind: 'cancel' }, initialReport))
       .toThrow('orphan reclamation did not succeed');
     expect(() => verifyOrphanCleanup(initialReport, {
-      kind: 'success', removedFiles: 1, bytesReclaimed: 40, failedRemovals: 1,
+      kind: 'success', removedFiles: 1, bytesReclaimed: 40, failedRemovals: 1, skippedRemovals: 0,
     }, initialReport)).toThrow('orphan reclamation totals differ from classification');
     expect(() => verifyOrphanCleanup(initialReport, {
-      kind: 'success', removedFiles: 2, bytesReclaimed: 90, failedRemovals: 0,
+      kind: 'success', removedFiles: 2, bytesReclaimed: 90, failedRemovals: 0, skippedRemovals: 0,
     }, {
       ...initialReport,
       deadLegacyStores: [],
       staleLeases: [],
       live: initialReport.live.filter((file) => file.name !== 'muster.sqlite3-wal'),
     })).toThrow('live SQLite trio or active lease missing after orphan cleanup');
+  });
+
+  it('fails closed when a pinned file diverged and removal was skipped', () => {
+    // A skipped removal means the classified object changed under the modal, so
+    // the run proved nothing about the set the user actually confirmed.
+    expect(() => verifyOrphanCleanup(initialReport, {
+      kind: 'success', removedFiles: 1, bytesReclaimed: 40, failedRemovals: 0, skippedRemovals: 1,
+    }, {
+      live: initialReport.live,
+      deadLegacyStores: [],
+      activeLeases: initialReport.activeLeases,
+      staleLeases: initialReport.staleLeases,
+    })).toThrow('orphan reclamation totals differ from classification');
   });
 });

@@ -169,7 +169,7 @@
           "type": "number",
           "default": 200,
           "minimum": 1,
-          "description": "Maximum persisted turns retained per completed task."
+          "description": "Number of newest turns whose file-change evidence is preserved; older eligible payloads are truncated while durable turn history remains."
         },
         "muster.retention.maxStoredOutputChars": {
           "type": "number",

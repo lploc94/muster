@@ -10,11 +10,12 @@ function report(fileBytes) {
     pageCount: Math.ceil(fileBytes / 4096),
     freelistCount: 0,
     pageSize: 4096,
-    autoVacuum: 0,
+    autoVacuum: 2,
     tableBytesSource: 'dbstat',
     tables: [
-      { name: 'operations', bytes: Math.floor(fileBytes / 2) },
-      { name: 'tasks', bytes: Math.ceil(fileBytes / 2) },
+      { name: 'operations', bytes: Math.floor(fileBytes / 3) },
+      { name: 'tasks', bytes: Math.floor(fileBytes / 3) },
+      { name: 'tool_calls', bytes: Math.ceil(fileBytes / 3) },
     ],
   };
 }
@@ -45,6 +46,7 @@ function completeEvidence() {
       canaryStoredInEvidence: false,
     },
     generatedAt: '2026-07-31T12:00:00.000Z',
+    commitSha: '0123456789abcdef0123456789abcdef01234567',
   };
 }
 
@@ -73,6 +75,17 @@ test('rejects lifecycle evidence that misses its byte, pass, row, or peer invari
     const evidence = completeEvidence();
     evidence.afterRetention.retention.completedPasses = 1;
     assert.ok(validateStorageLifecycleEvidence(evidence).some((failure) => /completedPasses/.test(failure)));
+  }
+  {
+    const evidence = completeEvidence();
+    evidence.afterSeed.storage.autoVacuum = 0;
+    assert.ok(validateStorageLifecycleEvidence(evidence).some((failure) => /autoVacuum must be 2/.test(failure)));
+  }
+  {
+    const evidence = completeEvidence();
+    evidence.afterRetention.storage.tables = evidence.afterRetention.storage.tables
+      .filter((table) => table.name !== 'tool_calls');
+    assert.ok(validateStorageLifecycleEvidence(evidence).some((failure) => /tool_calls bytes/.test(failure)));
   }
   {
     const evidence = completeEvidence();

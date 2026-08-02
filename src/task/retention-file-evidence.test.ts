@@ -79,7 +79,7 @@ describe('retention file evidence', () => {
     }
   }, 20_000);
 
-  it('strips bounded file-change diff bytes from settled turns of an open task without touching its running turn', async () => {
+  it('keeps the newest settled turn of an open task without touching its running turn', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-retention-open-file-evidence-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -120,14 +120,13 @@ describe('retention file evidence', () => {
       await expect(repository.execute({
         kind: 'applyRetention', workspaceId: 'ws', taskId: task.id, keepLatestTurns: 1,
         maxStoredOutputChars: 200_000,
-      })).resolves.toMatchObject({ ok: true, changed: true, retentionEntriesStripped: 1 });
+      })).resolves.toMatchObject({ ok: true, changed: false });
 
       const tools = await repository.listToolCalls(task.id);
       expect(tools.find((tool) => tool.turnId === settledTurn.id)?.fileChanges).toEqual([{
-        path: 'src/settled.ts', oldText: null, newText: '', oldLineCount: 1, newLineCount: 1,
-        retentionTruncated: true,
+        path: 'src/settled.ts', oldText: 'settled before', newText: 'settled after',
       }]);
-      expect(tools.find((tool) => tool.turnId === settledTurn.id)?.output).toContain('[output truncated by retention policy]');
+      expect(tools.find((tool) => tool.turnId === settledTurn.id)?.output).not.toContain('[output truncated by retention policy]');
       expect(tools.find((tool) => tool.turnId === runningTurn.id)?.fileChanges).toEqual([{
         path: 'src/running.ts', oldText: 'live before', newText: 'live after',
       }]);

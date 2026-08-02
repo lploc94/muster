@@ -802,10 +802,15 @@ export async function seedOrphanLifecycleFixtures(
 ): Promise<{ deadLegacyStores: number; staleLeases: number; activeLeases: number }> {
   const now = new Date();
   const stale = new Date(now.getTime() - 61_000);
+  // Names must match what the legacy JSON store actually produced --
+  // `${storePath}.lease.${encodeURIComponent(turnId)}` with storePath being the
+  // store file itself. A shortened `.lease.*` name would make this fixture
+  // agree with the classifier while proving nothing about real residue.
+  const staleLease = join(storageDirectory, '.muster-tasks.json.lease.turn%3Aorphan-uat');
   await writeFile(join(storageDirectory, '.muster-tasks.json'), '{}', 'utf8');
-  await writeFile(join(storageDirectory, '.lease.turn%3Aorphan-uat'), 'stale', 'utf8');
-  await writeFile(join(storageDirectory, '.lease.turn%3Aactive-uat'), 'active', 'utf8');
-  await utimes(join(storageDirectory, '.lease.turn%3Aorphan-uat'), stale, stale);
+  await writeFile(staleLease, 'stale', 'utf8');
+  await writeFile(join(storageDirectory, '.muster-tasks.json.lease.turn%3Aactive-uat'), 'active', 'utf8');
+  await utimes(staleLease, stale, stale);
   return { deadLegacyStores: 1, staleLeases: 1, activeLeases: 1 };
 }
 

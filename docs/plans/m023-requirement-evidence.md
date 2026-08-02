@@ -37,3 +37,9 @@ This map synchronizes the M023 storage requirements to the two tracked packaged 
 - Evidence: `docs/plans/m023-s08-orphan-lifecycle-evidence.json`
 - Verification: `npm run test:m023-s08-orphan-evidence`
 - The classified explicit cleanup removes exactly two orphan files and seven bytes with zero failures. The subsequent classification is empty, while the SQLite trio and one active lease remain present; database-byte reclamation remains separately reported in the same continuous two-host lifecycle run.
+
+## R046
+
+- Evidence: `scripts/verify-uninstall-entrypoint.test.mjs`
+- Verification: `node --test scripts/verify-uninstall-entrypoint.test.mjs`
+- The compiled uninstall entrypoint is exercised against an isolated extension-id directory: it removes recursive content, reports an absent directory safely, and refuses a non-extension directory without deleting its sentinel.

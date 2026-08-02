@@ -168,16 +168,26 @@ describe('worker-local SQLite page reclamation', () => {
     }
   });
 
-  it('returns a checkpointed noop when there are no free pages', () => {
+  it('reports a checkpointed WAL baseline even when there are no free pages', () => {
     const dbPath = tempDbPath();
     const db = openStoreDatabase({ path: dbPath });
     try {
+      // Create committed WAL content without freeing database pages. The pass is
+      // still a page-reclaim noop, but the caller must see that checkpointing
+      // reclaimed the WAL rather than receive a misleading zero baseline.
+      db.exec('CREATE TABLE wal_only_fixture (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)');
+      db.prepare('INSERT INTO wal_only_fixture (payload) VALUES (?)').run('x'.repeat(128 * 1024));
+      const walBefore = fs.statSync(`${dbPath}-wal`).size;
+      expect(walBefore).toBeGreaterThan(0);
+
       const result = reclaimOpenDatabase(db, dbPath);
 
       expect(result.mode).toBe('noop');
       expect(result.batchesRun).toBe(0);
       expect(result.walCheckpoints).toBe(1);
       expect(result.freelistCountBefore).toBe(0);
+      expect(result.walBytesBefore).toBe(walBefore);
+      expect(result.residualWalBytes).toBeLessThan(result.walBytesBefore);
       expect(result.freelistCountAfter).toBe(0);
     } finally {
       db.close();

@@ -62,6 +62,7 @@ function completeEvidence() {
       canaryStoredInEvidence: false,
     },
     generatedAt: '2026-08-01T12:00:00.000Z',
+    commitSha: '0123456789abcdef0123456789abcdef01234567',
   };
 }
 

@@ -587,7 +587,7 @@ export interface RepositoryCommandResult {
   /** Number of retained file-change evidence entries stripped by a retention command. */
   retentionEntriesStripped?: number;
   /** Number of safely terminal workflow metadata rows reclaimed by maintenance. */
-  reclaimedWorkflowRuns?: number;
+  strippedWorkflowMessageBodies?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -10264,15 +10264,31 @@ export class SqliteTaskRepository implements TaskRepository {
 
 
   private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
+    // Keep workflow_runs and their claims durable. Deleting a run cascades its
+    // start claim while the operation ledger remains, breaking idempotent replay
+    // (or leaving a replay result that points at a missing run). Routed message
+    // bodies are terminal transport payload only; no production reader consumes
+    // them after routing, so they are the safe reclaimable portion.
     const result = await this.db.run(
-      `DELETE FROM workflow_runs
+      `UPDATE workflow_routed_messages
+          SET body_json = '{"retentionStripped":true}'
         WHERE workspace_id = ?
-          AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-          ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
-      [this.workspaceId],
+          AND body_json <> '{"retentionStripped":true}'
+          AND run_id IN (
+            SELECT workflow_runs.run_id
+              FROM workflow_runs
+             WHERE workflow_runs.workspace_id = ?
+               AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+               ${terminalWorkflowRunSafetyPredicate('workflow_runs')}
+          )`,
+      [this.workspaceId, this.workspaceId],
     );
-    const reclaimedWorkflowRuns = result.changes ?? 0;
-    return { ok: true, changed: reclaimedWorkflowRuns > 0, reclaimedWorkflowRuns };
+    const strippedWorkflowMessageBodies = result.changes ?? 0;
+    return {
+      ok: true,
+      changed: strippedWorkflowMessageBodies > 0,
+      strippedWorkflowMessageBodies,
+    };
   }
 
   private async applyRetention(
@@ -10323,9 +10339,12 @@ export class SqliteTaskRepository implements TaskRepository {
     // window. Only settled turns are eligible: trimming reasoning or a tool
     // result that is still streaming would corrupt the active transcript just
     // as surely as deleting the row.
+    const keep = Math.max(0, Math.floor(command.keepLatestTurns));
     const settledTurnIds = new Set(
       (await this.listTurns(task.id))
         .filter((turn) => isTerminalTurn(turn.status))
+        .sort((left, right) => right.sequence - left.sequence || right.id.localeCompare(left.id))
+        .slice(keep)
         .map((turn) => turn.id),
     );
     const statements: SqlStatement[] = [];

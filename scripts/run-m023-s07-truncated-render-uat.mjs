@@ -1,13 +1,14 @@
 /**
  * Package Muster and launch one disposable VS Code Extension Development Host
  * to capture M023/S07's real webview retention-summary DOM observation.
- * T06 owns committing the resulting ledger; this runner writes only a caller
- * supplied temporary output or an explicit local path.
+ * The default output is the tracked evidence ledger. Callers may override it,
+ * but runtime fixtures always remain disposable under tempDir.
  */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import AdmZip from 'adm-zip';
 import { runTests } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
@@ -18,11 +19,13 @@ import {
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
+const commitSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const version = process.env.MUSTER_VSCODE_VERSION || 'stable';
 const vscodeExecutablePath = process.env.MUSTER_VSCODE_EXECUTABLE_PATH;
 const downloadTimeout = Number.parseInt(process.env.MUSTER_VSCODE_DOWNLOAD_TIMEOUT_MS || '120000', 10);
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm023-s07-render-'));
-const evidenceOut = process.env.MUSTER_UAT_EVIDENCE_OUT || path.join(tempDir, 'm023-s07-truncated-render-evidence.json');
+const evidenceOut = process.env.MUSTER_UAT_EVIDENCE_OUT ||
+  path.join(root, 'docs', 'plans', 'm023-s07-truncated-render-evidence.json');
 const hostResultOut = path.join(tempDir, 'host-result.json');
 
 function writeJson(filePath, value) {
@@ -75,10 +78,10 @@ async function main() {
     });
     if (!fs.existsSync(hostResultOut)) throw new Error('Extension Development Host exited without a render observation');
     const result = JSON.parse(fs.readFileSync(hostResultOut, 'utf8'));
-    writeJson(evidenceOut, assembleTruncatedRenderEvidence(result));
+    writeJson(evidenceOut, assembleTruncatedRenderEvidence(result, new Date().toISOString(), commitSha));
     console.log(`[run-m023-s07-truncated-render-uat] PASS evidence=${evidenceOut}`);
   } catch (error) {
-    const evidence = assembleBlockedTruncatedRenderEvidence(error);
+    const evidence = assembleBlockedTruncatedRenderEvidence(error, new Date().toISOString(), commitSha);
     writeJson(evidenceOut, evidence);
     console.log(`[run-m023-s07-truncated-render-uat] BLOCKED evidence=${evidenceOut}`);
     if (process.env.MUSTER_UAT_ALLOW_BLOCKED !== '1') throw error;

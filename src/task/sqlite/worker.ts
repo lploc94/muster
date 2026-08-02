@@ -382,11 +382,16 @@ function estimatedTableBytes(conn: DatabaseSync, tables: string[]): StorageRepor
 function storageReport(): StorageReportMeta {
   const conn = requireDb();
   if (!openPath) throw new MusterInvariantError('invariant', 'read');
-  const scalar = (pragma: string): number => {
-    const row = conn.prepare(`PRAGMA ${pragma}`).get() as Record<string, number>;
-    return Number(Object.values(row)[0]);
-  };
-  const names = tableNames(conn);
+  // One read transaction pins every SQLite-derived metric to one generation.
+  // Without it, a peer host can commit/checkpoint between dbstat, page_count,
+  // and freelist_count reads, producing a report that never existed at once.
+  conn.exec('BEGIN');
+  try {
+    const scalar = (pragma: string): number => {
+      const row = conn.prepare(`PRAGMA ${pragma}`).get() as Record<string, number>;
+      return Number(Object.values(row)[0]);
+    };
+    const names = tableNames(conn);
   let tableBytesSource: StorageReportMeta['tableBytesSource'] = 'dbstat';
   let tables: StorageReportMeta['tables'];
   try {
@@ -406,12 +411,15 @@ function storageReport(): StorageReportMeta {
     tableBytesSource = 'estimated';
     tables = estimatedTableBytes(conn, names);
   }
-  tables.sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name));
-  return {
-    fileBytes: fileBytes(openPath), walBytes: fileBytes(`${openPath}-wal`), shmBytes: fileBytes(`${openPath}-shm`),
-    pageCount: scalar('page_count'), freelistCount: scalar('freelist_count'), pageSize: scalar('page_size'),
-    autoVacuum: scalar('auto_vacuum'), tableBytesSource, tables,
-  };
+    tables.sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name));
+    return {
+      fileBytes: fileBytes(openPath), walBytes: fileBytes(`${openPath}-wal`), shmBytes: fileBytes(`${openPath}-shm`),
+      pageCount: scalar('page_count'), freelistCount: scalar('freelist_count'), pageSize: scalar('page_size'),
+      autoVacuum: scalar('auto_vacuum'), tableBytesSource, tables,
+    };
+  } finally {
+    conn.exec('COMMIT');
+  }
 }
 
 let forceStorageEstimate = false;

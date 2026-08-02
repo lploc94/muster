@@ -8,6 +8,8 @@ export type ReclaimResult = {
   mode: ReclaimMode;
   fileBytesBefore: number;
   fileBytesAfter: number;
+  /** WAL bytes before the first checkpoint; reports checkpoint-only reclamation. */
+  walBytesBefore: number;
   freelistCountBefore: number;
   freelistCountAfter: number;
   batchesRun: number;
@@ -59,9 +61,16 @@ function checkpointTruncate(db: DatabaseSync): void {
   if (busy !== 0) throw new MusterSqliteError('busy', 'write');
 }
 
-function resultBase(db: DatabaseSync, sourcePath: string): Omit<ReclaimResult, 'mode' | 'fileBytesAfter' | 'freelistCountAfter' | 'batchesRun' | 'walCheckpoints' | 'residualWalBytes'> {
+function resultBase(
+  db: DatabaseSync,
+  sourcePath: string,
+  walBytesBefore: number,
+): Omit<ReclaimResult, 'mode' | 'fileBytesAfter' | 'freelistCountAfter' | 'batchesRun' | 'walCheckpoints' | 'residualWalBytes'> {
   return {
+    // main-file baseline is after the initial checkpoint: only then are both
+    // sides comparable for incremental vacuum/VACUUM page reclamation.
     fileBytesBefore: fileBytes(sourcePath),
+    walBytesBefore,
     freelistCountBefore: scalar(db, 'freelist_count'),
   };
 }
@@ -98,11 +107,12 @@ export function reclaimOpenDatabase(
   options: ReclaimOptions = {},
 ): ReclaimResult {
   try {
-    // Establish an on-disk baseline before measuring. In WAL mode the main-file
-    // size can lag committed pages, which would make a post-reclaim comparison
-    // appear to grow even though pages were correctly released.
+    // Measure both main DB and WAL before checkpointing. A checkpoint-only pass
+    // can free significant WAL bytes while freelist_count remains zero; measuring
+    // afterward incorrectly reports that useful reclaim as a no-op.
+    const walBytesBefore = fileBytes(`${sourcePath}-wal`);
     checkpointTruncate(db);
-    const base = resultBase(db, sourcePath);
+    const base = resultBase(db, sourcePath, walBytesBefore);
     const autoVacuum = scalar(db, 'auto_vacuum');
 
     if (base.freelistCountBefore === 0) {

@@ -6,7 +6,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import AdmZip from 'adm-zip';
 import { downloadAndUnzipVSCode } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
@@ -15,6 +15,7 @@ import { validateOrphanLifecycleEvidence } from './m023-s08-orphan-lifecycle-evi
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
+const commitSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const version = process.env.MUSTER_VSCODE_VERSION || 'stable';
 const vscodeExecutablePathEnv = process.env.MUSTER_VSCODE_EXECUTABLE_PATH;
 const downloadTimeout = Number.parseInt(
@@ -203,6 +204,7 @@ function buildStorageLifecycleEvidence(result) {
       canaryStoredInEvidence: false,
     },
     generatedAt: new Date().toISOString(),
+    commitSha,
   };
 }
 
@@ -226,6 +228,7 @@ function buildOrphanLifecycleEvidence(result) {
       canaryStoredInEvidence: false,
     },
     generatedAt: new Date().toISOString(),
+    commitSha,
   };
 }
 

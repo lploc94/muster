@@ -68,7 +68,7 @@ export type RetentionPassReport = {
   reclaimMode: ReclaimMode;
   fileBytesBefore: number;
   fileBytesAfter: number;
-  reclaimedWorkflowRuns: number;
+  strippedWorkflowMessageBodies: number;
 };
 
 export type RetentionReportSnapshot = {
@@ -116,7 +116,7 @@ export function formatRetentionReportLines(snapshot: RetentionReportSnapshot): s
       `reclaim_mode: ${pass.reclaimMode}`,
       `file_bytes_before: ${pass.fileBytesBefore}`,
       `file_bytes_after: ${pass.fileBytesAfter}`,
-      `reclaimed_workflow_runs: ${pass.reclaimedWorkflowRuns}`,
+      `stripped_workflow_message_bodies: ${pass.strippedWorkflowMessageBodies}`,
     );
   }
   return lines;
@@ -161,7 +161,14 @@ export type CompactStorageCommandDeps = {
 
 export type ReclaimOrphanedFilesCommandResult =
   | { kind: 'cancel' }
-  | { kind: 'success'; removedFiles: number; bytesReclaimed: number; failedRemovals: number }
+  | {
+      kind: 'success';
+      removedFiles: number;
+      bytesReclaimed: number;
+      failedRemovals: number;
+      /** Classified files whose on-disk identity changed after the modal opened. */
+      skippedRemovals: number;
+    }
   | { kind: 'error'; code: string; message: string };
 
 export type ReclaimOrphanedFilesCommandDeps = {
@@ -294,6 +301,7 @@ export async function handleCompactStorageCommand(
     deps.appendLine(`mode: ${result.mode}`);
     deps.appendLine(`file_bytes_before: ${result.fileBytesBefore}`);
     deps.appendLine(`file_bytes_after: ${result.fileBytesAfter}`);
+    deps.appendLine(`wal_bytes_before: ${result.walBytesBefore}`);
     deps.appendLine(`freelist_before: ${result.freelistCountBefore}`);
     deps.appendLine(`freelist_after: ${result.freelistCountAfter}`);
     deps.appendLine(`batches_run: ${result.batchesRun}`);
@@ -342,7 +350,14 @@ export async function handleReclaimOrphanedFilesCommand(
       deps.appendLine('removed_files: 0');
       deps.appendLine('bytes_reclaimed: 0');
       deps.appendLine('failed_removals: 0');
-      return { kind: 'success', removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0 };
+      deps.appendLine('skipped_removals: 0');
+      return {
+        kind: 'success',
+        removedFiles: 0,
+        bytesReclaimed: 0,
+        failedRemovals: 0,
+        skippedRemovals: 0,
+      };
     }
 
     let choice: string | undefined;
@@ -361,6 +376,7 @@ export async function handleReclaimOrphanedFilesCommand(
     deps.appendLine(`removed_files: ${result.removed.length}`);
     deps.appendLine(`bytes_reclaimed: ${result.bytesReclaimed}`);
     deps.appendLine(`failed_removals: ${result.failedRemovals}`);
+    deps.appendLine(`skipped_removals: ${result.skippedRemovals}`);
     for (const file of result.removed) {
       deps.appendLine(`removed: ${file.name} (${file.bytes} bytes)`);
     }
@@ -369,6 +385,7 @@ export async function handleReclaimOrphanedFilesCommand(
       removedFiles: result.removed.length,
       bytesReclaimed: result.bytesReclaimed,
       failedRemovals: result.failedRemovals,
+      skippedRemovals: result.skippedRemovals,
     };
   } catch (error) {
     const code = errorCodeFromUnknown(error);

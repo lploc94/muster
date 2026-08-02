@@ -87,6 +87,8 @@ export interface ToolDiffFileView {
   outsideWorkspace: boolean;
   /** Diff text was removed by retention, so this row has no expandable body. */
   retentionTruncated: boolean;
+  /** Original-side counts retained as a non-diff summary, when stripped. */
+  retentionLineCounts?: { old: number; next: number };
   hasDiffBody: boolean;
   bodyId: string;
   toggleId: string;
@@ -244,7 +246,7 @@ function formatCountsLabel(
   comparisonUnavailable: boolean,
   retentionTruncated: boolean,
 ): string {
-  if (retentionTruncated) return `+${added} ${MINUS_SIGN}${removed} (retention summary)`;
+  if (retentionTruncated) return `${added} → ${removed} lines (retention summary)`;
   if (comparisonUnavailable) return 'Comparison unavailable';
   const base = `+${added} ${MINUS_SIGN}${removed}`;
   return partial ? `${base} (partial)` : base;
@@ -299,8 +301,10 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
     evidenceOccurrences.set(fingerprint, occurrence + 1);
     const fileIdSeed = `${toolIdSeed}-${sanitizeDomIdPart(entry.path)}-${fingerprint}-${occurrence}`;
     const retentionTruncated = entry.retentionTruncated === true;
+    // oldLineCount/newLineCount are the original side sizes, not an edit
+    // script. Never present them as added/removed lines after diff text is gone.
     const comparison = retentionTruncated
-      ? { added: entry.newLineCount ?? 0, removed: entry.oldLineCount ?? 0, comparisonUnavailable: false }
+      ? { added: 0, removed: 0, comparisonUnavailable: false }
       : compareDiffLines(entry.oldText, entry.newText, Math.max(0, deadline - Date.now()), false);
     const { added, removed, comparisonUnavailable } = comparison;
     const truncated = entry.truncated === true;
@@ -328,16 +332,15 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
       comparisonUnavailable,
       outsideWorkspace,
       retentionTruncated,
+      ...(retentionTruncated
+        ? { retentionLineCounts: { old: entry.oldLineCount ?? 0, next: entry.newLineCount ?? 0 } }
+        : {}),
       hasDiffBody: !retentionTruncated,
       bodyId: `tool-diff-body-${fileIdSeed}`,
       toggleId: `tool-diff-toggle-${fileIdSeed}`,
-      countsLabel: formatCountsLabel(
-        added,
-        removed,
-        countsPartial,
-        comparisonUnavailable,
-        retentionTruncated,
-      ),
+      countsLabel: retentionTruncated
+        ? formatCountsLabel(entry.oldLineCount ?? 0, entry.newLineCount ?? 0, false, false, true)
+        : formatCountsLabel(added, removed, countsPartial, comparisonUnavailable, false),
     };
     files.push(file);
   }
@@ -363,13 +366,15 @@ export function buildToolDiffView(input: BuildToolDiffViewInput): ToolDiffView {
 export function describeDiffFileForScreenReader(file: ToolDiffFileView): string {
   const addedWord = file.added === 1 ? 'line' : 'lines';
   const removedWord = file.removed === 1 ? 'line' : 'lines';
-  let prose = `${file.path}: ${file.added} ${addedWord} added, ${file.removed} ${removedWord} removed`;
+  let prose = file.retentionLineCounts
+    ? `${file.path}: ${file.retentionLineCounts.old} to ${file.retentionLineCounts.next} lines, diff text removed by retention`
+    : `${file.path}: ${file.added} ${addedWord} added, ${file.removed} ${removedWord} removed`;
   if (file.comparisonUnavailable) {
     prose = `${file.path}: comparison unavailable because this diff is too complex`;
     if (file.outsideWorkspace) prose += ', outside workspace';
     return prose;
   }
-  if (file.retentionTruncated) {
+  if (!file.retentionLineCounts && file.retentionTruncated) {
     prose += ', diff text removed by retention';
   } else if (file.countsPartial) {
     prose += ', counts are partial because this diff was truncated';
