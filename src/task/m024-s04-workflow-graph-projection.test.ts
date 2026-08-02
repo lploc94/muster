@@ -5,6 +5,10 @@ import * as path from 'node:path';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import { stageDispositionForSettlement } from './m018-test-helpers';
+import { routeRequestWorkflowGraph } from '../host/workflow-graph-route';
+import { buildWorkflowGraphView } from '../host/workflow-graph';
+import { parseWorkflowGraphResult } from '../shared/workflow-graph-wire';
+import { buildWorkflowGraphPanelView } from '../../webview/src/lib/workflow-graph-view';
 import type { MusterTask, TurnDisposition } from './types';
 
 const WORKSPACE_ID = 'ws';
@@ -102,6 +106,27 @@ describe('M024 S04 workflow graph projection', () => {
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
       const consumer = consumerStart.operation!.result.data as { runId: string };
+      await client.run(
+        `WITH RECURSIVE sequence(n) AS (
+           SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 65
+         ) INSERT INTO workflow_runs (
+           workspace_id, run_id, definition_id, definition_version, status, origin,
+           parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
+           continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
+           max_workflow_turns, max_children, max_depth, max_concurrency,
+           max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
+           children_reserved, started_at, deadline_at, created_at, updated_at
+         ) SELECT workspace_id, printf('child-run-%03d', sequence.n), definition_id,
+                  definition_version, 'running', 'child', run_id, owner_root_task_id,
+                  caller_task_id, caller_turn_id, NULL, policy_json,
+                  max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+                  max_children, max_depth, max_concurrency, max_aggregate_bytes,
+                  0, 0, 0, NULL, NULL, '2026-08-01T00:00:03.000Z',
+                  '2026-08-01T00:00:03.000Z'
+             FROM workflow_runs CROSS JOIN sequence
+            WHERE workspace_id = ? AND run_id = ?`,
+        [WORKSPACE_ID, consumer.runId],
+      );
       const five = await client.get<{ task_id: string }>(
         `SELECT task_id FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? AND node_id = 'five'`,
@@ -138,10 +163,29 @@ describe('M024 S04 workflow graph projection', () => {
         ],
         activeGate: expect.objectContaining({ status: 'satisfied', required: 1, satisfied: 1 }),
         feedbackRounds: [],
-        childRuns: [],
+        childRuns: expect.arrayContaining([{ runId: 'child-run-001', status: 'running' }]),
         reuse: { nodeCount: 4, edgeCount: 4 },
-        diagnostics: [],
+        diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
       });
+      const hostGraph = await buildWorkflowGraphView(repository, five!.task_id);
+      const outcome = await routeRequestWorkflowGraph(
+        { type: 'requestWorkflowGraph', requestId: 'graph-request-1', taskId: five!.task_id },
+        {
+          getFocused: () => ({ taskId: five!.task_id, generation: 1 }),
+          buildWorkflowGraph: async () => hostGraph,
+        },
+      );
+      expect(outcome.kind).toBe('message');
+      const result = parseWorkflowGraphResult((outcome as { message: unknown }).message);
+      expect(result).toMatchObject({ ok: true });
+      const panel = buildWorkflowGraphPanelView((result as Extract<typeof result, { ok: true }>).graph);
+      expect(panel.nodes.filter((node) => node.reused)).toHaveLength(4);
+      expect(panel.activeGate).toMatchObject({ satisfied: 1, required: 1 });
+      expect(panel.childRuns).toHaveLength(64);
+      expect(panel.childRuns[0]).toEqual({ id: 'child-run-001', status: 'running', statusLabel: 'Running' });
+      expect(panel.reuseSummary).toMatchObject({ nodeCount: 4, edgeCount: 4 });
+      expect(panel.degradedRead.diagnostics).toEqual(['Child workflow runs were truncated']);
+
       await expect(client.get(
         `SELECT fill.artifact_run_id FROM workflow_gate_bindings binding
          JOIN workflow_gate_fills fill ON fill.workspace_id = binding.workspace_id AND fill.run_id = binding.run_id
