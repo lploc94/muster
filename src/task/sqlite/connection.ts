@@ -266,8 +266,16 @@ function tryOpenExistingCurrent(
       assertCurrentSchemaComplete(db);
       return 'current';
     }
-    if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
-      throw new ConcurrentOpenStateChanged();
+    if (appAgain === 0 && verAgain === 0) {
+      // A concurrent peer can publish its full schema pages before this connection
+      // observes application_id/user_version. This worker may be arriving after the
+      // blank preflight (so `sawBlankPreflight` is false), therefore object presence
+      // alone is insufficient to distinguish the race from a foreign DB. Retry only
+      // when the *entire* exact Muster fingerprint is visible; foreign, partial, or
+      // modified schemas fail closed below without any retry or mutation.
+      if (opts.allowConcurrentNonemptyRetry || !findSchemaFingerprintFailure(db)) {
+        throw new ConcurrentOpenStateChanged();
+      }
     }
     if (appAgain !== 0 && appAgain !== MUSTER_APPLICATION_ID) {
       throw new ForeignDatabaseError(appAgain);

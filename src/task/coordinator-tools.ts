@@ -29,6 +29,7 @@ import {
   WORKFLOW_NODE_LABEL_MAX_LENGTH,
   WORKFLOW_RUN_GOAL_MAX_LENGTH,
   type StartWorkflowEntryInput,
+  type StartWorkflowNodeReuse,
   type WorkflowEntryContractV1,
   type WorkflowPolicyV1,
 } from './workflow-types';
@@ -244,6 +245,7 @@ export type ToolCommand =
       goal?: string;
       backend?: string;
       entryInputs: readonly StartWorkflowEntryInput[];
+      reuse: readonly StartWorkflowNodeReuse[];
     };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
@@ -457,6 +459,23 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
   return { name, topology, entryContracts };
 }
 
+function parseSemanticWorkflowReuse(value: unknown): StartWorkflowNodeReuse[] | undefined {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > WORKFLOW_GRAPH_MAX_NODES) return undefined;
+  const reuse: StartWorkflowNodeReuse[] = [];
+  const seen = new Set<string>();
+  for (const raw of value) {
+    if (!isRecord(raw)) return undefined;
+    if (Object.keys(raw).some((key) => !['node', 'fromRun'].includes(key))) return undefined;
+    const nodeId = requireString(raw, 'node');
+    const fromRun = requireString(raw, 'fromRun');
+    if (!nodeId || !fromRun || seen.has(nodeId)) return undefined;
+    seen.add(nodeId);
+    reuse.push({ nodeId, fromRun });
+  }
+  return reuse;
+}
+
 function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > WORKFLOW_ENTRY_CONTRACTS_MAX) return undefined;
@@ -464,14 +483,26 @@ function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] 
   const seen = new Set<string>();
   for (const raw of value) {
     if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['node', 'input', 'value'].includes(key))) return undefined;
+    if (Object.keys(raw).some((key) => !['node', 'input', 'value', 'fromRun'].includes(key))) return undefined;
     const entryNodeId = requireString(raw, 'node');
     const inputRef = requireString(raw, 'input');
-    if (!entryNodeId || !inputRef || typeof raw.value !== 'string') return undefined;
+    const hasLiteralValue = Object.prototype.hasOwnProperty.call(raw, 'value');
+    const literalValue = typeof raw.value === 'string' ? raw.value : undefined;
+    const fromRun = requireString(raw, 'fromRun');
+    if (
+      !entryNodeId ||
+      !inputRef ||
+      hasLiteralValue === Boolean(fromRun) ||
+      (hasLiteralValue && literalValue === undefined)
+    ) return undefined;
     const key = `${entryNodeId}\0${inputRef}`;
     if (seen.has(key)) return undefined;
     seen.add(key);
-    inputs.push({ entryNodeId, inputRef, kind: 'workflow_input', value: raw.value });
+    inputs.push(
+      hasLiteralValue
+        ? { entryNodeId, inputRef, kind: 'workflow_input', value: literalValue! }
+        : { entryNodeId, inputRef, fromRun: fromRun! },
+    );
   }
   return inputs;
 }
@@ -1404,6 +1435,8 @@ export function dispatch(
         if (semanticReference) {
           const entryInputs = parseSemanticWorkflowInputs(args.inputs);
           if (!entryInputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
+          const reuse = parseSemanticWorkflowReuse(args.reuse);
+          if (!reuse) return { ok: false, toolError: 'invalid start_workflow reuse' };
           if (
             'goal' in args &&
             (
@@ -1415,7 +1448,7 @@ export function dispatch(
             return { ok: false, toolError: 'invalid start_workflow goal' };
           }
           if (
-            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs'].includes(key))
+            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs', 'reuse'].includes(key))
           ) {
             return { ok: false, toolError: 'invalid start_workflow arguments' };
           }
@@ -1430,6 +1463,7 @@ export function dispatch(
               startIdempotencyKey,
               ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
               entryInputs,
+              reuse,
             },
           };
         }

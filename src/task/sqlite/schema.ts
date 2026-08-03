@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 2 as const;
+export const SQLITE_SCHEMA_VERSION = 3 as const;
 
 /**
  * Core task-store tables.
@@ -1058,6 +1058,18 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
                AND (return_gate.continuation_run_id = ${alias}.run_id
                  OR return_gate.child_run_id = ${alias}.run_id)
                AND return_gate.status IN ('open', 'satisfied')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_gate_fills gate_fill
+             WHERE gate_fill.workspace_id = ${alias}.workspace_id
+               AND COALESCE(gate_fill.artifact_run_id, gate_fill.run_id) = ${alias}.run_id
+               AND gate_fill.run_id <> ${alias}.run_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_return_gates return_gate_artifact
+             WHERE return_gate_artifact.workspace_id = ${alias}.workspace_id
+               AND return_gate_artifact.result_run_id = ${alias}.run_id
+               AND return_gate_artifact.continuation_run_id <> ${alias}.run_id
           )`;
 }
 

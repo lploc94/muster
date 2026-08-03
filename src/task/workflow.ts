@@ -11,6 +11,8 @@ import {
   DEFAULT_WORKFLOW_POLICY,
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
+  fingerprintStartEntryInputs,
+  fingerprintStartNodeReuse,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
@@ -19,6 +21,8 @@ import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
   GraphTopologyV1,
+  StartWorkflowEntryInput,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -47,6 +51,7 @@ export type {
   DefineWorkflowResult,
   GraphTopologyV1,
   OneNodeTopologyV1,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -223,6 +228,47 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
   }
   const outgoing = new Set(topology.edges.map((e) => e.fromNodeId));
   return topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
+}
+
+/**
+ * Node ids that can be skipped when these graph nodes are reused: each declared
+ * node plus every predecessor reachable over frozen reverse edges.
+ *
+ * Skipping the whole ancestor chain is correct *because* decodeTopology bans
+ * fan-out (workflow-codec.ts: `fan-out not allowed`), so every non-terminal node
+ * has exactly one outgoing route. A predecessor of a reused node therefore has
+ * no consumer other than that node: its only purpose is to produce the result
+ * being reused. Materializing it instead would spend an agent turn whose output
+ * lands on an already-prefilled gate and is dropped by ON CONFLICT DO NOTHING.
+ *
+ * If the fan-out ban is ever relaxed this becomes unsound (a predecessor feeding
+ * a still-live sibling would be skipped, and that sibling's gate would never
+ * fill). m024-s03-mid-tree-node-reuse.test.ts pins that dependency so the ban
+ * cannot be lifted without failing a test that points back here.
+ */
+export function ancestorNodeClosure(
+  topology: WorkflowTopologyV1,
+  nodeIds: readonly string[],
+): ReadonlySet<string> {
+  const closure = new Set(nodeIds);
+  if (topology.kind !== 'graph_v1') return closure;
+  const predecessors = new Map<string, string[]>();
+  for (const edge of topology.edges) {
+    const current = predecessors.get(edge.toNodeId) ?? [];
+    current.push(edge.fromNodeId);
+    predecessors.set(edge.toNodeId, current);
+  }
+  const pending = [...closure];
+  while (pending.length > 0) {
+    const nodeId = pending.pop()!;
+    for (const predecessor of predecessors.get(nodeId) ?? []) {
+      if (!closure.has(predecessor)) {
+        closure.add(predecessor);
+        pending.push(predecessor);
+      }
+    }
+  }
+  return closure;
 }
 
 /** Return the sole terminal for callers that explicitly require a single-sink topology. */
@@ -820,7 +866,8 @@ export function fingerprintStartWorkflow(input: {
   ownerRootTaskId?: string;
   callerTaskId?: string;
   callerTurnId?: string;
-  entryInputs?: readonly { entryNodeId: string; inputRef: string; kind: string; value: string }[];
+  entryInputs?: readonly StartWorkflowEntryInput[];
+  reuse?: readonly StartWorkflowNodeReuse[];
   policy?: WorkflowPolicyV1;
 }): string {
   const payload = JSON.stringify({
@@ -832,12 +879,8 @@ export function fingerprintStartWorkflow(input: {
     backend: input.backend,
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
-    entryInputs: (input.entryInputs ?? []).map((entryInput) => ({
-      entryNodeId: entryInput.entryNodeId,
-      inputRef: entryInput.inputRef,
-      kind: entryInput.kind,
-      valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
-    })),
+    entryInputs: fingerprintStartEntryInputs(input.entryInputs ?? []),
+    reuse: fingerprintStartNodeReuse(input.reuse ?? []),
     policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
@@ -860,6 +903,7 @@ export function validateStartWorkflow(
       goal: string;
       backend: string;
       entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
+      reuse: readonly StartWorkflowNodeReuse[];
       entryContracts: readonly WorkflowEntryContractV1[];
       policy: WorkflowPolicyV1;
       ownerRootTaskId?: string;
@@ -922,6 +966,21 @@ export function validateStartWorkflow(
   }
   const contracts = input.entryContracts ?? [];
   const entryInputs = input.entryInputs ?? [];
+  const reuse = input.reuse ?? [];
+  const reuseNodeIds = new Set<string>();
+  for (const item of reuse) {
+    if (
+      !isNonEmptyBounded(item.nodeId, 128) ||
+      !isNonEmptyBounded(item.fromRun, 128) ||
+      reuseNodeIds.has(item.nodeId) ||
+      // A reference naming a node outside this topology can never be applied;
+      // accepting it would silently start a run that executes every node.
+      !allNodeIds.includes(item.nodeId)
+    ) {
+      return { ok: false, reason: 'invalid reuse' };
+    }
+    reuseNodeIds.add(item.nodeId);
+  }
   const contractByKey = new Map<string, WorkflowEntryContractV1>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
   );
@@ -929,20 +988,27 @@ export function validateStartWorkflow(
   for (const entryInput of entryInputs) {
     if (
       !isNonEmptyBounded(entryInput.entryNodeId, 128) ||
-      !isNonEmptyBounded(entryInput.inputRef, 128) ||
-      !isNonEmptyBounded(entryInput.kind, 128) ||
-      typeof entryInput.value !== 'string'
+      !isNonEmptyBounded(entryInput.inputRef, 128)
     ) {
       return { ok: false, reason: 'invalid entry input' };
     }
     const key = `${entryInput.entryNodeId}\0${entryInput.inputRef}`;
     if (inputByKey.has(key)) return { ok: false, reason: 'duplicate entry input' };
     const contract = contractByKey.get(key);
-    if (!contract || contract.expectedArtifactKind !== entryInput.kind) {
-      return { ok: false, reason: 'entry input contract mismatch' };
-    }
-    if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
-      return { ok: false, reason: 'entry artifact too large' };
+    if (!contract) return { ok: false, reason: 'entry input contract mismatch' };
+    if ('value' in entryInput) {
+      if (
+        !isNonEmptyBounded(entryInput.kind, 128) ||
+        typeof entryInput.value !== 'string' ||
+        contract.expectedArtifactKind !== entryInput.kind
+      ) {
+        return { ok: false, reason: 'entry input contract mismatch' };
+      }
+      if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
+        return { ok: false, reason: 'entry artifact too large' };
+      }
+    } else if (!isNonEmptyBounded(entryInput.fromRun, 128)) {
+      return { ok: false, reason: 'invalid entry input' };
     }
     inputByKey.set(key, entryInput);
   }
@@ -986,6 +1052,7 @@ export function validateStartWorkflow(
     ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
     ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
     entryInputs: orderedEntryInputs,
+    reuse,
     policy,
   });
   return {
@@ -998,6 +1065,7 @@ export function validateStartWorkflow(
     goal,
     backend,
     entryInputs: orderedEntryInputs,
+    reuse,
     entryContracts: contracts,
     policy,
     ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
@@ -1065,7 +1133,14 @@ export function startWorkflowConflict(
 
 /** Shape a start validation / missing-definition failure. */
 export function startWorkflowInvalid(
-  reason: 'definition not found' | 'invalid start' | 'invalid identity',
+  reason:
+    | 'definition not found'
+    | 'invalid start'
+    | 'invalid identity'
+    | 'entry input reference unresolved'
+    | 'terminal node cannot be reused'
+    | 'node reuse reference unresolved'
+    | 'reuse aggregate exceeds policy',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {

@@ -101,6 +101,7 @@ Command Palette: **Muster: Developer Reset Global Database**
   successful reset hard-quiesce and offer **Reload Window** — they must not keep writing a stale
   projection.
 - **Never automatic:** activation, open, or write failures do **not** auto-reset the database.
+- **Schema v3 and later:** the store remains **reset-only**. An incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
 
 ---
 

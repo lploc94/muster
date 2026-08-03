@@ -73,6 +73,10 @@ const MUTABLE_OR_STATEFUL_IDS: readonly UatCommandId[] = [
   UAT_COMMANDS.seedOrphanLifecycleFixtures,
   UAT_COMMANDS.reclaimOrphanedFiles,
   UAT_COMMANDS.renderProbe,
+  // M024/S06: fixture seed mutates the store; the round-trip observer drives
+  // host focus and reads a live transport result. Both are Development-only.
+  UAT_COMMANDS.seedWorkflowGraphFixture,
+  UAT_COMMANDS.observeWorkflowGraphRoundTrip,
 ];
 
 describe('UAT surface tiering (release-surface invariant)', () => {

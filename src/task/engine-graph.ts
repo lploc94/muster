@@ -2908,6 +2908,7 @@ export async function executeToolCommand(
         ...(command.goal !== undefined ? { goal: command.goal } : {}),
         ...(command.backend !== undefined ? { backend: command.backend } : {}),
         entryInputs: command.entryInputs,
+        reuse: command.reuse,
         ownerRootTaskId: ctx.rootId,
         callerTaskId: ctx.callerTaskId,
         callerTurnId: ctx.turnId,

@@ -1,0 +1,2 @@
+[pipeline]
+foreground_deadline_secs = 1200

@@ -3,6 +3,7 @@ src/**
 scripts/**
 dist/scripts/**
 !dist/scripts/m023-s07-truncated-render-host.js
+!dist/scripts/m024-s06-workflow-graph-host.js
 mcp/**
 study/**
 webview/**

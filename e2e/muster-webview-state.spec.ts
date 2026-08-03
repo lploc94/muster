@@ -10971,6 +10971,76 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(durableBlob).not.toContain('../../etc');
   });
 
+  test('M024 S05 workflow graph: focused host result renders reuse, active gate, feedback, child run, and degraded state', async ({
+    page,
+  }) => {
+    const taskId = 'task-m024-s05-workflow';
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: taskId, goal: 'Run reuse workflow', viewStatus: 'running' })],
+      focusedTaskId: taskId,
+      subtree: [task({ id: taskId, goal: 'Run reuse workflow', viewStatus: 'running' })],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await expect.poll(async () => {
+      const messages = await postedMessages(page);
+      return messages.find((message) => (message as { type?: string }).type === 'requestWorkflowGraph');
+    }).toMatchObject({ type: 'requestWorkflowGraph', taskId });
+
+    const request = (await postedMessages(page)).find(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ) as { requestId: string; taskId: string };
+
+    await postRawHostMessage(page, {
+      type: 'workflowGraphResult',
+      requestId: request.requestId,
+      taskId: request.taskId,
+      ok: true,
+      graph: {
+        runId: 'run-m024-s05',
+        nodes: [
+          { nodeId: 'node-1', status: 'succeeded', reused: true },
+          { nodeId: 'node-2', status: 'succeeded', reused: true },
+          { nodeId: 'node-3', status: 'succeeded', reused: true },
+          { nodeId: 'node-4', status: 'succeeded', reused: true },
+          { nodeId: 'node-5', status: 'running', reused: false },
+        ],
+        edges: [
+          { fromNodeId: 'node-1', toNodeId: 'node-2', inputRef: 'result', reused: true },
+          { fromNodeId: 'node-2', toNodeId: 'node-3', inputRef: 'result', reused: true },
+          { fromNodeId: 'node-3', toNodeId: 'node-4', inputRef: 'result', reused: true },
+          { fromNodeId: 'node-4', toNodeId: 'node-5', inputRef: 'result', reused: false },
+        ],
+        activeGate: { gateId: 'gate-m024-s05', status: 'blocked', satisfied: 1, required: 2 },
+        feedbackRounds: [
+          { roundId: 'feedback-m024-s05', requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
+        ],
+        childRuns: [{ runId: 'child-run-m024-s05', status: 'running' }],
+        reuse: { nodeCount: 4, edgeCount: 3 },
+        diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-graph-panel');
+    await expect(panel).toBeVisible();
+    await expect(panel.locator('[data-node-id]')).toHaveCount(5);
+    await expect(panel.getByText('Supplied from a prior result', { exact: true })).toHaveCount(4);
+    await expect(panel.locator('[data-node-id="node-5"]')).toContainText('Active node');
+    await expect(panel).toContainText('4 reused nodes · 3 reused edges');
+    await expect(panel.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Blocked');
+    await expect(panel.locator('[data-gate-id="gate-m024-s05"]')).toContainText('1 of 2 required inputs supplied');
+    await expect(panel).toContainText('Feedback rounds');
+    await expect(panel).toContainText('1 of 2 responses received');
+    await expect(panel.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
+    await expect(panel.getByRole('status')).toContainText('Workflow graph may be incomplete');
+    await expect(panel).toContainText('Workflow nodes were truncated');
+  });
+
 });
 
 declare global {
