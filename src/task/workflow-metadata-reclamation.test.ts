@@ -189,10 +189,21 @@ describe('terminal workflow metadata reclamation', () => {
       const result = await repository.execute({ kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID });
 
       expect(result).toMatchObject({ ok: true, changed: true, strippedWorkflowMessageBodies: 1 });
+      // Retention strips only routed transport bodies. It deliberately preserves
+      // every workflow run: deleting a terminal run cascades its start claim while
+      // the operation ledger remains, which breaks idempotent replay. Cross-run
+      // artifact pins remain durable alongside the producer and consumer runs.
       await expect(client.all<{ run_id: string }>(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? ORDER BY run_id`, [WORKSPACE_ID],
-      )).resolves.toEqual([safeRunId, liveActivationRunId, liveGateRunId]
-        .sort((left, right) => left.localeCompare(right)).map((run_id) => ({ run_id })));
+      )).resolves.toEqual([
+        safeRunId, secondSafeRunId, pinnedProducerRunId, pinConsumerRunId,
+        liveGateRunId, liveActivationRunId,
+      ].sort((left, right) => left.localeCompare(right)).map((run_id) => ({ run_id })));
+      await expect(client.get<{ artifact_id: string }>(
+        `SELECT artifact_id FROM workflow_artifacts
+          WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+        [WORKSPACE_ID, pinnedProducerRunId, 'cross-run-pinned-artifact'],
+      )).resolves.toEqual({ artifact_id: 'cross-run-pinned-artifact' });
       // This fixture starts a workspace-scoped run (no claim row). Its operation
       // ledger and run still survive, so replay never points at a deleted target.
       await expect(client.get<{ count: number }>(
