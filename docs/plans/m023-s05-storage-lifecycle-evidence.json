@@ -1,0 +1,789 @@
+{
+  "ok": true,
+  "kind": "m023-s05-storage-lifecycle-live-uat",
+  "schemaVersion": 1,
+  "before": {
+    "storage": {
+      "fileBytes": 684032,
+      "walBytes": 177192,
+      "shmBytes": 32768,
+      "pageCount": 169,
+      "freelistCount": 0,
+      "pageSize": 4096,
+      "autoVacuum": 2,
+      "tableBytesSource": "dbstat",
+      "tables": [
+        {
+          "name": "workflow_runs",
+          "bytes": 32768
+        },
+        {
+          "name": "turns",
+          "bytes": 24576
+        },
+        {
+          "name": "change_log",
+          "bytes": 20480
+        },
+        {
+          "name": "task_session_bindings",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_activations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_continuations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_feedback_rounds",
+          "bytes": 20480
+        },
+        {
+          "name": "messages",
+          "bytes": 16384
+        },
+        {
+          "name": "resource_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "session_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "tasks",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_artifacts",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_definition_edges",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_nodes",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_return_gates",
+          "bytes": 16384
+        },
+        {
+          "name": "presentation_operations",
+          "bytes": 12288
+        },
+        {
+          "name": "presentations",
+          "bytes": 12288
+        },
+        {
+          "name": "reasoning_segments",
+          "bytes": 12288
+        },
+        {
+          "name": "runtime_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "send_outbox",
+          "bytes": 12288
+        },
+        {
+          "name": "session_owners",
+          "bytes": 12288
+        },
+        {
+          "name": "tool_calls",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_cancel_requests",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_disposition_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_inputs",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_definition_nodes",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_dependency_gates",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_entry_contracts",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_feedback_targets",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_gate_fills",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_start_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "workspace_locations",
+          "bytes": 12288
+        },
+        {
+          "name": "workspaces",
+          "bytes": 12288
+        },
+        {
+          "name": "change_feed_watermarks",
+          "bytes": 8192
+        },
+        {
+          "name": "operations",
+          "bytes": 8192
+        },
+        {
+          "name": "send_receipts",
+          "bytes": 8192
+        },
+        {
+          "name": "task_prerequisites",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_artifact_sources",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_definitions",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_gate_bindings",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_routed_messages",
+          "bytes": 8192
+        },
+        {
+          "name": "workspace_revisions",
+          "bytes": 8192
+        }
+      ]
+    },
+    "retention": {
+      "completedPasses": 20,
+      "failedPasses": 0,
+      "latestPassOrdinal": 20
+    },
+    "durableRows": {
+      "tasks": 6,
+      "turns": 7,
+      "messages": 14,
+      "operations": 0
+    },
+    "retentionTruncatedEntries": 0
+  },
+  "afterSeed": {
+    "storage": {
+      "fileBytes": 8093696,
+      "walBytes": 7972232,
+      "shmBytes": 32768,
+      "pageCount": 1976,
+      "freelistCount": 0,
+      "pageSize": 4096,
+      "autoVacuum": 2,
+      "tableBytesSource": "dbstat",
+      "tables": [
+        {
+          "name": "tool_calls",
+          "bytes": 7405568
+        },
+        {
+          "name": "workflow_runs",
+          "bytes": 32768
+        },
+        {
+          "name": "turns",
+          "bytes": 24576
+        },
+        {
+          "name": "change_log",
+          "bytes": 20480
+        },
+        {
+          "name": "task_session_bindings",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_activations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_continuations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_feedback_rounds",
+          "bytes": 20480
+        },
+        {
+          "name": "messages",
+          "bytes": 16384
+        },
+        {
+          "name": "resource_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "session_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "tasks",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_artifacts",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_definition_edges",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_nodes",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_return_gates",
+          "bytes": 16384
+        },
+        {
+          "name": "presentation_operations",
+          "bytes": 12288
+        },
+        {
+          "name": "presentations",
+          "bytes": 12288
+        },
+        {
+          "name": "reasoning_segments",
+          "bytes": 12288
+        },
+        {
+          "name": "runtime_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "send_outbox",
+          "bytes": 12288
+        },
+        {
+          "name": "session_owners",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_cancel_requests",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_disposition_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_inputs",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_definition_nodes",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_dependency_gates",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_entry_contracts",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_feedback_targets",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_gate_fills",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_start_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "workspace_locations",
+          "bytes": 12288
+        },
+        {
+          "name": "workspaces",
+          "bytes": 12288
+        },
+        {
+          "name": "change_feed_watermarks",
+          "bytes": 8192
+        },
+        {
+          "name": "operations",
+          "bytes": 8192
+        },
+        {
+          "name": "send_receipts",
+          "bytes": 8192
+        },
+        {
+          "name": "task_prerequisites",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_artifact_sources",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_definitions",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_gate_bindings",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_routed_messages",
+          "bytes": 8192
+        },
+        {
+          "name": "workspace_revisions",
+          "bytes": 8192
+        }
+      ]
+    },
+    "retention": {
+      "completedPasses": 20,
+      "failedPasses": 0,
+      "latestPassOrdinal": 20
+    },
+    "durableRows": {
+      "tasks": 8,
+      "turns": 13,
+      "messages": 14,
+      "operations": 0
+    },
+    "retentionTruncatedEntries": 0
+  },
+  "afterRetention": {
+    "storage": {
+      "fileBytes": 2785280,
+      "walBytes": 0,
+      "shmBytes": 32768,
+      "pageCount": 680,
+      "freelistCount": 0,
+      "pageSize": 4096,
+      "autoVacuum": 2,
+      "tableBytesSource": "dbstat",
+      "tables": [
+        {
+          "name": "tool_calls",
+          "bytes": 2097152
+        },
+        {
+          "name": "workflow_runs",
+          "bytes": 32768
+        },
+        {
+          "name": "change_log",
+          "bytes": 28672
+        },
+        {
+          "name": "turns",
+          "bytes": 24576
+        },
+        {
+          "name": "task_session_bindings",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_activations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_continuations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_feedback_rounds",
+          "bytes": 20480
+        },
+        {
+          "name": "messages",
+          "bytes": 16384
+        },
+        {
+          "name": "resource_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "session_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "tasks",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_artifacts",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_definition_edges",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_nodes",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_return_gates",
+          "bytes": 16384
+        },
+        {
+          "name": "presentation_operations",
+          "bytes": 12288
+        },
+        {
+          "name": "presentations",
+          "bytes": 12288
+        },
+        {
+          "name": "reasoning_segments",
+          "bytes": 12288
+        },
+        {
+          "name": "runtime_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "send_outbox",
+          "bytes": 12288
+        },
+        {
+          "name": "session_owners",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_cancel_requests",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_disposition_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_inputs",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_definition_nodes",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_dependency_gates",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_entry_contracts",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_feedback_targets",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_gate_fills",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_start_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "workspace_locations",
+          "bytes": 12288
+        },
+        {
+          "name": "workspaces",
+          "bytes": 12288
+        },
+        {
+          "name": "change_feed_watermarks",
+          "bytes": 8192
+        },
+        {
+          "name": "operations",
+          "bytes": 8192
+        },
+        {
+          "name": "send_receipts",
+          "bytes": 8192
+        },
+        {
+          "name": "task_prerequisites",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_artifact_sources",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_definitions",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_gate_bindings",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_routed_messages",
+          "bytes": 8192
+        },
+        {
+          "name": "workspace_revisions",
+          "bytes": 8192
+        }
+      ]
+    },
+    "retention": {
+      "completedPasses": 22,
+      "failedPasses": 0,
+      "latestPassOrdinal": 22
+    },
+    "durableRows": {
+      "tasks": 8,
+      "turns": 13,
+      "messages": 14,
+      "operations": 0
+    },
+    "retentionTruncatedEntries": 4
+  },
+  "peerAfterRetention": {
+    "storage": {
+      "fileBytes": 2785280,
+      "walBytes": 0,
+      "shmBytes": 32768,
+      "pageCount": 680,
+      "freelistCount": 0,
+      "pageSize": 4096,
+      "autoVacuum": 2,
+      "tableBytesSource": "dbstat",
+      "tables": [
+        {
+          "name": "tool_calls",
+          "bytes": 2097152
+        },
+        {
+          "name": "workflow_runs",
+          "bytes": 32768
+        },
+        {
+          "name": "change_log",
+          "bytes": 28672
+        },
+        {
+          "name": "turns",
+          "bytes": 24576
+        },
+        {
+          "name": "task_session_bindings",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_activations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_continuations",
+          "bytes": 20480
+        },
+        {
+          "name": "workflow_feedback_rounds",
+          "bytes": 20480
+        },
+        {
+          "name": "messages",
+          "bytes": 16384
+        },
+        {
+          "name": "resource_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "session_claims",
+          "bytes": 16384
+        },
+        {
+          "name": "tasks",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_artifacts",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_definition_edges",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_nodes",
+          "bytes": 16384
+        },
+        {
+          "name": "workflow_return_gates",
+          "bytes": 16384
+        },
+        {
+          "name": "presentation_operations",
+          "bytes": 12288
+        },
+        {
+          "name": "presentations",
+          "bytes": 12288
+        },
+        {
+          "name": "reasoning_segments",
+          "bytes": 12288
+        },
+        {
+          "name": "runtime_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "send_outbox",
+          "bytes": 12288
+        },
+        {
+          "name": "session_owners",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_cancel_requests",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_disposition_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "turn_inputs",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_definition_nodes",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_dependency_gates",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_entry_contracts",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_feedback_targets",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_gate_fills",
+          "bytes": 12288
+        },
+        {
+          "name": "workflow_start_claims",
+          "bytes": 12288
+        },
+        {
+          "name": "workspace_locations",
+          "bytes": 12288
+        },
+        {
+          "name": "workspaces",
+          "bytes": 12288
+        },
+        {
+          "name": "change_feed_watermarks",
+          "bytes": 8192
+        },
+        {
+          "name": "operations",
+          "bytes": 8192
+        },
+        {
+          "name": "send_receipts",
+          "bytes": 8192
+        },
+        {
+          "name": "task_prerequisites",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_artifact_sources",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_definitions",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_gate_bindings",
+          "bytes": 8192
+        },
+        {
+          "name": "workflow_routed_messages",
+          "bytes": 8192
+        },
+        {
+          "name": "workspace_revisions",
+          "bytes": 8192
+        }
+      ]
+    },
+    "retention": {
+      "completedPasses": 1,
+      "failedPasses": 0,
+      "latestPassOrdinal": 1
+    },
+    "durableRows": {
+      "tasks": 8,
+      "turns": 13,
+      "messages": 14,
+      "operations": 0
+    },
+    "retentionTruncatedEntries": 4
+  },
+  "contentSafety": {
+    "absolutePathsStoredInEvidence": false,
+    "messageBodiesStoredInEvidence": false,
+    "sessionIdsStoredInEvidence": false,
+    "canaryStoredInEvidence": false
+  },
+  "generatedAt": "2026-08-02T02:19:24.306Z",
+  "commitSha": "03e6e84fad4faf44d2874214efa5fb3e51ed6151"
+}

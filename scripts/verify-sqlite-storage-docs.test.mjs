@@ -17,6 +17,23 @@ const required = {
     'Muster: Back Up Global Database',
     'muster.developerResetGlobalDatabase',
     'Muster: Developer Reset Global Database',
+    'muster.compactStorage',
+    'Muster: Compact Storage',
+    'muster.reclaimOrphanedFiles',
+    'Muster: Reclaim Orphaned Files',
+    'unmigrated legacy history',
+    'only from the explicit Command Palette command',
+    'No timer, watcher, scheduled scan, or automatic sweep invokes orphan reclamation.',
+    'An empty classification emits zero values without prompting.',
+    'Cancellation emits no reclamation result.',
+    'removed_files',
+    'bytes_reclaimed',
+    'failed_removals',
+    'vscode:uninstall',
+    'tlelabs.muster',
+    'always exits 0',
+    'required_bytes',
+    'available_bytes',
     'not a backup',
     'no in-product restore/import command',
     'Supported manual restore',
@@ -150,6 +167,9 @@ function validate(files) {
   const byId = Object.fromEntries(commands.map((c) => [c.command, c.title]));
   assert.equal(byId['muster.backupDatabase'], 'Muster: Back Up Global Database');
   assert.equal(byId['muster.developerResetGlobalDatabase'], 'Muster: Developer Reset Global Database');
+  assert.equal(byId['muster.compactStorage'], 'Muster: Compact Storage');
+  assert.equal(byId['muster.reclaimOrphanedFiles'], 'Muster: Reclaim Orphaned Files');
+  assert.equal(pkg.scripts?.['vscode:uninstall'], 'node ./dist/src/uninstall.js');
   assert.ok(guide.includes('muster.backupDatabase'));
   assert.ok(guide.includes(byId['muster.backupDatabase']));
   assert.ok(guide.includes('muster.developerResetGlobalDatabase'));
@@ -179,6 +199,17 @@ test('rejects omitted location, command, restore, and privacy markers', async ()
   for (const marker of [
     'globalStorageUri',
     'muster.backupDatabase',
+    'muster.reclaimOrphanedFiles',
+    'Muster: Reclaim Orphaned Files',
+    'unmigrated legacy history',
+    'only from the explicit Command Palette command',
+    'No timer, watcher, scheduled scan, or automatic sweep invokes orphan reclamation.',
+    'An empty classification emits zero values without prompting.',
+    'Cancellation emits no reclamation result.',
+    'removed_files',
+    'vscode:uninstall',
+    'tlelabs.muster',
+    'always exits 0',
     'Supported manual restore',
     'does not encrypt SQLite at rest',
     'npm run test:sqlite-storage-docs',

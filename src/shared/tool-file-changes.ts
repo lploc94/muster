@@ -35,6 +35,10 @@ export interface BoundedToolFileChange {
    * workspace. Always `true` when set — never `false`.
    */
   outsideWorkspace?: true;
+  /** Present only after retention strips body text; paired with both line counts. */
+  retentionTruncated?: true;
+  oldLineCount?: number;
+  newLineCount?: number;
 }
 
 /** Path classification after sanitization; empty path means rejected. */
@@ -231,12 +235,30 @@ export function boundToolFileChanges(
     const outsideWorkspace =
       classified.outsideWorkspace === true || entry.outsideWorkspace === true;
 
+    // Retention summaries are host-generated and carry no diff body. Preserve
+    // them only as the complete structural tuple so malformed persistence cannot
+    // manufacture a no-diff render state at the webview boundary.
+    const oldLineCount = entry.oldLineCount;
+    const newLineCount = entry.newLineCount;
+    const retentionTruncated =
+      entry.retentionTruncated === true &&
+      entry.oldText === null &&
+      entry.newText === '' &&
+      typeof oldLineCount === 'number' && Number.isSafeInteger(oldLineCount) && oldLineCount >= 0 &&
+      typeof newLineCount === 'number' && Number.isSafeInteger(newLineCount) && newLineCount >= 0;
     const candidate: BoundedToolFileChange = {
       path: classified.path,
       oldText,
       newText: clippedNew.text,
       ...(truncated ? { truncated: true } : {}),
       ...(outsideWorkspace ? { outsideWorkspace: true } : {}),
+      ...(retentionTruncated
+        ? {
+            retentionTruncated: true,
+            oldLineCount: oldLineCount!,
+            newLineCount: newLineCount!,
+          }
+        : {}),
     };
     const candidateBytes = toolFileChangeRetainedBytes(candidate);
     if (retainedBytes + candidateBytes > TOOL_FILE_CHANGES_TOTAL_MAX_BYTES) {

@@ -53,6 +53,18 @@
       {
         "command": "muster.developerResetGlobalDatabase",
         "title": "Muster: Developer Reset Global Database"
+      },
+      {
+        "command": "muster.storageReport",
+        "title": "Muster: Show Storage Report"
+      },
+      {
+        "command": "muster.compactStorage",
+        "title": "Muster: Compact Storage"
+      },
+      {
+        "command": "muster.reclaimOrphanedFiles",
+        "title": "Muster: Reclaim Orphaned Files"
       }
     ],
     "configuration": {
@@ -157,7 +169,7 @@
           "type": "number",
           "default": 200,
           "minimum": 1,
-          "description": "Maximum persisted turns retained per completed task."
+          "description": "Number of newest turns whose file-change evidence is preserved; older eligible payloads are truncated while durable turn history remains."
         },
         "muster.retention.maxStoredOutputChars": {
           "type": "number",
@@ -317,6 +329,7 @@
     "build:webview": "vite build --config webview/vite.config.ts",
     "watch:webview": "vite build --config webview/vite.config.ts --watch",
     "vscode:prepublish": "npm run compile",
+    "vscode:uninstall": "node ./dist/src/uninstall.js",
     "mvp:claude": "tsx scripts/test-claude.ts",
     "mvp:grok": "tsx scripts/test-grok.ts",
     "mvp:kiro": "tsx scripts/test-kiro.ts",
@@ -401,6 +414,16 @@
     "test:sqlite-packaged-fault-uat": "node scripts/run-sqlite-packaged-fault-uat.mjs",
     "test:sqlite-phase5-evidence": "node --test scripts/sqlite-phase5-evidence-schema.test.mjs scripts/verify-sqlite-phase5-evidence.test.mjs",
     "test:sqlite-phase6-evidence": "node --test scripts/sqlite-phase6-evidence-schema.test.mjs scripts/verify-sqlite-phase6-evidence.test.mjs",
+    "test:m023-s05-storage-evidence": "node --test scripts/m023-s05-storage-lifecycle-evidence-schema.test.mjs scripts/verify-m023-s05-storage-lifecycle-evidence.test.mjs",
+    "test:m023-s05-storage-lifecycle-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs",
+    "test:m023-s07-render-schema": "node --test scripts/m023-s07-truncated-render-evidence-schema.test.mjs",
+    "test:m023-s07-render-assembly": "node --test scripts/m023-s07-render-evidence-assembly.test.mjs",
+    "test:m023-s07-render-evidence": "node --test scripts/verify-m023-s07-truncated-render-evidence.test.mjs",
+    "test:m023-s07-truncated-render-live-uat": "node scripts/run-m023-s07-truncated-render-uat.mjs",
+    "test:m023-s08-orphan-evidence": "node --test scripts/verify-m023-s08-orphan-lifecycle-evidence.test.mjs",
+    "test:m023-requirement-evidence": "node --test scripts/verify-m023-requirement-evidence.test.mjs",
+    "test:m023-evidence-gate": "npm run test:m023-s05-storage-evidence && npm run test:m023-s07-render-schema && npm run test:m023-s07-render-assembly && npm run test:m023-s07-render-evidence && npm run test:m023-s08-orphan-evidence && npm run test:m023-requirement-evidence",
+    "test:m023-s08-orphan-lifecycle-live-uat": "node scripts/run-sqlite-two-window-live-uat.mjs", 
     "mvp:grok-interrupt-and-send": "tsx scripts/test-grok-interrupt-and-send.ts",
     "test:webview:visual:linux": "node scripts/run-visual-baselines.mjs e2e/visual/muster-webview.visual.spec.ts",
     "test:webview:visual:linux:update": "node scripts/run-visual-baselines.mjs --update e2e/visual/muster-webview.visual.spec.ts",

@@ -1,0 +1,85 @@
+{
+  "ok": true,
+  "kind": "m023-s07-truncated-render-live-uat",
+  "schemaVersion": 1,
+  "verdict": "PASS",
+  "provenance": {
+    "vscodeVersion": "1.131.0",
+    "hostMode": "extension-development-host",
+    "probeSource": "live-extension-host-dom"
+  },
+  "observation": {
+    "fileChangeGroups": [
+      {
+        "fileRowCount": 1
+      },
+      {
+        "fileRowCount": 1
+      },
+      {
+        "fileRowCount": 1
+      },
+      {
+        "fileRowCount": 1
+      },
+      {
+        "fileRowCount": 1
+      },
+      {
+        "fileRowCount": 1
+      }
+    ],
+    "files": [
+      {
+        "retentionTruncated": true,
+        "pathText": "src/retained-0.ts",
+        "countsLabel": "1 → 1 lines (retention summary)",
+        "hasStaticSummary": true,
+        "hasDiffBody": false
+      },
+      {
+        "retentionTruncated": true,
+        "pathText": "src/retained-1.ts",
+        "countsLabel": "1 → 1 lines (retention summary)",
+        "hasStaticSummary": true,
+        "hasDiffBody": false
+      },
+      {
+        "retentionTruncated": true,
+        "pathText": "src/retained-2.ts",
+        "countsLabel": "1 → 1 lines (retention summary)",
+        "hasStaticSummary": true,
+        "hasDiffBody": false
+      },
+      {
+        "retentionTruncated": true,
+        "pathText": "src/retained-3.ts",
+        "countsLabel": "1 → 1 lines (retention summary)",
+        "hasStaticSummary": true,
+        "hasDiffBody": false
+      },
+      {
+        "retentionTruncated": false,
+        "pathText": "src/current.ts",
+        "countsLabel": "+1 −1",
+        "hasStaticSummary": false,
+        "hasDiffBody": true
+      },
+      {
+        "retentionTruncated": false,
+        "pathText": "src/live.ts",
+        "countsLabel": "+1 −1",
+        "hasStaticSummary": false,
+        "hasDiffBody": true
+      }
+    ]
+  },
+  "contentSafety": {
+    "absolutePathsStoredInEvidence": false,
+    "messageBodiesStoredInEvidence": false,
+    "sessionIdsStoredInEvidence": false,
+    "canaryStoredInEvidence": false
+  },
+  "generatedAt": "2026-08-02T02:18:59.139Z",
+  "commitSha": "03e6e84fad4faf44d2874214efa5fb3e51ed6151"
+}

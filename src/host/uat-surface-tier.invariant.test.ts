@@ -64,6 +64,15 @@ const MUTABLE_OR_STATEFUL_IDS: readonly UatCommandId[] = [
   UAT_COMMANDS.runDoctor,
   UAT_COMMANDS.acceptFirstTask,
   UAT_COMMANDS.nativeFirstRunCleanup,
+  // M023: storage lifecycle harness. seedStorageWorkload writes tasks/turns,
+  // runRetentionPass mutates payloads, reclaimOrphanedFiles deletes files, and
+  // renderProbe returns a path-bearing DOM observation (D079).
+  UAT_COMMANDS.seedStorageWorkload,
+  UAT_COMMANDS.storageLifecycleState,
+  UAT_COMMANDS.runRetentionPass,
+  UAT_COMMANDS.seedOrphanLifecycleFixtures,
+  UAT_COMMANDS.reclaimOrphanedFiles,
+  UAT_COMMANDS.renderProbe,
 ];
 
 describe('UAT surface tiering (release-surface invariant)', () => {
@@ -115,9 +124,24 @@ describe('activate() honours the resolved tier (production source scan)', () => 
 
   it('resolves a tier instead of a bare boolean env check', () => {
     expect(extensionSource).toMatch(/resolveUatSurface\s*\(/);
-    expect(extensionSource).toMatch(/registerLiveUatCommands\(\s*context,\s*uatSurface\s*\)/);
+    // The resolved tier must reach the registrar, so its allowlist and early
+    // return decide access. M023 appends storage args after it.
+    expect(extensionSource).toMatch(/registerLiveUatCommands\(\s*context,\s*uatSurface\s*[,)]/);
     // A bare isUatModeEnabled gate in activate() would re-open the surface.
     expect(extensionSource).not.toMatch(/const\s+liveUatEnabled\s*=\s*isUatModeEnabled\s*\(/);
+  });
+
+  it('keeps the M023 path-bearing probe and retention override Development-only', () => {
+    // liveUatEnabled is true for a Production VSIX at the packaging tier, so
+    // these two affordances must key off the strictly stronger 'full' check.
+    expect(extensionSource).toMatch(/const\s+fullUatSurface\s*=\s*uatSurface\s*===\s*'full'/);
+    expect(extensionSource).toMatch(/new MusterChatProvider\([^)]*fullUatSurface/);
+    expect(extensionSource).toMatch(
+      /resolveRetentionScheduleIntervalMs\(\s*fullUatSurface\s*\)/,
+    );
+    expect(extensionSource).not.toMatch(
+      /resolveRetentionScheduleIntervalMs\(\s*liveUatEnabled\s*\)/,
+    );
   });
 
   it('guards the store-mutating registrations behind a tier check', () => {
@@ -136,6 +160,11 @@ describe('activate() honours the resolved tier (production source scan)', () => 
       'UAT_COMMANDS.putSendOutbox',
       'UAT_COMMANDS.putPresentation',
       'UAT_COMMANDS.hostState',
+      // M023 storage-lifecycle handlers carry the same requirement.
+      'UAT_COMMANDS.seedStorageWorkload',
+      'UAT_COMMANDS.runRetentionPass',
+      'UAT_COMMANDS.reclaimOrphanedFiles',
+      'UAT_COMMANDS.renderProbe',
     ]) {
       const at = body.indexOf(command);
       expect(at, `${command} must be registered in registerLiveUatCommands`).toBeGreaterThan(-1);

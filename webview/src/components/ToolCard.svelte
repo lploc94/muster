@@ -116,13 +116,22 @@
   </button>
 
   {#if diffView}
-    <div class="tool-card__diff mt-1.5" role="group" aria-label="File changes">
+    <div
+      class="tool-card__diff mt-1.5"
+      role="group"
+      aria-label="File changes"
+      data-muster-file-changes
+    >
       {#each diffView.files as file (file.bodyId)}
         {@const bodyOpen = isFileBodyExpanded(file.bodyId)}
         {@const srSummary = describeDiffFileForScreenReader(file)}
-        <div class="tool-card__diff-file">
+        <div
+          class="tool-card__diff-file"
+          data-muster-file-change
+          data-muster-retention-truncated={file.retentionTruncated ? 'true' : undefined}
+        >
           <div class="tool-card__diff-summary">
-            {#if diffView.collapsedByDefault}
+            {#if file.hasDiffBody}
               <button
                 id={file.toggleId}
                 type="button"
@@ -136,23 +145,28 @@
                   class="codicon {bodyOpen ? 'codicon-chevron-down' : 'codicon-chevron-right'} tool-card__diff-chevron"
                   aria-hidden="true"
                 ></span>
-                <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+                <span class="tool-card__diff-path font-mono break-all" data-muster-file-path>{file.path}</span>
                 {#if file.outsideWorkspace}
                   <span class="tool-card__diff-outside" aria-hidden="true">Outside workspace</span>
                 {/if}
-                <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
+                <span class="tool-card__diff-counts" aria-hidden="true" data-muster-file-counts>{file.countsLabel}</span>
               </button>
             {:else}
-              <div class="tool-card__diff-summary-static" aria-label={srSummary}>
-                <span class="tool-card__diff-path font-mono break-all">{file.path}</span>
+              <div
+                class="tool-card__diff-summary-static"
+                aria-label={srSummary}
+                data-muster-file-summary="static"
+              >
+                <span class="tool-card__diff-path font-mono break-all" data-muster-file-path>{file.path}</span>
                 {#if file.outsideWorkspace}
                   <span class="tool-card__diff-outside" aria-hidden="true">Outside workspace</span>
                 {/if}
-                <span class="tool-card__diff-counts" aria-hidden="true">{file.countsLabel}</span>
+                <span class="tool-card__diff-counts" aria-hidden="true" data-muster-file-counts>{file.countsLabel}</span>
               </div>
             {/if}
           </div>
 
+          {#if file.hasDiffBody}
           <div
             id={file.bodyId}
             class="tool-card__diff-body-panel"
@@ -160,6 +174,7 @@
             aria-labelledby={diffView.collapsedByDefault ? file.toggleId : undefined}
             data-collapsed={bodyOpen ? 'false' : 'true'}
             aria-hidden={bodyOpen ? undefined : 'true'}
+            data-muster-diff-body
           >
             <div class="tool-card__diff-body-inner">
               {#if bodyOpen}
@@ -190,6 +205,7 @@
               {/if}
             </div>
           </div>
+          {/if}
         </div>
       {/each}
       {#if diffView.fileChangesOmitted !== undefined}

@@ -6,13 +6,16 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import AdmZip from 'adm-zip';
 import { downloadAndUnzipVSCode } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
+import { validateStorageLifecycleEvidence } from './m023-s05-storage-lifecycle-evidence-schema.mjs';
+import { validateOrphanLifecycleEvidence } from './m023-s08-orphan-lifecycle-evidence-schema.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
+const commitSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 const version = process.env.MUSTER_VSCODE_VERSION || 'stable';
 const vscodeExecutablePathEnv = process.env.MUSTER_VSCODE_EXECUTABLE_PATH;
 const downloadTimeout = Number.parseInt(
@@ -23,7 +26,10 @@ const downloadTimeout = Number.parseInt(
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'm2w-'));
 const evidenceOut =
   process.env.MUSTER_UAT_EVIDENCE_OUT ||
-  path.join(root, 'docs', 'plans', 'sqlite-phase4-two-window-live-uat-evidence.json');
+  path.join(root, 'docs', 'plans', 'm023-s05-storage-lifecycle-evidence.json');
+const orphanEvidenceOut =
+  process.env.MUSTER_S08_ORPHAN_EVIDENCE_OUT ||
+  path.join(root, 'docs', 'plans', 'm023-s08-orphan-lifecycle-evidence.json');
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -50,7 +56,9 @@ function linkSharedGlobalStorage(userDataDir, sharedStorageDir) {
   if (fs.existsSync(target) || fs.lstatSync(target, { throwIfNoEntry: false })) {
     fs.rmSync(target, { recursive: true, force: true });
   }
-  fs.symlinkSync(sharedStorageDir, target, 'dir');
+  // Windows directory symlinks require Developer Mode or elevation; a junction
+  // provides the same local-directory sharing without that privilege.
+  fs.symlinkSync(sharedStorageDir, target, process.platform === 'win32' ? 'junction' : 'dir');
 }
 
 function spawnWindow({
@@ -85,6 +93,9 @@ function spawnWindow({
     MUSTER_UAT_ROLE: role,
     MUSTER_UAT_PEER_GENERATION: String(generation),
     MUSTER_UAT_CONTROL_DIR: controlDir,
+    // UAT-only: A proves recurring maintenance; B keeps holding the same store
+    // without issuing a competing write pass during the short proof window.
+    MUSTER_RETENTION_INTERVAL_MS: role === 'A' ? '1000' : '300000',
   };
   const label = role === 'B' ? `B${generation}` : role;
   const logStream = fs.createWriteStream(logPath, { flags: appendLog ? 'a' : 'w' });
@@ -163,7 +174,7 @@ function validateSuccessResult(result) {
     !db ||
     typeof db.dbFileToken !== 'string' ||
     !/^[a-f0-9]{16}$/.test(db.dbFileToken) ||
-    db.userVersion !== 7 ||
+    db.userVersion !== 2 ||
     db.applicationId !== 0x4d555354 ||
     db.journalMode !== 'wal'
   ) {
@@ -172,6 +183,53 @@ function validateSuccessResult(result) {
   if (!Number.isSafeInteger(result.finalRevision) || result.finalRevision < 1) {
     throw new Error('invalid final revision');
   }
+  if (!result.storageLifecycle || typeof result.storageLifecycle !== 'object') {
+    throw new Error('UAT did not return storage lifecycle observations');
+  }
+}
+
+function buildStorageLifecycleEvidence(result) {
+  return {
+    ok: true,
+    kind: 'm023-s05-storage-lifecycle-live-uat',
+    schemaVersion: 1,
+    before: result.storageLifecycle.before,
+    afterSeed: result.storageLifecycle.afterSeed,
+    afterRetention: result.storageLifecycle.afterRetention,
+    peerAfterRetention: result.storageLifecycle.peerAfterRetention,
+    contentSafety: {
+      absolutePathsStoredInEvidence: false,
+      messageBodiesStoredInEvidence: false,
+      sessionIdsStoredInEvidence: false,
+      canaryStoredInEvidence: false,
+    },
+    generatedAt: new Date().toISOString(),
+    commitSha,
+  };
+}
+
+function buildOrphanLifecycleEvidence(result) {
+  return {
+    ok: true,
+    kind: 'm023-s08-orphan-lifecycle-live-uat',
+    schemaVersion: 1,
+    before: result.storageLifecycle.before,
+    afterSeed: result.storageLifecycle.afterSeed,
+    afterRetention: result.storageLifecycle.afterRetention,
+    peerAfterRetention: result.storageLifecycle.peerAfterRetention,
+    orphanBeforeCleanup: result.storageLifecycle.orphanBeforeCleanup,
+    orphanCleanup: result.storageLifecycle.orphanCleanup,
+    afterOrphanCleanup: result.storageLifecycle.afterOrphanCleanup,
+    peerAfterOrphanCleanup: result.storageLifecycle.peerAfterOrphanCleanup,
+    contentSafety: {
+      absolutePathsStoredInEvidence: false,
+      messageBodiesStoredInEvidence: false,
+      sessionIdsStoredInEvidence: false,
+      canaryStoredInEvidence: false,
+    },
+    generatedAt: new Date().toISOString(),
+    commitSha,
+  };
 }
 
 function buildEvidence(result, exitA, peerExits) {
@@ -248,6 +306,14 @@ async function main() {
     const sharedStorage = path.join(tempDir, 'gs');
     const controlDir = path.join(tempDir, 'ctl');
     for (const dir of [workspacePath, userDataA, userDataB, sharedStorage, controlDir]) ensureDir(dir);
+    // The storage fixture creates five settled turns and one live turn. Keep one
+    // settled turn so the production scheduler must truncate exactly four older
+    // payloads; without this workspace setting, the default 200 retains all.
+    ensureDir(path.join(workspacePath, '.vscode'));
+    fs.writeFileSync(
+      path.join(workspacePath, '.vscode', 'settings.json'),
+      `${JSON.stringify({ 'muster.retention.maxRetainedTurnsPerTask': 1 })}\n`,
+    );
     linkSharedGlobalStorage(userDataA, sharedStorage);
     linkSharedGlobalStorage(userDataB, sharedStorage);
 
@@ -339,7 +405,11 @@ async function main() {
       throw new Error(`invalid Extension Host exits: A=${exitA.code} B=${peerExits.map((e) => e.code).join(',')}`);
     }
     validateSuccessResult(result);
-    const evidence = buildEvidence(result, exitA, peerExits);
+    const evidence = buildStorageLifecycleEvidence(result);
+    const evidenceFailures = validateStorageLifecycleEvidence(evidence, { requirePass: true });
+    if (evidenceFailures.length > 0) {
+      throw new Error(`storage lifecycle evidence invalid: ${evidenceFailures.join('; ')}`);
+    }
     const serialized = JSON.stringify(evidence);
     const forbidden = [
       tempDir,
@@ -356,11 +426,22 @@ async function main() {
 
     ensureDir(path.dirname(evidenceOut));
     writeJson(evidenceOut, evidence);
+    const orphanEvidence = buildOrphanLifecycleEvidence(result);
+    const orphanEvidenceFailures = validateOrphanLifecycleEvidence(orphanEvidence, { requirePass: true });
+    if (orphanEvidenceFailures.length > 0) {
+      throw new Error(`orphan lifecycle evidence invalid: ${orphanEvidenceFailures.join('; ')}`);
+    }
+    const orphanSerialized = JSON.stringify(orphanEvidence);
+    const orphanLeaked = forbidden.find((value) => orphanSerialized.includes(value));
+    if (orphanLeaked) throw new Error('orphan evidence contains a forbidden path or synthetic body');
+    ensureDir(path.dirname(orphanEvidenceOut));
+    writeJson(orphanEvidenceOut, orphanEvidence);
     console.log(
       `[muster-two-window-live-uat] PASS scenarios=${result.scenarios.map((s) => s.id).join(',')} ` +
         `finalRevision=${result.finalRevision} vscode=${result.vscodeVersion} node=${result.nodeVersion}`,
     );
     console.log(`[muster-two-window-live-uat] evidence=${evidenceOut}`);
+    console.log(`[muster-two-window-live-uat] orphanEvidence=${orphanEvidenceOut}`);
   } finally {
     if (!keepTemp) {
       try {

@@ -4,12 +4,37 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 
+interface PackagedReclaimResult {
+  mode: 'incremental' | 'full' | 'refused' | 'noop';
+  fileBytesBefore: number;
+  fileBytesAfter: number;
+  freelistCountBefore: number;
+  freelistCountAfter: number;
+  batchesRun: number;
+  walCheckpoints: number;
+  residualWalBytes: number;
+}
+
+interface PackagedStorageReport {
+  fileBytes: number;
+  walBytes: number;
+  shmBytes: number;
+  pageCount: number;
+  freelistCount: number;
+  pageSize: number;
+  autoVacuum: number;
+  tables: Array<{ name: string; bytes: number }>;
+  tableBytesSource: 'dbstat' | 'estimated';
+}
+
 interface PackagedDbClient {
   open(dbPath: string, busyTimeoutMs?: number): Promise<void>;
   get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
   all<T>(sql: string, params?: unknown[]): Promise<T[]>;
   run(sql: string, params?: unknown[]): Promise<{ changes: number; lastInsertRowid: number }>;
   pragma(name: string): Promise<number>;
+  reclaimStorage(): Promise<PackagedReclaimResult>;
+  storageReport(): Promise<PackagedStorageReport>;
   backup(
     destinationPath: string,
     options?: { overwrite?: boolean },
@@ -56,7 +81,13 @@ export async function run(): Promise<void> {
   }
   const nodeMajor = Number.parseInt(process.versions.node.split('.')[0] ?? '0', 10);
   assert.ok(nodeMajor >= 22, `Extension Host Node is too old for node:sqlite: ${process.versions.node}`);
-  const sqlite = require('node:sqlite') as { DatabaseSync?: unknown };
+  const sqlite = require('node:sqlite') as {
+    DatabaseSync?: new (p: string, o?: { readOnly?: boolean }) => {
+      exec(sql: string): void;
+      prepare(sql: string): { get: (...a: unknown[]) => unknown; all: (...a: unknown[]) => unknown[] };
+      close(): void;
+    };
+  };
   assert.equal(typeof sqlite.DatabaseSync, 'function', 'Extension Host does not provide node:sqlite DatabaseSync');
 
   const sqliteDir = path.join(extension.extensionPath, 'dist', 'src', 'task', 'sqlite');
@@ -130,6 +161,41 @@ export async function run(): Promise<void> {
       `INSERT INTO workspace_revisions (workspace_id, revision) VALUES (?, ?)`,
       ['ws-smoke', 3],
     );
+
+    // M023/S01 + S02: these measurements and reclaim run through the packaged
+    // worker inside Electron, not merely local Node's node:sqlite implementation.
+    assert.equal(await client.pragma('auto_vacuum'), 2);
+    assert.equal(await client.pragma('journal_size_limit'), 16 * 1024 * 1024);
+    await client.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES (?,?,?,?,?)`,
+      ['ws-reclaim', 'reclaim-key', 'x'.repeat(8 * 1024 * 1024), 'now', 'now'],
+    );
+    await client.run('DELETE FROM workspaces WHERE id = ?', ['ws-reclaim']);
+    const beforeReclaim = await client.storageReport();
+    assert.ok(beforeReclaim.freelistCount > 0, 'deleted payload must leave SQLite free pages');
+    const reclaimResult = await client.reclaimStorage();
+    const storageReport = await client.storageReport();
+    assert.equal(reclaimResult.mode, 'incremental');
+    assert.ok(reclaimResult.fileBytesAfter < reclaimResult.fileBytesBefore, 'reclaim must shrink the main database file');
+    assert.ok(reclaimResult.freelistCountAfter < reclaimResult.freelistCountBefore, 'reclaim must reduce SQLite free pages');
+    assert.ok(reclaimResult.batchesRun > 0 && reclaimResult.batchesRun <= 16, 'reclaim batch count must be bounded and observable');
+    assert.ok(reclaimResult.walCheckpoints >= 3, 'reclaim must report its checked WAL checkpoints');
+    assert.ok(reclaimResult.residualWalBytes <= 16 * 1024 * 1024, 'reclaim must leave WAL within the owned connection limit');
+    assert.equal(storageReport.fileBytes, reclaimResult.fileBytesAfter, 'after report must use the reclaim measurement surface');
+    assert.ok(storageReport.fileBytes < beforeReclaim.fileBytes, 'reclaim must shrink the report file bytes after payload deletion');
+    assert.deepEqual(fs.readdirSync(tempDir).sort(), ['muster.sqlite3', 'muster.sqlite3-shm', 'muster.sqlite3-wal']);
+    assert.ok(storageReport.fileBytes > 0, 'storage report must include database bytes');
+    assert.ok(storageReport.pageCount > 0, 'storage report must include a positive page count');
+    assert.ok(storageReport.pageSize > 0, 'storage report must include a positive page size');
+    assert.ok(
+      storageReport.tables.every((table) => table.bytes >= 0 && table.bytes <= storageReport.pageCount * storageReport.pageSize),
+      'each table byte count must be bounded by the database page capacity',
+    );
+    assert.ok(
+      storageReport.tableBytesSource === 'dbstat' || storageReport.tableBytesSource === 'estimated',
+      `unexpected storage report byte source: ${String(storageReport.tableBytesSource)}`,
+    );
     const backupPath = path.join(tempDir, 'muster-backup.sqlite3');
     const backupMeta = await client.backup(backupPath, { overwrite: false });
     assert.ok(
@@ -175,9 +241,45 @@ export async function run(): Promise<void> {
       artifact.close();
     }
 
+    // M023/S02: Persist a schema-current store in SQLite's legacy NONE mode,
+    // then reopen it through a second packaged worker. This proves normal open
+    // accepts mixed modes and does not silently rewrite the existing file.
+    const legacyPath = path.join(tempDir, 'legacy-muster.sqlite3');
+    const legacyBootstrap = new packaged.DbClient({ workerPath });
+    await legacyBootstrap.open(legacyPath);
+    await legacyBootstrap.close();
+    const legacyFixture = new sqlite.DatabaseSync!(legacyPath);
+    try {
+      legacyFixture.exec('PRAGMA auto_vacuum = NONE');
+      legacyFixture.exec('VACUUM');
+      const legacyAutoVacuum = legacyFixture.prepare('PRAGMA auto_vacuum').get() as Record<string, number>;
+      assert.equal(Object.values(legacyAutoVacuum)[0], 0, 'legacy fixture must persist auto_vacuum = NONE');
+    } finally {
+      legacyFixture.close();
+    }
+    const legacyClient = new packaged.DbClient({ workerPath });
+    try {
+      await legacyClient.open(legacyPath);
+      assert.equal(await legacyClient.pragma('application_id'), 0x4d555354);
+      assert.equal(await legacyClient.pragma('user_version'), schema.SQLITE_SCHEMA_VERSION);
+      assert.equal(
+        await legacyClient.pragma('auto_vacuum'),
+        0,
+        'opening a legacy store must preserve auto_vacuum = NONE',
+      );
+      assert.equal(await legacyClient.pragma('journal_size_limit'), 16 * 1024 * 1024);
+    } finally {
+      await legacyClient.close();
+    }
+
     console.log(
       `[muster-sqlite-host-smoke] ok vscode=${vscode.version} node=${process.versions.node} ` +
-        `remote=${vscode.env.remoteName ?? 'desktop'} backup=${backupMeta.mechanism}`,
+        `remote=${vscode.env.remoteName ?? 'desktop'} backup=${backupMeta.mechanism} ` +
+        `autoVacuum=${storageReport.autoVacuum} journalSizeLimit=${await client.pragma('journal_size_limit')} ` +
+        `reclaimMode=${reclaimResult.mode} reclaimBytes=${reclaimResult.fileBytesBefore}->${reclaimResult.fileBytesAfter} ` +
+        `reclaimFreelist=${reclaimResult.freelistCountBefore}->${reclaimResult.freelistCountAfter} ` +
+        `reclaimBatches=${reclaimResult.batchesRun} reclaimCheckpoints=${reclaimResult.walCheckpoints} ` +
+        `residualWalBytes=${reclaimResult.residualWalBytes} tableBytesSource=${storageReport.tableBytesSource}`, 
     );
   } finally {
     await client.close();

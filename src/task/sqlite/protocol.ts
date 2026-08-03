@@ -15,7 +15,14 @@ import {
   type SqliteErrorCode,
   type SqliteOperationClass,
 } from './errors';
-import type { BackupResultMeta, DbResponse, ResetResultMeta, RunResult } from './rpc';
+import type {
+  BackupResultMeta,
+  DbResponse,
+  ReclaimResultMeta,
+  ResetResultMeta,
+  RunResult,
+  StorageReportMeta,
+} from './rpc';
 import { SQLITE_WORKFLOW_ENVELOPE_MAX_BYTES } from '../content-limits';
 import type { RepositoryCommandResult } from '../repository';
 
@@ -279,6 +286,14 @@ export function parseWireSuccessResponse(input: unknown): {
       }
       return { ok: true, response: { kind: 'scalar', requestId, value: obj.value } };
     }
+    case 'reclaim': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseReclaimResult(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'reclaim', requestId, result } };
+    }
     case 'backup': {
       if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
         return { ok: false, payload: makeProtocolError() };
@@ -286,6 +301,14 @@ export function parseWireSuccessResponse(input: unknown): {
       const result = parseBackupResult(obj.result);
       if (!result) return { ok: false, payload: makeProtocolError() };
       return { ok: true, response: { kind: 'backup', requestId, result } };
+    }
+    case 'storageReport': {
+      if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
+        return { ok: false, payload: makeProtocolError() };
+      }
+      const result = parseStorageReport(obj.result);
+      if (!result) return { ok: false, payload: makeProtocolError() };
+      return { ok: true, response: { kind: 'storageReport', requestId, result } };
     }
     case 'reset': {
       if (!exactKeys(obj, ['kind', 'requestId', 'result'])) {
@@ -298,6 +321,91 @@ export function parseWireSuccessResponse(input: unknown): {
     default:
       return { ok: false, payload: makeProtocolError() };
   }
+}
+
+function parseReclaimResult(value: unknown): ReclaimResultMeta | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const obj = value as Record<string, unknown>;
+  const baseKeys = [
+    'mode',
+    'fileBytesBefore',
+    'fileBytesAfter',
+    'walBytesBefore',
+    'freelistCountBefore',
+    'freelistCountAfter',
+    'batchesRun',
+    'walCheckpoints',
+    'residualWalBytes',
+  ];
+  const optionalKeys = ['requiredBytes', 'availableBytes'];
+  if (!Object.keys(obj).every((key) => baseKeys.includes(key) || optionalKeys.includes(key))) {
+    return undefined;
+  }
+  if (!baseKeys.every((key) => Object.prototype.hasOwnProperty.call(obj, key))) return undefined;
+  if (obj.mode !== 'incremental' && obj.mode !== 'full' && obj.mode !== 'refused' && obj.mode !== 'noop') {
+    return undefined;
+  }
+  for (const key of baseKeys.slice(1)) {
+    if (!isSafeNonNegativeInt(obj[key])) return undefined;
+  }
+  const hasRequired = Object.prototype.hasOwnProperty.call(obj, 'requiredBytes');
+  const hasAvailable = Object.prototype.hasOwnProperty.call(obj, 'availableBytes');
+  const requiresCapacityDiagnostic = obj.mode === 'full' || obj.mode === 'refused';
+  if (hasRequired !== hasAvailable || requiresCapacityDiagnostic !== hasRequired) return undefined;
+  if (hasRequired && (!isSafeNonNegativeInt(obj.requiredBytes) || !isSafeNonNegativeInt(obj.availableBytes))) {
+    return undefined;
+  }
+  return {
+    mode: obj.mode,
+    fileBytesBefore: obj.fileBytesBefore as number,
+    fileBytesAfter: obj.fileBytesAfter as number,
+    walBytesBefore: obj.walBytesBefore as number,
+    freelistCountBefore: obj.freelistCountBefore as number,
+    freelistCountAfter: obj.freelistCountAfter as number,
+    batchesRun: obj.batchesRun as number,
+    walCheckpoints: obj.walCheckpoints as number,
+    residualWalBytes: obj.residualWalBytes as number,
+    ...(hasRequired
+      ? { requiredBytes: obj.requiredBytes as number, availableBytes: obj.availableBytes as number }
+      : {}),
+  };
+}
+
+function parseStorageReport(value: unknown): StorageReportMeta | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const obj = value as Record<string, unknown>;
+  const keys = [
+    'fileBytes', 'walBytes', 'shmBytes', 'pageCount', 'freelistCount',
+    'pageSize', 'autoVacuum', 'tableBytesSource', 'tables',
+  ];
+  if (!exactKeys(obj, keys)) return undefined;
+  for (const key of ['fileBytes', 'walBytes', 'shmBytes', 'pageCount', 'freelistCount', 'pageSize']) {
+    if (!isSafeNonNegativeInt(obj[key])) return undefined;
+  }
+  if ((obj.pageCount as number) < 1 || (obj.pageSize as number) < 1) return undefined;
+  if (!Number.isSafeInteger(obj.autoVacuum) || ![0, 1, 2].includes(obj.autoVacuum as number)) return undefined;
+  if (obj.tableBytesSource !== 'dbstat' && obj.tableBytesSource !== 'estimated') return undefined;
+  if (!Array.isArray(obj.tables) || obj.tables.length > 4096) return undefined;
+  let previous = Number.POSITIVE_INFINITY;
+  const tables: StorageReportMeta['tables'] = [];
+  for (const item of obj.tables) {
+    if (!item || typeof item !== 'object') return undefined;
+    const table = item as Record<string, unknown>;
+    if (!exactKeys(table, ['name', 'bytes']) || typeof table.name !== 'string' ||
+      table.name.length === 0 || !isSafeNonNegativeInt(table.bytes) || table.bytes > previous) {
+      return undefined;
+    }
+    previous = table.bytes;
+    tables.push({ name: table.name, bytes: table.bytes });
+  }
+  return {
+    fileBytes: obj.fileBytes as number, walBytes: obj.walBytes as number,
+    shmBytes: obj.shmBytes as number, pageCount: obj.pageCount as number,
+    freelistCount: obj.freelistCount as number, pageSize: obj.pageSize as number,
+    autoVacuum: obj.autoVacuum as number,
+    tableBytesSource: obj.tableBytesSource,
+    tables,
+  };
 }
 
 function parseResetResult(value: unknown): ResetResultMeta | undefined {

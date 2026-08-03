@@ -11,12 +11,16 @@
  * paths — never a parallel DbClient.
  */
 
+import { utimes, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import type {
   PresentationRecord,
   SendOutboxEntry,
   TaskRepository,
 } from '../task/repository';
+import type { StorageReportMeta } from '../task/sqlite/rpc';
 import type { MusterTask, TaskMessage, TaskTurn } from '../task/types';
+import type { RetentionReportSnapshot } from './sqlite-maintenance-commands';
 
 export const UAT_MODE_ENV = 'MUSTER_UAT_MODE';
 
@@ -57,6 +61,15 @@ export const UAT_COMMANDS = {
   runDoctor: 'muster.uat.runDoctor',
   acceptFirstTask: 'muster.uat.acceptFirstTask',
   nativeFirstRunCleanup: 'muster.uat.nativeFirstRunCleanup',
+  /** M023/S05 storage lifecycle observations (production-path delegates). */
+  seedStorageWorkload: 'muster.uat.seedStorageWorkload',
+  storageLifecycleState: 'muster.uat.storageLifecycleState',
+  runRetentionPass: 'muster.uat.runRetentionPass',
+  /** M023/S08 orphan lifecycle delegates; registered only in live UAT mode. */
+  seedOrphanLifecycleFixtures: 'muster.uat.seedOrphanLifecycleFixtures',
+  reclaimOrphanedFiles: 'muster.uat.reclaimOrphanedFiles',
+  /** M023/S07 read-only webview DOM observation; registered only in UAT mode. */
+  renderProbe: 'muster.uat.renderProbe',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];
@@ -644,6 +657,162 @@ export async function putPresentation(
     presentationId: args.presentationId,
     workspaceRevision: await repository.getWorkspaceRevision(),
   };
+}
+
+export type StorageLifecycleSeedResult = {
+  seededTasks: number;
+  seededTurns: number;
+  seededToolCalls: number;
+};
+
+const STORAGE_SEED_TASK_ID = 'uat-storage-seed-terminal';
+const STORAGE_SEED_ACTIVE_TASK_ID = 'uat-storage-seed-active';
+// Remains inside the shared 128 KiB per-side file-change boundary while
+// contributing four substantial, retention-eligible diff payloads.
+const STORAGE_SEED_LARGE_DIFF = 'x'.repeat(120 * 1024);
+// Uses the established open-task tool-output retention branch to ensure the
+// seed exceeds pages already allocated by scenarios A-I; it is not returned
+// by the numeric lifecycle observation surface.
+const STORAGE_SEED_LARGE_OUTPUT = 'y'.repeat(1_250 * 1024);
+const STORAGE_SEED_AGE_MS = 366 * 24 * 60 * 60 * 1_000;
+
+/** Keeps the live fixture eligible as wall time advances without changing production retention policy. */
+function makeStorageSeedIso(offsetMs = 0): string {
+  return new Date(Date.now() - STORAGE_SEED_AGE_MS + offsetMs).toISOString();
+}
+
+/**
+ * Creates five settled turns plus one live turn. With keepLatestTurns=1, the
+ * newest small settled turn survives and the four older large diffs are eligible.
+ * The caller owns UAT gating; this helper never opens a parallel database client.
+ */
+export async function seedStorageWorkload(
+  repository: Pick<TaskRepository, 'execute'>,
+  workspaceId: string,
+): Promise<StorageLifecycleSeedResult> {
+  const terminalTask = { ...makeTask(STORAGE_SEED_TASK_ID, 'UAT storage lifecycle terminal workload'), lifecycle: 'succeeded' as const };
+  const activeTask = makeTask(STORAGE_SEED_ACTIVE_TASK_ID, 'UAT storage lifecycle active workload');
+  await repository.execute({ kind: 'createTask', workspaceId, task: terminalTask });
+  await repository.execute({ kind: 'createTask', workspaceId, task: activeTask });
+
+  // SQLite retention preserves durable rows, but truncates oversized payloads
+  // on settled turns belonging to an otherwise open task.
+  const settledTurns: TaskTurn[] = Array.from({ length: 5 }, (_, index) => index + 1).map((sequence) => ({
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-settled-${sequence}`,
+    taskId: activeTask.id,
+    sequence,
+    status: 'succeeded' as const,
+    trigger: 'user' as const,
+    inputs: [],
+    createdAt: makeStorageSeedIso(sequence * 1_000),
+    finishedAt: makeStorageSeedIso(sequence * 1_000 + 500),
+  }));
+  for (const turn of settledTurns) {
+    await repository.execute({ kind: 'createTurn', workspaceId, turn });
+  }
+  const activeTurn: TaskTurn = {
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-6`, taskId: activeTask.id, sequence: 6,
+    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(6_000), startedAt: makeStorageSeedIso(6_100),
+  };
+  await repository.execute({ kind: 'createTurn', workspaceId, turn: activeTurn });
+
+  await repository.execute({
+    kind: 'appendTranscriptBatch', workspaceId, taskId: activeTask.id,
+    toolCalls: settledTurns.map((turn, index) => ({
+      id: `${turn.id}:edit`, taskId: activeTask.id, turnId: turn.id, toolCallId: 'edit', order: 0,
+      name: 'edit_file', kind: 'builtin' as const, status: 'success' as const,
+      output: STORAGE_SEED_LARGE_OUTPUT,
+      fileChanges: index < 4
+        ? [{
+          path: `src/retained-${index}.ts`, oldText: STORAGE_SEED_LARGE_DIFF, newText: STORAGE_SEED_LARGE_DIFF,
+        }]
+        : [{ path: 'src/current.ts', oldText: 'before', newText: 'after' }],
+      createdAt: makeStorageSeedIso(6_000 + index), updatedAt: makeStorageSeedIso(6_000 + index),
+    })),
+  });
+  await repository.execute({
+    kind: 'appendTranscriptBatch', workspaceId, taskId: activeTask.id,
+    toolCalls: [{
+      id: `${activeTurn.id}:edit`, taskId: activeTask.id, turnId: activeTurn.id, toolCallId: 'edit', order: 0,
+      name: 'edit_file', kind: 'builtin', status: 'success',
+      fileChanges: [{ path: 'src/live.ts', oldText: 'live-before', newText: 'live-after' }],
+      createdAt: makeStorageSeedIso(7_000), updatedAt: makeStorageSeedIso(7_000),
+    }],
+  });
+  return { seededTasks: 2, seededTurns: settledTurns.length + 1, seededToolCalls: settledTurns.length + 1 };
+}
+
+type LifecycleDbProbe = {
+  storageReport(): Promise<StorageReportMeta>;
+  get<T>(sql: string, params?: unknown[]): Promise<T | undefined>;
+};
+
+type LifecycleRetentionReport = { snapshot(): RetentionReportSnapshot };
+
+export type StorageLifecycleState = {
+  storage: StorageReportMeta;
+  retention: { completedPasses: number; failedPasses: number; latestPassOrdinal: number };
+  durableRows: { tasks: number; turns: number; messages: number; operations: number };
+  retentionTruncatedEntries: number;
+};
+
+/** Numeric-and-enum-only storage lifecycle observation for the live UAT runner. */
+export async function readStorageLifecycleState(deps: {
+  repository: Pick<TaskRepository, 'listTasks' | 'listToolCalls'>;
+  sqliteClient: LifecycleDbProbe;
+  retentionReport: LifecycleRetentionReport;
+  workspaceId: string;
+}): Promise<StorageLifecycleState> {
+  const tables = ['tasks', 'turns', 'messages', 'operations'] as const;
+  const [storage, snapshot, rows, tasks] = await Promise.all([
+    deps.sqliteClient.storageReport(),
+    Promise.resolve(deps.retentionReport.snapshot()),
+    Promise.all(tables.map(async (table) => {
+      const row = await deps.sqliteClient.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM ${table} WHERE workspace_id = ?`, [deps.workspaceId],
+      );
+      return [table, row?.count ?? 0] as const;
+    })),
+    deps.repository.listTasks(deps.workspaceId),
+  ]);
+  const toolCalls = await Promise.all(tasks.map((task) => deps.repository.listToolCalls(task.id)));
+  const retentionTruncatedEntries = toolCalls.flat(2).reduce(
+    (count, tool) => count + (tool.fileChanges ?? []).filter((change) => change.retentionTruncated === true).length,
+    0,
+  );
+  const latestPassOrdinal = snapshot.completedPassDetails.at(-1)?.ordinal ?? 0;
+  return {
+    storage,
+    retention: { completedPasses: snapshot.completedPasses, failedPasses: snapshot.failedPasses, latestPassOrdinal },
+    durableRows: Object.fromEntries(rows) as StorageLifecycleState['durableRows'],
+    retentionTruncatedEntries,
+  };
+}
+
+/** Preserves production retention failure semantics while giving UAT a direct pass seam. */
+export async function runRetentionPass<T>(runPass: () => Promise<T>): Promise<T> {
+  return runPass();
+}
+
+/**
+ * Creates only classifier-recognized orphan fixtures beside the activated store.
+ * Results deliberately expose numeric totals, never filenames or filesystem paths.
+ */
+export async function seedOrphanLifecycleFixtures(
+  storageDirectory: string,
+): Promise<{ deadLegacyStores: number; staleLeases: number; activeLeases: number }> {
+  const now = new Date();
+  const stale = new Date(now.getTime() - 61_000);
+  // Names must match what the legacy JSON store actually produced --
+  // `${storePath}.lease.${encodeURIComponent(turnId)}` with storePath being the
+  // store file itself. A shortened `.lease.*` name would make this fixture
+  // agree with the classifier while proving nothing about real residue.
+  const staleLease = join(storageDirectory, '.muster-tasks.json.lease.turn%3Aorphan-uat');
+  await writeFile(join(storageDirectory, '.muster-tasks.json'), '{}', 'utf8');
+  await writeFile(staleLease, 'stale', 'utf8');
+  await writeFile(join(storageDirectory, '.muster-tasks.json.lease.turn%3Aactive-uat'), 'active', 'utf8');
+  await utimes(staleLease, stale, stale);
+  return { deadLegacyStores: 1, staleLeases: 1, activeLeases: 1 };
 }
 
 export async function readDurableSurfaces(

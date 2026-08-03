@@ -88,13 +88,17 @@ import {
 } from './transitions';
 import { TRUNCATION_MARKER } from './retention';
 import {
+  isBoundedToolFileChanges,
+  stripToolFileChangeEvidenceForRetention,
+} from '../shared/tool-file-change-contract';
+import {
   PRESENTATION_MARKDOWN_MAX_CHARS,
   TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
   truncateUtf8Bytes,
 } from './content-limits';
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
-import { CHANGE_FEED_RETAIN_REVISIONS } from './sqlite/schema';
+import { CHANGE_FEED_RETAIN_REVISIONS, terminalWorkflowRunSafetyPredicate } from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
@@ -545,11 +549,13 @@ export type RepositoryCommand =
       relatedTurns: readonly TaskTurn[]; messages: readonly TaskMessage[];
     }
   | {
-      /** Row-level retention; terminal tasks prune old turn chains, open tasks
-       * only truncate settled rendered output. */
+      /** Payload-only retention; it never deletes task, turn, message, or
+       * operation rows, and only truncates settled rendered output. */
       kind: 'applyRetention'; workspaceId: string; taskId: string; keepLatestTurns: number;
       maxStoredOutputChars?: number;
     }
+  /** Deletes only safely terminal workflow metadata; durable transcript rows are untouched. */
+  | { kind: 'reclaimTerminalWorkflowMetadata'; workspaceId: string }
   /** Stable host-facing name for the retention policy command. */
   | {
       kind: 'applyRetentionPolicy'; workspaceId: string; taskId: string; keepLatestTurns: number;
@@ -578,6 +584,10 @@ export interface RepositoryCommandResult {
    */
   ok: boolean;
   changed?: boolean;
+  /** Number of retained file-change evidence entries stripped by a retention command. */
+  retentionEntriesStripped?: number;
+  /** Number of safely terminal workflow metadata rows reclaimed by maintenance. */
+  strippedWorkflowMessageBodies?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -1148,27 +1158,6 @@ function validatePrepareDispatch(
 function truncateRetentionContent(content: string, maxChars: number): string {
   if (content.length <= maxChars) return content;
   return content.slice(0, Math.max(0, maxChars - TRUNCATION_MARKER.length)) + TRUNCATION_MARKER;
-}
-
-/** Keep the newest turns, then include every retry ancestor so a retained retry
- * is never left pointing at a deleted predecessor. */
-function retainedTurnIds(turns: readonly TaskTurn[], keepLatestTurns: number): Set<string> {
-  const keep = new Set(
-    [...turns]
-      .sort((a, b) => b.sequence - a.sequence || b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
-      .slice(0, Math.max(0, Math.floor(keepLatestTurns)))
-      .map((turn) => turn.id),
-  );
-  const byId = new Map(turns.map((turn) => [turn.id, turn]));
-  const pending = [...keep];
-  while (pending.length > 0) {
-    const turn = byId.get(pending.pop()!);
-    if (turn?.retryOf && !keep.has(turn.retryOf) && byId.has(turn.retryOf)) {
-      keep.add(turn.retryOf);
-      pending.push(turn.retryOf);
-    }
-  }
-  return keep;
 }
 
 /** SQLite-backed repository for one workspace in the shared global database. */
@@ -3857,6 +3846,8 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'applyRetention':
       case 'applyRetentionPolicy':
         return this.applyRetention(command);
+      case 'reclaimTerminalWorkflowMetadata':
+        return this.reclaimTerminalWorkflowMetadata();
       default: {
         const _exhaustive: never = command;
         return _exhaustive;
@@ -10272,6 +10263,34 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
 
+  private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
+    // Keep workflow_runs and their claims durable. Deleting a run cascades its
+    // start claim while the operation ledger remains, breaking idempotent replay
+    // (or leaving a replay result that points at a missing run). Routed message
+    // bodies are terminal transport payload only; no production reader consumes
+    // them after routing, so they are the safe reclaimable portion.
+    const result = await this.db.run(
+      `UPDATE workflow_routed_messages
+          SET body_json = '{"retentionStripped":true}'
+        WHERE workspace_id = ?
+          AND body_json <> '{"retentionStripped":true}'
+          AND run_id IN (
+            SELECT workflow_runs.run_id
+              FROM workflow_runs
+             WHERE workflow_runs.workspace_id = ?
+               AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+               ${terminalWorkflowRunSafetyPredicate('workflow_runs')}
+          )`,
+      [this.workspaceId, this.workspaceId],
+    );
+    const strippedWorkflowMessageBodies = result.changes ?? 0;
+    return {
+      ok: true,
+      changed: strippedWorkflowMessageBodies > 0,
+      strippedWorkflowMessageBodies,
+    };
+  }
+
   private async applyRetention(
     command:
       | Extract<RepositoryCommand, { kind: 'applyRetention' }>
@@ -10279,245 +10298,40 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<RepositoryCommandResult> {
     const task = await this.getTask(command.taskId);
     if (!task) return { ok: true, changed: false };
+    // Retention is payload-only: terminal task history remains addressable so
+    // transcripts, operation replays, and workflow evidence retain stable IDs.
     if (isTerminalLifecycle(task.lifecycle)) {
       const turns = await this.listTurns(task.id);
-      const keep = retainedTurnIds(turns, command.keepLatestTurns);
-      const drop = turns.filter((turn) => !keep.has(turn.id)).map((turn) => turn.id);
-      if (drop.length === 0) return { ok: true, changed: false };
-      const rest: SqlStatement[] = [
-        // Turn-bound messages/tool calls/reasoning/cancel + claim rows cascade
-        // through FK. User rows only have an input reference, so clean up the
-        // ones no remaining turn references after that cascade.
-        {
-          sql: `DELETE FROM messages
-                 WHERE workspace_id = ? AND task_id = ? AND turn_id IS NULL
-                   AND NOT EXISTS (
-                     SELECT 1 FROM turn_inputs i
-                      WHERE i.workspace_id = messages.workspace_id
-                        AND i.kind = 'message'
-                        AND json_extract(i.payload_json, '$.messageId') = messages.id
-                   )`,
-          params: [this.workspaceId, task.id],
-        },
-        ...drop.map((turnId) => ({
-          sql: `DELETE FROM operations
-                 WHERE workspace_id = ? AND ledger_key GLOB ?
-                   AND NOT EXISTS (
-                     SELECT 1 FROM turns
-                      WHERE workspace_id = operations.workspace_id AND id = ?
-                   )
-                   AND NOT EXISTS (
-                     SELECT 1 FROM workflow_artifact_sources source
-                      WHERE source.workspace_id = operations.workspace_id
-                        AND source.engine_start_operation_key = operations.ledger_key
-                   )`,
-          params: [this.workspaceId, `${escapeGlob(turnId)}:*`, turnId],
-        })),
-      ];
-      const results = await this.writeIfFirstChanged(
-        {
-          sql: `WITH retention_scope(workspace_id) AS (VALUES (?)),
-                     prunable_runs(run_id) AS (
-                       SELECT run.run_id
-                         FROM retention_scope scope
-                         JOIN workflow_runs run
-                           ON run.workspace_id = scope.workspace_id
-                        WHERE run.status IN ('succeeded', 'failed', 'cancelled')
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_runs child
-                             WHERE child.workspace_id = run.workspace_id
-                               AND child.parent_run_id = run.run_id
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1
-                              FROM workflow_nodes node
-                              JOIN tasks task
-                                ON task.workspace_id = node.workspace_id
-                               AND task.id = node.task_id
-                             WHERE node.workspace_id = run.workspace_id
-                               AND node.run_id = run.run_id
-                               AND task.lifecycle NOT IN ('succeeded', 'failed', 'cancelled', 'skipped')
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_dependency_gates gate_row
-                             WHERE gate_row.workspace_id = run.workspace_id
-                               AND gate_row.run_id = run.run_id
-                               AND gate_row.status IN ('open', 'satisfied')
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_feedback_rounds round_row
-                             WHERE round_row.workspace_id = run.workspace_id
-                               AND round_row.run_id = run.run_id
-                               AND round_row.status IN ('open', 'satisfied')
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_activations activation
-                             WHERE activation.workspace_id = run.workspace_id
-                               AND activation.run_id = run.run_id
-                               AND activation.status IN ('queued', 'running')
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_continuations continuation
-                             WHERE continuation.workspace_id = run.workspace_id
-                               AND (continuation.run_id = run.run_id OR continuation.child_run_id = run.run_id)
-                               AND continuation.status IN ('pending', 'resolved')
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM workflow_return_gates return_gate
-                             WHERE return_gate.workspace_id = run.workspace_id
-                               AND (return_gate.continuation_run_id = run.run_id
-                                 OR return_gate.child_run_id = run.run_id)
-                               AND return_gate.status IN ('open', 'satisfied')
-                          )
-                     ),
-                     pinned_turns(turn_id) AS (
-                       SELECT candidate.id
-                         FROM retention_scope scope
-                         JOIN workflow_nodes node
-                           ON node.workspace_id = scope.workspace_id
-                         JOIN workflow_runs run
-                           ON run.workspace_id = node.workspace_id
-                          AND run.run_id = node.run_id
-                         JOIN turns candidate
-                           ON candidate.workspace_id = node.workspace_id
-                          AND candidate.task_id = node.task_id
-                        WHERE run.status = 'running'
-                       UNION ALL
-                       SELECT run.caller_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_runs run
-                           ON run.workspace_id = scope.workspace_id
-                        WHERE run.status = 'running'
-                       UNION ALL
-                       SELECT claim.caller_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_start_claims claim
-                           ON claim.workspace_id = scope.workspace_id
-                         JOIN workflow_runs run
-                           ON run.workspace_id = claim.workspace_id
-                          AND run.run_id = claim.run_id
-                        WHERE run.status = 'running'
-                       UNION ALL
-                       SELECT activation.primary_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_activations activation
-                           ON activation.workspace_id = scope.workspace_id
-                        WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
-                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
-                       UNION ALL
-                       SELECT activation.execution_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_activations activation
-                           ON activation.workspace_id = scope.workspace_id
-                        WHERE activation.status IN ('queued', 'running', 'failed', 'interrupted')
-                           AND activation.run_id NOT IN (SELECT run_id FROM prunable_runs)
-                       UNION ALL
-                       SELECT gate.reserved_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_dependency_gates gate
-                           ON gate.workspace_id = scope.workspace_id
-                        WHERE gate.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT round_row.requester_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_feedback_rounds round_row
-                           ON round_row.workspace_id = scope.workspace_id
-                        WHERE round_row.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT round_row.resume_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_feedback_rounds round_row
-                           ON round_row.workspace_id = scope.workspace_id
-                        WHERE round_row.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT target.request_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_feedback_rounds round_row
-                           ON round_row.workspace_id = scope.workspace_id
-                         JOIN workflow_feedback_targets target
-                           ON target.workspace_id = round_row.workspace_id
-                          AND target.run_id = round_row.run_id
-                          AND target.round_id = round_row.round_id
-                        WHERE round_row.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT target.response_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_feedback_rounds round_row
-                           ON round_row.workspace_id = scope.workspace_id
-                         JOIN workflow_feedback_targets target
-                           ON target.workspace_id = round_row.workspace_id
-                          AND target.run_id = round_row.run_id
-                          AND target.round_id = round_row.round_id
-                        WHERE round_row.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT routed.source_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_routed_messages routed
-                           ON routed.workspace_id = scope.workspace_id
-                         JOIN workflow_runs run
-                           ON run.workspace_id = routed.workspace_id
-                          AND run.run_id = routed.run_id
-                        WHERE run.status = 'running'
-                       UNION ALL
-                       SELECT continuation.caller_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_continuations continuation
-                           ON continuation.workspace_id = scope.workspace_id
-                        WHERE continuation.status IN ('pending', 'resolved')
-                       UNION ALL
-                       SELECT continuation.producing_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_continuations continuation
-                           ON continuation.workspace_id = scope.workspace_id
-                        WHERE continuation.status IN ('pending', 'resolved')
-                       UNION ALL
-                       SELECT return_gate.caller_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_return_gates return_gate
-                           ON return_gate.workspace_id = scope.workspace_id
-                        WHERE return_gate.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT return_gate.execution_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_return_gates return_gate
-                           ON return_gate.workspace_id = scope.workspace_id
-                        WHERE return_gate.status IN ('open', 'satisfied')
-                       UNION ALL
-                       SELECT source.producing_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_artifact_sources source
-                           ON source.workspace_id = scope.workspace_id
-                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
-                       UNION ALL
-                       SELECT source.caller_turn_id
-                         FROM retention_scope scope
-                         JOIN workflow_artifact_sources source
-                           ON source.workspace_id = scope.workspace_id
-                        WHERE source.run_id NOT IN (SELECT run_id FROM prunable_runs)
-                       UNION ALL
-                       SELECT claim.turn_id
-                         FROM retention_scope scope
-                         JOIN turn_disposition_claims claim
-                           ON claim.workspace_id = scope.workspace_id
-                        WHERE claim.status = 'staged'
-                     )
-                 DELETE FROM turns
-                 WHERE workspace_id = ? AND task_id = ? AND id IN (${placeholders(drop.length)})
-                   AND NOT EXISTS (
-                     SELECT 1 FROM pinned_turns WHERE turn_id = turns.id
-                   )
-                    AND EXISTS (
-                      SELECT 1 FROM tasks
-                       WHERE workspace_id = ? AND id = ?
-                         AND lifecycle IN ('succeeded', 'failed', 'cancelled', 'skipped')
-                    )`,
-          params: [this.workspaceId, this.workspaceId, task.id, ...drop, this.workspaceId, task.id],
-        },
-        rest,
-        { kind: 'turn', id: task.id, taskId: task.id, change: 'retention' },
-        new Date().toISOString(),
+      const keep = Math.max(0, Math.floor(command.keepLatestTurns));
+      const agedTurnIds = new Set(
+        [...turns]
+          .sort((left, right) => right.sequence - left.sequence || right.id.localeCompare(left.id))
+          .slice(keep)
+          .map((turn) => turn.id),
       );
-      return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
+      const statements: SqlStatement[] = [];
+      const changes: ChangeRecord[] = [];
+      let retentionEntriesStripped = 0;
+      for (const tool of await this.listToolCalls(task.id)) {
+        if (!agedTurnIds.has(tool.turnId) || !isBoundedToolFileChanges(tool.fileChanges) ||
+          tool.fileChanges.every((change) => change.retentionTruncated === true)) continue;
+        const fileChanges = [] as NonNullable<typeof tool.fileChanges>;
+        for (const change of tool.fileChanges) {
+          const stripped = stripToolFileChangeEvidenceForRetention(change);
+          if (!stripped) {
+            fileChanges.length = 0;
+            break;
+          }
+          fileChanges.push(stripped);
+        }
+        if (fileChanges.length !== tool.fileChanges.length) continue;
+        statements.push(toolCallStatement(this.workspaceId, { ...tool, fileChanges }));
+        retentionEntriesStripped += fileChanges.length;
+        changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
+      }
+      if (statements.length === 0) return { ok: true, changed: false };
+      await this.write(statements, changes, new Date().toISOString());
+      return { ok: true, changed: true, retentionEntriesStripped };
     }
 
     const maxChars = Math.max(0, Math.floor(command.maxStoredOutputChars ?? Number.MAX_SAFE_INTEGER));
@@ -10525,13 +10339,49 @@ export class SqliteTaskRepository implements TaskRepository {
     // window. Only settled turns are eligible: trimming reasoning or a tool
     // result that is still streaming would corrupt the active transcript just
     // as surely as deleting the row.
+    const keep = Math.max(0, Math.floor(command.keepLatestTurns));
     const settledTurnIds = new Set(
       (await this.listTurns(task.id))
         .filter((turn) => isTerminalTurn(turn.status))
+        .sort((left, right) => right.sequence - left.sequence || right.id.localeCompare(left.id))
+        .slice(keep)
         .map((turn) => turn.id),
     );
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
+    let retentionEntriesStripped = 0;
+    for (const tool of await this.listToolCalls(task.id)) {
+      if (!settledTurnIds.has(tool.turnId)) continue;
+      let retainedTool = tool;
+      let changed = false;
+      if (isBoundedToolFileChanges(tool.fileChanges) &&
+        !tool.fileChanges.every((change) => change.retentionTruncated === true)) {
+        const fileChanges = [] as NonNullable<typeof tool.fileChanges>;
+        for (const change of tool.fileChanges) {
+          const stripped = stripToolFileChangeEvidenceForRetention(change);
+          if (!stripped) {
+            fileChanges.length = 0;
+            break;
+          }
+          fileChanges.push(stripped);
+        }
+        if (fileChanges.length === tool.fileChanges.length) {
+          retainedTool = { ...retainedTool, fileChanges };
+          retentionEntriesStripped += fileChanges.length;
+          changed = true;
+        }
+      }
+      if (typeof tool.output === 'string') {
+        const output = truncateRetentionContent(tool.output, maxChars);
+        if (output !== tool.output) {
+          retainedTool = { ...retainedTool, output };
+          changed = true;
+        }
+      }
+      if (!changed) continue;
+      statements.push(toolCallStatement(this.workspaceId, retainedTool));
+      changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
+    }
     for (const message of await this.listMessages(task.id)) {
       if (message.role !== 'assistant' || message.state !== 'complete' ||
         !message.turnId || !settledTurnIds.has(message.turnId)) continue;
@@ -10542,13 +10392,6 @@ export class SqliteTaskRepository implements TaskRepository {
         params: [content, this.workspaceId, message.id, message.content],
       });
       changes.push({ kind: 'message', id: message.id, taskId: task.id, change: 'truncate' });
-    }
-    for (const tool of await this.listToolCalls(task.id)) {
-      if (!settledTurnIds.has(tool.turnId) || typeof tool.output !== 'string') continue;
-      const output = truncateRetentionContent(tool.output, maxChars);
-      if (output === tool.output) continue;
-      statements.push(toolCallStatement(this.workspaceId, { ...tool, output }));
-      changes.push({ kind: 'tool_call', id: tool.id, taskId: task.id, change: 'truncate' });
     }
     for (const reasoning of await this.listReasoning(task.id)) {
       if (!settledTurnIds.has(reasoning.turnId)) continue;
@@ -10562,7 +10405,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     if (statements.length === 0) return { ok: true, changed: false };
     await this.write(statements, changes, new Date().toISOString());
-    return { ok: true, changed: true };
+    return { ok: true, changed: true, retentionEntriesStripped };
   }
 }
 

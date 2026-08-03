@@ -333,6 +333,56 @@ describe('buildToolDiffView', () => {
     expect(view.files[0].oldText).toBe('old-line');
     expect(view.files[0].newText).toBe('new-line');
   });
+
+  it('renders retention-stripped evidence as a non-expandable line-count summary', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-retained',
+      fileChanges: [
+        {
+          path: 'src/aged.ts',
+          oldText: null,
+          newText: '',
+          retentionTruncated: true,
+          oldLineCount: 3,
+          newLineCount: 5,
+        },
+      ],
+    });
+
+    expect(view.collapsedByDefault).toBe(false);
+    expect(view.files[0]).toMatchObject({
+      path: 'src/aged.ts',
+      retentionTruncated: true,
+      hasDiffBody: false,
+      // The retained contract records side sizes, not a diff. Never invent
+      // +5/-3 when the original content no longer exists to compare.
+      added: 0,
+      removed: 0,
+      retentionLineCounts: { old: 3, next: 5 },
+      countsPartial: false,
+      countsLabel: '3 → 5 lines (retention summary)',
+    });
+    expect(describeDiffFileForScreenReader(view.files[0])).toBe(
+      'src/aged.ts: 3 to 5 lines, diff text removed by retention',
+    );
+  });
+
+  it('does not present identical retained sides as additions and removals', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-retained-identical',
+      fileChanges: [{
+        path: 'src/unchanged.ts', oldText: null, newText: '', retentionTruncated: true,
+        oldLineCount: 1, newLineCount: 1,
+      }],
+    });
+
+    expect(view.files[0]).toMatchObject({
+      added: 0,
+      removed: 0,
+      retentionLineCounts: { old: 1, next: 1 },
+      countsLabel: '1 → 1 lines (retention summary)',
+    });
+  });
 });
 
 /** Build a max-side single-change fixture: full retained line budget, one central edit. */
@@ -585,6 +635,8 @@ describe('describeDiffFileForScreenReader', () => {
       countsPartial: false,
       comparisonUnavailable: false,
       outsideWorkspace: false,
+      retentionTruncated: false,
+      hasDiffBody: true,
       bodyId: 'tool-diff-body-x-0',
       toggleId: 'tool-diff-toggle-x-0',
       lines: [],

@@ -42,6 +42,10 @@ import {
   projectWorkspacePatches,
 } from './host/workspace-patch';
 import { WorkspaceRevisionPoller } from './host/workspace-revision-poller';
+import {
+  resolveRetentionScheduleIntervalMs,
+  RetentionScheduler,
+} from './host/retention-scheduler';
 import { LatestFocusTransition } from './host/focus-transition';
 import {
   reconcileExternalWorkspaceChanges,
@@ -62,12 +66,20 @@ import {
   readRedactedBridgeHealth,
   readRedactedDbIdentity,
   readRedactedDeactivateTrace,
+  readStorageLifecycleState,
   resolveUatSurface,
+  runRetentionPass,
+  seedOrphanLifecycleFixtures,
+  seedStorageWorkload,
   type UatCommandId,
   type UatDeactivateTrace,
   type UatHostState,
   type UatSurfaceTier,
 } from './host/uat-commands';
+import {
+  createWebviewRenderProbeCoordinator,
+  type WebviewRenderProbeCoordinator,
+} from './host/webview-render-probe';
 import {
   NATIVE_FIRST_RUN_UAT_PROMPT,
   isNativeFirstRunProviderId,
@@ -184,10 +196,17 @@ import {
 import { applyTerminalStorageQuiesce } from './host/terminal-storage-coordinator';
 import { quiesceForMaintenance } from './host/sqlite-maintenance-coordinator';
 import {
+  formatRetentionReportLines,
   handleBackupDatabaseCommand,
+  handleCompactStorageCommand,
   handleDeveloperResetCommand,
+  handleReclaimOrphanedFilesCommand,
+  RetentionReport,
+  type RetentionPassReport,
   MUSTER_BACKUP_DATABASE_COMMAND,
+  MUSTER_COMPACT_STORAGE_COMMAND,
   MUSTER_DEVELOPER_RESET_COMMAND,
+  MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,
 } from './host/sqlite-maintenance-commands';
 import {
   handleRunDiagnosticsCommand,
@@ -196,6 +215,15 @@ import {
 } from './host/run-diagnostics-command';
 import { createTerminalStorageLifecycle } from './host/terminal-storage-lifecycle';
 import { runDurableHostSend } from './host/durable-send-coordinator';
+import {
+  classifyStorageOrphans,
+  readStorageDirectoryEntries,
+  removeStorageOrphans,
+} from './host/storage-orphans';
+import {
+  observeOrphanLifecycle,
+  verifyOrphanCleanup,
+} from './host/uat-orphan-lifecycle';
 
 
 /** Activation fail-closed error: safe message only, no path/SQL/content. */
@@ -219,6 +247,7 @@ import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { registerUninstallStorageTarget } from './uninstall';
 
 let askBridge: AskBridge | undefined;
 let elicitationBridge: ElicitationBridge | undefined;
@@ -238,6 +267,8 @@ let taskRepository: TaskRepository | undefined;
 let workspaceRoot: string | undefined;
 /** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
+/** Process-local retention observations; intentionally reset on host/window reload. */
+const retentionReport = new RetentionReport();
 let sqliteWorkspaceId: string | undefined;
 /** Production chat provider (always tracked; UAT may also alias it). */
 let chatProvider: MusterChatProvider | undefined;
@@ -567,8 +598,6 @@ function getRetentionConfig(): RetentionConfig {
   };
 }
 
-let retentionInFlight: Promise<void> | undefined;
-
 function repositoryWorkspaceId(): string {
   if (!sqliteWorkspaceId) {
     throw new Error('SQLite workspace is not ready');
@@ -576,31 +605,42 @@ function repositoryWorkspaceId(): string {
   return sqliteWorkspaceId;
 }
 
-/** Apply retention through named repository commands; never rewrite the host envelope. */
-async function applyRetentionToRepository(repository: TaskRepository): Promise<void> {
+/** Apply retention through named repository commands and capture path-free storage evidence. */
+async function applyRetentionToRepository(
+  repository: TaskRepository,
+): Promise<Omit<RetentionPassReport, 'ordinal'>> {
+  const client = sqliteClient;
+  if (!client) throw new Error('SQLite store is not open');
   const config = getRetentionConfig();
+  const before = await client.storageReport();
   const tasks = await repository.listTasks(repositoryWorkspaceId());
+  let entriesStripped = 0;
   for (const task of tasks) {
-    await repository.execute({
+    const result = await repository.execute({
       kind: 'applyRetentionPolicy',
       workspaceId: repositoryWorkspaceId(),
       taskId: task.id,
       keepLatestTurns: config.maxTurnsPerTask,
       maxStoredOutputChars: config.maxStoredOutputChars,
     });
+    entriesStripped += result.retentionEntriesStripped ?? 0;
   }
-}
-
-function scheduleRetention(): void {
-  const repository = taskRepository;
-  if (!repository || retentionInFlight) return;
-  retentionInFlight = applyRetentionToRepository(repository)
-    .catch(() => {
-      // Retention is maintenance; a failed pass must not interrupt a user turn.
-    })
-    .finally(() => {
-      retentionInFlight = undefined;
-    });
+  const workflowReclamation = await repository.execute({
+    kind: 'reclaimTerminalWorkflowMetadata',
+    workspaceId: repositoryWorkspaceId(),
+  });
+  const after = await client.storageReport();
+  const reclaimed = await client.reclaimStorage();
+  return {
+    tasksVisited: tasks.length,
+    entriesStripped,
+    toolCallsBytesBefore: before.tables.find((table) => table.name === 'tool_calls')?.bytes ?? 0,
+    toolCallsBytesAfter: after.tables.find((table) => table.name === 'tool_calls')?.bytes ?? 0,
+    reclaimMode: reclaimed.mode,
+    fileBytesBefore: reclaimed.fileBytesBefore,
+    fileBytesAfter: reclaimed.fileBytesAfter,
+    strippedWorkflowMessageBodies: workflowReclamation.strippedWorkflowMessageBodies ?? 0,
+  };
 }
 
 class MusterChatProvider implements vscode.WebviewViewProvider {
@@ -631,9 +671,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   /** Polling starts only after the current view/focus has an authoritative snapshot. */
   private pollingReady = false;
   private windowStateSub: vscode.Disposable | undefined;
+  /** UAT-only DOM observation bridge, created for the current resolved webview. */
+  private renderProbeCoordinator: WebviewRenderProbeCoordinator | undefined;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
+    private readonly uatRenderProbeEnabled = false,
   ) {}
 
   /** Optional non-production interceptor used by native first-run UAT accept. */
@@ -650,6 +693,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     } catch {
       // best-effort
     }
+  }
+
+  /** Requests a read-only DOM observation; command registration supplies the UAT gate. */
+  requestRenderProbeForUat() {
+    if (!this.renderProbeCoordinator) {
+      throw new Error('UAT render probe webview unavailable');
+    }
+    return this.renderProbeCoordinator.request();
   }
 
   /**
@@ -2746,7 +2797,14 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     _context: vscode.WebviewViewResolveContext,
     _token: vscode.CancellationToken,
   ) {
+    this.renderProbeCoordinator?.dispose();
     this._view = webviewView;
+    if (this.uatRenderProbeEnabled) {
+      this.renderProbeCoordinator = createWebviewRenderProbeCoordinator({
+        postMessage: (message) => webviewView.webview.postMessage(message),
+        createRequestId: () => randomUUID(),
+      });
+    }
     this.windowFocused = vscode.window.state.focused;
     this.pollingReady = false;
 
@@ -2782,6 +2840,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
 
     // Abort in-flight Test Connection probes when this webview instance is disposed.
     webviewView.onDidDispose(() => {
+      this.renderProbeCoordinator?.dispose();
+      this.renderProbeCoordinator = undefined;
       try {
         backendProbeService?.disposeAll();
       } catch {
@@ -2790,6 +2850,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     });
 
     webviewView.webview.onDidReceiveMessage(async (data) => {
+      if (this.renderProbeCoordinator?.accept(data)) {
+        return;
+      }
       if (maintenanceActive && data?.type !== 'debugLog' && data?.type !== 'ready') {
         this.postCommandError('Muster storage maintenance is in progress. Try again after reload.');
         return;
@@ -3572,6 +3635,10 @@ export async function activate(context: vscode.ExtensionContext) {
     context.extensionMode === vscode.ExtensionMode.Production,
   );
   const liveUatEnabled = uatSurface !== 'none';
+  // M023 host affordances — the path-bearing DOM render probe (D079) and the
+  // retention-interval override — stay Development-only. A Production VSIX is
+  // capped at the redacted `packaging` tier, so neither may be reachable there.
+  const fullUatSurface = uatSurface === 'full';
   // Patch PATH from the login shell BEFORE anything spawns a backend CLI, so a
   // GUI-launched editor (minimal PATH) can both detect and actually run the CLIs.
   await installAugmentedPath();
@@ -3587,9 +3654,20 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+  // vscode:uninstall has no ExtensionContext. Register this installation's
+  // profile/authority-resolved path now rather than guessing a Stable-Code path
+  // later and risking another installation's storage.
+  // Uninstall discovery is best-effort support metadata; a transient registry
+  // lock must never prevent the primary extension runtime from activating.
+  await registerUninstallStorageTarget(context.extensionPath, context.globalStorageUri.fsPath)
+    .catch(() => undefined);
 
   // Maintenance commands remain available even when storage open fails (P5-W5).
   registerSqliteMaintenanceCommands(context, dbPath);
+  const reclaimOrphanedFilesForUat = registerStorageReportCommand(
+    context,
+    context.globalStorageUri.fsPath,
+  );
 
   const wsFolder = vscode.workspace.workspaceFolders?.[0];
   workspaceRoot = wsFolder?.uri.fsPath;
@@ -3679,7 +3757,7 @@ export async function activate(context: vscode.ExtensionContext) {
     return;
   }
 
-  const provider = new MusterChatProvider(context.extensionUri);
+  const provider = new MusterChatProvider(context.extensionUri, fullUatSurface);
   chatProvider = provider;
   if (liveUatEnabled) {
     uatChatProvider = provider;
@@ -3948,7 +4026,12 @@ export async function activate(context: vscode.ExtensionContext) {
   );
 
   if (liveUatEnabled) {
-    registerLiveUatCommands(context, uatSurface);
+    registerLiveUatCommands(
+      context,
+      uatSurface,
+      context.globalStorageUri.fsPath,
+      reclaimOrphanedFilesForUat,
+    );
   }
 
   try {
@@ -4363,7 +4446,14 @@ export async function activate(context: vscode.ExtensionContext) {
         return result.presentationStatus;
       },
     });
-    scheduleRetention();
+    const retentionScheduler = new RetentionScheduler({
+      intervalMs: resolveRetentionScheduleIntervalMs(fullUatSurface),
+      runPass: () => applyRetentionToRepository(taskRepository!),
+      onPassCompleted: (pass) => retentionReport.recordCompleted(pass),
+      onPassFailed: () => retentionReport.recordFailure(),
+    });
+    retentionScheduler.start();
+    context.subscriptions.push(retentionScheduler);
     context.subscriptions.push(
       vscode.workspace.onDidGrantWorkspaceTrust(() => {
         try {
@@ -4446,6 +4536,122 @@ async function handlePeerExternalReset(): Promise<void> {
       // best-effort
     }
   }
+}
+
+/**
+ * Emit storage accounting and safe orphan basenames without exposing filesystem paths.
+ * The command remains registered before a store opens so a failed activation produces
+ * an actionable diagnostic instead of an unhandled command rejection.
+ */
+function registerStorageReportCommand(
+  context: vscode.ExtensionContext,
+  storageDirectory: string,
+): () => Promise<unknown> {
+  const channel = vscode.window.createOutputChannel('Muster Storage Report');
+  context.subscriptions.push(
+    channel,
+    vscode.commands.registerCommand('muster.storageReport', async () => {
+      if (!sqliteClient) {
+        channel.appendLine('Storage report unavailable: SQLite store is not open.');
+        channel.show(true);
+        return;
+      }
+
+      try {
+        const report = await sqliteClient.storageReport();
+        const orphans = classifyStorageOrphans(
+          await readStorageDirectoryEntries(storageDirectory),
+          Date.now(),
+          60_000,
+        );
+        const lines = [
+          'Muster storage report',
+          `file_bytes: ${report.fileBytes}`,
+          `wal_bytes: ${report.walBytes}`,
+          `shm_bytes: ${report.shmBytes}`,
+          `page_count: ${report.pageCount}`,
+          `freelist_count: ${report.freelistCount}`,
+          `page_size: ${report.pageSize}`,
+          `auto_vacuum: ${report.autoVacuum}`,
+          `table_bytes_source: ${report.tableBytesSource}`,
+          ...formatRetentionReportLines(retentionReport.snapshot()),
+          ...report.tables.map((table) => `table: ${table.name} bytes: ${table.bytes}`),
+          ...orphans.deadLegacyStores.map((file) => `orphan_legacy: ${file.name} bytes: ${file.bytes}`),
+          ...orphans.activeLeases.map((file) => `lease_active: ${file.name} bytes: ${file.bytes}`),
+          ...orphans.staleLeases.map((file) => `lease_stale: ${file.name} bytes: ${file.bytes}`),
+        ];
+        for (const line of lines) channel.appendLine(line);
+      } catch {
+        channel.appendLine('Storage report unavailable: SQLite storage could not be read.');
+      }
+      channel.show(true);
+    }),
+    vscode.commands.registerCommand(MUSTER_COMPACT_STORAGE_COMMAND, async () => {
+      const client = sqliteClient;
+      if (!client) {
+        channel.appendLine('Storage compaction unavailable: SQLite store is not open.');
+        channel.show(true);
+        return;
+      }
+      await handleCompactStorageCommand({
+        storageReport: () => client.storageReport(),
+        reclaimStorage: () => client.reclaimStorage(),
+        appendLine: (line) => channel.appendLine(line),
+        showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+        isMaintenanceActive: () => maintenanceActive,
+        setMaintenanceActive: (active) => {
+          maintenanceActive = active;
+        },
+      });
+      channel.show(true);
+    }),
+    vscode.commands.registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND, async () => {
+      await reclaimOrphanedFiles(false);
+      channel.show(true);
+    }),
+  );
+
+  async function reclaimOrphanedFiles(confirmForUat: boolean) {
+    return handleReclaimOrphanedFilesCommand({
+      showWarningMessage: confirmForUat
+        ? async (_message, ...items) => items[0]
+        : async (message, ...items) => await vscode.window.showWarningMessage(message, { modal: true }, ...items),
+      readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory),
+      classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000),
+      removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report),
+      appendLine: (line) => channel.appendLine(line),
+      showErrorMessage: (message) => vscode.window.showErrorMessage(message),
+      isMaintenanceActive: () => maintenanceActive,
+      setMaintenanceActive: (active) => {
+        maintenanceActive = active;
+      },
+    });
+  }
+
+  return async () => {
+    const before = classifyStorageOrphans(
+      await readStorageDirectoryEntries(storageDirectory),
+      Date.now(),
+      60_000,
+    );
+    const cleanup = await reclaimOrphanedFiles(true);
+    const after = classifyStorageOrphans(
+      await readStorageDirectoryEntries(storageDirectory),
+      Date.now(),
+      60_000,
+    );
+    const verified = verifyOrphanCleanup(before, cleanup, after);
+    return {
+      before: observeOrphanLifecycle(before),
+      cleanup: {
+        removedFiles: verified.removedFiles,
+        bytesReclaimed: verified.bytesReclaimed,
+        failedRemovals: verified.failedRemovals,
+        skippedRemovals: verified.skippedRemovals,
+      },
+      after: verified.postCleanup,
+    };
+  };
 }
 
 /**
@@ -4616,6 +4822,8 @@ function registerSqliteMaintenanceCommands(
 function registerLiveUatCommands(
   context: vscode.ExtensionContext,
   tier: UatSurfaceTier,
+  storageDirectory: string,
+  reclaimOrphanedFilesForUat: () => Promise<unknown>,
 ): void {
   // PACKAGING_UAT_COMMAND_IDS in uat-commands.ts is the single source of truth
   // for what a Production host may expose; this helper just honours it.
@@ -4780,6 +4988,34 @@ function registerLiveUatCommands(
         rootId: String(args.rootId),
         presentationId: String(args.presentationId),
       });
+    }),
+    // M023/S05 storage lifecycle observations — activated production delegates only.
+    vscode.commands.registerCommand(UAT_COMMANDS.seedStorageWorkload, async () => {
+      const { repository, workspaceId } = requireRepo();
+      return seedStorageWorkload(repository, workspaceId);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.storageLifecycleState, async () => {
+      const { repository, workspaceId } = requireRepo();
+      return readStorageLifecycleState({
+        repository,
+        sqliteClient: requireClient(),
+        retentionReport,
+        workspaceId,
+      });
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.runRetentionPass, async () => {
+      const { repository } = requireRepo();
+      return runRetentionPass(() => applyRetentionToRepository(repository));
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.seedOrphanLifecycleFixtures, async () => {
+      return seedOrphanLifecycleFixtures(storageDirectory);
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.reclaimOrphanedFiles, async () => {
+      return reclaimOrphanedFilesForUat();
+    }),
+    vscode.commands.registerCommand(UAT_COMMANDS.renderProbe, async () => {
+      if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
+      return uatChatProvider.requestRenderProbeForUat();
     }),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {

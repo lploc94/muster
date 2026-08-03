@@ -19,6 +19,15 @@ export interface ToolFileChange {
    * never `false` — absent means in-workspace or unclassified-safe.
    */
   outsideWorkspace?: true;
+  /**
+   * Present only after retention removes stored diff text; never `false`.
+   * `oldText` is null and `newText` is empty, while line counts preserve a
+   * change summary distinct from engine-side byte-bound clipping.
+   */
+  retentionTruncated?: true;
+  /** Original logical line counts preserved by retention stripping. */
+  oldLineCount?: number;
+  newLineCount?: number;
 }
 
 export type NormalizedEvent =

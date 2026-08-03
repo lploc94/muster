@@ -3,6 +3,9 @@ import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 const extensionSource = readFileSync(resolve(process.cwd(), 'src/extension.ts'), 'utf8');
+const packageJson = JSON.parse(
+  readFileSync(resolve(process.cwd(), 'package.json'), 'utf8'),
+) as { contributes: { commands: Array<{ command: string; title: string }> } };
 
 describe('SQLite-only activation boundary', () => {
   it('has no filesystem JSON task-store path or watcher', () => {
@@ -22,5 +25,97 @@ describe('SQLite-only activation boundary', () => {
     expect(extensionSource).toMatch(
       /if \(!sqliteProbe\.available\) \{[\s\S]*showErrorMessage\(message\);[\s\S]*throw new Error\(message\);/,
     );
+  });
+
+  it('registers orphan reclamation through the path-free storage adapters and contributes it to VS Code', () => {
+    expect(extensionSource).toContain('registerCommand(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND');
+    expect(extensionSource).toContain('await reclaimOrphanedFiles(false)');
+    expect(extensionSource).toContain('handleReclaimOrphanedFilesCommand({');
+    expect(extensionSource).toContain('readStorageDirectoryEntries: () => readStorageDirectoryEntries(storageDirectory)');
+    expect(extensionSource).toContain('classifyStorageOrphans: (entries) => classifyStorageOrphans(entries, Date.now(), 60_000)');
+    expect(extensionSource).toContain('removeStorageOrphans: (report) => removeStorageOrphans(storageDirectory, report)');
+    expect(packageJson.contributes.commands).toContainEqual({
+      command: 'muster.reclaimOrphanedFiles',
+      title: 'Muster: Reclaim Orphaned Files',
+    });
+  });
+
+  it('keeps orphan reclamation explicit-command-only with no automatic lifecycle caller', () => {
+    const reclaimHandlerReferences = extensionSource.match(/handleReclaimOrphanedFilesCommand/g) ?? [];
+
+    // One import and one shared production invocation back both the normal
+    // explicit command and the live-UAT delegate. A timer, watcher, activation
+    // hook, or retention path must not gain another call site.
+    expect(reclaimHandlerReferences).toHaveLength(2);
+    expect(extensionSource).toMatch(
+      /registerCommand\(MUSTER_RECLAIM_ORPHANED_FILES_COMMAND,[\s\S]*?await reclaimOrphanedFiles\(false\)/,
+    );
+    expect(extensionSource).toMatch(
+      /async function reclaimOrphanedFiles\(confirmForUat: boolean\)[\s\S]*?handleReclaimOrphanedFilesCommand\(\{/,
+    );
+    expect(extensionSource).not.toMatch(
+      /(?:setInterval|setTimeout|createFileSystemWatcher|applyRetentionToRepository|runRetentionPass)[\s\S]{0,800}handleReclaimOrphanedFilesCommand/,
+    );
+  });
+
+  it('registers storage report and user-invocable compaction through the redacted client surface', () => {
+    expect(extensionSource).toContain("registerCommand('muster.storageReport'");
+    expect(extensionSource).toContain('registerCommand(MUSTER_COMPACT_STORAGE_COMMAND');
+    expect(extensionSource).toContain('handleCompactStorageCommand({');
+    expect(extensionSource).toContain('reclaimStorage: () => client.reclaimStorage()');
+    expect(extensionSource).toContain('sqliteClient.storageReport()');
+    expect(extensionSource).toContain('readStorageDirectoryEntries(');
+    expect(extensionSource).toContain('classifyStorageOrphans(');
+    for (const field of [
+      'fileBytes',
+      'walBytes',
+      'shmBytes',
+      'pageCount',
+      'freelistCount',
+      'pageSize',
+      'autoVacuum',
+      'tableBytesSource',
+    ]) {
+      expect(extensionSource).toContain(`report.${field}`);
+    }
+  });
+
+  it('wires storage lifecycle UAT commands to activated repository, SQLite client, and retention report singletons', () => {
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.seedStorageWorkload');
+    expect(extensionSource).toContain('seedStorageWorkload(repository, workspaceId)');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.storageLifecycleState');
+    expect(extensionSource).toContain('readStorageLifecycleState({');
+    expect(extensionSource).toContain('repository,');
+    expect(extensionSource).toContain('sqliteClient: requireClient(),');
+    expect(extensionSource).toContain('retentionReport,');
+    expect(extensionSource).toContain('workspaceId,');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.runRetentionPass');
+    expect(extensionSource).toContain('runRetentionPass(() => applyRetentionToRepository(repository))');
+    expect(packageJson.contributes.commands).not.toContainEqual(
+      expect.objectContaining({ command: 'muster.uat.storageLifecycleState' }),
+    );
+  });
+
+  it('keeps orphan lifecycle fixture and production-handler delegates live-UAT-only', () => {
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.seedOrphanLifecycleFixtures');
+    expect(extensionSource).toContain('seedOrphanLifecycleFixtures(storageDirectory)');
+    expect(extensionSource).toContain('registerCommand(UAT_COMMANDS.reclaimOrphanedFiles');
+    expect(extensionSource).toMatch(
+      /registerLiveUatCommands\(\s*context,\s*uatSurface,\s*context\.globalStorageUri\.fsPath,\s*reclaimOrphanedFilesForUat,\s*\)/,
+    );
+    expect(extensionSource).toContain('return reclaimOrphanedFilesForUat()');
+    expect(extensionSource).toContain('const cleanup = await reclaimOrphanedFiles(true)');
+    expect(extensionSource).toContain('const verified = verifyOrphanCleanup(before, cleanup, after)');
+    expect(extensionSource).toContain('showWarningMessage: confirmForUat');
+    expect(extensionSource).toContain('? async (_message, ...items) => items[0]');
+
+    for (const command of [
+      'muster.uat.seedOrphanLifecycleFixtures',
+      'muster.uat.reclaimOrphanedFiles',
+    ]) {
+      expect(packageJson.contributes.commands).not.toContainEqual(
+        expect.objectContaining({ command }),
+      );
+    }
   });
 });

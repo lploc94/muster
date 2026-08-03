@@ -531,18 +531,26 @@ describe('M018 S07 bounded workflow status projection', () => {
         workspaceId: 'ws',
         taskId: p1.taskId,
         keepLatestTurns: 0,
-      })).resolves.toMatchObject({ ok: true, changed: true });
-      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeUndefined();
+      })).resolves.toMatchObject({ ok: true, changed: false });
+      await expect(ctx.repository.getTurn(p1.activationTurnId)).resolves.toBeDefined();
+
+      // Retention must not delete the durable run envelope. Its start claim and
+      // operation ledger are replay identities, while artifacts remain immutable
+      // workflow evidence. This fixture has no routed transport body to strip.
+      await expect(ctx.repository.execute({
+        kind: 'reclaimTerminalWorkflowMetadata',
+        workspaceId: 'ws',
+      })).resolves.toMatchObject({ ok: true, changed: false, strippedWorkflowMessageBodies: 0 });
       await expect(ctx.client.get(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         ['ws', data.runId],
-      )).resolves.toBeUndefined();
+      )).resolves.toMatchObject({ run_id: data.runId });
       await expect(ctx.client.get(
         `SELECT artifact_id FROM workflow_artifact_sources
           WHERE workspace_id = ? AND artifact_id = ?`,
         ['ws', artifactId],
-      )).resolves.toBeUndefined();
-      await expect(ctx.repository.getWorkflowStatusForTask(p1.taskId)).resolves.toBeUndefined();
+      )).resolves.toMatchObject({ artifact_id: artifactId });
+      await expect(ctx.repository.getWorkflowStatusForTask(p1.taskId)).resolves.toBeDefined();
       await expect(ctx.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {
       await ctx.close();

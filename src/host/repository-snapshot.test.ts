@@ -264,6 +264,40 @@ describe('buildRepositorySnapshot', () => {
     });
   }, 20_000);
 
+  it('preserves retention-truncated file summaries through the bounded host transcript', async () => {
+    await withRepo('repository-snapshot-retention-summary', async (repo) => {
+      const focused = task('retention-focus');
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task: focused });
+      await repo.execute({
+        kind: 'createTurn', workspaceId: 'ws',
+        turn: makeTurn('retention-turn', focused.id, 1, 'succeeded'),
+      });
+      await repo.execute({
+        kind: 'appendTranscriptBatch', workspaceId: 'ws', taskId: focused.id,
+        toolCalls: [{
+          id: 'retention-tool', taskId: focused.id, turnId: 'retention-turn',
+          toolCallId: 'retention-call', order: 0, name: 'Edit', kind: 'builtin', status: 'success',
+          fileChanges: [{
+            path: 'src/retained.ts', oldText: null, newText: '',
+            oldLineCount: 9, newLineCount: 12, retentionTruncated: true,
+          }],
+          createdAt: '2026-07-17T00:00:02.000Z', updatedAt: '2026-07-17T00:00:02.000Z',
+        }],
+      });
+
+      const projection = await buildRepositorySnapshot(repo, 'ws', focused.id, new Map());
+      expect(projection.snapshot.transcript).toContainEqual(expect.objectContaining({
+        id: 'retention-tool',
+        content: expect.objectContaining({
+          fileChanges: [{
+            path: 'src/retained.ts', oldText: null, newText: '',
+            oldLineCount: 9, newLineCount: 12, retentionTruncated: true,
+          }],
+        }),
+      }));
+    });
+  }, 20_000);
+
   it('accepts legacy repository toolKind content while preferring persisted kind', () => {
     const base = {
       id: 'legacy-tool',

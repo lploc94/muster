@@ -13,8 +13,10 @@ import type {
   BackupResultMeta,
   DbRequest,
   DbResponse,
+  ReclaimResultMeta,
   ResetResultMeta,
   RunResult,
+  StorageReportMeta,
   SqlStatement,
   SqlValue,
 } from './rpc';
@@ -321,6 +323,31 @@ export class DbClient {
       throw new DbWorkerError(makeProtocolError());
     }
     return res.value;
+  }
+
+  /** Reclaims pages from the currently open store; metadata never includes paths. */
+  async reclaimStorage(): Promise<ReclaimResultMeta> {
+    const res = await this.send({ kind: 'reclaim' });
+    if (res.kind !== 'reclaim') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
+  }
+
+  /** Byte accounting metadata for the currently open store; never paths. */
+  async storageReport(
+    options: { forceTableBytesSource?: 'dbstat' | 'estimated' } = {},
+  ): Promise<StorageReportMeta> {
+    const res = await this.send({
+      kind: 'storageReport',
+      ...(this.faultCapability && options.forceTableBytesSource
+        ? { forceTableBytesSource: options.forceTableBytesSource }
+        : {}),
+    });
+    if (res.kind !== 'storageReport') {
+      throw new DbWorkerError(makeProtocolError());
+    }
+    return res.result;
   }
 
   /**

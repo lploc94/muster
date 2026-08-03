@@ -4,14 +4,34 @@
  * Backup database + developer reset global database. No VS Code imports —
  * production wires showSaveDialog / messages / reload; tests inject fakes.
  */
-import type { BackupResultMeta } from '../task/sqlite/rpc';
+import type { BackupResultMeta, ReclaimResultMeta } from '../task/sqlite/rpc';
+import type { ReclaimMode } from '../task/sqlite/reclaim';
 import { safeMessageForCode, isSqliteErrorCode, type SqliteErrorCode } from '../task/sqlite/errors';
+import type {
+  StorageDirectoryEntry,
+  StorageOrphanRemoval,
+  StorageOrphanReport,
+} from './storage-orphans';
 
 export const MUSTER_BACKUP_DATABASE_COMMAND = 'muster.backupDatabase';
 export const MUSTER_DEVELOPER_RESET_COMMAND = 'muster.developerResetGlobalDatabase';
+export const MUSTER_COMPACT_STORAGE_COMMAND = 'muster.compactStorage';
+export const MUSTER_RECLAIM_ORPHANED_FILES_COMMAND = 'muster.reclaimOrphanedFiles';
 
 export const MUSTER_BACKUP_COMMAND_TITLE = 'Muster: Back Up Global Database';
 export const MUSTER_RESET_COMMAND_TITLE = 'Muster: Developer Reset Global Database';
+export const MUSTER_COMPACT_STORAGE_COMMAND_TITLE = 'Muster: Compact Storage';
+export const MUSTER_RECLAIM_ORPHANED_FILES_COMMAND_TITLE = 'Muster: Reclaim Orphaned Files';
+
+export const RECLAIM_ORPHANED_FILES_MODAL_MESSAGE =
+  'This permanently removes stale lease files and legacy history that may not have been migrated from Muster storage. This cannot be undone.';
+export const RECLAIM_ORPHANED_FILES_CHOICE = 'Reclaim Orphaned Files';
+
+function formatReclaimOrphanedFilesModalMessage(report: StorageOrphanReport): string {
+  const removable = [...report.deadLegacyStores, ...report.staleLeases];
+  const bytes = removable.reduce((total, file) => total + file.bytes, 0);
+  return `${RECLAIM_ORPHANED_FILES_MODAL_MESSAGE}\n\n${removable.length} files (${bytes} bytes) will be permanently removed. Live SQLite data and active leases are not selected.`;
+}
 
 /** Exact modal body for global-scope reset (profile + authority). */
 export const RESET_MODAL_MESSAGE =
@@ -31,6 +51,76 @@ export type ResetCommandResult =
   | { kind: 'cancel' }
   | { kind: 'success' }
   | { kind: 'error'; code: string; message: string; recoveryAction?: string };
+
+export type CompactStorageCommandResult =
+  | { kind: 'success'; mode: 'incremental' | 'full' }
+  | { kind: 'noop'; mode: 'noop' }
+  | { kind: 'refused'; mode: 'refused'; requiredBytes: number; availableBytes: number }
+  | { kind: 'error'; code: string; message: string };
+
+/** Per-pass, path-free retention evidence shown by Muster Storage Report. */
+export type RetentionPassReport = {
+  ordinal: number;
+  tasksVisited: number;
+  entriesStripped: number;
+  toolCallsBytesBefore: number;
+  toolCallsBytesAfter: number;
+  reclaimMode: ReclaimMode;
+  fileBytesBefore: number;
+  fileBytesAfter: number;
+  strippedWorkflowMessageBodies: number;
+};
+
+export type RetentionReportSnapshot = {
+  completedPasses: number;
+  failedPasses: number;
+  completedPassDetails: readonly RetentionPassReport[];
+};
+
+/** In-memory pass history intentionally resets when the extension host reloads. */
+export class RetentionReport {
+  private readonly completedPassDetails: RetentionPassReport[] = [];
+  private failedPasses = 0;
+
+  recordCompleted(pass: Omit<RetentionPassReport, 'ordinal'> | RetentionPassReport): void {
+    this.completedPassDetails.push({ ...pass, ordinal: this.completedPassDetails.length + 1 });
+  }
+
+  recordFailure(): void {
+    this.failedPasses += 1;
+  }
+
+  snapshot(): RetentionReportSnapshot {
+    return {
+      completedPasses: this.completedPassDetails.length,
+      failedPasses: this.failedPasses,
+      completedPassDetails: [...this.completedPassDetails],
+    };
+  }
+}
+
+/** Stable, path-free report formatter for the user-invoked Storage Report channel. */
+export function formatRetentionReportLines(snapshot: RetentionReportSnapshot): string[] {
+  const lines = [
+    'Muster retention report',
+    `completed_passes: ${snapshot.completedPasses}`,
+    `failed_passes: ${snapshot.failedPasses}`,
+  ];
+  for (const pass of snapshot.completedPassDetails) {
+    lines.push(
+      `retention_pass: ${pass.ordinal}`,
+      `tasks_visited: ${pass.tasksVisited}`,
+      `entries_stripped: ${pass.entriesStripped}`,
+      `tool_calls_bytes_before: ${pass.toolCallsBytesBefore}`,
+      `tool_calls_bytes_after: ${pass.toolCallsBytesAfter}`,
+      `reclaim_mode: ${pass.reclaimMode}`,
+      `file_bytes_before: ${pass.fileBytesBefore}`,
+      `file_bytes_after: ${pass.fileBytesAfter}`,
+      `stripped_workflow_message_bodies: ${pass.strippedWorkflowMessageBodies}`,
+    );
+  }
+  return lines;
+}
 
 export type DeveloperResetCommandOptions = {
   withoutBackupOnly?: boolean;
@@ -56,6 +146,42 @@ export type BackupCommandDeps = {
   isMaintenanceActive?: () => boolean;
   setMaintenanceActive?: (active: boolean) => void;
   skipMaintenanceGuard?: boolean;
+};
+
+export type CompactStorageCommandDeps = {
+  /** Measured mode is the routing authority; never infer it from store age. */
+  storageReport: () => Promise<Pick<{ autoVacuum: number }, 'autoVacuum'>>;
+  reclaimStorage: () => Promise<ReclaimResultMeta>;
+  /** Muster Storage Report channel; handler emits enum/numeric fields only. */
+  appendLine: (line: string) => void;
+  showErrorMessage: (message: string) => void | PromiseLike<unknown>;
+  isMaintenanceActive: () => boolean;
+  setMaintenanceActive: (active: boolean) => void;
+};
+
+export type ReclaimOrphanedFilesCommandResult =
+  | { kind: 'cancel' }
+  | {
+      kind: 'success';
+      removedFiles: number;
+      bytesReclaimed: number;
+      failedRemovals: number;
+      /** Classified files whose on-disk identity changed after the modal opened. */
+      skippedRemovals: number;
+    }
+  | { kind: 'error'; code: string; message: string };
+
+export type ReclaimOrphanedFilesCommandDeps = {
+  showWarningMessage: (message: string, ...items: string[]) => Promise<string | undefined>;
+  /** The production adapter reads its global storage directory but exposes no path. */
+  readStorageDirectoryEntries: () => Promise<readonly StorageDirectoryEntry[]>;
+  classifyStorageOrphans: (entries: readonly StorageDirectoryEntry[]) => StorageOrphanReport;
+  removeStorageOrphans: (report: StorageOrphanReport) => Promise<StorageOrphanRemoval>;
+  /** Muster Storage Report channel; path-free enum, numeric, and basename values only. */
+  appendLine: (line: string) => void;
+  showErrorMessage: (message: string) => void | PromiseLike<unknown>;
+  isMaintenanceActive: () => boolean;
+  setMaintenanceActive: (active: boolean) => void;
 };
 
 export type ResetCommandDeps = {
@@ -143,6 +269,131 @@ export async function handleBackupDatabaseCommand(
     if (claimGuard) {
       deps.setMaintenanceActive?.(false);
     }
+  }
+}
+
+/**
+ * Muster: Compact Storage. The pre-measured auto_vacuum mode decides whether
+ * the worker may use bounded incremental reclaim (2) or legacy preflight-gated
+ * full compaction (0). FULL mode (1) is intentionally a no-op.
+ */
+export async function handleCompactStorageCommand(
+  deps: CompactStorageCommandDeps,
+): Promise<CompactStorageCommandResult> {
+  if (deps.isMaintenanceActive()) {
+    const message = safeMessageForCode('busy');
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code: 'busy', message };
+  }
+  deps.setMaintenanceActive(true);
+
+  try {
+    const report = await deps.storageReport();
+    if (report.autoVacuum !== 0 && report.autoVacuum !== 2) {
+      deps.appendLine('Muster storage reclamation');
+      deps.appendLine('mode: noop');
+      deps.appendLine(`auto_vacuum: ${report.autoVacuum}`);
+      return { kind: 'noop', mode: 'noop' };
+    }
+
+    const result = await deps.reclaimStorage();
+    deps.appendLine('Muster storage reclamation');
+    deps.appendLine(`mode: ${result.mode}`);
+    deps.appendLine(`file_bytes_before: ${result.fileBytesBefore}`);
+    deps.appendLine(`file_bytes_after: ${result.fileBytesAfter}`);
+    deps.appendLine(`wal_bytes_before: ${result.walBytesBefore}`);
+    deps.appendLine(`freelist_before: ${result.freelistCountBefore}`);
+    deps.appendLine(`freelist_after: ${result.freelistCountAfter}`);
+    deps.appendLine(`batches_run: ${result.batchesRun}`);
+    deps.appendLine(`wal_checkpoints: ${result.walCheckpoints}`);
+    deps.appendLine(`residual_wal_bytes: ${result.residualWalBytes}`);
+
+    if (result.mode === 'refused') {
+      // The wire contract makes both values mandatory for refused results.
+      const requiredBytes = result.requiredBytes ?? 0;
+      const availableBytes = result.availableBytes ?? 0;
+      deps.appendLine(`required_bytes: ${requiredBytes}`);
+      deps.appendLine(`available_bytes: ${availableBytes}`);
+      return { kind: 'refused', mode: 'refused', requiredBytes, availableBytes };
+    }
+    if (result.mode === 'noop') return { kind: 'noop', mode: 'noop' };
+    return { kind: 'success', mode: result.mode };
+  } catch (error) {
+    const code = errorCodeFromUnknown(error);
+    const message = safeMessageForCode(code);
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code, message };
+  } finally {
+    deps.setMaintenanceActive(false);
+  }
+}
+
+/**
+ * Muster: Reclaim Orphaned Files. The injected classifier is the sole authority
+ * for candidates; this handler never receives or emits a filesystem path.
+ */
+export async function handleReclaimOrphanedFilesCommand(
+  deps: ReclaimOrphanedFilesCommandDeps,
+): Promise<ReclaimOrphanedFilesCommandResult> {
+  if (deps.isMaintenanceActive()) {
+    const message = safeMessageForCode('busy');
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code: 'busy', message };
+  }
+  deps.setMaintenanceActive(true);
+
+  try {
+    const report = deps.classifyStorageOrphans(await deps.readStorageDirectoryEntries());
+    const removableFiles = report.deadLegacyStores.length + report.staleLeases.length;
+    if (removableFiles === 0) {
+      deps.appendLine('Muster orphan reclamation');
+      deps.appendLine('removed_files: 0');
+      deps.appendLine('bytes_reclaimed: 0');
+      deps.appendLine('failed_removals: 0');
+      deps.appendLine('skipped_removals: 0');
+      return {
+        kind: 'success',
+        removedFiles: 0,
+        bytesReclaimed: 0,
+        failedRemovals: 0,
+        skippedRemovals: 0,
+      };
+    }
+
+    let choice: string | undefined;
+    try {
+      choice = await deps.showWarningMessage(
+        formatReclaimOrphanedFilesModalMessage(report),
+        RECLAIM_ORPHANED_FILES_CHOICE,
+      );
+    } catch {
+      return { kind: 'cancel' };
+    }
+    if (choice !== RECLAIM_ORPHANED_FILES_CHOICE) return { kind: 'cancel' };
+
+    const result = await deps.removeStorageOrphans(report);
+    deps.appendLine('Muster orphan reclamation');
+    deps.appendLine(`removed_files: ${result.removed.length}`);
+    deps.appendLine(`bytes_reclaimed: ${result.bytesReclaimed}`);
+    deps.appendLine(`failed_removals: ${result.failedRemovals}`);
+    deps.appendLine(`skipped_removals: ${result.skippedRemovals}`);
+    for (const file of result.removed) {
+      deps.appendLine(`removed: ${file.name} (${file.bytes} bytes)`);
+    }
+    return {
+      kind: 'success',
+      removedFiles: result.removed.length,
+      bytesReclaimed: result.bytesReclaimed,
+      failedRemovals: result.failedRemovals,
+      skippedRemovals: result.skippedRemovals,
+    };
+  } catch (error) {
+    const code = errorCodeFromUnknown(error);
+    const message = safeMessageForCode(code);
+    await deps.showErrorMessage(message);
+    return { kind: 'error', code, message };
+  } finally {
+    deps.setMaintenanceActive(false);
   }
 }
 

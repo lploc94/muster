@@ -8,7 +8,11 @@ import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
-import { UAT_COMMANDS, type UatHostState } from '../src/host/uat-commands';
+import {
+  UAT_COMMANDS,
+  type StorageLifecycleState,
+  type UatHostState,
+} from '../src/host/uat-commands';
 
 type Json = null | boolean | number | string | Json[] | { [key: string]: Json };
 
@@ -56,11 +60,39 @@ type DurableSurfaces = {
   presentation?: { presentationId: string; revision: number; markdownLength: number };
 };
 
+type OrphanBucket = { count: number; bytes: number };
+type OrphanLifecycleObservation = {
+  deadLegacyStores: OrphanBucket;
+  staleLeases: OrphanBucket;
+  removable: OrphanBucket;
+  liveFiles: { sqlite: boolean; wal: boolean; shm: boolean; activeLeaseCount: number };
+};
+type OrphanLifecycleResult = {
+  before: OrphanLifecycleObservation;
+  cleanup: {
+    removedFiles: number;
+    bytesReclaimed: number;
+    failedRemovals: number;
+    skippedRemovals: number;
+  };
+  after: OrphanLifecycleObservation;
+};
+
 const ROLE = process.env.MUSTER_UAT_ROLE ?? '';
 const CONTROL_DIR = process.env.MUSTER_UAT_CONTROL_DIR ?? '';
 const PEER_GENERATION = Number.parseInt(process.env.MUSTER_UAT_PEER_GENERATION ?? '1', 10);
 const POLL_MS = 75;
 const DEFAULT_TIMEOUT_MS = 90_000;
+
+// Keep literal IDs here for source-boundary review; calls still resolve through
+// the activated UAT command map so renamed command IDs fail at compile time.
+const STORAGE_LIFECYCLE_COMMAND_IDS = {
+  seed: 'muster.uat.seedStorageWorkload',
+  state: 'muster.uat.storageLifecycleState',
+  retention: 'muster.uat.runRetentionPass',
+  orphanFixture: 'muster.uat.seedOrphanLifecycleFixtures',
+  orphanReclaim: 'muster.uat.reclaimOrphanedFiles',
+} as const;
 
 function controlPath(...parts: string[]): string {
   return path.join(CONTROL_DIR, ...parts);
@@ -115,6 +147,29 @@ async function waitForLocalHostState(
     const state = await cmd<UatHostState>(UAT_COMMANDS.hostState);
     if (predicate(state)) return state;
     if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for local ${label}`);
+    await sleep(POLL_MS);
+  }
+}
+
+async function waitForStorageLifecycleState(
+  label: string,
+  predicate: (state: StorageLifecycleState) => boolean,
+  timeoutMs = 30_000,
+): Promise<StorageLifecycleState> {
+  const start = Date.now();
+  let lastState: StorageLifecycleState | undefined;
+  for (;;) {
+    const state = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+    if (predicate(state)) return state;
+    lastState = state;
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(
+        `timeout waiting for ${label}; ` +
+        `completedPasses=${lastState.retention.completedPasses} ` +
+        `failedPasses=${lastState.retention.failedPasses} ` +
+        `truncatedEntries=${lastState.retentionTruncatedEntries}`,
+      );
+    }
     await sleep(POLL_MS);
   }
 }
@@ -267,8 +322,8 @@ async function runOrchestratorA(): Promise<void> {
   assert.equal(identityA.dbFileToken, identityB.dbFileToken, 'hosts opened different DB files');
   assert.equal(identityA.workspaceId, identityB.workspaceId, 'workspace ids diverged');
   assert.notEqual(pingA.sessionId, readyB1.sessionId, 'expected distinct Extension Hosts');
-  assert.equal(identityA.userVersion, 7, 'schema version drifted');
-  assert.equal(identityB.userVersion, 7, 'peer schema version drifted');
+  assert.equal(identityA.userVersion, 2, 'schema version drifted');
+  assert.equal(identityB.userVersion, 2, 'peer schema version drifted');
   assert.equal(identityA.applicationId, 0x4d555354);
   assert.equal(identityA.journalMode, 'wal');
 
@@ -513,42 +568,75 @@ async function runOrchestratorA(): Promise<void> {
     120_000,
   );
   const identityB2 = await peer<DbIdentity>(UAT_COMMANDS.identity);
-  let durableB: DurableSurfaces | undefined;
-  const durableStart = Date.now();
-  for (;;) {
-    durableB = await peer<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
-      rootId: created.taskId, presentationId: 'uat-plan',
-    });
-    if (durableB.sendOutbox.some((entry) =>
-      entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected')) {
-      break;
-    }
-    if (Date.now() - durableStart > 30_000) {
-      throw new Error('timeout waiting for durable pending-outbox replay');
-    }
-    await sleep(POLL_MS);
-  }
-  const [durableA, restartedState] = await Promise.all([
-    cmd<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
-      rootId: created.taskId, presentationId: 'uat-plan',
-    }),
-    peer<UatHostState>(UAT_COMMANDS.hostState),
-  ]);
-  const durableOk = [durableA, durableB].every((value) =>
+  // VS Code can restore the sidebar as host-visible before the fresh webview
+  // renderer mounts. Force a real hide/reveal cycle so the production webview
+  // receives outboxSnapshot before snapshot and replays the pending send.
+  await peer('workbench.action.closeSidebar');
+  await waitForPeerHostState(
+    'fresh-host hidden view',
+    (state) => !state.viewVisible && !state.pollingReady,
+  );
+  await peer('muster.openChat');
+  await peer(UAT_COMMANDS.forcePollingActive);
+  await waitForPeerHostState(
+    'fresh-host webview hydration',
+    (state) => state.viewResolved && state.viewVisible && state.pollingReady,
+  );
+  // A fresh production webview recovers the pending fixture after compatible
+  // snapshot hydration. Its failed replay stays durably visible as rejected;
+  // the independently rejected record and presentation must also survive.
+  const hasExpectedDurableSurfaces = (value: DurableSurfaces): boolean =>
     value.sendOutbox.some((entry) =>
       entry.clientRequestId === 'uat-outbox-pending' && entry.status === 'rejected') &&
     value.sendOutbox.some((entry) =>
       entry.clientRequestId === 'uat-outbox-reject' && entry.status === 'rejected') &&
     value.presentation?.presentationId === 'uat-plan' &&
     value.presentation.revision === 1 &&
-    value.presentation.markdownLength > 0,
+    value.presentation.markdownLength > 0;
+  const waitForPeerDurableSurfaces = async (
+    label: string,
+    timeoutMs = 30_000,
+  ): Promise<{ durable: DurableSurfaces; state: UatHostState }> => {
+    const start = Date.now();
+    let lastDurable: DurableSurfaces | undefined;
+    for (;;) {
+      // `peer` advances a shared mailbox cursor, so requests to the same
+      // Extension Host must remain ordered. Parallel local/peer work elsewhere
+      // is safe because it uses separate command channels.
+      const durable = await peer<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
+        rootId: created.taskId, presentationId: 'uat-plan',
+      });
+      const state = await peer<UatHostState>(UAT_COMMANDS.hostState);
+      if (hasExpectedDurableSurfaces(durable)) return { durable, state };
+      lastDurable = durable;
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(
+          `timeout waiting for peer ${label}; ` +
+          `outboxCount=${lastDurable.sendOutbox.length} ` +
+          `presentationPresent=${lastDurable.presentation !== undefined}`, 
+        );
+      }
+      await sleep(POLL_MS);
+    }
+  };
+  const [durableA, peerDurableReadback] = await Promise.all([
+    cmd<DurableSurfaces>(UAT_COMMANDS.readDurableSurfaces, {
+      rootId: created.taskId, presentationId: 'uat-plan',
+    }),
+    waitForPeerDurableSurfaces('fresh-host durable restoration'),
+  ]);
+  const durableB = peerDurableReadback.durable;
+  const restartedState = peerDurableReadback.state;
+  const durableOk = [durableA, durableB].every(hasExpectedDurableSurfaces);
+  const identityOk = identityB2.dbFileToken === identityA.dbFileToken;
+  const tasksOk = arraysEqual(
+    [...restartedState.taskIds].sort(),
+    [...taskIdsBeforeRestart].sort(),
   );
   record(
     'H',
-    durableOk &&
-      identityB2.dbFileToken === identityA.dbFileToken &&
-      arraysEqual([...restartedState.taskIds].sort(), [...taskIdsBeforeRestart].sort()),
-    `peer restarted generation=${readyB2.generation}; pending replay rejected safely; durable surfaces restored`,
+    durableOk && identityOk && tasksOk,
+    `peer restarted generation=${readyB2.generation}; recovered pending entry was rejected; explicit rejection persisted; durable surfaces restored; durableOk=${durableOk} identityOk=${identityOk} tasksOk=${tasksOk}`, 
   );
 
   // I — two SQLite writers start at the same time, then both projections converge.
@@ -597,6 +685,73 @@ async function runOrchestratorA(): Promise<void> {
     `simultaneous writers converged rev=${finalA.appliedWorkspaceRevision} tasks=${finalA.taskIds.length}`,
   );
 
+  // M023/S05 — preserve the original A–I protocol while observing the storage
+  // lifecycle through the activated production repository in both hosts.
+  progress('storage-lifecycle');
+  assert.equal(UAT_COMMANDS.seedStorageWorkload, STORAGE_LIFECYCLE_COMMAND_IDS.seed);
+  assert.equal(UAT_COMMANDS.storageLifecycleState, STORAGE_LIFECYCLE_COMMAND_IDS.state);
+  assert.equal(UAT_COMMANDS.runRetentionPass, STORAGE_LIFECYCLE_COMMAND_IDS.retention);
+  const lifecycleBefore = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+  await cmd(UAT_COMMANDS.seedStorageWorkload);
+  const lifecycleAfterSeed = await cmd<StorageLifecycleState>(UAT_COMMANDS.storageLifecycleState);
+  const scheduledPassTarget = lifecycleAfterSeed.retention.completedPasses + 2;
+  const lifecycleAfterScheduledPasses = await waitForStorageLifecycleState(
+    'two scheduled retention passes',
+    (state) =>
+      state.retention.completedPasses >= scheduledPassTarget &&
+      state.retention.failedPasses === 0 &&
+      state.retentionTruncatedEntries === 4,
+    90_000,
+  );
+  // The command shares the scheduler's production retention/reclamation path;
+  // this explicit seam makes its completion observable without a parallel DB.
+  await cmd(UAT_COMMANDS.runRetentionPass);
+  const lifecycleAfterRetention = await cmd<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.equal(
+    lifecycleAfterRetention.retention.completedPasses,
+    lifecycleAfterScheduledPasses.retention.completedPasses,
+    'direct UAT pass must not fabricate scheduler completion evidence',
+  );
+  const lifecyclePeerAfterRetention = await peer<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.ok(
+    lifecycleAfterSeed.storage.fileBytes > lifecycleBefore.storage.fileBytes,
+    'seeded workload did not grow database bytes',
+  );
+  assert.ok(
+    lifecycleAfterRetention.storage.fileBytes < lifecycleAfterSeed.storage.fileBytes,
+    'retention did not shrink database bytes',
+  );
+  assert.equal(
+    lifecyclePeerAfterRetention.storage.fileBytes,
+    lifecycleAfterRetention.storage.fileBytes,
+    'peer storage report did not converge after reclamation',
+  );
+
+  // M023/S08 — seed classifier-recognized fixtures only after retention, then
+  // use the UAT-gated delegate which exercises the sole production reclaim handler.
+  progress('orphan-lifecycle');
+  assert.equal(UAT_COMMANDS.seedOrphanLifecycleFixtures, STORAGE_LIFECYCLE_COMMAND_IDS.orphanFixture);
+  assert.equal(UAT_COMMANDS.reclaimOrphanedFiles, STORAGE_LIFECYCLE_COMMAND_IDS.orphanReclaim);
+  await cmd(UAT_COMMANDS.seedOrphanLifecycleFixtures);
+  const orphanLifecycle = await cmd<OrphanLifecycleResult>(UAT_COMMANDS.reclaimOrphanedFiles);
+  const lifecycleAfterOrphanCleanup = await cmd<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  const lifecyclePeerAfterOrphanCleanup = await peer<StorageLifecycleState>(
+    UAT_COMMANDS.storageLifecycleState,
+  );
+  assert.ok(orphanLifecycle.before.removable.count > 0, 'orphan fixture was not classified');
+  assert.equal(orphanLifecycle.cleanup.removedFiles, orphanLifecycle.before.removable.count);
+  assert.equal(orphanLifecycle.cleanup.bytesReclaimed, orphanLifecycle.before.removable.bytes);
+  assert.equal(orphanLifecycle.cleanup.failedRemovals, 0);
+  assert.equal(orphanLifecycle.after.removable.count, 0);
+  assert.equal(orphanLifecycle.after.removable.bytes, 0);
+  assert.equal(lifecyclePeerAfterOrphanCleanup.storage.fileBytes, lifecycleAfterOrphanCleanup.storage.fileBytes);
+
   writeJson(controlPath('result.json'), {
     ok: scenarios.every((scenario) => scenario.verdict === 'PASS'),
     kind: 'live-two-window-extension-host',
@@ -623,6 +778,19 @@ async function runOrchestratorA(): Promise<void> {
     finalRevision: finalA.appliedWorkspaceRevision,
     finalTaskCount: finalA.taskIds.length,
     scenarios,
+    storageLifecycle: {
+      before: lifecycleBefore,
+      afterSeed: lifecycleAfterSeed,
+      afterRetention: lifecycleAfterRetention,
+      peerAfterRetention: lifecyclePeerAfterRetention,
+      orphanBeforeCleanup: orphanLifecycle.before,
+      orphanCleanup: orphanLifecycle.cleanup,
+      afterOrphanCleanup: {
+        state: lifecycleAfterOrphanCleanup,
+        classification: orphanLifecycle.after,
+      },
+      peerAfterOrphanCleanup: lifecyclePeerAfterOrphanCleanup,
+    },
   });
   writeJson(controlPath('done.json'), { stop: true });
 }

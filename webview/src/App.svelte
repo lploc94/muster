@@ -67,6 +67,7 @@
   import { resolveOpenBackendSetupAction } from './lib/composer-backend-setup';
   import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import { vscode } from './lib/vscode';
+  import { collectToolCardRenderObservations } from './lib/render-probe';
 
   type PendingElicitation =
     | {
@@ -535,6 +536,22 @@
   onMount(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+
+      // This response is intentionally outside the production protocol: the
+      // host can issue its paired request only through the UAT-gated command.
+      if (
+        msg &&
+        typeof msg === 'object' &&
+        (msg as { type?: unknown }).type === 'renderProbeRequest' &&
+        typeof (msg as { requestId?: unknown }).requestId === 'string'
+      ) {
+        vscode.postMessage({
+          type: 'renderProbeResponse',
+          requestId: (msg as { requestId: string }).requestId,
+          observation: collectToolCardRenderObservations(document),
+        });
+        return;
+      }
 
       // Protocol-drift detection: the bootstrap `snapshot` carries the host's
       // protocolVersion. Check it BEFORE the strict isExtMessage guard, because a
