@@ -233,6 +233,18 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
 /**
  * Node ids that can be skipped when these graph nodes are reused: each declared
  * node plus every predecessor reachable over frozen reverse edges.
+ *
+ * Skipping the whole ancestor chain is correct *because* decodeTopology bans
+ * fan-out (workflow-codec.ts: `fan-out not allowed`), so every non-terminal node
+ * has exactly one outgoing route. A predecessor of a reused node therefore has
+ * no consumer other than that node: its only purpose is to produce the result
+ * being reused. Materializing it instead would spend an agent turn whose output
+ * lands on an already-prefilled gate and is dropped by ON CONFLICT DO NOTHING.
+ *
+ * If the fan-out ban is ever relaxed this becomes unsound (a predecessor feeding
+ * a still-live sibling would be skipped, and that sibling's gate would never
+ * fill). m024-s03-mid-tree-node-reuse.test.ts pins that dependency so the ban
+ * cannot be lifted without failing a test that points back here.
  */
 export function ancestorNodeClosure(
   topology: WorkflowTopologyV1,
@@ -960,7 +972,10 @@ export function validateStartWorkflow(
     if (
       !isNonEmptyBounded(item.nodeId, 128) ||
       !isNonEmptyBounded(item.fromRun, 128) ||
-      reuseNodeIds.has(item.nodeId)
+      reuseNodeIds.has(item.nodeId) ||
+      // A reference naming a node outside this topology can never be applied;
+      // accepting it would silently start a run that executes every node.
+      !allNodeIds.includes(item.nodeId)
     ) {
       return { ok: false, reason: 'invalid reuse' };
     }
@@ -1124,7 +1139,8 @@ export function startWorkflowInvalid(
     | 'invalid identity'
     | 'entry input reference unresolved'
     | 'terminal node cannot be reused'
-    | 'node reuse reference unresolved',
+    | 'node reuse reference unresolved'
+    | 'reuse aggregate exceeds policy',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {

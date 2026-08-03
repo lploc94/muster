@@ -4,8 +4,8 @@
   "schemaVersion": 1,
   "before": {
     "storage": {
-      "fileBytes": 692224,
-      "walBytes": 0,
+      "fileBytes": 684032,
+      "walBytes": 177192,
       "shmBytes": 32768,
       "pageCount": 169,
       "freelistCount": 0,
@@ -184,9 +184,9 @@
       ]
     },
     "retention": {
-      "completedPasses": 18,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 18
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 6,
@@ -198,10 +198,10 @@
   },
   "afterSeed": {
     "storage": {
-      "fileBytes": 6811648,
-      "walBytes": 6464312,
+      "fileBytes": 8093696,
+      "walBytes": 7972232,
       "shmBytes": 32768,
-      "pageCount": 1664,
+      "pageCount": 1976,
       "freelistCount": 0,
       "pageSize": 4096,
       "autoVacuum": 2,
@@ -209,7 +209,7 @@
       "tables": [
         {
           "name": "tool_calls",
-          "bytes": 6127616
+          "bytes": 7405568
         },
         {
           "name": "workflow_runs",
@@ -378,13 +378,13 @@
       ]
     },
     "retention": {
-      "completedPasses": 18,
+      "completedPasses": 20,
       "failedPasses": 0,
-      "latestPassOrdinal": 18
+      "latestPassOrdinal": 20
     },
     "durableRows": {
       "tasks": 8,
-      "turns": 12,
+      "turns": 13,
       "messages": 14,
       "operations": 0
     },
@@ -392,10 +392,10 @@
   },
   "afterRetention": {
     "storage": {
-      "fileBytes": 1507328,
+      "fileBytes": 2785280,
       "walBytes": 0,
       "shmBytes": 32768,
-      "pageCount": 368,
+      "pageCount": 680,
       "freelistCount": 0,
       "pageSize": 4096,
       "autoVacuum": 2,
@@ -403,7 +403,7 @@
       "tables": [
         {
           "name": "tool_calls",
-          "bytes": 819200
+          "bytes": 2097152
         },
         {
           "name": "workflow_runs",
@@ -572,13 +572,13 @@
       ]
     },
     "retention": {
-      "completedPasses": 20,
+      "completedPasses": 22,
       "failedPasses": 0,
-      "latestPassOrdinal": 20
+      "latestPassOrdinal": 22
     },
     "durableRows": {
       "tasks": 8,
-      "turns": 12,
+      "turns": 13,
       "messages": 14,
       "operations": 0
     },
@@ -586,10 +586,10 @@
   },
   "peerAfterRetention": {
     "storage": {
-      "fileBytes": 1507328,
+      "fileBytes": 2785280,
       "walBytes": 0,
       "shmBytes": 32768,
-      "pageCount": 368,
+      "pageCount": 680,
       "freelistCount": 0,
       "pageSize": 4096,
       "autoVacuum": 2,
@@ -597,7 +597,7 @@
       "tables": [
         {
           "name": "tool_calls",
-          "bytes": 819200
+          "bytes": 2097152
         },
         {
           "name": "workflow_runs",
@@ -772,7 +772,7 @@
     },
     "durableRows": {
       "tasks": 8,
-      "turns": 12,
+      "turns": 13,
       "messages": 14,
       "operations": 0
     },
@@ -801,15 +801,16 @@
   "orphanCleanup": {
     "removedFiles": 2,
     "bytesReclaimed": 7,
-    "failedRemovals": 0
+    "failedRemovals": 0,
+    "skippedRemovals": 0
   },
   "afterOrphanCleanup": {
     "state": {
       "storage": {
-        "fileBytes": 1507328,
+        "fileBytes": 2785280,
         "walBytes": 0,
         "shmBytes": 32768,
-        "pageCount": 368,
+        "pageCount": 680,
         "freelistCount": 0,
         "pageSize": 4096,
         "autoVacuum": 2,
@@ -817,7 +818,7 @@
         "tables": [
           {
             "name": "tool_calls",
-            "bytes": 819200
+            "bytes": 2097152
           },
           {
             "name": "workflow_runs",
@@ -986,13 +987,13 @@
         ]
       },
       "retention": {
-        "completedPasses": 20,
+        "completedPasses": 22,
         "failedPasses": 0,
-        "latestPassOrdinal": 20
+        "latestPassOrdinal": 22
       },
       "durableRows": {
         "tasks": 8,
-        "turns": 12,
+        "turns": 13,
         "messages": 14,
         "operations": 0
       },
@@ -1021,10 +1022,10 @@
   },
   "peerAfterOrphanCleanup": {
     "storage": {
-      "fileBytes": 1507328,
+      "fileBytes": 2785280,
       "walBytes": 0,
       "shmBytes": 32768,
-      "pageCount": 368,
+      "pageCount": 680,
       "freelistCount": 0,
       "pageSize": 4096,
       "autoVacuum": 2,
@@ -1032,7 +1033,7 @@
       "tables": [
         {
           "name": "tool_calls",
-          "bytes": 819200
+          "bytes": 2097152
         },
         {
           "name": "workflow_runs",
@@ -1207,7 +1208,7 @@
     },
     "durableRows": {
       "tasks": 8,
-      "turns": 12,
+      "turns": 13,
       "messages": 14,
       "operations": 0
     },
@@ -1219,5 +1220,6 @@
     "sessionIdsStoredInEvidence": false,
     "canaryStoredInEvidence": false
   },
-  "generatedAt": "2026-08-01T02:06:15.609Z"
+  "generatedAt": "2026-08-02T02:19:24.309Z",
+  "commitSha": "03e6e84fad4faf44d2874214efa5fb3e51ed6151"
 }

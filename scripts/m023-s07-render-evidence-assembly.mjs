@@ -17,8 +17,8 @@ function boundedReason(error) {
     .slice(0, MAX_BLOCKED_REASON_LENGTH);
 }
 
-/** @param {unknown} result @param {string} generatedAt */
-export function assembleTruncatedRenderEvidence(result, generatedAt = new Date().toISOString()) {
+/** @param {unknown} result @param {string} generatedAt @param {string} commitSha */
+export function assembleTruncatedRenderEvidence(result, generatedAt = new Date().toISOString(), commitSha = '') {
   if (!result || typeof result !== 'object' || result.ok !== true || result.kind !== HOST_KIND) {
     throw new Error('live Extension Development Host DOM result is required for PASS evidence');
   }
@@ -43,14 +43,15 @@ export function assembleTruncatedRenderEvidence(result, generatedAt = new Date()
       canaryStoredInEvidence: false,
     },
     generatedAt,
+    commitSha,
   };
   const failures = validateTruncatedRenderEvidence(evidence, { requirePass: true });
   if (failures.length) throw new Error(`live host observation failed evidence contract: ${failures.join('; ')}`);
   return evidence;
 }
 
-/** @param {unknown} error @param {string} generatedAt */
-export function assembleBlockedTruncatedRenderEvidence(error, generatedAt = new Date().toISOString()) {
+/** @param {unknown} error @param {string} generatedAt @param {string} commitSha */
+export function assembleBlockedTruncatedRenderEvidence(error, generatedAt = new Date().toISOString(), commitSha = '') {
   const evidence = {
     ok: false,
     kind: 'm023-s07-truncated-render-live-uat',
@@ -58,6 +59,7 @@ export function assembleBlockedTruncatedRenderEvidence(error, generatedAt = new 
     verdict: 'BLOCKED',
     blockedReason: boundedReason(error) || 'live Extension Development Host run was blocked without a diagnostic reason',
     generatedAt,
+    commitSha,
   };
   const failures = validateTruncatedRenderEvidence(evidence);
   if (failures.length) throw new Error(`blocked evidence failed contract: ${failures.join('; ')}`);

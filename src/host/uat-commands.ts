@@ -690,7 +690,8 @@ function makeStorageSeedIso(offsetMs = 0): string {
 }
 
 /**
- * Creates a bounded, retention-eligible production workload plus one live turn.
+ * Creates five settled turns plus one live turn. With keepLatestTurns=1, the
+ * newest small settled turn survives and the four older large diffs are eligible.
  * The caller owns UAT gating; this helper never opens a parallel database client.
  */
 export async function seedStorageWorkload(
@@ -704,7 +705,7 @@ export async function seedStorageWorkload(
 
   // SQLite retention preserves durable rows, but truncates oversized payloads
   // on settled turns belonging to an otherwise open task.
-  const settledTurns: TaskTurn[] = Array.from({ length: 4 }, (_, index) => index + 1).map((sequence) => ({
+  const settledTurns: TaskTurn[] = Array.from({ length: 5 }, (_, index) => index + 1).map((sequence) => ({
     id: `${STORAGE_SEED_ACTIVE_TASK_ID}-settled-${sequence}`,
     taskId: activeTask.id,
     sequence,
@@ -718,8 +719,8 @@ export async function seedStorageWorkload(
     await repository.execute({ kind: 'createTurn', workspaceId, turn });
   }
   const activeTurn: TaskTurn = {
-    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-5`, taskId: activeTask.id, sequence: 5,
-    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(5_000), startedAt: makeStorageSeedIso(5_100),
+    id: `${STORAGE_SEED_ACTIVE_TASK_ID}-turn-6`, taskId: activeTask.id, sequence: 6,
+    status: 'running', trigger: 'user', inputs: [], createdAt: makeStorageSeedIso(6_000), startedAt: makeStorageSeedIso(6_100),
   };
   await repository.execute({ kind: 'createTurn', workspaceId, turn: activeTurn });
 
@@ -810,10 +811,15 @@ export async function seedOrphanLifecycleFixtures(
 ): Promise<{ deadLegacyStores: number; staleLeases: number; activeLeases: number }> {
   const now = new Date();
   const stale = new Date(now.getTime() - 61_000);
+  // Names must match what the legacy JSON store actually produced --
+  // `${storePath}.lease.${encodeURIComponent(turnId)}` with storePath being the
+  // store file itself. A shortened `.lease.*` name would make this fixture
+  // agree with the classifier while proving nothing about real residue.
+  const staleLease = join(storageDirectory, '.muster-tasks.json.lease.turn%3Aorphan-uat');
   await writeFile(join(storageDirectory, '.muster-tasks.json'), '{}', 'utf8');
-  await writeFile(join(storageDirectory, '.lease.turn%3Aorphan-uat'), 'stale', 'utf8');
-  await writeFile(join(storageDirectory, '.lease.turn%3Aactive-uat'), 'active', 'utf8');
-  await utimes(join(storageDirectory, '.lease.turn%3Aorphan-uat'), stale, stale);
+  await writeFile(staleLease, 'stale', 'utf8');
+  await writeFile(join(storageDirectory, '.muster-tasks.json.lease.turn%3Aactive-uat'), 'active', 'utf8');
+  await utimes(staleLease, stale, stale);
   return { deadLegacyStores: 1, staleLeases: 1, activeLeases: 1 };
 }
 

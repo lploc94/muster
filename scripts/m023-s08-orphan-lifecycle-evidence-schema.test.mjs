@@ -49,7 +49,7 @@ function completeEvidence() {
     afterRetention,
     peerAfterRetention: afterRetention,
     orphanBeforeCleanup: classification({ count: 1, bytes: 400 }, { count: 1, bytes: 600 }),
-    orphanCleanup: { removedFiles: 2, bytesReclaimed: 1000, failedRemovals: 0 },
+    orphanCleanup: { removedFiles: 2, bytesReclaimed: 1000, failedRemovals: 0, skippedRemovals: 0 },
     afterOrphanCleanup: {
       state: state(1000),
       classification: classification({ count: 0, bytes: 0 }, { count: 0, bytes: 0 }),
@@ -62,6 +62,7 @@ function completeEvidence() {
       canaryStoredInEvidence: false,
     },
     generatedAt: '2026-08-01T12:00:00.000Z',
+    commitSha: '0123456789abcdef0123456789abcdef01234567',
   };
 }
 
@@ -73,7 +74,7 @@ test('rejects vacuous or mismatched orphan cleanup facts', () => {
   {
     const evidence = completeEvidence();
     evidence.orphanBeforeCleanup = classification({ count: 0, bytes: 0 }, { count: 0, bytes: 0 });
-    evidence.orphanCleanup = { removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0 };
+    evidence.orphanCleanup = { removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0, skippedRemovals: 0 };
     assert.ok(validateOrphanLifecycleEvidence(evidence).some((failure) => /non-empty orphan reclamation/.test(failure)));
   }
   {

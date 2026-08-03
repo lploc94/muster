@@ -13,6 +13,7 @@ const ROOT_KEYS = new Set([
   'peerAfterRetention',
   'contentSafety',
   'generatedAt',
+  'commitSha',
 ]);
 const STATE_KEYS = new Set(['storage', 'retention', 'durableRows', 'retentionTruncatedEntries']);
 const STORAGE_KEYS = new Set([
@@ -36,6 +37,7 @@ const CONTENT_SAFETY_KEYS = [
   'canaryStoredInEvidence',
 ];
 const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const SAFE_TABLE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const MAX_BYTES = 2_000_000_000;
 const MAX_COUNT = 1_000_000;
@@ -63,7 +65,7 @@ function validateStorage(storage, label) {
   for (const key of ['fileBytes', 'walBytes', 'shmBytes']) nonNegativeInteger(storage[key], `${label}.${key}`, failures, MAX_BYTES);
   for (const key of ['pageCount', 'freelistCount', 'pageSize', 'autoVacuum']) nonNegativeInteger(storage[key], `${label}.${key}`, failures);
   if (storage.pageSize !== 4096) failures.push(`${label}.pageSize must be 4096`);
-  if (![0, 1, 2].includes(storage.autoVacuum)) failures.push(`${label}.autoVacuum must be 0, 1, or 2`);
+  if (storage.autoVacuum !== 2) failures.push(`${label}.autoVacuum must be 2 for the incremental lifecycle proof`);
   if (storage.tableBytesSource !== 'dbstat' && storage.tableBytesSource !== 'estimated') {
     failures.push(`${label}.tableBytesSource must be dbstat or estimated`);
   }
@@ -144,6 +146,12 @@ export function validateStorageLifecycleEvidence(evidence, opts = {}) {
   }
   if (retained?.retention?.failedPasses !== 0) failures.push('afterRetention.retention.failedPasses must be 0');
   if (retained?.retentionTruncatedEntries !== 4) failures.push('afterRetention.retentionTruncatedEntries must be 4');
+  for (const [label, state] of [['afterSeed', seeded], ['afterRetention', retained]]) {
+    const toolCalls = state?.storage?.tables?.find((table) => table?.name === 'tool_calls');
+    if (!toolCalls || !Number.isSafeInteger(toolCalls.bytes) || toolCalls.bytes <= 0) {
+      failures.push(`${label}.storage.tables must include non-zero tool_calls bytes`);
+    }
+  }
   for (const rows of ROW_KEYS) {
     if (Number.isSafeInteger(seeded?.durableRows?.[rows]) && Number.isSafeInteger(retained?.durableRows?.[rows]) && seeded.durableRows[rows] !== retained.durableRows[rows]) {
       failures.push(`durableRows.${rows} must be unchanged afterSeed to afterRetention`);
@@ -160,6 +168,7 @@ export function validateStorageLifecycleEvidence(evidence, opts = {}) {
     for (const key of CONTENT_SAFETY_KEYS) if (safety[key] !== false) failures.push(`contentSafety.${key} must be false`);
   }
   if (typeof evidence.generatedAt !== 'string' || !ISO_TS.test(evidence.generatedAt)) failures.push('generatedAt must be ISO UTC');
+  if (typeof evidence.commitSha !== 'string' || !COMMIT_SHA.test(evidence.commitSha)) failures.push('commitSha must be a full git SHA');
   if (SENSITIVE.test(JSON.stringify(evidence))) failures.push('evidence contains sensitive content');
   return failures;
 }

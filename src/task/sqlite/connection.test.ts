@@ -142,6 +142,55 @@ describe('openStoreDatabase', () => {
     }
   });
 
+  it('rejects a foreign non-default auto_vacuum mode before it can be changed', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('PRAGMA auto_vacuum = FULL');
+      seed.exec('VACUUM');
+      seed.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(NonEmptyUnclaimedDatabaseError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(0);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(scalar(after, 'auto_vacuum')).toBe(1);
+      expect(journalMode(after)).toBe('delete');
+    } finally {
+      after.close();
+    }
+  });
+
+  it('rejects sqlite_sequence residue as non-blank before applying Muster pragmas', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('CREATE TABLE seed (id INTEGER PRIMARY KEY AUTOINCREMENT)');
+      seed.exec('INSERT INTO seed DEFAULT VALUES');
+      seed.exec('DROP TABLE seed');
+      seed.close();
+    }
+
+    expect(() => openStoreDatabase({ path: dbPath })).toThrow(NonEmptyUnclaimedDatabaseError);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(0);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(scalar(after, 'auto_vacuum')).toBe(0);
+      expect(journalMode(after)).toBe('delete');
+      expect(after.prepare("SELECT name FROM sqlite_schema WHERE name = 'sqlite_sequence'").get())
+        .toMatchObject({ name: 'sqlite_sequence' });
+    } finally {
+      after.close();
+    }
+  });
+
   it('rejects unclaimed incompatible user_version without stamping application_id or WAL', () => {
     const dbPath = tempDbPath();
     {

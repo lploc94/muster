@@ -163,17 +163,20 @@ describe('sqlite maintenance commands (P5-W5)', () => {
     const appendLine = vi.fn();
     const snapshot = {
       live: [],
-      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
+      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120, modifiedAtMs: 0 }],
       activeLeases: [],
-      staleLeases: [{ name: '.lease.turn%3Astale', bytes: 30 }],
+      staleLeases: [
+        { name: '.muster-tasks.json.lease.turn%3Astale', bytes: 30, modifiedAtMs: 0 },
+      ],
     };
     const removeStorageOrphans = vi.fn(async () => ({
       removed: [
-        { name: '.muster-tasks.json', bytes: 120 },
-        { name: '.lease.turn%3Astale', bytes: 30 },
+        { name: '.muster-tasks.json', bytes: 120, modifiedAtMs: 0 },
+        { name: '.muster-tasks.json.lease.turn%3Astale', bytes: 30, modifiedAtMs: 0 },
       ],
       bytesReclaimed: 150,
       failedRemovals: 1,
+      skippedRemovals: 1,
     }));
     let active = false;
 
@@ -193,13 +196,20 @@ describe('sqlite maintenance commands (P5-W5)', () => {
       setMaintenanceActive: (value) => { active = value; },
     });
 
-    expect(result).toEqual({ kind: 'success', removedFiles: 2, bytesReclaimed: 150, failedRemovals: 1 });
+    expect(result).toEqual({
+      kind: 'success',
+      removedFiles: 2,
+      bytesReclaimed: 150,
+      failedRemovals: 1,
+      skippedRemovals: 1,
+    });
     expect(removeStorageOrphans).toHaveBeenCalledOnce();
     expect(removeStorageOrphans).toHaveBeenCalledWith(snapshot);
     const report = appendLine.mock.calls.flat().join('\n');
     expect(report).toContain('removed_files: 2');
     expect(report).toContain('bytes_reclaimed: 150');
     expect(report).toContain('failed_removals: 1');
+    expect(report).toContain('skipped_removals: 1');
     expect(report).toContain('removed: .muster-tasks.json (120 bytes)');
     expect(report).not.toMatch(/[A-Z]:\\|\//);
     expect(active).toBe(false);
@@ -209,7 +219,7 @@ describe('sqlite maintenance commands (P5-W5)', () => {
     const readStorageDirectoryEntries = vi.fn(async () => []);
     const classifyStorageOrphans = vi.fn(() => ({
       live: [],
-      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120 }],
+      deadLegacyStores: [{ name: '.muster-tasks.json', bytes: 120, modifiedAtMs: 0 }],
       activeLeases: [],
       staleLeases: [],
     }));
@@ -245,9 +255,11 @@ describe('sqlite maintenance commands (P5-W5)', () => {
       showWarningMessage,
       readStorageDirectoryEntries: async () => [],
       classifyStorageOrphans: () => ({
-        live: [{ name: 'muster.sqlite3', bytes: 100 }],
+        live: [{ name: 'muster.sqlite3', bytes: 100, modifiedAtMs: 0 }],
         deadLegacyStores: [],
-        activeLeases: [{ name: '.lease.turn%3Alive', bytes: 20 }],
+        activeLeases: [
+          { name: '.muster-tasks.json.lease.turn%3Alive', bytes: 20, modifiedAtMs: 0 },
+        ],
         staleLeases: [],
       }),
       removeStorageOrphans,
@@ -257,7 +269,13 @@ describe('sqlite maintenance commands (P5-W5)', () => {
       setMaintenanceActive: vi.fn(),
     });
 
-    expect(result).toEqual({ kind: 'success', removedFiles: 0, bytesReclaimed: 0, failedRemovals: 0 });
+    expect(result).toEqual({
+      kind: 'success',
+      removedFiles: 0,
+      bytesReclaimed: 0,
+      failedRemovals: 0,
+      skippedRemovals: 0,
+    });
     expect(showWarningMessage).not.toHaveBeenCalled();
     expect(removeStorageOrphans).not.toHaveBeenCalled();
     expect(appendLine.mock.calls.flat()).toEqual([
@@ -265,6 +283,7 @@ describe('sqlite maintenance commands (P5-W5)', () => {
       'removed_files: 0',
       'bytes_reclaimed: 0',
       'failed_removals: 0',
+      'skipped_removals: 0',
     ]);
   });
 

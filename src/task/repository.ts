@@ -587,9 +587,7 @@ export interface RepositoryCommandResult {
   /** Number of retained file-change evidence entries stripped by a retention command. */
   retentionEntriesStripped?: number;
   /** Number of safely terminal workflow metadata rows reclaimed by maintenance. */
-  reclaimedWorkflowRuns?: number;
-  /** Number of terminal runs retained because another run pins one of their artifacts. */
-  skippedPinnedWorkflowRuns?: number;
+  strippedWorkflowMessageBodies?: number;
   /** A non-secret, UI-safe denial reason for a conditional command. */
   reason?: string;
   /** Present for operation-idempotency replay/claim commands. */
@@ -5104,7 +5102,8 @@ export class SqliteTaskRepository implements TaskRepository {
         | 'invalid identity'
         | 'entry input reference unresolved'
         | 'terminal node cannot be reused'
-        | 'node reuse reference unresolved',
+        | 'node reuse reference unresolved'
+        | 'reuse aggregate exceeds policy',
     ): RepositoryCommandResult => {
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
       return {
@@ -5300,7 +5299,9 @@ export class SqliteTaskRepository implements TaskRepository {
             AND artifact.revision = run.terminal_result_artifact_revision
           WHERE run.workspace_id = ? AND run.run_id = ?
             AND run.owner_root_task_id = ?
-            AND run.status IN ('succeeded', 'failed', 'cancelled')`,
+            -- Only a succeeded run is "done": a failed or cancelled run may have
+            -- written a terminal pointer whose result was never actually accepted.
+            AND run.status = 'succeeded'`,
         [this.workspaceId, input.fromRun, validated.ownerRootTaskId],
       );
       if (
@@ -5356,7 +5357,9 @@ export class SqliteTaskRepository implements TaskRepository {
           WHERE artifact.workspace_id = ? AND artifact.run_id = ?
             AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'
             AND run.owner_root_task_id = ?
-            AND run.status IN ('succeeded', 'failed', 'cancelled')
+            -- Same rule as entry-input reuse: only harvest node results from a run
+            -- that actually succeeded, never from a failed or cancelled one.
+            AND run.status = 'succeeded'
           ORDER BY artifact.revision DESC
           LIMIT 1`,
         [this.workspaceId, reuse.fromRun, reuse.nodeId, validated.ownerRootTaskId ?? null],
@@ -5952,6 +5955,14 @@ export class SqliteTaskRepository implements TaskRepository {
         const aggregate = `[workflow-aggregate] ${incoming.map((edge) =>
           `${edge.inputRef}=${resolvedReuseByNode.get(edge.fromNodeId)!.value}`,
         ).join(' ')}`;
+        // Fan-in reuse concatenates N prior results into one activation message, so it
+        // must honour the same aggregate ceiling as the entry and live contribution
+        // paths. Each value is individually bounded by maxArtifactBytes at resolve time,
+        // but their sum is not. Returning here is safe and fail-closed: statements are
+        // only collected in `rest` and executed after this loop, so nothing is written.
+        if (Buffer.byteLength(aggregate, 'utf8') > validated.policy.maxAggregateBytes) {
+          return invalidStart('reuse aggregate exceeds policy');
+        }
         materializedBoundaryTaskIds.push(activation.taskId);
         const task: MusterTask = {
           id: activation.taskId, role: node.role ?? 'worker', lifecycle: 'open', releaseState: 'released',
@@ -10618,50 +10629,30 @@ export class SqliteTaskRepository implements TaskRepository {
 
 
   private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
-    const terminalRunIds = await this.db.all<{ run_id: string }>(
-      `SELECT run_id FROM workflow_runs
+    // Keep workflow_runs and their claims durable. Deleting a run cascades its
+    // start claim while the operation ledger remains, breaking idempotent replay
+    // (or leaving a replay result that points at a missing run). Routed message
+    // bodies are terminal transport payload only; no production reader consumes
+    // them after routing, so they are the safe reclaimable portion.
+    const result = await this.db.run(
+      `UPDATE workflow_routed_messages
+          SET body_json = '{"retentionStripped":true}'
         WHERE workspace_id = ?
-          AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-          ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
-      [this.workspaceId],
-    );
-    const pinned = await this.db.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM workflow_runs run
-        WHERE run.workspace_id = ?
-          AND run.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-          AND (
-            EXISTS (
-              SELECT 1 FROM workflow_gate_fills gate_fill
-               WHERE gate_fill.workspace_id = run.workspace_id
-                 AND COALESCE(gate_fill.artifact_run_id, gate_fill.run_id) = run.run_id
-                 AND gate_fill.run_id <> run.run_id
-            )
-            OR EXISTS (
-              SELECT 1 FROM workflow_return_gates return_gate_artifact
-               WHERE return_gate_artifact.workspace_id = run.workspace_id
-                 AND return_gate_artifact.result_run_id = run.run_id
-                 AND return_gate_artifact.continuation_run_id <> run.run_id
-            )
+          AND body_json <> '{"retentionStripped":true}'
+          AND run_id IN (
+            SELECT workflow_runs.run_id
+              FROM workflow_runs
+             WHERE workflow_runs.workspace_id = ?
+               AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+               ${terminalWorkflowRunSafetyPredicate('workflow_runs')}
           )`,
-      [this.workspaceId],
+      [this.workspaceId, this.workspaceId],
     );
-    let reclaimedWorkflowRuns = 0;
-    for (const { run_id } of terminalRunIds) {
-      const result = await this.db.run(
-        `DELETE FROM workflow_runs
-          WHERE workspace_id = ? AND run_id = ?
-            AND status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-            ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
-        [this.workspaceId, run_id],
-      );
-      reclaimedWorkflowRuns += result.changes ?? 0;
-    }
-    const skippedPinnedWorkflowRuns = pinned?.count ?? 0;
+    const strippedWorkflowMessageBodies = result.changes ?? 0;
     return {
       ok: true,
-      changed: reclaimedWorkflowRuns > 0,
-      reclaimedWorkflowRuns,
-      skippedPinnedWorkflowRuns,
+      changed: strippedWorkflowMessageBodies > 0,
+      strippedWorkflowMessageBodies,
     };
   }
 
@@ -10713,9 +10704,12 @@ export class SqliteTaskRepository implements TaskRepository {
     // window. Only settled turns are eligible: trimming reasoning or a tool
     // result that is still streaming would corrupt the active transcript just
     // as surely as deleting the row.
+    const keep = Math.max(0, Math.floor(command.keepLatestTurns));
     const settledTurnIds = new Set(
       (await this.listTurns(task.id))
         .filter((turn) => isTerminalTurn(turn.status))
+        .sort((left, right) => right.sequence - left.sequence || right.id.localeCompare(left.id))
+        .slice(keep)
         .map((turn) => turn.id),
     );
     const statements: SqlStatement[] = [];

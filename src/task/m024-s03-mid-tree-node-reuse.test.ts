@@ -6,7 +6,7 @@ import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
-import { fingerprintStartWorkflow } from './workflow';
+import { fingerprintStartWorkflow, validateStartWorkflow } from './workflow';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import type { MusterTask } from './types';
 
@@ -84,6 +84,15 @@ describe('start_workflow mid-tree node reuse', () => {
       ok: false,
       toolError: 'invalid start_workflow reuse',
     });
+  });
+
+  it('rejects a reuse destination outside the declared topology', () => {
+    expect(validateStartWorkflow({
+      definitionId: 'wf-graph', version: 1, startIdempotencyKey: 'unknown-reuse',
+      createdAt: '2026-08-01T00:00:00.000Z', entryNodeId: 'source',
+      entryNodeIds: ['source'], allNodeIds: ['source', 'middle', 'sink'],
+      reuse: [{ nodeId: 'not-a-node', fromRun: 'prior-run' }],
+    })).toEqual({ ok: false, reason: 'invalid reuse' });
   });
 
   it.each([

@@ -11,6 +11,7 @@ const requiredMappings = {
   R043: ['docs/plans/m023-s05-storage-lifecycle-evidence.json'],
   R044: ['docs/plans/m023-s05-storage-lifecycle-evidence.json'],
   R045: ['docs/plans/m023-s08-orphan-lifecycle-evidence.json'],
+  R046: ['scripts/verify-uninstall-entrypoint.test.mjs'],
 };
 
 function mappedReferences(markdown, id) {
@@ -44,15 +45,15 @@ async function loadTrackedFiles() {
   return readFile(new URL('docs/plans/m023-requirement-evidence.md', root), 'utf8');
 }
 
-test('tracked M023 requirement evidence maps R040 through R045 to existing artifacts', async () => {
+test('tracked M023 requirement evidence maps R040 through R046 to existing artifacts', async () => {
   await validateRequirementEvidence(await loadTrackedFiles());
 });
 
 test('rejects missing mappings and missing artifact files', async () => {
   const markdown = await loadTrackedFiles();
   await assert.rejects(
-    validateRequirementEvidence(markdown.replace('## R045', '## Missing R045')),
-    /missing evidence mapping: R045/,
+    validateRequirementEvidence(markdown.replace('## R046', '## Missing R046')),
+    /missing evidence mapping: R046/,
   );
   await assert.rejects(
     validateRequirementEvidence(markdown, async (reference) => {

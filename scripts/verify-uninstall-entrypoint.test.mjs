@@ -9,11 +9,11 @@ import { fileURLToPath } from 'node:url';
 const root = fileURLToPath(new URL('../', import.meta.url));
 const entrypoint = path.join(root, 'dist', 'src', 'uninstall.js');
 
-function runEntrypoint(storageDirectory) {
+function runEntrypoint(storageDirectory, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [entrypoint], {
       cwd: root,
-      env: { ...process.env, MUSTER_GLOBAL_STORAGE_DIR: storageDirectory },
+      env: { ...process.env, MUSTER_GLOBAL_STORAGE_DIR: storageDirectory, ...extraEnv },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
@@ -22,6 +22,22 @@ function runEntrypoint(storageDirectory) {
     child.stderr.on('data', (chunk) => { stderr += chunk; });
     child.on('error', reject);
     child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+function registerTarget(extensionRoot, storageDirectory, registryPath) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e',
+      `require('./dist/src/uninstall.js').registerUninstallStorageTarget(${JSON.stringify(extensionRoot)}, ${JSON.stringify(storageDirectory)})`,
+    ], {
+      cwd: root,
+      env: { ...process.env, MUSTER_UNINSTALL_REGISTRY_PATH: registryPath },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    child.stderr.on('data', (chunk) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(stderr)));
   });
 }
 
@@ -61,6 +77,23 @@ test('compiled uninstall entrypoint removes only the extension global-storage di
   });
 });
 
+test('compiled uninstall entrypoint resolves only its activation-registered storage target', async () => {
+  await withTemporaryDirectory(async (temporaryDirectory) => {
+    const storageDirectory = path.join(temporaryDirectory, 'profile-authority', 'tlelabs.muster');
+    const registry = path.join(temporaryDirectory, 'registry.json');
+    await mkdir(storageDirectory, { recursive: true });
+    await writeFile(path.join(storageDirectory, 'muster.sqlite3'), 'database');
+    await registerTarget(root, storageDirectory, registry);
+
+    const result = await runEntrypoint(undefined, { MUSTER_UNINSTALL_REGISTRY_PATH: registry });
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, '');
+    assert.match(result.stdout, /^uninstall: reclaimed_bytes: 8\r?\n$/);
+    await assert.rejects(access(storageDirectory));
+  });
+});
+
 test('compiled uninstall entrypoint exits zero and reports an absent storage directory', async () => {
   await withTemporaryDirectory(async (temporaryDirectory) => {
     const result = await runEntrypoint(path.join(temporaryDirectory, 'tlelabs.muster'));
@@ -68,6 +101,18 @@ test('compiled uninstall entrypoint exits zero and reports an absent storage dir
     assert.equal(result.code, 0);
     assert.equal(result.stderr, '');
     assert.equal(result.stdout, 'uninstall: absent\n');
+  });
+});
+
+test('compiled uninstall entrypoint refuses an unregistered default instead of guessing Stable Code storage', async () => {
+  await withTemporaryDirectory(async (temporaryDirectory) => {
+    const result = await runEntrypoint(undefined, {
+      MUSTER_UNINSTALL_REGISTRY_PATH: path.join(temporaryDirectory, 'missing-registry.json'),
+    });
+
+    assert.equal(result.code, 0);
+    assert.equal(result.stderr, '');
+    assert.equal(result.stdout, 'uninstall: refused\n');
   });
 });
 

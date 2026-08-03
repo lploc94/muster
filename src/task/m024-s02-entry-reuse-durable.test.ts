@@ -126,11 +126,13 @@ describe('M024 S02 durable cross-run entry reuse', () => {
       )).resolves.toEqual({
         content: '[workflow-entry]\ninputRef="prior_result" utf8Bytes=20\nreused terminal body',
       });
+      // Reclamation no longer deletes workflow_runs (that cascaded start claims and
+      // broke idempotent replay); it only strips routed message bodies of terminal,
+      // unpinned runs. This producer is pinned by the consumer gate fill above, so the
+      // pass must report no change and leave the producer addressable.
       await expect(repository.execute({
         kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID,
-      })).resolves.toMatchObject({
-        ok: true, changed: false, reclaimedWorkflowRuns: 0, skippedPinnedWorkflowRuns: 1,
-      });
+      })).resolves.toMatchObject({ ok: true, changed: false });
       await expect(client.get(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         [WORKSPACE_ID, producer.runId],

@@ -18,7 +18,7 @@ export type OrphanLifecycleObservation = {
 
 export type VerifiedOrphanCleanup = Pick<
   Extract<ReclaimOrphanedFilesCommandResult, { kind: 'success' }>,
-  'removedFiles' | 'bytesReclaimed' | 'failedRemovals'
+  'removedFiles' | 'bytesReclaimed' | 'failedRemovals' | 'skippedRemovals'
 > & { postCleanup: OrphanLifecycleObservation };
 
 function summarize(files: readonly StorageFile[]): OrphanBucketObservation {
@@ -77,6 +77,9 @@ export function verifyOrphanCleanup(
     result.removedFiles !== expected.count
     || result.bytesReclaimed !== expected.bytes
     || result.failedRemovals !== 0
+    // A skipped removal means the pinned file changed under the modal. The run
+    // proved nothing about the classified set, so it cannot pass as evidence.
+    || result.skippedRemovals !== 0
   ) {
     throw new Error('orphan reclamation totals differ from classification');
   }
@@ -94,6 +97,7 @@ export function verifyOrphanCleanup(
     removedFiles: result.removedFiles,
     bytesReclaimed: result.bytesReclaimed,
     failedRemovals: result.failedRemovals,
+    skippedRemovals: result.skippedRemovals,
     postCleanup,
   };
 }

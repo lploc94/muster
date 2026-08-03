@@ -6,7 +6,7 @@
 const ROOT_KEYS = new Set([
   'ok', 'kind', 'schemaVersion', 'before', 'afterSeed', 'afterRetention',
   'peerAfterRetention', 'orphanBeforeCleanup', 'orphanCleanup',
-  'afterOrphanCleanup', 'peerAfterOrphanCleanup', 'contentSafety', 'generatedAt',
+  'afterOrphanCleanup', 'peerAfterOrphanCleanup', 'contentSafety', 'generatedAt', 'commitSha',
 ]);
 const STATE_KEYS = new Set(['storage', 'retention', 'durableRows', 'retentionTruncatedEntries']);
 const STORAGE_KEYS = new Set(['fileBytes', 'walBytes', 'shmBytes', 'pageCount', 'freelistCount', 'pageSize', 'autoVacuum', 'tableBytesSource', 'tables']);
@@ -16,10 +16,11 @@ const TABLE_KEYS = new Set(['name', 'bytes']);
 const CLASSIFICATION_KEYS = new Set(['deadLegacyStores', 'staleLeases', 'removable', 'liveFiles']);
 const BUCKET_KEYS = new Set(['count', 'bytes']);
 const LIVE_FILES_KEYS = new Set(['sqlite', 'wal', 'shm', 'activeLeaseCount']);
-const CLEANUP_KEYS = new Set(['removedFiles', 'bytesReclaimed', 'failedRemovals']);
+const CLEANUP_KEYS = new Set(['removedFiles', 'bytesReclaimed', 'failedRemovals', 'skippedRemovals']);
 const AFTER_CLEANUP_KEYS = new Set(['state', 'classification']);
 const CONTENT_SAFETY_KEYS = ['absolutePathsStoredInEvidence', 'messageBodiesStoredInEvidence', 'sessionIdsStoredInEvidence', 'canaryStoredInEvidence'];
 const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const SAFE_TABLE_NAME = /^[a-z][a-z0-9_]{0,63}$/;
 const MAX_BYTES = 2_000_000_000;
 const MAX_COUNT = 1_000_000;
@@ -110,7 +111,7 @@ export function validateOrphanLifecycleEvidence(evidence, opts = {}) {
   if (Number.isSafeInteger(retained?.storage?.fileBytes) && retained.storage.fileBytes !== peer?.storage?.fileBytes) failures.push('peerAfterRetention.storage.fileBytes must equal afterRetention.storage.fileBytes');
   if (classified?.removable?.count < 1 || classified?.removable?.bytes < 1) failures.push('orphanBeforeCleanup.removable must prove non-empty orphan reclamation');
   if (classified?.removable?.count !== (classified?.deadLegacyStores?.count ?? NaN) + (classified?.staleLeases?.count ?? NaN) || classified?.removable?.bytes !== (classified?.deadLegacyStores?.bytes ?? NaN) + (classified?.staleLeases?.bytes ?? NaN)) failures.push('orphanBeforeCleanup.removable must equal classified bucket totals');
-  if (cleanup?.removedFiles !== classified?.removable?.count || cleanup?.bytesReclaimed !== classified?.removable?.bytes || cleanup?.failedRemovals !== 0) failures.push('orphanCleanup totals must exactly equal classified removables with no failed removals');
+  if (cleanup?.removedFiles !== classified?.removable?.count || cleanup?.bytesReclaimed !== classified?.removable?.bytes || cleanup?.failedRemovals !== 0 || cleanup?.skippedRemovals !== 0) failures.push('orphanCleanup totals must exactly equal classified removables with no failed or skipped removals');
   if (after?.classification?.removable?.count !== 0 || after?.classification?.removable?.bytes !== 0 || after?.classification?.deadLegacyStores?.count !== 0 || after?.classification?.staleLeases?.count !== 0) failures.push('afterOrphanCleanup classification must contain no removable orphans');
   const live = after?.classification?.liveFiles;
   if (live?.sqlite !== true || live?.wal !== true || live?.shm !== true || live?.activeLeaseCount < 1) failures.push('afterOrphanCleanup must prove SQLite trio and active lease survival');
@@ -119,6 +120,7 @@ export function validateOrphanLifecycleEvidence(evidence, opts = {}) {
   if (!isObject(safety)) failures.push('contentSafety required');
   else { unknownKeys(safety, new Set(CONTENT_SAFETY_KEYS), 'contentSafety', failures); requiredKeys(safety, new Set(CONTENT_SAFETY_KEYS), 'contentSafety', failures); for (const key of CONTENT_SAFETY_KEYS) if (safety[key] !== false) failures.push(`contentSafety.${key} must be false`); }
   if (typeof evidence.generatedAt !== 'string' || !ISO_TS.test(evidence.generatedAt)) failures.push('generatedAt must be ISO UTC');
+  if (typeof evidence.commitSha !== 'string' || !COMMIT_SHA.test(evidence.commitSha)) failures.push('commitSha must be a full git SHA');
   if (SENSITIVE.test(JSON.stringify(evidence))) failures.push('evidence contains sensitive content');
   return failures;
 }

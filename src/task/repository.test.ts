@@ -1289,7 +1289,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('preserves terminal history and truncates only settled output on open tasks', async () => {
+  it('preserves terminal history and keeps the newest settled output on open tasks', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-retention-policy-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -1351,20 +1351,20 @@ describe('SqliteTaskRepository', () => {
       await expect(repository.execute({
         kind: 'applyRetention', workspaceId: 'ws', taskId: open.id, keepLatestTurns: 1,
         maxStoredOutputChars: 30,
-      })).resolves.toMatchObject({ changed: true });
+      })).resolves.toMatchObject({ changed: false });
       await expect(repository.listTurns(open.id)).resolves.toMatchObject([
         { id: openTurn.id }, { id: liveTurn.id, status: 'running' },
       ]);
       await expect(repository.listMessages(open.id)).resolves.toMatchObject([
-        { id: 'open-assistant', content: expect.stringContaining('[output truncated by retention policy]') },
+        { id: 'open-assistant', content: oversized },
         { id: 'live-assistant', content: oversized },
       ]);
       await expect(repository.listToolCalls(open.id)).resolves.toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: 'open-tool', output: expect.stringContaining('[output truncated by retention policy]') }),
+        expect.objectContaining({ id: 'open-tool', output: oversized }),
         expect.objectContaining({ id: 'live-tool', output: oversized }),
       ]));
       await expect(repository.listReasoning(open.id)).resolves.toEqual(expect.arrayContaining([
-        expect.objectContaining({ id: 'open-reasoning', content: expect.stringContaining('[output truncated by retention policy]') }),
+        expect.objectContaining({ id: 'open-reasoning', content: oversized }),
         expect.objectContaining({ id: 'live-reasoning', content: oversized }),
       ]));
     } finally {

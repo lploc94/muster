@@ -1,4 +1,5 @@
-import { readdir, rm, stat } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
+import { lstat, readdir, rm, stat } from 'node:fs/promises';
 import * as path from 'node:path';
 
 /** A path-free filesystem observation suitable for the storage report surface. */
@@ -12,6 +13,12 @@ export type StorageDirectoryEntry = {
 export type StorageFile = {
   name: string;
   bytes: number;
+  /**
+   * Pins the exact filesystem object that was classified. Removal re-reads this
+   * so a file replaced after the confirmation modal is declined rather than
+   * deleted under a basename the user was never shown.
+   */
+  modifiedAtMs: number;
 };
 
 /**
@@ -30,6 +37,8 @@ export type StorageOrphanRemoval = {
   removed: StorageFile[];
   bytesReclaimed: number;
   failedRemovals: number;
+  /** Classified files whose on-disk identity changed before removal ran. */
+  skippedRemovals: number;
 };
 
 const LIVE_STORAGE_FILES = new Set([
@@ -38,7 +47,10 @@ const LIVE_STORAGE_FILES = new Set([
   'muster.sqlite3-shm',
 ]);
 const LEGACY_STORE_FILE = '.muster-tasks.json';
-const LEASE_PREFIX = '.lease.turn%3A';
+// The legacy JSON store named leases `${storePath}.lease.${encodeURIComponent(turnId)}`,
+// and storePath was always the `.muster-tasks.json` file itself. Real residue is
+// therefore `.muster-tasks.json.lease.turn%3A<id>`, never a bare `.lease.` name.
+const LEASE_PREFIX = `${LEGACY_STORE_FILE}.lease.`;
 
 /**
  * Reads a directory into path-free facts. A store can legitimately not exist
@@ -84,7 +96,7 @@ export function classifyStorageOrphans(
   };
 
   for (const entry of entries) {
-    const file = { name: entry.name, bytes: entry.bytes };
+    const file = { name: entry.name, bytes: entry.bytes, modifiedAtMs: entry.modifiedAtMs };
     if (LIVE_STORAGE_FILES.has(entry.name)) {
       report.live.push(file);
     } else if (entry.name === LEGACY_STORE_FILE) {
@@ -110,6 +122,7 @@ export async function removeStorageOrphans(
   const removed: StorageFile[] = [];
   let bytesReclaimed = 0;
   let failedRemovals = 0;
+  let skippedRemovals = 0;
 
   for (const file of [...report.deadLegacyStores, ...report.staleLeases]) {
     if (file.name !== path.basename(file.name)) {
@@ -117,8 +130,24 @@ export async function removeStorageOrphans(
       continue;
     }
 
+    const target = path.join(directory, file.name);
+    // The modal described one exact object. A lease refreshed or recreated while
+    // the modal was open is a different file that merely inherited the basename,
+    // so re-read identity and decline on divergence.
+    let current: Stats;
     try {
-      await rm(path.join(directory, file.name));
+      current = await lstat(target);
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failedRemovals += 1;
+      continue;
+    }
+    if (!current.isFile() || current.size !== file.bytes || current.mtimeMs !== file.modifiedAtMs) {
+      skippedRemovals += 1;
+      continue;
+    }
+
+    try {
+      await rm(target);
       removed.push(file);
       bytesReclaimed += file.bytes;
     } catch (error: unknown) {
@@ -126,5 +155,5 @@ export async function removeStorageOrphans(
     }
   }
 
-  return { removed, bytesReclaimed, failedRemovals };
+  return { removed, bytesReclaimed, failedRemovals, skippedRemovals };
 }

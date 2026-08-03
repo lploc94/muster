@@ -39,7 +39,9 @@ function hostResult(overrides = {}) {
 }
 
 test('assembles only a schema-valid PASS ledger from a live extension host DOM result', () => {
-  const evidence = assembleTruncatedRenderEvidence(hostResult(), '2026-07-31T12:00:00.000Z');
+  const evidence = assembleTruncatedRenderEvidence(
+    hostResult(), '2026-07-31T12:00:00.000Z', '0123456789abcdef0123456789abcdef01234567',
+  );
   assert.deepEqual(validateTruncatedRenderEvidence(evidence, { requirePass: true }), []);
   assert.equal(evidence.provenance.probeSource, 'live-extension-host-dom');
   assert.equal(evidence.contentSafety.messageBodiesStoredInEvidence, false);
@@ -56,6 +58,7 @@ test('makes bounded, content-safe BLOCKED evidence when launch or host observati
   const evidence = assembleBlockedTruncatedRenderEvidence(
     new Error(`failed at D:/private/workspace with ${'x'.repeat(600)}`),
     '2026-07-31T12:00:00.000Z',
+    '0123456789abcdef0123456789abcdef01234567',
   );
   assert.deepEqual(validateTruncatedRenderEvidence(evidence), []);
   assert.equal(evidence.verdict, 'BLOCKED');

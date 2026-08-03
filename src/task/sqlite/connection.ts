@@ -113,14 +113,10 @@ function readScalar(db: DatabaseSync, pragma: string): number {
   return typeof value === 'number' ? value : 0;
 }
 
-/** True when the DB already has any non-internal table/view/index/trigger. */
-function hasUserSchemaObjects(db: DatabaseSync): boolean {
+/** True when the DB already contains any schema object, including SQLite residue. */
+function hasSchemaObjects(db: DatabaseSync): boolean {
   const row = db
-    .prepare(
-      `SELECT COUNT(*) AS n
-       FROM sqlite_schema
-       WHERE name NOT LIKE 'sqlite_%'`,
-    )
+    .prepare('SELECT COUNT(*) AS n FROM sqlite_schema')
     .get() as { n: number } | undefined;
   return (row?.n ?? 0) > 0;
 }
@@ -207,7 +203,7 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
     if (userVersion !== 0) {
       throw new IncompatibleSchemaError(userVersion);
     }
-    if (hasUserSchemaObjects(db)) {
+    if (hasSchemaObjects(db)) {
       // Blank preflight saw no objects; exclusive sees objects without Muster
       // markers — peer commit race / header visibility. Reopen fresh.
       db.exec('ROLLBACK');
@@ -258,7 +254,11 @@ function tryOpenExistingCurrent(
   if (userVersion !== 0) {
     throw new IncompatibleSchemaError(userVersion);
   }
-  if (hasUserSchemaObjects(db)) {
+  // A fresh SQLite file has no schema and auto_vacuum NONE. Any existing
+  // schema object (including sqlite_sequence) or non-default vacuum mode is
+  // foreign residue, not a blank Muster candidate. Reject before setting any
+  // durable pragma so a foreign DB can never be mutated during preflight.
+  if (readScalar(db, 'auto_vacuum') !== 0 || hasSchemaObjects(db)) {
     // Re-read markers once — peer commit can expose schema before header markers.
     const appAgain = readScalar(db, 'application_id');
     const verAgain = readScalar(db, 'user_version');

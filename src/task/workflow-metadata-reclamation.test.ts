@@ -79,7 +79,7 @@ async function terminalizeRun(client: DbClient, repository: SqliteTaskRepository
 }
 
 describe('terminal workflow metadata reclamation', () => {
-  it('removes only safely terminal workflow runs and preserves durable rows', async () => {
+  it('strips only terminal transport payloads and preserves durable workflow rows', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-workflow-metadata-reclamation-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -177,23 +177,33 @@ describe('terminal workflow metadata reclamation', () => {
         [WORKSPACE_ID, liveGateRunId, liveGate!.gate_id],
       );
 
+      await client.run(
+        `INSERT INTO workflow_routed_messages (
+           workspace_id, run_id, message_id, source_node_id, destination_node_id,
+           kind, body_json, created_at
+         ) VALUES (?,?,?,?,?,?,?,?)`,
+        [WORKSPACE_ID, safeRunId, 'reclaimable-message', 'source', 'destination', 'terminal_next',
+          '{"large":"transport payload"}', NOW],
+      );
       const before = await rowCounts(client);
       const result = await repository.execute({ kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID });
 
-      expect(result).toMatchObject({
-        ok: true,
-        changed: true,
-        reclaimedWorkflowRuns: 2,
-        skippedPinnedWorkflowRuns: 1,
-      });
+      expect(result).toMatchObject({ ok: true, changed: true, strippedWorkflowMessageBodies: 1 });
       await expect(client.all<{ run_id: string }>(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? ORDER BY run_id`, [WORKSPACE_ID],
-      )).resolves.toEqual([
-        { run_id: liveActivationRunId },
-        { run_id: liveGateRunId },
-        { run_id: pinConsumerRunId },
-        { run_id: pinnedProducerRunId },
-      ].sort((a, b) => a.run_id.localeCompare(b.run_id)));
+      )).resolves.toEqual([safeRunId, liveActivationRunId, liveGateRunId]
+        .sort((left, right) => left.localeCompare(right)).map((run_id) => ({ run_id })));
+      // This fixture starts a workspace-scoped run (no claim row). Its operation
+      // ledger and run still survive, so replay never points at a deleted target.
+      await expect(client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM operations WHERE workspace_id = ?`,
+        [WORKSPACE_ID],
+      )).resolves.toEqual({ count: before.operations });
+      await expect(client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
+        [WORKSPACE_ID, safeRunId, 'reclaimable-message'],
+      )).resolves.toEqual({ body_json: '{"retentionStripped":true}' });
       await expect(rowCounts(client)).resolves.toEqual(before);
       await expect(client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {

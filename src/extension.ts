@@ -254,6 +254,7 @@ import { USER_INTERACTION_TIMEOUT_MS } from './host/interaction-timeouts';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { registerUninstallStorageTarget } from './uninstall';
 
 let askBridge: AskBridge | undefined;
 let elicitationBridge: ElicitationBridge | undefined;
@@ -645,8 +646,7 @@ async function applyRetentionToRepository(
     reclaimMode: reclaimed.mode,
     fileBytesBefore: reclaimed.fileBytesBefore,
     fileBytesAfter: reclaimed.fileBytesAfter,
-    reclaimedWorkflowRuns: workflowReclamation.reclaimedWorkflowRuns ?? 0,
-    skippedPinnedWorkflowRuns: workflowReclamation.skippedPinnedWorkflowRuns ?? 0,
+    strippedWorkflowMessageBodies: workflowReclamation.strippedWorkflowMessageBodies ?? 0,
   };
 }
 
@@ -3723,6 +3723,13 @@ export async function activate(context: vscode.ExtensionContext) {
   }
 
   const dbPath = path.join(context.globalStorageUri.fsPath, 'muster.sqlite3');
+  // vscode:uninstall has no ExtensionContext. Register this installation's
+  // profile/authority-resolved path now rather than guessing a Stable-Code path
+  // later and risking another installation's storage.
+  // Uninstall discovery is best-effort support metadata; a transient registry
+  // lock must never prevent the primary extension runtime from activating.
+  await registerUninstallStorageTarget(context.extensionPath, context.globalStorageUri.fsPath)
+    .catch(() => undefined);
 
   // Maintenance commands remain available even when storage open fails (P5-W5).
   registerSqliteMaintenanceCommands(context, dbPath);
@@ -4709,6 +4716,7 @@ function registerStorageReportCommand(
         removedFiles: verified.removedFiles,
         bytesReclaimed: verified.bytesReclaimed,
         failedRemovals: verified.failedRemovals,
+        skippedRemovals: verified.skippedRemovals,
       },
       after: verified.postCleanup,
     };

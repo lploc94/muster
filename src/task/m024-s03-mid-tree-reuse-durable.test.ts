@@ -175,9 +175,11 @@ describe('M024 S03 durable mid-tree reuse', () => {
       expect(forbiddenProjectionLeak(inspection)).toEqual([]);
       expect(forbiddenProjectionLeak(status)).toEqual([]);
 
+      // The reused producer artifact stays addressable across a reclamation pass:
+      // the shared pin predicate excludes runs whose artifacts another run references.
       await expect(repository.execute({
         kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID,
-      })).resolves.toMatchObject({ ok: true, skippedPinnedWorkflowRuns: 1 });
+      })).resolves.toMatchObject({ ok: true });
       await expect(client.get(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`, [WORKSPACE_ID, producer.runId],
       )).resolves.toEqual({ run_id: producer.runId });

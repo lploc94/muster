@@ -354,14 +354,34 @@ describe('buildToolDiffView', () => {
       path: 'src/aged.ts',
       retentionTruncated: true,
       hasDiffBody: false,
-      added: 5,
-      removed: 3,
+      // The retained contract records side sizes, not a diff. Never invent
+      // +5/-3 when the original content no longer exists to compare.
+      added: 0,
+      removed: 0,
+      retentionLineCounts: { old: 3, next: 5 },
       countsPartial: false,
-      countsLabel: `+5 ${MINUS}3 (retention summary)`,
+      countsLabel: '3 → 5 lines (retention summary)',
     });
     expect(describeDiffFileForScreenReader(view.files[0])).toBe(
-      'src/aged.ts: 5 lines added, 3 lines removed, diff text removed by retention',
+      'src/aged.ts: 3 to 5 lines, diff text removed by retention',
     );
+  });
+
+  it('does not present identical retained sides as additions and removals', () => {
+    const view = buildToolDiffView({
+      toolCallId: 'tc-retained-identical',
+      fileChanges: [{
+        path: 'src/unchanged.ts', oldText: null, newText: '', retentionTruncated: true,
+        oldLineCount: 1, newLineCount: 1,
+      }],
+    });
+
+    expect(view.files[0]).toMatchObject({
+      added: 0,
+      removed: 0,
+      retentionLineCounts: { old: 1, next: 1 },
+      countsLabel: '1 → 1 lines (retention summary)',
+    });
   });
 });
 

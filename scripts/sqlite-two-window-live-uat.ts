@@ -69,7 +69,12 @@ type OrphanLifecycleObservation = {
 };
 type OrphanLifecycleResult = {
   before: OrphanLifecycleObservation;
-  cleanup: { removedFiles: number; bytesReclaimed: number; failedRemovals: number };
+  cleanup: {
+    removedFiles: number;
+    bytesReclaimed: number;
+    failedRemovals: number;
+    skippedRemovals: number;
+  };
   after: OrphanLifecycleObservation;
 };
 

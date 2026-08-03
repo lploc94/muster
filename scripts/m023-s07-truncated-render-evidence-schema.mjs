@@ -13,6 +13,7 @@ const ROOT_KEYS = new Set([
   'contentSafety',
   'blockedReason',
   'generatedAt',
+  'commitSha',
 ]);
 const PROVENANCE_KEYS = new Set(['vscodeVersion', 'hostMode', 'probeSource']);
 const OBSERVATION_KEYS = new Set(['fileChangeGroups', 'files']);
@@ -31,6 +32,7 @@ const CONTENT_SAFETY_KEYS = [
   'canaryStoredInEvidence',
 ];
 const ISO_TS = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const VSCODE_VERSION = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?$/;
 const SENSITIVE = /CANARY_|\/Users\/|\/home\/|\/private\/tmp\/|\/var\/folders\/|\/tmp\/[A-Za-z0-9._-]+|[A-Za-z]:\\|\bfile:\/\/|\\?"(?:workspaceId|sessionId|taskId|messageBody|prompt)\\?"\s*:|\bSELECT\b|\bINSERT\s+INTO\b|\bUPDATE\b|\bDELETE\s+FROM\b|stackTrace|\bError:\s|\bat\s+(?:async\s+)?[\w.<>$[\]]+\(/i;
 
@@ -155,6 +157,9 @@ export function validateTruncatedRenderEvidence(evidence, opts = {}) {
   if (evidence.schemaVersion !== 1) failures.push('schemaVersion must be 1');
   if (typeof evidence.generatedAt !== 'string' || !ISO_TS.test(evidence.generatedAt)) {
     failures.push('generatedAt must be ISO UTC');
+  }
+  if (typeof evidence.commitSha !== 'string' || !COMMIT_SHA.test(evidence.commitSha)) {
+    failures.push('commitSha must be a full git SHA');
   }
 
   if (evidence.verdict === 'PASS') {

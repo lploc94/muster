@@ -39,6 +39,7 @@ function livePassEvidence() {
       canaryStoredInEvidence: false,
     },
     generatedAt: '2026-07-31T12:00:00.000Z',
+    commitSha: '0123456789abcdef0123456789abcdef01234567',
   };
 }
 
@@ -50,6 +51,7 @@ function blockedEvidence() {
     verdict: 'BLOCKED',
     blockedReason: 'VS Code Extension Development Host could not be launched.',
     generatedAt: '2026-07-31T12:00:00.000Z',
+    commitSha: '0123456789abcdef0123456789abcdef01234567',
   };
 }
 
