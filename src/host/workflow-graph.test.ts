@@ -15,7 +15,7 @@ describe('buildWorkflowGraphView', () => {
       runId: 'run-1',
       nodes: [
         { nodeId: 'reused-producer', status: 'reused' },
-        { nodeId: 'live-consumer', status: 'running' },
+        { nodeId: 'live-consumer', status: 'active' },
       ],
       edges: [
         { fromNodeId: 'reused-producer', toNodeId: 'live-consumer', inputRef: 'source' },
@@ -31,7 +31,7 @@ describe('buildWorkflowGraphView', () => {
       runId: 'run-1',
       nodes: [
         { nodeId: 'reused-producer', status: 'reused', reused: true },
-        { nodeId: 'live-consumer', status: 'running', reused: false },
+        { nodeId: 'live-consumer', status: 'active', reused: false },
       ],
       edges: [
         {

@@ -54,6 +54,8 @@ import {
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
   ancestorNodeClosure,
+  isReuseClosureComplete,
+  isReusableArtifactKindCompatible,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
   deriveChildReturnFenceId,
@@ -5103,6 +5105,8 @@ export class SqliteTaskRepository implements TaskRepository {
         | 'entry input reference unresolved'
         | 'terminal node cannot be reused'
         | 'node reuse reference unresolved'
+        | 'node reuse closure incomplete'
+        | 'reuse artifact kind mismatch'
         | 'reuse aggregate exceeds policy',
     ): RepositoryCommandResult => {
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
@@ -5274,6 +5278,12 @@ export class SqliteTaskRepository implements TaskRepository {
       artifactId?: string;
       artifactRevision?: number;
     }>();
+    const entryContractByKey = new Map<string, (typeof validated.entryContracts)[number]>(
+      validated.entryContracts.map((contract) => [
+        `${contract.entryNodeId}\0${contract.inputRef}`,
+        contract,
+      ] as const),
+    );
     for (const input of validated.entryInputs) {
       const key = `${input.entryNodeId}\0${input.inputRef}`;
       if ('value' in input) {
@@ -5313,6 +5323,17 @@ export class SqliteTaskRepository implements TaskRepository {
         typeof referenced.artifact_kind !== 'string' ||
         typeof referenced.artifact_payload_json !== 'string'
       ) return invalidStart('entry input reference unresolved');
+      const contract = entryContractByKey.get(key);
+      if (
+        !contract ||
+        !isReusableArtifactKindCompatible(
+          contract.expectedArtifactKind,
+          referenced.artifact_kind,
+          'entry',
+        )
+      ) {
+        return invalidStart('reuse artifact kind mismatch');
+      }
       let value: unknown;
       try {
         value = (JSON.parse(referenced.artifact_payload_json) as Record<string, unknown>).result;
@@ -5354,12 +5375,24 @@ export class SqliteTaskRepository implements TaskRepository {
            JOIN workflow_runs run
              ON run.workspace_id = artifact.workspace_id
             AND run.run_id = artifact.run_id
+           JOIN workflow_artifact_sources source
+             ON source.workspace_id = artifact.workspace_id
+            AND source.run_id = artifact.run_id
+            AND source.artifact_id = artifact.artifact_id
+            AND source.artifact_revision = artifact.revision
+            AND source.source_kind = 'workflow_node'
+            AND source.producer_node_id = artifact.producer_node_id
+           JOIN turns producing_turn
+             ON producing_turn.workspace_id = source.workspace_id
+            AND producing_turn.id = source.producing_turn_id
+            AND producing_turn.task_id = source.producer_task_id
+            AND producing_turn.status = 'succeeded'
           WHERE artifact.workspace_id = ? AND artifact.run_id = ?
             AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'
             AND run.owner_root_task_id = ?
-            -- Same rule as entry-input reuse: only harvest node results from a run
-            -- that actually succeeded, never from a failed or cancelled one.
-            AND run.status = 'succeeded'
+            -- A completed producer remains reusable when a later node fails, but
+            -- never harvest from a still-mutating source run.
+            AND run.status IN ('succeeded', 'failed', 'cancelled')
           ORDER BY artifact.revision DESC
           LIMIT 1`,
         [this.workspaceId, reuse.fromRun, reuse.nodeId, validated.ownerRootTaskId ?? null],
@@ -5392,12 +5425,44 @@ export class SqliteTaskRepository implements TaskRepository {
         value,
       });
     }
-    const reusedNodeIds = ancestorNodeClosure(
-      topo,
-      validated.reuse.map((reuse) => reuse.nodeId),
-    );
+    const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.nodeId);
+    const reusedNodeIds = ancestorNodeClosure(topo, declaredReuseNodeIds);
+    if (!isReuseClosureComplete(topo, declaredReuseNodeIds, reusedNodeIds)) {
+      return invalidStart('node reuse closure incomplete');
+    }
+    /**
+     * Boundary consumers are live nodes whose every incoming edge is pre-filled from a
+     * reused producer, so startWorkflowRun materializes their activation directly instead
+     * of waiting for a live contribution. Each one spends a workflow turn exactly like an
+     * executable entry, so both the budget check and the reservation must account for them
+     * here, before any statement is built. Reserving them through a per-consumer
+     * `UPDATE ... WHERE workflow_turns_reserved < max_workflow_turns` instead would silently
+     * no-op once the budget is exhausted while the task/turn/message rows still committed,
+     * letting a run exceed maxWorkflowTurnsPerRun.
+     */
+    const boundaryEdges = topo.kind === 'graph_v1'
+      ? topo.edges.filter((edge) =>
+          reusedNodeIds.has(edge.fromNodeId) && !reusedNodeIds.has(edge.toNodeId))
+      : [];
+    for (const edge of boundaryEdges) {
+      const artifact = resolvedReuseByNode.get(edge.fromNodeId);
+      const expectedKind = edge.expectedArtifactKind ?? 'next_result';
+      if (
+        artifact &&
+        !isReusableArtifactKindCompatible(expectedKind, artifact.artifactKind, 'node')
+      ) {
+        return invalidStart('reuse artifact kind mismatch');
+      }
+    }
+    const materializedBoundaryNodeIds = topo.kind === 'graph_v1'
+      ? [...new Set(boundaryEdges.map((edge) => edge.toNodeId))].filter((nodeId) =>
+          topo.edges
+            .filter((edge) => edge.toNodeId === nodeId)
+            .every((edge) => boundaryEdges.includes(edge)))
+      : [];
     const executableEntries = identities.entries.filter((entry) => !reusedNodeIds.has(entry.nodeId));
-    if (executableEntries.length > validated.policy.maxWorkflowTurnsPerRun) {
+    const reservedWorkflowTurns = executableEntries.length + materializedBoundaryNodeIds.length;
+    if (reservedWorkflowTurns > validated.policy.maxWorkflowTurnsPerRun) {
       return invalidStart('invalid start');
     }
     const resultPayload = startWorkflowCreated(validated);
@@ -5645,7 +5710,7 @@ export class SqliteTaskRepository implements TaskRepository {
           validated.policy.maxConcurrency,
           validated.policy.maxAggregateBytes,
           0,
-          executableEntries.length,
+          reservedWorkflowTurns,
           0,
           validated.createdAt,
           deadlineAt,
@@ -5905,15 +5970,11 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     if (topo.kind === 'graph_v1') {
-      const boundaryEdges = topo.edges.filter((edge) =>
-        reusedNodeIds.has(edge.fromNodeId) && !reusedNodeIds.has(edge.toNodeId),
-      );
       const graphBindings: SqlStatement[] = [];
       const boundaryFills: SqlStatement[] = [];
       for (const edge of topo.edges) {
         const gateId = gateByNode.get(edge.toNodeId);
         if (!gateId) continue;
-        const reusedArtifact = resolvedReuseByNode.get(edge.fromNodeId);
         graphBindings.push({
           sql: `INSERT INTO workflow_gate_bindings (
                   workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
@@ -5921,7 +5982,7 @@ export class SqliteTaskRepository implements TaskRepository {
                 ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
           params: [
             this.workspaceId, identities.runId, gateId, edge.inputRef, edge.fromNodeId,
-            reusedNodeIds.has(edge.fromNodeId) ? reusedArtifact?.artifactKind ?? edge.expectedArtifactKind ?? 'next_result' : edge.expectedArtifactKind ?? 'next_result',
+            edge.expectedArtifactKind ?? 'next_result',
           ],
         });
       }
@@ -5944,10 +6005,8 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       rest.push(...boundaryFills);
       /* T04 activation materialization follows the completed cross-run fills below. */
-      const boundaryConsumerIds = new Set(boundaryEdges.map((edge) => edge.toNodeId));
-      for (const nodeId of boundaryConsumerIds) {
+      for (const nodeId of materializedBoundaryNodeIds) {
         const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
-        if (!incoming.every((edge) => boundaryEdges.includes(edge))) continue;
         const gateId = gateByNode.get(nodeId)!;
         const activation = deriveNodeActivationIdentities(identities.runId, nodeId);
         const activationId = stableId('wfact', `${identities.runId}\0next\0${gateId}\0${nodeId}`);
@@ -5985,13 +6044,6 @@ export class SqliteTaskRepository implements TaskRepository {
         // The gate is now fully pre-filled; materialize the same deterministic consumer identities
         // used by the normal contribution path.
         rest.push(
-          {
-            sql: `UPDATE workflow_runs
-                     SET workflow_turns_reserved = workflow_turns_reserved + 1
-                   WHERE workspace_id = ? AND run_id = ?
-                     AND workflow_turns_reserved < max_workflow_turns`,
-            params: [this.workspaceId, identities.runId],
-          },
           {
             sql: `UPDATE workflow_dependency_gates SET status = 'satisfied'
                    WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'open'`,

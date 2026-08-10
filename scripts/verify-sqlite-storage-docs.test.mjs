@@ -72,6 +72,9 @@ const required = {
   'package.json': [
     '"test:sqlite-storage-docs": "node --test scripts/verify-sqlite-storage-docs.test.mjs"',
   ],
+  'src/task/sqlite/schema.ts': [
+    'export const SQLITE_SCHEMA_VERSION =',
+  ],
 };
 
 const forbiddenClaims = [
@@ -130,6 +133,20 @@ function validate(files) {
   }
 
   const guide = files['docs/SQLITE-STORAGE.md'];
+  const schemaSource = files['src/task/sqlite/schema.ts'];
+  const schemaVersion = schemaSource.match(/SQLITE_SCHEMA_VERSION\s*=\s*(\d+)\s+as const/)?.[1];
+  assert.ok(schemaVersion, 'schema.ts missing a parseable SQLITE_SCHEMA_VERSION');
+  assert.match(
+    guide,
+    new RegExp(`Current owned schema is \\*\\*v${schemaVersion}\\*\\*\\.`),
+    'SQLITE-STORAGE.md current-schema claim drifted from SQLITE_SCHEMA_VERSION',
+  );
+  assert.doesNotMatch(
+    guide,
+    /Opening a populated \*\*v\d+\*\* store migrates|migration-v\d+\.test\.ts/,
+    'SQLITE-STORAGE.md must not claim a nonexistent migration path or test',
+  );
+
   const restoreStart = guide.indexOf('## 3. Supported manual restore');
   assert.ok(restoreStart >= 0, 'SQLITE-STORAGE.md missing manual restore section');
   const nextHeading = guide.indexOf('\n## ', restoreStart + 1);
@@ -225,8 +242,17 @@ test('rejects omitted location, command, restore, and privacy markers', async ()
   }
 });
 
-test('rejects false encryption, open replace, partial delete, migration, and export-as-backup claims', async () => {
+test('rejects false encryption, schema drift, open replace, partial delete, migration, and export-as-backup claims', async () => {
   const files = await trackedFiles();
+
+  const schemaDrift = files['docs/SQLITE-STORAGE.md'].replace(
+    'Current owned schema is **v3**.',
+    'Current owned schema is **v8**.',
+  );
+  assert.throws(
+    () => validate({ ...files, 'docs/SQLITE-STORAGE.md': schemaDrift }),
+    /current-schema claim drifted/,
+  );
 
   const encryption = `${files['docs/SQLITE-STORAGE.md']}\nMuster SQLite is encrypted at rest with SQLCipher.`;
   assert.throws(

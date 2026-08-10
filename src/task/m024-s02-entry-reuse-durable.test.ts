@@ -94,6 +94,26 @@ describe('M024 S02 durable cross-run entry reuse', () => {
         terminal_result_artifact_revision: 1,
       });
 
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-consumer-kind-mismatch', version: 1,
+        name: 'consumer kind mismatch', topology: {
+          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
+        }, entryContracts: [{
+          entryNodeId: 'entry', inputRef: 'prior_result', expectedArtifactKind: 'text',
+        }], createdAt: NOW,
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-consumer-kind-mismatch', version: 1,
+        startIdempotencyKey: 'consumer-kind-mismatch', createdAt: '2026-08-01T00:00:02.500Z',
+        entryInputs: [{ entryNodeId: 'entry', inputRef: 'prior_result', fromRun: producer.runId }],
+        ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'reuse artifact kind mismatch' });
+      await expect(client.all(
+        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
+        [WORKSPACE_ID, 'wf-consumer-kind-mismatch'],
+      )).resolves.toEqual([]);
+
       const consumerStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-consumer', version: 1,
         startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:03.000Z',

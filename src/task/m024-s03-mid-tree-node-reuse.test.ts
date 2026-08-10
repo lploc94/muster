@@ -6,7 +6,7 @@ import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
-import { fingerprintStartWorkflow, validateStartWorkflow } from './workflow';
+import { DEFAULT_WORKFLOW_POLICY, fingerprintStartWorkflow, validateStartWorkflow } from './workflow';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import type { MusterTask } from './types';
 
@@ -199,6 +199,51 @@ describe('start_workflow mid-tree node reuse', () => {
         turn: { ...priorTurn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:00.750Z', disposition },
         expectedStatuses: ['running'], relatedTurns: [], messages: [],
       })).resolves.toMatchObject({ ok: true, changed: true });
+
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-kind-mismatch', version: 1,
+        name: 'kind mismatch', topology: {
+          kind: 'graph_v1',
+          nodes: [{ nodeId: 'source' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'source_result' },
+            { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result', expectedArtifactKind: 'workflow_input' },
+          ],
+        }, createdAt,
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-kind-mismatch', version: 1,
+        startIdempotencyKey: 'kind-mismatch', createdAt: '2026-08-01T00:00:00.800Z',
+        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'reuse artifact kind mismatch' });
+      await expect(client.all(
+        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-kind-mismatch'],
+      )).resolves.toEqual([]);
+
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-budget-boundary', version: 1,
+        name: 'budget boundary', topology: {
+          kind: 'graph_v1',
+          nodes: ['source', 'middle', 'sink', 'other', 'other_sink'].map((nodeId) => ({ nodeId })),
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'source_result' },
+            { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result' },
+            { fromNodeId: 'other', toNodeId: 'other_sink', inputRef: 'other_result' },
+          ],
+        }, policy: { ...DEFAULT_WORKFLOW_POLICY, maxWorkflowTurnsPerRun: 1 }, createdAt,
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-budget-boundary', version: 1,
+        startIdempotencyKey: 'budget-boundary', createdAt: '2026-08-01T00:00:00.900Z',
+        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'invalid start' });
+      await expect(client.all(
+        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-budget-boundary'],
+      )).resolves.toEqual([]);
 
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,

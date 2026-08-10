@@ -14,7 +14,7 @@ function graph(overrides: Partial<WorkflowGraphWireGraph> = {}): WorkflowGraphWi
     nodes: [
       { nodeId: 'one', status: 'reused', reused: true },
       { nodeId: 'two', status: 'reused', reused: true },
-      { nodeId: 'five', status: 'running', reused: false },
+      { nodeId: 'five', status: 'active', reused: false },
     ],
     edges: [
       { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result', reused: true },
@@ -68,7 +68,7 @@ describe('workflow graph probe coordinator', () => {
         reusedEdgeCount: 1,
         reuseNodeCount: 2,
         reuseEdgeCount: 1,
-        nodeStatuses: ['reused', 'running'],
+        nodeStatuses: ['active', 'reused'],
         childRunCount: 0,
         feedbackRoundCount: 0,
         diagnostics: [],

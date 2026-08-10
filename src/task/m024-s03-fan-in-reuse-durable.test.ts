@@ -76,6 +76,118 @@ async function produce(
 }
 
 describe('M024 S03 independent fan-in artifact reuse', () => {
+  it('reuses a succeeded node from a source run that failed downstream', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-failed-source-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+        [WORKSPACE_ID, 'm024-s03-failed-source', 'M024 S03 failed source', NOW, NOW],
+      );
+      const repository = new SqliteTaskRepository(client, WORKSPACE_ID);
+      await repository.execute({ kind: 'createTask', workspaceId: WORKSPACE_ID, task: rootTask() });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: WORKSPACE_ID,
+        turn: { id: 'root-turn', taskId: 'root-1', sequence: 1, status: 'running', trigger: 'user', inputs: [], createdAt: NOW, startedAt: NOW },
+      });
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'source-fails-late', version: 1,
+        name: 'source fails late', topology: {
+          kind: 'graph_v1', nodes: [{ nodeId: 'one' }, { nodeId: 'later' }],
+          edges: [{ fromNodeId: 'one', toNodeId: 'later', inputRef: 'one_result' }],
+        }, createdAt: NOW,
+      });
+      const sourceStart = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'source-fails-late', version: 1,
+        startIdempotencyKey: 'source-fails-late', createdAt: NOW,
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
+      });
+      expect(sourceStart).toMatchObject({ ok: true, changed: true });
+      const source = sourceStart.operation!.result.data as { runId: string; entryTaskId: string; activationTurnId: string };
+      await expect(settleSucceeded(
+        repository, client, source.entryTaskId, source.activationTurnId,
+        'one completed result', '2026-08-01T00:00:01.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      const later = await client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'later'`,
+        [WORKSPACE_ID, source.runId],
+      );
+      expect(later?.task_id).toBeTruthy();
+      const laterTurn = (await repository.listTurns(later!.task_id))[0]!;
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+        ['2026-08-01T00:00:02.000Z', WORKSPACE_ID, laterTurn.id],
+      );
+      const laterTask = await repository.getTask(later!.task_id);
+      const runningLaterTurn = await repository.getTurn(laterTurn.id);
+      const failDisposition: TurnDisposition = { kind: 'workflow_fail', reason: 'downstream failed' };
+      await stageDispositionForSettlement(repository, runningLaterTurn!, failDisposition);
+      await expect(repository.execute({
+        kind: 'settleTurnAndApplyEffects', workspaceId: WORKSPACE_ID,
+        expectedTaskRevision: laterTask!.revision,
+        task: { ...laterTask!, updatedAt: '2026-08-01T00:00:02.000Z' },
+        turn: { ...runningLaterTurn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:02.000Z', disposition: failDisposition },
+        expectedStatuses: ['running'], relatedTurns: [], messages: [],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        [WORKSPACE_ID, source.runId],
+      )).resolves.toEqual({ status: 'failed' });
+      await expect(client.get(
+        `SELECT turn.status
+           FROM workflow_artifacts artifact
+           JOIN workflow_artifact_sources source
+             ON source.workspace_id = artifact.workspace_id
+            AND source.run_id = artifact.run_id
+            AND source.artifact_id = artifact.artifact_id
+            AND source.artifact_revision = artifact.revision
+           JOIN turns turn
+             ON turn.workspace_id = source.workspace_id
+            AND turn.id = source.producing_turn_id
+            AND turn.task_id = source.producer_task_id
+          WHERE artifact.workspace_id = ? AND artifact.run_id = ?
+            AND artifact.producer_node_id = 'one' AND artifact.kind = 'next_result'`,
+        [WORKSPACE_ID, source.runId],
+      )).resolves.toEqual({ status: 'succeeded' });
+
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'reuse-after-failure', version: 1,
+        name: 'reuse after failure', topology: {
+          kind: 'graph_v1', nodes: [{ nodeId: 'one' }, { nodeId: 'sink' }],
+          edges: [{ fromNodeId: 'one', toNodeId: 'sink', inputRef: 'one_result' }],
+        }, createdAt: NOW,
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'reuse-after-failure', version: 1,
+        startIdempotencyKey: 'reuse-succeeded-node', createdAt: '2026-08-01T00:00:03.000Z',
+        reuse: [{ nodeId: 'one', fromRun: source.runId }],
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
+      })).resolves.toMatchObject({ ok: true, changed: true, affectedTaskIds: [expect.any(String)] });
+
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'reuse-failed-node', version: 1,
+        name: 'reuse failed node', topology: {
+          kind: 'graph_v1', nodes: [{ nodeId: 'later' }, { nodeId: 'sink' }],
+          edges: [{ fromNodeId: 'later', toNodeId: 'sink', inputRef: 'later_result' }],
+        }, createdAt: NOW,
+      });
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'reuse-failed-node', version: 1,
+        startIdempotencyKey: 'reuse-failed-node', createdAt: '2026-08-01T00:00:04.000Z',
+        reuse: [{ nodeId: 'later', fromRun: source.runId }],
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'node reuse reference unresolved' });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it('fills a new fifth task from four independently completed producer runs', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-fan-in-'));
     const client = new DbClient({
@@ -98,12 +210,6 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
       const producers = await Promise.all(['one', 'two', 'three', 'four'].map((nodeId, index) =>
         produce(repository, client, nodeId, `${nodeId} prior result`, index + 1),
       ));
-      // A terminal artifact can exist on a run later marked failed, but it is not
-      // a reusable "done" result. Reject it before the consumer claims any rows.
-      await client.run(
-        `UPDATE workflow_runs SET status = 'failed' WHERE workspace_id = ? AND run_id = ?`,
-        [WORKSPACE_ID, producers[0]!.runId],
-      );
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'five-inputs', version: 1,
         name: 'combine four prior results',
@@ -114,17 +220,6 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
           })),
         }, createdAt: NOW,
       });
-
-      await expect(repository.execute({
-        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'five-inputs', version: 1,
-        startIdempotencyKey: 'failed-source', createdAt: '2026-08-01T00:00:09.000Z',
-        reuse: [{ nodeId: 'one', fromRun: producers[0]!.runId }],
-        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
-      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'node reuse reference unresolved' });
-      await client.run(
-        `UPDATE workflow_runs SET status = 'succeeded' WHERE workspace_id = ? AND run_id = ?`,
-        [WORKSPACE_ID, producers[0]!.runId],
-      );
 
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'five-inputs', version: 1,

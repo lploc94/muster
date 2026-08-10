@@ -292,6 +292,8 @@ export type StartWorkflowResult =
         | 'entry input reference unresolved'
         | 'terminal node cannot be reused'
         | 'node reuse reference unresolved'
+        | 'node reuse closure incomplete'
+        | 'reuse artifact kind mismatch'
         | 'reuse aggregate exceeds policy'
         | 'start fingerprint conflict'
         | 'invalid identity';

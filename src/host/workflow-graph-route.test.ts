@@ -9,7 +9,7 @@ function deps(overrides?: Partial<WorkflowGraphRouteDeps>): WorkflowGraphRouteDe
     getFocused: () => ({ taskId: 'task-1', generation: 1 }),
     buildWorkflowGraph: async () => ({
       runId: 'run-1',
-      nodes: [{ nodeId: 'node-1', status: 'running', reused: false }],
+      nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
       edges: [],
       feedbackRounds: [],
       childRuns: [],
@@ -137,7 +137,7 @@ describe('routeRequestWorkflowGraph', () => {
         ok: true,
         graph: {
           runId: 'run-1',
-          nodes: [{ nodeId: 'node-1', status: 'running', reused: false }],
+          nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
           edges: [],
           feedbackRounds: [],
           childRuns: [],

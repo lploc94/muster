@@ -2380,7 +2380,7 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
         ok: true,
         graph: {
           runId: 'run-1',
-          nodes: [{ nodeId: 'node-1', status: 'running', reused: false }],
+          nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
           edges: [],
           feedbackRounds: [],
           childRuns: [],

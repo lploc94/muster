@@ -16,7 +16,7 @@ function graph(
       { nodeId: "two", status: "reused", reused: true },
       { nodeId: "three", status: "reused", reused: true },
       { nodeId: "four", status: "reused", reused: true },
-      { nodeId: "five", status: "running", reused: false },
+      { nodeId: "five", status: "active", reused: false },
     ],
     edges: [
       { fromNodeId: "one", toNodeId: "two", inputRef: "source", reused: true },
@@ -107,7 +107,7 @@ describe("buildWorkflowGraphPanelView", () => {
       },
       {
         id: "five",
-        status: "running",
+        status: "active",
         statusLabel: "Running",
         reused: false,
         active: true,
@@ -184,7 +184,10 @@ describe("buildWorkflowGraphPanelView", () => {
     });
   });
 
-  it("uses safe fallback copy for future host status values without exposing arbitrary diagnostic text", () => {
+  it("covers durable node and gate statuses while retaining a safe fallback for future values", () => {
+    for (const status of ["pending", "active", "reused", "succeeded", "consumed"]) {
+      expect(workflowGraphStatusLabel(status)).not.toBe("Unknown status");
+    }
     expect(workflowGraphStatusLabel("blocked")).toBe("Blocked");
     expect(workflowGraphStatusLabel("satisfied")).toBe("Satisfied");
     expect(workflowGraphStatusLabel("future_state")).toBe("Unknown status");

@@ -71,6 +71,7 @@ const STATUS_LABELS: Readonly<Record<string, string>> = {
   pending: "Waiting for inputs",
   satisfied: "Satisfied",
   queued: "Queued",
+  active: "Running",
   running: "Running",
   reused: "Reused",
   succeeded: "Succeeded",
@@ -79,6 +80,7 @@ const STATUS_LABELS: Readonly<Record<string, string>> = {
   blocked: "Blocked",
   open: "Open",
   closed: "Closed",
+  consumed: "Consumed",
 };
 
 const DIAGNOSTIC_LABELS: Readonly<Record<WorkflowGraphDiagnosticCode, string>> =
@@ -128,7 +130,7 @@ export function buildWorkflowGraphPanelView(
   graph: WorkflowGraphWireGraph,
 ): WorkflowGraphPanelView {
   const activeNodeId =
-    graph.nodes.find((node) => node.status === "running")?.nodeId ?? null;
+    graph.nodes.find((node) => node.status === "active")?.nodeId ?? null;
 
   return {
     runId: graph.runId,

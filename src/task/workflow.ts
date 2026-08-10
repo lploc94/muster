@@ -271,6 +271,38 @@ export function ancestorNodeClosure(
   return closure;
 }
 
+/**
+ * Every reused-to-live boundary needs an explicit source reference. Under graph_v1's
+ * current fan-out ban this is structurally guaranteed, but keeping the assertion at
+ * the reuse boundary makes a future topology widening fail closed instead of silently
+ * suppressing an ancestor whose live consumer would never receive an artifact.
+ */
+export function isReuseClosureComplete(
+  topology: WorkflowTopologyV1,
+  declaredNodeIds: readonly string[],
+  closure: ReadonlySet<string> = ancestorNodeClosure(topology, declaredNodeIds),
+): boolean {
+  if (topology.kind !== 'graph_v1') return true;
+  const declared = new Set(declaredNodeIds);
+  return topology.edges.every((edge) =>
+    !closure.has(edge.fromNodeId) || closure.has(edge.toNodeId) || declared.has(edge.fromNodeId));
+}
+
+/**
+ * Cross-run entry references intentionally adapt a prior terminal `next_result`
+ * into a caller-authored `workflow_input` slot. Mid-tree node reuse has no such
+ * adapter: it must satisfy the frozen dependency edge kind exactly.
+ */
+export function isReusableArtifactKindCompatible(
+  expectedKind: string,
+  artifactKind: string,
+  target: 'entry' | 'node',
+): boolean {
+  return expectedKind === artifactKind || (
+    target === 'entry' && expectedKind === 'workflow_input' && artifactKind === 'next_result'
+  );
+}
+
 /** Return the sole terminal for callers that explicitly require a single-sink topology. */
 export function terminalNodeId(topology: WorkflowTopologyV1): string {
   const terminals = terminalNodeIds(topology);
@@ -1140,6 +1172,8 @@ export function startWorkflowInvalid(
     | 'entry input reference unresolved'
     | 'terminal node cannot be reused'
     | 'node reuse reference unresolved'
+    | 'node reuse closure incomplete'
+    | 'reuse artifact kind mismatch'
     | 'reuse aggregate exceeds policy',
   definitionId?: string,
   version?: number,

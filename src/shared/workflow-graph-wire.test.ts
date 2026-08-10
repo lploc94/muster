@@ -16,7 +16,7 @@ const valid: WorkflowGraphResult = {
     runId: 'run-1',
     nodes: [
       { nodeId: 'plan', status: 'succeeded', reused: true },
-      { nodeId: 'implement', status: 'running', reused: false },
+      { nodeId: 'implement', status: 'active', reused: false },
     ],
     edges: [{ fromNodeId: 'plan', toNodeId: 'implement', inputRef: 'plan', reused: true }],
     activeGate: { gateId: 'gate-implement', status: 'waiting', satisfied: 1, required: 2 },

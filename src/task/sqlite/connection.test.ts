@@ -76,7 +76,7 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('session_claims');
       expect(tables).toContain('resource_claims');
       expect(tables).toContain('turn_cancel_requests');
-      // Schema v8 blank claim includes workflow tables + writer-guard triggers.
+      // Current blank claim includes workflow tables + writer-guard triggers.
       expect(tables).toContain('workflow_definitions');
       expect(tables).toContain('workflow_runs');
       expect(tables).toContain('workflow_nodes');
@@ -139,6 +139,31 @@ describe('openStoreDatabase', () => {
       expect(tables).toEqual(['foreign_table']);
     } finally {
       after.close();
+    }
+  });
+
+  it('claims an empty INCREMENTAL file left by a concurrent first-open preamble', () => {
+    const dbPath = tempDbPath();
+    {
+      const seed = new DatabaseSync(dbPath);
+      seed.exec('PRAGMA journal_mode = DELETE');
+      seed.exec('PRAGMA auto_vacuum = INCREMENTAL');
+      seed.exec('VACUUM');
+      expect(scalar(seed, 'application_id')).toBe(0);
+      expect(scalar(seed, 'user_version')).toBe(0);
+      expect(scalar(seed, 'auto_vacuum')).toBe(2);
+      expect(seed.prepare('SELECT COUNT(*) AS n FROM sqlite_schema').get()).toEqual({ n: 0 });
+      seed.close();
+    }
+
+    const claimed = openStoreDatabase({ path: dbPath });
+    try {
+      expect(scalar(claimed, 'application_id')).toBe(MUSTER_APPLICATION_ID);
+      expect(scalar(claimed, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
+      expect(scalar(claimed, 'auto_vacuum')).toBe(2);
+      expect(journalMode(claimed)).toBe('wal');
+    } finally {
+      claimed.close();
     }
   });
 
@@ -233,6 +258,38 @@ describe('openStoreDatabase', () => {
         .all()
         .map((r) => (r as { name: string }).name);
       expect(tables).toEqual(['leftover']);
+    } finally {
+      after.close();
+    }
+  });
+
+  it('rejects a stable exact-schema database without ownership markers before the full retry deadline', () => {
+    const dbPath = tempDbPath();
+    {
+      const owned = openStoreDatabase({ path: dbPath });
+      owned.close();
+      const unclaim = new DatabaseSync(dbPath);
+      unclaim.exec('PRAGMA application_id = 0');
+      unclaim.exec('PRAGMA user_version = 0');
+      unclaim.close();
+    }
+
+    const startedAt = Date.now();
+    // busyTimeout=5s gives the old deadline-only behavior a 10s retry window.
+    // The explicit concurrent-state cap must reject well before half of it, even
+    // when the full suite is contending for CPU and filesystem bandwidth.
+    expect(() => openStoreDatabase({ path: dbPath, busyTimeoutMs: 5_000 })).toThrow(
+      NonEmptyUnclaimedDatabaseError,
+    );
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+
+    const after = reopenReadonly(dbPath);
+    try {
+      expect(scalar(after, 'application_id')).toBe(0);
+      expect(scalar(after, 'user_version')).toBe(0);
+      expect(journalMode(after)).toBe('wal');
+      expect(after.prepare("SELECT name FROM sqlite_schema WHERE name = 'workspaces'").get())
+        .toEqual({ name: 'workspaces' });
     } finally {
       after.close();
     }

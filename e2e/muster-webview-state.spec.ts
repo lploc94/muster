@@ -11008,7 +11008,7 @@ test.describe('M019 S05 Assembled First Run', () => {
           { nodeId: 'node-2', status: 'succeeded', reused: true },
           { nodeId: 'node-3', status: 'succeeded', reused: true },
           { nodeId: 'node-4', status: 'succeeded', reused: true },
-          { nodeId: 'node-5', status: 'running', reused: false },
+          { nodeId: 'node-5', status: 'active', reused: false },
         ],
         edges: [
           { fromNodeId: 'node-1', toNodeId: 'node-2', inputRef: 'result', reused: true },

@@ -34,6 +34,7 @@ plan.md
 .gsd*
 .gsd*/**
 .bg-shell/**
+.tmp-context.txt
 Python/**
 NUL
 nul

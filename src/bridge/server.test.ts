@@ -470,7 +470,7 @@ describe('MusterBridgeServer auth', () => {
                 definitionVersion: 2,
                 runStatus: 'running',
                 policy: { maxDepth: 8 },
-                nodes: [{ nodeId: 'review', status: 'running' }],
+                nodes: [{ nodeId: 'review', status: 'active' }],
                 gates: [{ gateId: 'gate-internal', status: 'satisfied' }],
                 activations: [{
                   activationId: 'activation-internal',
@@ -532,7 +532,7 @@ describe('MusterBridgeServer auth', () => {
       runRef: 'wfr-1',
       workflowRef: 'review-flow@2',
       status: 'running',
-      nodes: [{ node: 'review', status: 'running' }],
+      nodes: [{ node: 'review', status: 'active' }],
       activations: [{ node: 'review', kind: 'dependency_gate', status: 'running' }],
       feedback: [],
       children: [],

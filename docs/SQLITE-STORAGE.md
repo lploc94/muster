@@ -192,19 +192,21 @@ actions stay available.
 
 ---
 
-## 8. Schema v8 and migration notes
+## 8. Schema v3 and reset-only notes
 
-- Current owned schema is **v8**. Opening a populated **v7** store migrates under `BEGIN EXCLUSIVE`
-  with commit-boundary rollback; injected migration failure leaves readable v7 unchanged.
-- v8 adds workflow definition/run/node/gate tables and registers writer-version UDF + write-guard
-  triggers so already-open v7 connections fail closed with terminal `schema_changed` (Reload Window).
+- Current owned schema is **v3**. Muster has no in-place migration framework: opening an owned store
+  with any incompatible version fails closed with reset guidance and never rewrites user data.
+- Schema v3 includes workflow definition/run/node/gate tables, the writer-version UDF, and write-guard
+  triggers. An already-open stale writer fails closed with terminal `schema_changed` and must reload.
+- A Developer Reset creates an empty current-schema store; it is destructive replacement, not a
+  data-preserving migration. Back up first when existing task or chat history matters.
 - Diagnostics never expose database paths, SQL/parameters, credentials, prompt text, or artifact bodies.
 
 ## 9. Verification (contributors)
 
 ```bash
 npm run test:sqlite-storage-docs
-npx vitest run src/task/sqlite/privacy-redaction.test.ts src/task/sqlite/migration-v8.test.ts
+npx vitest run src/task/m024-s06-schema-evidence.test.ts src/task/sqlite/reset.test.ts src/task/sqlite/privacy-redaction.test.ts
 npm run test:source-boundary && npm run test:source-boundary:fixtures
 ```
 
