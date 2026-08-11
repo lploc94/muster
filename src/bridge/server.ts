@@ -323,13 +323,15 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
       reuse: {
         type: 'array',
         maxItems: WORKFLOW_GRAPH_MAX_NODES,
-        description: 'Optional prior-run references for reusable non-terminal graph nodes. Each item is exactly {node, fromRun}.',
+        description: 'Optional prior-execution bindings for reusable non-terminal graph nodes. Each item is exactly {node, fromRun, fromNode, fromTask}: node is the destination in this workflow, while fromRun/fromNode/fromTask name the exact completed prior execution whose result is bound. Every predecessor of a reused node must also be bound, otherwise the start is rejected.',
         items: {
           type: 'object',
-          required: ['node', 'fromRun'],
+          required: ['node', 'fromRun', 'fromNode', 'fromTask'],
           properties: {
-            node: { ...PRESENTATION_ID, description: 'Non-terminal graph nodeKey to reuse.' },
-            fromRun: { ...OP_ID, description: 'Opaque prior workflow run reference that produced this node result.' },
+            node: { ...PRESENTATION_ID, description: 'Non-terminal graph nodeKey in this workflow that receives the reused result.' },
+            fromRun: { ...OP_ID, description: 'Opaque prior workflow run reference that produced the result.' },
+            fromNode: { ...PRESENTATION_ID, description: 'nodeKey in the prior run that produced the result. Need not match node.' },
+            fromTask: { ...OP_ID, description: 'Exact completed prior task execution whose result is bound.' },
           },
           additionalProperties: false,
         },

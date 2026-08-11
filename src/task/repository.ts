@@ -53,8 +53,7 @@ import {
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
-  ancestorNodeClosure,
-  isReuseClosureComplete,
+  unboundReuseAncestors,
   isReusableArtifactKindCompatible,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
@@ -5358,9 +5357,11 @@ export class SqliteTaskRepository implements TaskRepository {
       artifactRevision: number;
       artifactKind: string;
       value: string;
+      sourceNodeId: string;
+      sourceTaskId: string;
     }>();
     for (const reuse of validated.reuse) {
-      if (terminalNodeIdSet.has(reuse.nodeId)) {
+      if (terminalNodeIdSet.has(reuse.destinationNodeId)) {
         return invalidStart('terminal node cannot be reused');
       }
       const referenced = await this.db.get<{
@@ -5389,13 +5390,20 @@ export class SqliteTaskRepository implements TaskRepository {
             AND producing_turn.status = 'succeeded'
           WHERE artifact.workspace_id = ? AND artifact.run_id = ?
             AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'
+            -- The caller names the exact completed execution. Without this the engine
+            -- would pick "latest matching row" for the node, which is a guess: one node
+            -- id maps to a different task in every run.
+            AND source.producer_task_id = ?
             AND run.owner_root_task_id = ?
             -- A completed producer remains reusable when a later node fails, but
             -- never harvest from a still-mutating source run.
             AND run.status IN ('succeeded', 'failed', 'cancelled')
           ORDER BY artifact.revision DESC
           LIMIT 1`,
-        [this.workspaceId, reuse.fromRun, reuse.nodeId, validated.ownerRootTaskId ?? null],
+        [
+          this.workspaceId, reuse.sourceRunId, reuse.sourceNodeId, reuse.sourceTaskId,
+          validated.ownerRootTaskId ?? null,
+        ],
       );
       if (
         !referenced ||
@@ -5417,17 +5425,24 @@ export class SqliteTaskRepository implements TaskRepository {
       if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > validated.policy.maxArtifactBytes) {
         return invalidStart('node reuse reference unresolved');
       }
-      resolvedReuseByNode.set(reuse.nodeId, {
+      resolvedReuseByNode.set(reuse.destinationNodeId, {
         runId: referenced.run_id,
         artifactId: referenced.artifact_id,
         artifactRevision: Number(referenced.revision),
         artifactKind: referenced.kind,
         value,
+        sourceNodeId: reuse.sourceNodeId,
+        sourceTaskId: reuse.sourceTaskId,
       });
     }
-    const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.nodeId);
-    const reusedNodeIds = ancestorNodeClosure(topo, declaredReuseNodeIds);
-    if (!isReuseClosureComplete(topo, declaredReuseNodeIds, reusedNodeIds)) {
+    /**
+     * Reuse is bind-only: `reused` covers exactly the declared destinations, never an
+     * expanded ancestor closure. Any predecessor the caller did not bind is rejected
+     * rather than silently marked reused with no task and no provenance.
+     */
+    const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.destinationNodeId);
+    const reusedNodeIds: ReadonlySet<string> = new Set(declaredReuseNodeIds);
+    if (unboundReuseAncestors(topo, declaredReuseNodeIds).length > 0) {
       return invalidStart('node reuse closure incomplete');
     }
     /**
@@ -5818,10 +5833,17 @@ export class SqliteTaskRepository implements TaskRepository {
           isEntry && entry ? entry.messageId : null,
         ],
       });
+      /**
+       * `reused` covers exactly the caller-bound destinations, so provenance is present
+       * for every one of them. That keeps `status = 'reused'` backed by a durable source
+       * identity instead of being an unverifiable claim on a task-less row.
+       */
+      const reuseProvenance = resolvedReuseByNode.get(nodeGate.nodeId);
       rest.push({
         sql: `INSERT INTO workflow_nodes (
-                workspace_id, run_id, node_id, task_id, status
-              ) VALUES (?,?,?,?,?)
+                workspace_id, run_id, node_id, task_id, status,
+                source_run_id, source_node_id, source_task_id
+              ) VALUES (?,?,?,?,?,?,?,?)
               ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
         params: [
           this.workspaceId,
@@ -5829,6 +5851,9 @@ export class SqliteTaskRepository implements TaskRepository {
           nodeGate.nodeId,
           isEntry && entry ? entry.taskId : null,
           reusedNodeIds.has(nodeGate.nodeId) ? 'reused' : isEntry ? 'active' : 'pending',
+          reuseProvenance?.runId ?? null,
+          reuseProvenance?.sourceNodeId ?? null,
+          reuseProvenance?.sourceTaskId ?? null,
         ],
       });
     }

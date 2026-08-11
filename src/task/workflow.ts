@@ -231,61 +231,34 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
 }
 
 /**
- * Node ids that can be skipped when these graph nodes are reused: each declared
- * node plus every predecessor reachable over frozen reverse edges.
+ * Predecessors of declared reuse targets that the caller did not also bind.
  *
- * Skipping the whole ancestor chain is correct *because* decodeTopology bans
- * fan-out (workflow-codec.ts: `fan-out not allowed`), so every non-terminal node
- * has exactly one outgoing route. A predecessor of a reused node therefore has
- * no consumer other than that node: its only purpose is to produce the result
- * being reused. Materializing it instead would spend an agent turn whose output
- * lands on an already-prefilled gate and is dropped by ON CONFLICT DO NOTHING.
+ * Reuse is bind-only: a node is `reused` if and only if the caller supplied an exact
+ * source execution for it. An earlier revision instead expanded the declared set over
+ * reverse edges and marked every ancestor `reused` with `task_id = NULL`, producing
+ * nodes that neither ran nor carried provenance — the graph claimed work was reused
+ * while no artifact or execution backed the claim. Callers must bind the whole
+ * ancestor chain explicitly so every suppressed node has an auditable source.
  *
- * If the fan-out ban is ever relaxed this becomes unsound (a predecessor feeding
- * a still-live sibling would be skipped, and that sibling's gate would never
- * fill). m024-s03-mid-tree-node-reuse.test.ts pins that dependency so the ban
- * cannot be lifted without failing a test that points back here.
+ * Checking direct predecessors is sufficient: a declared node forces its immediate
+ * predecessors to be declared, which inductively closes the set back to the entries.
+ *
+ * Returns the offending node ids (sorted) so the caller can report what is missing;
+ * empty means the declared set is ancestor-closed.
  */
-export function ancestorNodeClosure(
-  topology: WorkflowTopologyV1,
-  nodeIds: readonly string[],
-): ReadonlySet<string> {
-  const closure = new Set(nodeIds);
-  if (topology.kind !== 'graph_v1') return closure;
-  const predecessors = new Map<string, string[]>();
-  for (const edge of topology.edges) {
-    const current = predecessors.get(edge.toNodeId) ?? [];
-    current.push(edge.fromNodeId);
-    predecessors.set(edge.toNodeId, current);
-  }
-  const pending = [...closure];
-  while (pending.length > 0) {
-    const nodeId = pending.pop()!;
-    for (const predecessor of predecessors.get(nodeId) ?? []) {
-      if (!closure.has(predecessor)) {
-        closure.add(predecessor);
-        pending.push(predecessor);
-      }
-    }
-  }
-  return closure;
-}
-
-/**
- * Every reused-to-live boundary needs an explicit source reference. Under graph_v1's
- * current fan-out ban this is structurally guaranteed, but keeping the assertion at
- * the reuse boundary makes a future topology widening fail closed instead of silently
- * suppressing an ancestor whose live consumer would never receive an artifact.
- */
-export function isReuseClosureComplete(
+export function unboundReuseAncestors(
   topology: WorkflowTopologyV1,
   declaredNodeIds: readonly string[],
-  closure: ReadonlySet<string> = ancestorNodeClosure(topology, declaredNodeIds),
-): boolean {
-  if (topology.kind !== 'graph_v1') return true;
+): readonly string[] {
+  if (topology.kind !== 'graph_v1') return [];
   const declared = new Set(declaredNodeIds);
-  return topology.edges.every((edge) =>
-    !closure.has(edge.fromNodeId) || closure.has(edge.toNodeId) || declared.has(edge.fromNodeId));
+  const unbound = new Set<string>();
+  for (const edge of topology.edges) {
+    if (declared.has(edge.toNodeId) && !declared.has(edge.fromNodeId)) {
+      unbound.add(edge.fromNodeId);
+    }
+  }
+  return [...unbound].sort();
 }
 
 /**
@@ -1002,16 +975,20 @@ export function validateStartWorkflow(
   const reuseNodeIds = new Set<string>();
   for (const item of reuse) {
     if (
-      !isNonEmptyBounded(item.nodeId, 128) ||
-      !isNonEmptyBounded(item.fromRun, 128) ||
-      reuseNodeIds.has(item.nodeId) ||
-      // A reference naming a node outside this topology can never be applied;
-      // accepting it would silently start a run that executes every node.
-      !allNodeIds.includes(item.nodeId)
+      !isNonEmptyBounded(item.destinationNodeId, 128) ||
+      !isNonEmptyBounded(item.sourceRunId, 128) ||
+      !isNonEmptyBounded(item.sourceNodeId, 128) ||
+      !isNonEmptyBounded(item.sourceTaskId, 128) ||
+      reuseNodeIds.has(item.destinationNodeId) ||
+      // A destination outside this topology can never be applied; accepting it would
+      // silently start a run that executes every node.
+      !allNodeIds.includes(item.destinationNodeId)
     ) {
       return { ok: false, reason: 'invalid reuse' };
     }
-    reuseNodeIds.add(item.nodeId);
+    // `sourceNodeId` is intentionally not checked against this topology: the artifact
+    // may come from a different definition whose node names do not appear here.
+    reuseNodeIds.add(item.destinationNodeId);
   }
   const contractByKey = new Map<string, WorkflowEntryContractV1>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),

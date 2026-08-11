@@ -36,15 +36,21 @@ const ROOT_TURN_ID = 'uat-workflow-graph-root-turn';
 const PRODUCER_DEFINITION_ID = 'uat-wf-producer';
 const CHAIN_DEFINITION_ID = 'uat-wf-five-chain';
 const CHAIN_NODES = ['one', 'two', 'three', 'four', 'five'] as const;
-/** The only node outside the reuse closure, so the only one that activates. */
+/** The only node the caller does not bind, so the only one that activates. */
 const LIVE_NODE_ID = 'five';
 /**
- * Reuse resolves a producer result *by node id*, so the producer's single node
- * must carry the same id as the consumer node being reused. Naming it anything
- * else (e.g. `produce`) makes the reference unresolvable and the consumer start
- * fails with `node reuse reference unresolved`.
+ * Deliberately unlike every chain node id. Reuse binds a source execution
+ * (run + node + task) to a destination node, so the producer's node id does not
+ * have to match the destination it feeds. A fixture that named it `four` could
+ * not tell a real binding apart from an id coincidence.
  */
-const REUSED_NODE_ID = 'four';
+const PRODUCER_NODE_ID = 'produce';
+/**
+ * Reuse is bind-only: binding just `four` is rejected because its predecessors
+ * would otherwise be marked reused with no source and no execution behind them.
+ * All four ancestors of the live node are bound to the same producer execution.
+ */
+const REUSED_NODE_IDS = ['one', 'two', 'three', 'four'] as const;
 
 /** Bounded seed result: the task the harness should focus, plus shape counters. */
 export type WorkflowGraphFixtureResult = {
@@ -160,8 +166,8 @@ export async function seedWorkflowGraphFixture(
     name: 'UAT producer',
     topology: {
       kind: 'one_node_v1',
-      nodes: [{ nodeId: REUSED_NODE_ID }],
-      entryNodeId: REUSED_NODE_ID,
+      nodes: [{ nodeId: PRODUCER_NODE_ID }],
+      entryNodeId: PRODUCER_NODE_ID,
     },
     createdAt: iso(0),
   });
@@ -222,7 +228,12 @@ export async function seedWorkflowGraphFixture(
     version: 1,
     startIdempotencyKey: 'uat-workflow-graph-consumer',
     createdAt: iso(2_000),
-    reuse: [{ nodeId: REUSED_NODE_ID, fromRun: producer.runId }],
+    reuse: REUSED_NODE_IDS.map((destinationNodeId) => ({
+      destinationNodeId,
+      sourceRunId: producer.runId,
+      sourceNodeId: PRODUCER_NODE_ID,
+      sourceTaskId: producer.entryTaskId,
+    })),
     ownerRootTaskId: WORKFLOW_GRAPH_FIXTURE_ROOT_TASK_ID,
     callerTaskId: WORKFLOW_GRAPH_FIXTURE_ROOT_TASK_ID,
     callerTurnId: ROOT_TURN_ID,
@@ -250,9 +261,24 @@ export async function seedWorkflowGraphFixture(
       `workflow graph fixture expected exactly one live node '${LIVE_NODE_ID}', found ${live.length}`,
     );
   }
-  if (reused.length !== CHAIN_NODES.length - 1) {
+  if (reused.length !== REUSED_NODE_IDS.length) {
     throw new Error(
-      `workflow graph fixture expected ${CHAIN_NODES.length - 1} reused nodes, found ${reused.length}`,
+      `workflow graph fixture expected ${REUSED_NODE_IDS.length} reused nodes, found ${reused.length}`,
+    );
+  }
+  // Every reused node must carry the exact source execution the caller bound, so the
+  // fixture proves provenance is durable rather than inferred from a status string.
+  const unbound = await client.all<{ node_id: string }>(
+    `SELECT node_id FROM workflow_nodes
+      WHERE workspace_id = ? AND run_id = ? AND status = 'reused'
+        AND (source_run_id IS NOT ? OR source_node_id IS NOT ? OR source_task_id IS NOT ?)`,
+    [workspaceId, consumer.runId, producer.runId, PRODUCER_NODE_ID, producer.entryTaskId],
+  );
+  if (unbound.length > 0) {
+    throw new Error(
+      `workflow graph fixture found reused nodes without the bound source: ${unbound
+        .map((node) => node.node_id)
+        .join(', ')}`,
     );
   }
 

@@ -245,9 +245,20 @@ test('rejects omitted location, command, restore, and privacy markers', async ()
 test('rejects false encryption, schema drift, open replace, partial delete, migration, and export-as-backup claims', async () => {
   const files = await trackedFiles();
 
+  // Derived, not hardcoded: the validator compares the guide against
+  // SQLITE_SCHEMA_VERSION, so pinning a literal version here made this fixture a
+  // silent no-op on the next schema bump, and a no-op replacement asserts nothing.
+  const currentVersion = files['src/task/sqlite/schema.ts']
+    .match(/SQLITE_SCHEMA_VERSION\s*=\s*(\d+)\s+as const/)?.[1];
+  assert.ok(currentVersion, 'schema.ts missing a parseable SQLITE_SCHEMA_VERSION');
+  const currentClaim = `Current owned schema is **v${currentVersion}**.`;
+  assert.ok(
+    files['docs/SQLITE-STORAGE.md'].includes(currentClaim),
+    `SQLITE-STORAGE.md missing the current-schema claim: ${currentClaim}`,
+  );
   const schemaDrift = files['docs/SQLITE-STORAGE.md'].replace(
-    'Current owned schema is **v3**.',
-    'Current owned schema is **v8**.',
+    currentClaim,
+    `Current owned schema is **v${Number(currentVersion) + 5}**.`,
   );
   assert.throws(
     () => validate({ ...files, 'docs/SQLITE-STORAGE.md': schemaDrift }),

@@ -114,10 +114,23 @@ export function fingerprintStartEntryInputs(
 
 export function fingerprintStartNodeReuse(
   reuse: readonly StartWorkflowNodeReuse[],
-): readonly { nodeId: string; fromRun: string }[] {
+): readonly {
+  destinationNodeId: string;
+  sourceRunId: string;
+  sourceNodeId: string;
+  sourceTaskId: string;
+}[] {
+  // All four identities are fingerprinted: two starts binding different source
+  // executions to the same destination node are different starts, so they must not
+  // collide on the start idempotency ledger.
   return [...reuse]
-    .map(({ nodeId, fromRun }) => ({ nodeId, fromRun }))
-    .sort((left, right) => left.nodeId.localeCompare(right.nodeId));
+    .map(({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId }) => ({
+      destinationNodeId,
+      sourceRunId,
+      sourceNodeId,
+      sourceTaskId,
+    }))
+    .sort((left, right) => left.destinationNodeId.localeCompare(right.destinationNodeId));
 }
 
 export function formatWorkflowEntryAggregate(

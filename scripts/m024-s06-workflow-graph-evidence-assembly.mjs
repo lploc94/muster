@@ -13,7 +13,7 @@
 const HOST_KIND = 'm024-s06-workflow-graph-host-result';
 const EVIDENCE_KIND = 'm024-s06-workflow-graph-live-uat';
 const MAX_BLOCKED_REASON_LENGTH = 500;
-/** Chain of five nodes with reuse at `four` suppresses exactly one..four. */
+/** Chain of five nodes; the caller binds one..four, so only `five` activates. */
 const EXPECTED_NODE_COUNT = 5;
 const EXPECTED_EDGE_COUNT = 4;
 const EXPECTED_REUSED_NODE_COUNT = 4;

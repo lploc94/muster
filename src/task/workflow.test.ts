@@ -39,8 +39,7 @@ import {
   maximumWorkflowEntryAggregateBytes,
   terminalNodeIds,
   terminalNodeId,
-  ancestorNodeClosure,
-  isReuseClosureComplete,
+  unboundReuseAncestors,
   isReusableArtifactKindCompatible,
   validateDefineWorkflow,
 } from './workflow';
@@ -278,10 +277,15 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
         { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result' },
       ],
     };
-    const closure = ancestorNodeClosure(widenedTopology, ['middle']);
-    expect([...closure].sort()).toEqual(['middle', 'source']);
-    expect(isReuseClosureComplete(widenedTopology, ['middle'], closure)).toBe(false);
-    expect(isReuseClosureComplete(widenedTopology, ['source', 'middle'], closure)).toBe(true);
+    // Reuse is bind-only, so binding `middle` without its predecessor is rejected rather
+    // than silently expanding the reused set to a node with no source and no execution.
+    expect(unboundReuseAncestors(widenedTopology, ['middle'])).toEqual(['source']);
+    expect(unboundReuseAncestors(widenedTopology, ['source', 'middle'])).toEqual([]);
+    expect(unboundReuseAncestors(widenedTopology, ['sink'])).toEqual(['middle', 'source']);
+    // Fan-out is safe under bind-only reuse: `source` is bound while `middle` and `sink`
+    // stay live, and each live consumer's edge from `source` is prefilled at start. The
+    // superseded closure expansion is what made a widened topology unsound.
+    expect(unboundReuseAncestors(widenedTopology, ['source'])).toEqual([]);
 
     expect(isReusableArtifactKindCompatible('next_result', 'next_result', 'node')).toBe(true);
     expect(isReusableArtifactKindCompatible('workflow_input', 'next_result', 'entry')).toBe(true);

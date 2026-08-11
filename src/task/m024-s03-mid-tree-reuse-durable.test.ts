@@ -74,7 +74,9 @@ describe('M024 S03 durable mid-tree reuse', () => {
       });
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-four', version: 1,
-        name: 'produce four', topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'four' }], entryNodeId: 'four' }, createdAt: NOW,
+        // Named unlike any chain node on purpose: reuse binds a source execution to a
+        // destination node, so matching ids must not be what makes the binding resolve.
+        name: 'produce four', topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'produce' }], entryNodeId: 'produce' }, createdAt: NOW,
       });
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
@@ -103,7 +105,15 @@ describe('M024 S03 durable mid-tree reuse', () => {
       const consumerStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
         startIdempotencyKey: 'consumer-five-chain', createdAt: '2026-08-01T00:00:02.000Z',
-        reuse: [{ nodeId: 'four', fromRun: producer.runId }],
+        // Every suppressed node is bound explicitly to the exact producing execution.
+        // Binding only `four` is rejected (see the closure test): an unbound ancestor
+        // would otherwise be marked reused while nothing produced its result.
+        reuse: ['one', 'two', 'three', 'four'].map((destinationNodeId) => ({
+          destinationNodeId,
+          sourceRunId: producer.runId,
+          sourceNodeId: 'produce',
+          sourceTaskId: producer.entryTaskId,
+        })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
@@ -112,17 +122,31 @@ describe('M024 S03 durable mid-tree reuse', () => {
       // the in-memory projection and scheduler can see it without a full reload.
       const consumer = consumerStart.operation!.result.data as { runId: string };
 
-      const nodes = await client.all<{ node_id: string; task_id: string | null; status: string }>(
-        `SELECT node_id, task_id, status FROM workflow_nodes
+      const nodes = await client.all<{
+        node_id: string; task_id: string | null; status: string;
+        source_run_id: string | null; source_node_id: string | null; source_task_id: string | null;
+      }>(
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+           FROM workflow_nodes
          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
       );
+      // Each reused node records the caller-bound source execution, so provenance is
+      // durable rather than re-derived from "latest row for this node id".
+      const boundSource = {
+        source_run_id: producer.runId,
+        source_node_id: 'produce',
+        source_task_id: producer.entryTaskId,
+      };
       expect(nodes).toEqual([
-        { node_id: 'five', task_id: expect.any(String), status: 'active' },
-        { node_id: 'four', task_id: null, status: 'reused' },
-        { node_id: 'one', task_id: null, status: 'reused' },
-        { node_id: 'three', task_id: null, status: 'reused' },
-        { node_id: 'two', task_id: null, status: 'reused' },
+        {
+          node_id: 'five', task_id: expect.any(String), status: 'active',
+          source_run_id: null, source_node_id: null, source_task_id: null,
+        },
+        { node_id: 'four', task_id: null, status: 'reused', ...boundSource },
+        { node_id: 'one', task_id: null, status: 'reused', ...boundSource },
+        { node_id: 'three', task_id: null, status: 'reused', ...boundSource },
+        { node_id: 'two', task_id: null, status: 'reused', ...boundSource },
       ]);
       const liveFive = nodes.find((node) => node.node_id === 'five');
       expect(liveFive?.task_id).toEqual(expect.any(String));

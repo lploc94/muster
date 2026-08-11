@@ -466,12 +466,22 @@ function parseSemanticWorkflowReuse(value: unknown): StartWorkflowNodeReuse[] | 
   const seen = new Set<string>();
   for (const raw of value) {
     if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['node', 'fromRun'].includes(key))) return undefined;
-    const nodeId = requireString(raw, 'node');
-    const fromRun = requireString(raw, 'fromRun');
-    if (!nodeId || !fromRun || seen.has(nodeId)) return undefined;
-    seen.add(nodeId);
-    reuse.push({ nodeId, fromRun });
+    if (
+      Object.keys(raw).some((key) =>
+        !['node', 'fromRun', 'fromNode', 'fromTask'].includes(key))
+    ) return undefined;
+    const destinationNodeId = requireString(raw, 'node');
+    const sourceRunId = requireString(raw, 'fromRun');
+    // Source is addressed separately from destination: the artifact may come from a
+    // differently-named node, and only `fromTask` pins the exact prior execution.
+    const sourceNodeId = requireString(raw, 'fromNode');
+    const sourceTaskId = requireString(raw, 'fromTask');
+    if (
+      !destinationNodeId || !sourceRunId || !sourceNodeId || !sourceTaskId ||
+      seen.has(destinationNodeId)
+    ) return undefined;
+    seen.add(destinationNodeId);
+    reuse.push({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId });
   }
   return reuse;
 }

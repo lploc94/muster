@@ -80,8 +80,9 @@ export async function run(): Promise<void> {
     (state) => state.viewResolved && state.viewVisible && state.pollingReady,
   );
 
-  // Real reuse run: one settled producer, then a five-node chain reusing node
-  // `four`, so only `five` activates and owns a graph.
+  // Real reuse run: one settled producer, then a five-node chain whose first four
+  // nodes are each bound to that producer's execution, so only `five` activates
+  // and owns a graph. Reuse is bind-only: an unbound ancestor would be rejected.
   const fixture = await command<WorkflowGraphFixtureResult>(
     UAT_COMMANDS.seedWorkflowGraphFixture,
   );

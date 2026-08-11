@@ -27,8 +27,10 @@ afterEach(() => {
 });
 
 describe('M024 S06 schema evidence baseline', () => {
-  it('uses schema v3 and requires an explicit reset for an incompatible owned store', () => {
-    expect(SQLITE_SCHEMA_VERSION).toBe(3);
+  it('uses schema v4 and requires an explicit reset for an incompatible owned store', () => {
+    // Bumped to 4 by the reuse-provenance columns on workflow_nodes. Reset-only
+    // semantics are unchanged: an older store is rejected, never migrated.
+    expect(SQLITE_SCHEMA_VERSION).toBe(4);
 
     const dbPath = tempDbPath();
     const current = openStoreDatabase({ path: dbPath });
@@ -53,7 +55,9 @@ describe('M024 S06 schema evidence baseline', () => {
     const reset = openStoreDatabase({ path: dbPath });
     try {
       expect(scalar(reset, 'application_id')).toBe(MUSTER_APPLICATION_ID);
-      expect(scalar(reset, 'user_version')).toBe(3);
+      // Asserted against the constant, not a second literal: the literal pin lives in the
+      // SQLITE_SCHEMA_VERSION expectation above, so a bump cannot pass here by accident.
+      expect(scalar(reset, 'user_version')).toBe(SQLITE_SCHEMA_VERSION);
       expect(
         reset.prepare('SELECT COUNT(*) AS n FROM workspaces').get(),
       ).toEqual({ n: 0 });

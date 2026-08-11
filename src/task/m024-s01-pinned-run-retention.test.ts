@@ -20,6 +20,7 @@ describe('M024 pinned terminal workflow run retention', () => {
   });
 
   it('bumps the reset-only schema version when the prune predicate changes', () => {
-    expect(SQLITE_SCHEMA_VERSION).toBe(3);
+    // v4 added reuse provenance columns to workflow_nodes; the store stays reset-only.
+    expect(SQLITE_SCHEMA_VERSION).toBe(4);
   });
 });

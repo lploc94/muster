@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 3 as const;
+export const SQLITE_SCHEMA_VERSION = 4 as const;
 
 /**
  * Core task-store tables.
@@ -506,13 +506,30 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE RESTRICT
   )`,
 
+  /**
+   * `source_*` records which exact prior execution a `reused` node was bound to at start.
+   * Without it a reused node is only `task_id IS NULL` plus a status string, so nothing
+   * durable proves the caller authorized that specific source rather than the engine
+   * having guessed a matching row.
+   *
+   * Deliberately no FK on `source_task_id`: provenance is a historical record that must
+   * outlive the source run, and M023 retention deletes tasks outright (`deleteTasks`),
+   * which an enforced reference would either block or silently blank.
+   */
   `CREATE TABLE IF NOT EXISTS workflow_nodes (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
     task_id TEXT,
     status TEXT NOT NULL,
+    source_run_id TEXT,
+    source_node_id TEXT,
+    source_task_id TEXT,
     PRIMARY KEY (workspace_id, run_id, node_id),
+    CHECK (
+      (source_run_id IS NULL AND source_node_id IS NULL AND source_task_id IS NULL)
+      OR (source_run_id IS NOT NULL AND source_node_id IS NOT NULL AND source_task_id IS NOT NULL)
+    ),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, task_id)
@@ -1172,9 +1189,29 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
           AND (
             binding.producer_node_id IS NULL
             OR (
+              -- Live contribution: the producing node of this run filled its own edge.
               source.source_kind = 'workflow_node'
               AND artifact.producer_node_id = binding.producer_node_id
               AND source.producer_node_id = binding.producer_node_id
+            )
+            OR (
+              -- Cross-run reuse: the artifact was produced by a node in another run whose
+              -- id need not match this topology's producer. Requiring equality made a
+              -- differently-named source unusable, collapsing source and destination onto
+              -- one id. Authority comes from the destination node's recorded provenance,
+              -- so an unbound or mismatched source is still rejected here.
+              source.source_kind = 'workflow_node'
+              AND EXISTS (
+                SELECT 1
+                  FROM workflow_nodes destination
+                 WHERE destination.workspace_id = NEW.workspace_id
+                   AND destination.run_id = NEW.run_id
+                   AND destination.node_id = binding.producer_node_id
+                   AND destination.status = 'reused'
+                   AND destination.source_run_id = artifact.run_id
+                   AND destination.source_node_id = artifact.producer_node_id
+                   AND destination.source_task_id = source.producer_task_id
+              )
             )
           )
      )

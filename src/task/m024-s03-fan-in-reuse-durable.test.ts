@@ -165,9 +165,27 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'reuse-after-failure', version: 1,
         startIdempotencyKey: 'reuse-succeeded-node', createdAt: '2026-08-01T00:00:03.000Z',
-        reuse: [{ nodeId: 'one', fromRun: source.runId }],
+        reuse: [{
+          destinationNodeId: 'one', sourceRunId: source.runId,
+          sourceNodeId: 'one', sourceTaskId: source.entryTaskId,
+        }],
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       })).resolves.toMatchObject({ ok: true, changed: true, affectedTaskIds: [expect.any(String)] });
+
+      // Same reusable run and node, but a real task that did not produce that artifact.
+      // The engine must honour the caller's exact execution rather than resolving the
+      // newest artifact for the node id, which would silently accept this binding.
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'reuse-after-failure', version: 1,
+        startIdempotencyKey: 'reuse-wrong-task', createdAt: '2026-08-01T00:00:03.500Z',
+        reuse: [{
+          destinationNodeId: 'one', sourceRunId: source.runId,
+          sourceNodeId: 'one', sourceTaskId: later!.task_id,
+        }],
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
+      })).resolves.toMatchObject({
+        ok: false, conflict: true, reason: 'node reuse reference unresolved',
+      });
 
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'reuse-failed-node', version: 1,
@@ -179,7 +197,10 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'reuse-failed-node', version: 1,
         startIdempotencyKey: 'reuse-failed-node', createdAt: '2026-08-01T00:00:04.000Z',
-        reuse: [{ nodeId: 'later', fromRun: source.runId }],
+        reuse: [{
+          destinationNodeId: 'later', sourceRunId: source.runId,
+          sourceNodeId: 'later', sourceTaskId: later!.task_id,
+        }],
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'node reuse reference unresolved' });
     } finally {
@@ -224,22 +245,44 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'five-inputs', version: 1,
         startIdempotencyKey: 'fan-in', createdAt: '2026-08-01T00:00:10.000Z',
-        reuse: producers.map((producer, index) => ({ nodeId: ['one', 'two', 'three', 'four'][index]!, fromRun: producer.runId })),
+        // Four destinations, four different source runs and executions: provenance has to
+        // be recorded per node, not once per start.
+        reuse: producers.map((producer, index) => ({
+          destinationNodeId: ['one', 'two', 'three', 'four'][index]!,
+          sourceRunId: producer.runId,
+          sourceNodeId: ['one', 'two', 'three', 'four'][index]!,
+          sourceTaskId: producer.entryTaskId,
+        })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
       expect(started).toMatchObject({ ok: true, changed: true });
       const consumer = started.operation!.result.data as { runId: string };
 
-      await expect(client.all<{ node_id: string; task_id: string | null; status: string }>(
-        `SELECT node_id, task_id, status FROM workflow_nodes
+      const sourceOf = (nodeId: string) => {
+        const index = ['one', 'two', 'three', 'four'].indexOf(nodeId);
+        return {
+          source_run_id: producers[index]!.runId,
+          source_node_id: nodeId,
+          source_task_id: producers[index]!.entryTaskId,
+        };
+      };
+      await expect(client.all<{
+        node_id: string; task_id: string | null; status: string;
+        source_run_id: string | null; source_node_id: string | null; source_task_id: string | null;
+      }>(
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+           FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
       )).resolves.toEqual([
-        { node_id: 'five', task_id: expect.any(String), status: 'active' },
-        { node_id: 'four', task_id: null, status: 'reused' },
-        { node_id: 'one', task_id: null, status: 'reused' },
-        { node_id: 'three', task_id: null, status: 'reused' },
-        { node_id: 'two', task_id: null, status: 'reused' },
+        {
+          node_id: 'five', task_id: expect.any(String), status: 'active',
+          source_run_id: null, source_node_id: null, source_task_id: null,
+        },
+        { node_id: 'four', task_id: null, status: 'reused', ...sourceOf('four') },
+        { node_id: 'one', task_id: null, status: 'reused', ...sourceOf('one') },
+        { node_id: 'three', task_id: null, status: 'reused', ...sourceOf('three') },
+        { node_id: 'two', task_id: null, status: 'reused', ...sourceOf('two') },
       ]);
       await expect(client.get<{ count: number }>(
         `SELECT COUNT(*) AS count FROM workflow_gate_fills
@@ -267,7 +310,12 @@ describe('M024 S03 independent fan-in artifact reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'five-inputs', version: 1,
         startIdempotencyKey: 'fan-in-overflow', createdAt: '2026-08-01T00:00:11.000Z',
-        reuse: largeProducers.map((producer, index) => ({ nodeId: ['one', 'two', 'three', 'four'][index]!, fromRun: producer.runId })),
+        reuse: largeProducers.map((producer, index) => ({
+          destinationNodeId: ['one', 'two', 'three', 'four'][index]!,
+          sourceRunId: producer.runId,
+          sourceNodeId: ['one', 'two', 'three', 'four'][index]!,
+          sourceTaskId: producer.entryTaskId,
+        })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'reuse aggregate exceeds policy' });
       await expect(client.get<{ count: number }>(

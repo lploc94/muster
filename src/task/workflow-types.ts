@@ -162,10 +162,24 @@ export type StartWorkflowEntryInput =
   | StartWorkflowEntryLiteralInput
   | StartWorkflowEntryRunReferenceInput;
 
-/** Caller-authorized reuse of a prior run's result for one graph node. */
+/**
+ * Caller-authorized reuse of one exact completed prior execution for one graph node.
+ *
+ * Source and destination are separate identities on purpose: the artifact was produced
+ * by `sourceNodeId` in `sourceRunId` (possibly under a different definition, so that id
+ * need not exist in this run's topology), and is bound to `destinationNodeId` here.
+ * `sourceTaskId` pins the exact execution, because one node id maps to a different task
+ * in every run, so "latest matching row" is a guess rather than a caller authorization.
+ */
 export interface StartWorkflowNodeReuse {
-  nodeId: string;
-  fromRun: string;
+  /** Node in this run's frozen topology that receives the reused artifact. */
+  destinationNodeId: string;
+  /** Prior run that produced the artifact. */
+  sourceRunId: string;
+  /** Node in the prior run's topology that produced the artifact. */
+  sourceNodeId: string;
+  /** Exact completed task execution whose artifact is bound. */
+  sourceTaskId: string;
 }
 
 /**

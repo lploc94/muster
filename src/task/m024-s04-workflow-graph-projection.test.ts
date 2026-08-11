@@ -101,7 +101,14 @@ describe('M024 S04 workflow graph projection', () => {
       const consumerStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
         startIdempotencyKey: 'consumer-five-chain', createdAt: '2026-08-01T00:00:02.000Z',
-        reuse: [{ nodeId: 'four', fromRun: producer.runId }],
+        // Bind-only reuse: every ancestor of the live node is bound explicitly to the
+        // producing execution, so the projection's reused set is fully accounted for.
+        reuse: ['one', 'two', 'three', 'four'].map((destinationNodeId) => ({
+          destinationNodeId,
+          sourceRunId: producer.runId,
+          sourceNodeId: 'four',
+          sourceTaskId: producer.entryTaskId,
+        })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
@@ -133,16 +140,25 @@ describe('M024 S04 workflow graph projection', () => {
         [WORKSPACE_ID, consumer.runId],
       );
       expect(five?.task_id).toEqual(expect.any(String));
+      const bound = {
+        source_run_id: producer.runId,
+        source_node_id: 'four',
+        source_task_id: producer.entryTaskId,
+      };
       await expect(client.all(
-        `SELECT node_id, task_id, status FROM workflow_nodes
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+           FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
       )).resolves.toEqual([
-        { node_id: 'five', task_id: five!.task_id, status: 'active' },
-        { node_id: 'four', task_id: null, status: 'reused' },
-        { node_id: 'one', task_id: null, status: 'reused' },
-        { node_id: 'three', task_id: null, status: 'reused' },
-        { node_id: 'two', task_id: null, status: 'reused' },
+        {
+          node_id: 'five', task_id: five!.task_id, status: 'active',
+          source_run_id: null, source_node_id: null, source_task_id: null,
+        },
+        { node_id: 'four', task_id: null, status: 'reused', ...bound },
+        { node_id: 'one', task_id: null, status: 'reused', ...bound },
+        { node_id: 'three', task_id: null, status: 'reused', ...bound },
+        { node_id: 'two', task_id: null, status: 'reused', ...bound },
       ]);
 
       const graph = await repository.getWorkflowGraphForTask(five!.task_id);

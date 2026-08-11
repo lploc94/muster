@@ -33,6 +33,20 @@ function rootTask(createdAt: string): MusterTask {
   };
 }
 
+/**
+ * Reuse is bind-only, so a caller reusing `middle` must also bind its predecessor
+ * `source`; otherwise the start is rejected as an incomplete closure. Both bind to the
+ * same prior execution, which is exactly what the producer run made available.
+ */
+function boundAncestors(prior: { runId: string; entryTaskId: string }) {
+  return ['source', 'middle'].map((destinationNodeId) => ({
+    destinationNodeId,
+    sourceRunId: prior.runId,
+    sourceNodeId: 'middle',
+    sourceTaskId: prior.entryTaskId,
+  }));
+}
+
 const fingerprintBase = {
   definitionId: 'workflow-definition',
   version: 1,
@@ -46,7 +60,12 @@ describe('start_workflow mid-tree node reuse', () => {
   it('decodes reuse references into the engine command', () => {
     const result = dispatch(
       'start_workflow',
-      { workflow, reuse: [{ node: 'four', fromRun: 'run-prior' }] },
+      {
+        workflow,
+        reuse: [{
+          node: 'four', fromRun: 'run-prior', fromNode: 'produce', fromTask: 'wft_prior',
+        }],
+      },
       ctx(),
     );
 
@@ -54,30 +73,51 @@ describe('start_workflow mid-tree node reuse', () => {
       ok: true,
       command: {
         kind: 'start_workflow',
-        reuse: [{ nodeId: 'four', fromRun: 'run-prior' }],
+        // Source is addressed independently of the destination: `produce` is not a node
+        // of this workflow at all, and `fromTask` names which execution of it is bound.
+        reuse: [{
+          destinationNodeId: 'four',
+          sourceRunId: 'run-prior',
+          sourceNodeId: 'produce',
+          sourceTaskId: 'wft_prior',
+        }],
       },
     });
   });
 
-  it('fingerprints reuse references distinctly', () => {
+  it('fingerprints every reuse identity, not just the source run', () => {
+    const base = {
+      destinationNodeId: 'four', sourceRunId: 'run-prior', sourceNodeId: 'produce',
+    };
     const first = fingerprintStartWorkflow({
-      ...fingerprintBase,
-      reuse: [{ nodeId: 'four', fromRun: 'run-prior-a' }],
+      ...fingerprintBase, reuse: [{ ...base, sourceTaskId: 'wft_a' }],
     });
-    const second = fingerprintStartWorkflow({
-      ...fingerprintBase,
-      reuse: [{ nodeId: 'four', fromRun: 'run-prior-b' }],
-    });
-
-    expect(first).not.toBe(second);
+    // Same destination and same source run, different bound execution: a different start,
+    // so it must not collide with `first` on the start idempotency ledger.
+    expect(fingerprintStartWorkflow({
+      ...fingerprintBase, reuse: [{ ...base, sourceTaskId: 'wft_b' }],
+    })).not.toBe(first);
+    expect(fingerprintStartWorkflow({
+      ...fingerprintBase, reuse: [{ ...base, sourceNodeId: 'other', sourceTaskId: 'wft_a' }],
+    })).not.toBe(first);
+    expect(fingerprintStartWorkflow({
+      ...fingerprintBase, reuse: [{ ...base, sourceRunId: 'run-other', sourceTaskId: 'wft_a' }],
+    })).not.toBe(first);
   });
 
   it.each([
-    ['missing fromRun', { node: 'four' }],
-    ['missing node', { fromRun: 'run-prior' }],
-    ['extra key', { node: 'four', fromRun: 'run-prior', value: 'forbidden' }],
-    ['non-string fromRun', { node: 'four', fromRun: 1 }],
-    ['duplicate node', { node: 'four', fromRun: 'run-prior' }, { node: 'four', fromRun: 'run-other' }],
+    ['missing fromRun', { node: 'four', fromNode: 'produce', fromTask: 'wft_prior' }],
+    ['missing node', { fromRun: 'run-prior', fromNode: 'produce', fromTask: 'wft_prior' }],
+    ['missing fromNode', { node: 'four', fromRun: 'run-prior', fromTask: 'wft_prior' }],
+    ['missing fromTask', { node: 'four', fromRun: 'run-prior', fromNode: 'produce' }],
+    ['extra key', { node: 'four', fromRun: 'run-prior', fromNode: 'produce', fromTask: 'wft_prior', value: 'forbidden' }],
+    ['non-string fromRun', { node: 'four', fromRun: 1, fromNode: 'produce', fromTask: 'wft_prior' }],
+    ['non-string fromTask', { node: 'four', fromRun: 'run-prior', fromNode: 'produce', fromTask: 1 }],
+    [
+      'duplicate destination',
+      { node: 'four', fromRun: 'run-prior', fromNode: 'produce', fromTask: 'wft_a' },
+      { node: 'four', fromRun: 'run-other', fromNode: 'produce', fromTask: 'wft_b' },
+    ],
   ])('rejects malformed reuse: %s', (_caseName, first, second?) => {
     const reuse = second === undefined ? [first] : [first, second];
     expect(dispatch('start_workflow', { workflow, reuse }, ctx())).toEqual({
@@ -91,13 +131,39 @@ describe('start_workflow mid-tree node reuse', () => {
       definitionId: 'wf-graph', version: 1, startIdempotencyKey: 'unknown-reuse',
       createdAt: '2026-08-01T00:00:00.000Z', entryNodeId: 'source',
       entryNodeIds: ['source'], allNodeIds: ['source', 'middle', 'sink'],
-      reuse: [{ nodeId: 'not-a-node', fromRun: 'prior-run' }],
+      reuse: [{
+        destinationNodeId: 'not-a-node', sourceRunId: 'prior-run',
+        sourceNodeId: 'source', sourceTaskId: 'wft_prior',
+      }],
     })).toEqual({ ok: false, reason: 'invalid reuse' });
   });
 
+  it('accepts a source node id that is absent from the destination topology', () => {
+    // The artifact may have been produced by a differently-named node under another
+    // definition. Validating `sourceNodeId` against this topology would make exactly the
+    // cross-definition reuse this contract exists for impossible to express.
+    expect(validateStartWorkflow({
+      definitionId: 'wf-graph', version: 1, startIdempotencyKey: 'foreign-source',
+      createdAt: '2026-08-01T00:00:00.000Z', entryNodeId: 'source',
+      entryNodeIds: ['source'], allNodeIds: ['source', 'middle', 'sink'],
+      reuse: [{
+        destinationNodeId: 'middle', sourceRunId: 'prior-run',
+        sourceNodeId: 'not-in-this-topology', sourceTaskId: 'wft_prior',
+      }],
+    })).toMatchObject({ ok: true });
+  });
+
   it.each([
-    ['a terminal target', { nodeId: 'sink', fromRun: 'prior-run' }, 'terminal node cannot be reused'],
-    ['a missing producer result', { nodeId: 'middle', fromRun: 'prior-run' }, 'node reuse reference unresolved'],
+    [
+      'a terminal target',
+      { destinationNodeId: 'sink', sourceRunId: 'prior-run', sourceNodeId: 'produce', sourceTaskId: 'wft_prior' },
+      'terminal node cannot be reused',
+    ],
+    [
+      'a missing producer result',
+      { destinationNodeId: 'middle', sourceRunId: 'prior-run', sourceNodeId: 'produce', sourceTaskId: 'wft_prior' },
+      'node reuse reference unresolved',
+    ],
   ])('rejects %s before it claims a consumer run', async (_caseName, reuse, reason) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-reuse-reject-'));
     const client = new DbClient({
@@ -121,7 +187,7 @@ describe('start_workflow mid-tree node reuse', () => {
 
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
-        startIdempotencyKey: `reject-${reuse.nodeId}`, createdAt: '2026-08-01T00:00:00.000Z',
+        startIdempotencyKey: `reject-${reuse.destinationNodeId}`, createdAt: '2026-08-01T00:00:00.000Z',
         reuse: [reuse], ownerRootTaskId: 'root-1', callerTaskId: 'caller-1', callerTurnId: 'turn-1',
       })).resolves.toMatchObject({ ok: false, conflict: true, reason });
       await expect(client.all(
@@ -136,7 +202,7 @@ describe('start_workflow mid-tree node reuse', () => {
     }
   }, 20_000);
 
-  it('persists the declared node and its reversed-edge ancestors as reused without execution rows', async () => {
+  it('persists every caller-bound node as reused with durable source provenance', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s03-reuse-closure-'));
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
@@ -214,7 +280,7 @@ describe('start_workflow mid-tree node reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-kind-mismatch', version: 1,
         startIdempotencyKey: 'kind-mismatch', createdAt: '2026-08-01T00:00:00.800Z',
-        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        reuse: boundAncestors(prior), ownerRootTaskId: 'root-1',
         callerTaskId: 'root-1', callerTurnId: 'turn-1',
       })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'reuse artifact kind mismatch' });
       await expect(client.all(
@@ -237,7 +303,7 @@ describe('start_workflow mid-tree node reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-budget-boundary', version: 1,
         startIdempotencyKey: 'budget-boundary', createdAt: '2026-08-01T00:00:00.900Z',
-        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        reuse: boundAncestors(prior), ownerRootTaskId: 'root-1',
         callerTaskId: 'root-1', callerTurnId: 'turn-1',
       })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'invalid start' });
       await expect(client.all(
@@ -245,23 +311,51 @@ describe('start_workflow mid-tree node reuse', () => {
         ['ws', 'wf-budget-boundary'],
       )).resolves.toEqual([]);
 
+      // Binding `middle` alone leaves its predecessor `source` unbound. Suppressing it
+      // would mark a node reused with no task and no source: a claim that work was
+      // reused when nothing produced it. Reuse is bind-only, so this fails closed.
+      await expect(repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
+        startIdempotencyKey: 'unbound-ancestor', createdAt: '2026-08-01T00:00:00.950Z',
+        reuse: [{
+          destinationNodeId: 'middle', sourceRunId: prior.runId,
+          sourceNodeId: 'middle', sourceTaskId: prior.entryTaskId,
+        }],
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      })).resolves.toMatchObject({
+        ok: false, conflict: true, reason: 'node reuse closure incomplete',
+      });
+      await expect(client.all(
+        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-graph'],
+      )).resolves.toEqual([]);
+
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
         startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:01.000Z',
-        reuse: [{ nodeId: 'middle', fromRun: prior.runId }], ownerRootTaskId: 'root-1',
+        reuse: boundAncestors(prior), ownerRootTaskId: 'root-1',
         callerTaskId: 'root-1', callerTurnId: 'turn-1',
       });
       expect(started).toMatchObject({ ok: true, changed: true });
       const consumer = started.operation!.result.data as { runId: string };
 
+      const bound = {
+        source_run_id: prior.runId,
+        source_node_id: 'middle',
+        source_task_id: prior.entryTaskId,
+      };
       await expect(client.all(
-        `SELECT node_id, task_id, status FROM workflow_nodes
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+           FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         ['ws', consumer.runId],
       )).resolves.toEqual([
-        { node_id: 'middle', task_id: null, status: 'reused' },
-        { node_id: 'sink', task_id: expect.any(String), status: 'active' },
-        { node_id: 'source', task_id: null, status: 'reused' },
+        { node_id: 'middle', task_id: null, status: 'reused', ...bound },
+        {
+          node_id: 'sink', task_id: expect.any(String), status: 'active',
+          source_run_id: null, source_node_id: null, source_task_id: null,
+        },
+        { node_id: 'source', task_id: null, status: 'reused', ...bound },
       ]);
       await expect(client.get(
         `SELECT workflow_turns_reserved FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
