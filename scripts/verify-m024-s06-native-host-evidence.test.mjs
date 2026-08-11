@@ -72,9 +72,15 @@ exit code: 0
   assert.throws(() => validateNativeHostEvidence(genericPass), /workflow-graph-live-uat|host\.ts/);
 });
 
-test('the native SQLite smoke asserts schema-v3 but remains graph-free', async () => {
+test('the native SQLite smoke pins packaged schema to its source tree but stays graph-free', async () => {
   const smoke = await readFile(smokeUrl, 'utf8');
-  assert.match(smoke, /schema\.SQLITE_SCHEMA_VERSION,\s*3,/);
+  // Deliberately version-agnostic. Pinning the literal here forced a hand edit in two
+  // files on every schema bump, and because this job runs outside vitest a missed edit
+  // surfaced only as a packaged-host CI failure. Acknowledging a bump stays machine-
+  // enforced by the vitest schema tests; the contract this file owns is that the
+  // packaged artifact agrees with the tree it was built from.
+  assert.match(smoke, /from '\.\.\/src\/task\/sqlite\/schema'/);
+  assert.match(smoke, /schema\.SQLITE_SCHEMA_VERSION,\s*TREE_SCHEMA_VERSION,/);
   assert.doesNotMatch(smoke, /requestWorkflowGraph|workflowGraphResult/);
 });
 
