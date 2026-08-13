@@ -1,9 +1,10 @@
 # M024 Workflow Reuse Review Follow-up
 
-**Status:** ACCEPTED FOLLOW-UP DEBT (PR #41)  
+**Status:** IMPLEMENTED
 **Recorded:** 2026-08-13  
 **Source review:** `feat/m024-workflow-artifact-reuse-graph-visibility` at `a6ed434`  
-**Disposition:** PR #41 may merge with these findings recorded. All five findings must be remediated on `main` immediately after merge.
+**Implemented:** 2026-08-13 in `de030445cfcda2709b0615b563198541234d4322`
+**Disposition:** All five accepted findings were remediated on `main` after PR #41 merged.
 
 ## Scope
 
@@ -79,15 +80,30 @@ Public tool guidance still describes reuse as `{node, fromRun}` even though the 
 
 ## Completion Gate
 
-- [ ] F1 partial reuse materializes every unbound node.
-- [ ] F2 public inspection exposes exact reusable execution identity.
-- [ ] F3 terminal reuse runs leave no live dependency gates.
-- [ ] F4 SQLite makes reuse provenance immutable.
-- [ ] F5 all public guidance uses the four-field binding.
-- [ ] Focused workflow, bridge, projection, retention, schema, and documentation tests pass.
-- [ ] `npx tsc --noEmit -p .` passes.
-- [ ] Full CI passes on the remediation commit.
+- [x] F1 partial reuse materializes every unbound node.
+- [x] F2 public inspection exposes exact reusable execution identity.
+- [x] F3 terminal reuse runs leave no live dependency gates.
+- [x] F4 SQLite makes reuse provenance immutable.
+- [x] F5 all public guidance uses the four-field binding.
+- [x] Focused workflow, bridge, projection, retention, schema, and documentation tests pass.
+- [x] `npx tsc --noEmit -p .` passes.
+- [x] Full CI passes on the remediation commit.
 
 ## Closure Evidence
 
-Record the implementing commit, named regression tests, schema version decision, and final verification results here before changing the status to **IMPLEMENTED**.
+- Implementing commit: `de030445cfcda2709b0615b563198541234d4322` (`fix: complete workflow reuse remediation`).
+- F1 regression evidence:
+  - `start_workflow mid-tree node reuse > persists every caller-bound node as reused with durable source provenance` proves an unbound predecessor materializes, then crosses a delayed reused cut point after source-task lineage cleanup.
+  - `M024 S03 independent fan-in artifact reuse > serializes mixed materialized fan-in through a reused node and survives reload` proves concurrent settlement, exactly-once fills/activation, consumed reused gates, reload durability, and terminal completion.
+- F2 regression evidence:
+  - `M024 S03 durable mid-tree reuse > reuses one through four, activates and settles only five, pins the producer, and remains bounded` obtains the reusable task identity from bounded inspection.
+  - `MusterBridgeServer auth > exposes the exact workflow catalog and rejects removed delegate-task tools` passes the returned public `runRef`, node, and `taskRef` directly into public `start_workflow` and asserts the exact internal four-field binding.
+- F3 regression evidence: the M024 S03 durable chain and fan-in tests assert reused gates are `consumed`, valid terminal inspection has no `terminal_run_has_live_gate`, and no live gate remains after terminal settlement.
+- F4 regression evidence: `workflow node reuse invariants` directly proves exact provenance requirements, source-task authority, immutable reuse identity/artifact coordinates, and valid materialized lifecycle transitions.
+- F5 regression evidence: `M024 S04 agent-facing workflow graph boundary > pins exact reuse guidance across the active public surfaces` rejects the obsolete two-field shape across bridge and documentation sources.
+- Schema decision: reset-only SQLite schema advanced from v4 to v5. Reused rows now pin exact source artifact coordinates, require complete provenance only for `status = 'reused'`, validate source-task authority at insertion, and reject later reuse identity/status mutation. Older owned stores fail closed with reset guidance; no in-place migration was added.
+- Local verification:
+  - `npm test`: 218 files and 2,678 tests passed.
+  - `npm run compile`, `npm run test:source-boundary`, `npm run test:sqlite-storage-docs`, `npm run check:svelte`, and `git diff --check` passed.
+  - Focused reviewer regressions: 7 files and 39 tests passed.
+- Hosted verification: GitHub Actions CI run [31670707896](https://github.com/lploc94/muster/actions/runs/31670707896) passed for `de03044`, including the compile/full-webview job, SQLite Extension Host matrix, workflow graph native-host evidence, packaging gate, and real install gate.
