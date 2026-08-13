@@ -13,6 +13,11 @@ describe('M024 pinned terminal workflow run retention', () => {
     expect(predicate).toContain('COALESCE(gate_fill.artifact_run_id, gate_fill.run_id) = run.run_id');
     expect(predicate).toContain('gate_fill.run_id <> run.run_id');
 
+    expect(predicate).toContain('FROM workflow_nodes reused_node');
+    expect(predicate).toContain('reused_node.workspace_id = run.workspace_id');
+    expect(predicate).toContain('reused_node.source_run_id = run.run_id');
+    expect(predicate).toContain('reused_node.run_id <> run.run_id');
+
     expect(predicate).toContain('FROM workflow_return_gates return_gate_artifact');
     expect(predicate).toContain('return_gate_artifact.workspace_id = run.workspace_id');
     expect(predicate).toContain('return_gate_artifact.result_run_id = run.run_id');
@@ -20,7 +25,7 @@ describe('M024 pinned terminal workflow run retention', () => {
   });
 
   it('bumps the reset-only schema version when the prune predicate changes', () => {
-    // v4 added reuse provenance columns to workflow_nodes; the store stays reset-only.
-    expect(SQLITE_SCHEMA_VERSION).toBe(4);
+    // v5 makes workflow-node reuse provenance immutable and pins its source artifact.
+    expect(SQLITE_SCHEMA_VERSION).toBe(5);
   });
 });

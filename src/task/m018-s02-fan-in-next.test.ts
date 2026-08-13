@@ -240,6 +240,10 @@ describe('M018 S02 fan-in NEXT activation', () => {
         ['ws', data.runId, consumerGate!.gateId],
       );
       expect(gateAfterFirst).toMatchObject({ status: 'open' });
+      await expect(ctx.client.get(
+        'SELECT status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?',
+        ['ws', data.runId, 'p1'],
+      )).resolves.toEqual({ status: 'succeeded' });
 
       const consumerNodeAfterFirst = await ctx.client.get(
         'SELECT task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?',

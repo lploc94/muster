@@ -53,7 +53,6 @@ import {
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
-  unboundReuseAncestors,
   isReusableArtifactKindCompatible,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
@@ -2724,9 +2723,10 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const nodeRows = await this.db.all<{
       node_id: string;
+      task_id: string | null;
       status: string;
     }>(
-      `SELECT node_id, status
+      `SELECT node_id, task_id, status
          FROM workflow_nodes
         WHERE workspace_id = ? AND run_id = ?
         ORDER BY node_id
@@ -2907,6 +2907,7 @@ export class SqliteTaskRepository implements TaskRepository {
       nodes: nodeRows.slice(0, 64).map((node) => ({
         nodeId: node.node_id,
         status: node.status,
+        ...(node.status === 'succeeded' && node.task_id ? { taskId: node.task_id } : {}),
       })),
       gates: gateRows.slice(0, 64).map((gate) => ({
         gateId: gate.gate_id,
@@ -5104,7 +5105,6 @@ export class SqliteTaskRepository implements TaskRepository {
         | 'entry input reference unresolved'
         | 'terminal node cannot be reused'
         | 'node reuse reference unresolved'
-        | 'node reuse closure incomplete'
         | 'reuse artifact kind mismatch'
         | 'reuse aggregate exceeds policy',
     ): RepositoryCommandResult => {
@@ -5435,15 +5435,25 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTaskId: reuse.sourceTaskId,
       });
     }
-    /**
-     * Reuse is bind-only: `reused` covers exactly the declared destinations, never an
-     * expanded ancestor closure. Any predecessor the caller did not bind is rejected
-     * rather than silently marked reused with no task and no provenance.
-     */
     const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.destinationNodeId);
     const reusedNodeIds: ReadonlySet<string> = new Set(declaredReuseNodeIds);
-    if (unboundReuseAncestors(topo, declaredReuseNodeIds).length > 0) {
-      return invalidStart('node reuse closure incomplete');
+    const readyReusedNodeIds = new Set<string>();
+    if (topo.kind === 'graph_v1') {
+      for (const entryNodeId of startEntryNodeIds) {
+        if (reusedNodeIds.has(entryNodeId)) readyReusedNodeIds.add(entryNodeId);
+      }
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const nodeId of reusedNodeIds) {
+          if (readyReusedNodeIds.has(nodeId)) continue;
+          const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
+          if (incoming.length > 0 && incoming.every((edge) => readyReusedNodeIds.has(edge.fromNodeId))) {
+            readyReusedNodeIds.add(nodeId);
+            changed = true;
+          }
+        }
+      }
     }
     /**
      * Boundary consumers are live nodes whose every incoming edge is pre-filled from a
@@ -5455,11 +5465,10 @@ export class SqliteTaskRepository implements TaskRepository {
      * no-op once the budget is exhausted while the task/turn/message rows still committed,
      * letting a run exceed maxWorkflowTurnsPerRun.
      */
-    const boundaryEdges = topo.kind === 'graph_v1'
-      ? topo.edges.filter((edge) =>
-          reusedNodeIds.has(edge.fromNodeId) && !reusedNodeIds.has(edge.toNodeId))
+    const reuseOutputEdges = topo.kind === 'graph_v1'
+      ? topo.edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId))
       : [];
-    for (const edge of boundaryEdges) {
+    for (const edge of reuseOutputEdges) {
       const artifact = resolvedReuseByNode.get(edge.fromNodeId);
       const expectedKind = edge.expectedArtifactKind ?? 'next_result';
       if (
@@ -5469,11 +5478,13 @@ export class SqliteTaskRepository implements TaskRepository {
         return invalidStart('reuse artifact kind mismatch');
       }
     }
+    const startReuseEdges = reuseOutputEdges.filter((edge) => readyReusedNodeIds.has(edge.fromNodeId));
     const materializedBoundaryNodeIds = topo.kind === 'graph_v1'
-      ? [...new Set(boundaryEdges.map((edge) => edge.toNodeId))].filter((nodeId) =>
+      ? [...new Set(startReuseEdges.map((edge) => edge.toNodeId))].filter((nodeId) =>
+          !reusedNodeIds.has(nodeId) &&
           topo.edges
             .filter((edge) => edge.toNodeId === nodeId)
-            .every((edge) => boundaryEdges.includes(edge)))
+            .every((edge) => startReuseEdges.includes(edge)))
       : [];
     const executableEntries = identities.entries.filter((entry) => !reusedNodeIds.has(entry.nodeId));
     const reservedWorkflowTurns = executableEntries.length + materializedBoundaryNodeIds.length;
@@ -5827,7 +5838,7 @@ export class SqliteTaskRepository implements TaskRepository {
           identities.runId,
           nodeGate.gateId,
           nodeGate.nodeId,
-          isEntry ? 'satisfied' : 'open',
+          readyReusedNodeIds.has(nodeGate.nodeId) ? 'consumed' : isEntry ? 'satisfied' : 'open',
           isEntry && entry ? entry.activationId : null,
           isEntry && entry ? entry.activationTurnId : null,
           isEntry && entry ? entry.messageId : null,
@@ -5842,8 +5853,9 @@ export class SqliteTaskRepository implements TaskRepository {
       rest.push({
         sql: `INSERT INTO workflow_nodes (
                 workspace_id, run_id, node_id, task_id, status,
-                source_run_id, source_node_id, source_task_id
-              ) VALUES (?,?,?,?,?,?,?,?)
+                source_run_id, source_node_id, source_task_id,
+                source_artifact_id, source_artifact_revision
+              ) VALUES (?,?,?,?,?,?,?,?,?,?)
               ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
         params: [
           this.workspaceId,
@@ -5854,6 +5866,8 @@ export class SqliteTaskRepository implements TaskRepository {
           reuseProvenance?.runId ?? null,
           reuseProvenance?.sourceNodeId ?? null,
           reuseProvenance?.sourceTaskId ?? null,
+          reuseProvenance?.artifactId ?? null,
+          reuseProvenance?.artifactRevision ?? null,
         ],
       });
     }
@@ -6012,7 +6026,7 @@ export class SqliteTaskRepository implements TaskRepository {
         });
       }
       rest.push(...graphBindings);
-      for (const edge of boundaryEdges) {
+      for (const edge of startReuseEdges) {
         const gateId = gateByNode.get(edge.toNodeId)!;
         const artifact = resolvedReuseByNode.get(edge.fromNodeId);
         if (!artifact) return invalidStart('node reuse reference unresolved');
@@ -6800,10 +6814,10 @@ export class SqliteTaskRepository implements TaskRepository {
       });
     }
     const resultBody = workflowResultFromSettlement(command, disposition.result);
-    const edge = topology.kind === 'graph_v1'
+    const initialEdge = topology.kind === 'graph_v1'
       ? outgoingEdge(topology, producerNode.node_id)
       : undefined;
-    if (!edge) {
+    if (!initialEdge) {
       const terminalIds = terminalNodeIds(topology);
       const terminalCompletion = await this.workflowTerminalCompletion(
         producerNode.run_id,
@@ -6974,22 +6988,133 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     if (topology.kind !== 'graph_v1') return empty;
 
-    const gate = await this.db.get<{ gate_id: string; status: string }>(
-      `SELECT gate_id, status FROM workflow_dependency_gates
-        WHERE workspace_id = ? AND run_id = ? AND consumer_node_id = ?`,
-      [this.workspaceId, producerNode.run_id, edge.toNodeId],
-    );
-    if (!gate || typeof gate.gate_id !== 'string') {
-      return empty;
-    }
-
     const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
     // D050 / R027: contribution-scoped revision is deterministic (not priorMax+1).
     const revision = deriveProducerArtifactRevision(disposition.change);
+    type PlannedFill = {
+      edge: (typeof topology.edges)[number];
+      gateId: string;
+      artifactRunId: string | null;
+      artifactId: string;
+      artifactRevision: number;
+    };
+    const plannedFills: PlannedFill[] = [];
+    const consumedReuseGateIds: string[] = [];
+    let contributionEdge = initialEdge;
+    let contributionArtifact: Omit<PlannedFill, 'edge' | 'gateId'> = {
+      artifactRunId: null,
+      artifactId,
+      artifactRevision: revision,
+    };
+    let activationEdge: (typeof topology.edges)[number] | undefined;
+    let activationGate: { gate_id: string; status: string } | undefined;
+    while (true) {
+      const gate = await this.db.get<{ gate_id: string; status: string }>(
+        `SELECT gate_id, status FROM workflow_dependency_gates
+          WHERE workspace_id = ? AND run_id = ? AND consumer_node_id = ?`,
+        [this.workspaceId, producerNode.run_id, contributionEdge.toNodeId],
+      );
+      if (!gate || typeof gate.gate_id !== 'string') return empty;
+      const gateProgress = await this.db.get<{
+        required: number;
+        filled: number;
+        current_filled: number;
+      }>(
+        `SELECT
+           (SELECT COUNT(*) FROM workflow_gate_bindings
+             WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS required,
+           (SELECT COUNT(*) FROM workflow_gate_fills
+             WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS filled,
+           (SELECT COUNT(*) FROM workflow_gate_fills
+             WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?) AS current_filled`,
+        [
+          this.workspaceId, producerNode.run_id, gate.gate_id,
+          this.workspaceId, producerNode.run_id, gate.gate_id,
+          this.workspaceId, producerNode.run_id, gate.gate_id, contributionEdge.inputRef,
+        ],
+      );
+      if (Number(gateProgress?.current_filled) !== 0) return empty;
+      const willSatisfyGate = gate.status === 'open'
+        && Number(gateProgress?.filled) + 1 >= Number(gateProgress?.required);
+      plannedFills.push({
+        edge: contributionEdge,
+        gateId: gate.gate_id,
+        ...contributionArtifact,
+      });
+      const destination = await this.db.get<{
+        status: string;
+        source_run_id: string | null;
+        source_node_id: string | null;
+        source_task_id: string | null;
+        source_artifact_id: string | null;
+        source_artifact_revision: number | null;
+      }>(
+        `SELECT status, source_run_id, source_node_id, source_task_id,
+                source_artifact_id, source_artifact_revision
+           FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+        [this.workspaceId, producerNode.run_id, contributionEdge.toNodeId],
+      );
+      if (!destination || destination.status !== 'reused') {
+        if (willSatisfyGate) {
+          activationEdge = contributionEdge;
+          activationGate = gate;
+        }
+        break;
+      }
+      if (!willSatisfyGate) break;
+      consumedReuseGateIds.push(gate.gate_id);
+      const nextEdge = outgoingEdge(topology, contributionEdge.toNodeId);
+      if (!nextEdge) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'invalid_route',
+          reasonText: 'reused terminal node',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      const reusedArtifact = await this.db.get<{
+        run_id: string;
+        artifact_id: string;
+        revision: number;
+      }>(
+        `SELECT artifact.run_id, artifact.artifact_id, artifact.revision
+           FROM workflow_artifacts artifact
+          WHERE artifact.workspace_id = ? AND artifact.run_id = ?
+            AND artifact.artifact_id = ? AND artifact.revision = ?
+            AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'`,
+        [
+          this.workspaceId,
+          destination.source_run_id,
+          destination.source_artifact_id,
+          destination.source_artifact_revision,
+          destination.source_node_id,
+        ],
+      );
+      if (!reusedArtifact) {
+        return this.planWorkflowFailClosure({
+          runId: producerNode.run_id,
+          reasonCode: 'invalid_route',
+          reasonText: 'reused node artifact missing',
+          at: command.turn.finishedAt ?? new Date().toISOString(),
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
+        });
+      }
+      contributionEdge = nextEdge;
+      contributionArtifact = {
+        artifactRunId: reusedArtifact.run_id,
+        artifactId: reusedArtifact.artifact_id,
+        artifactRevision: reusedArtifact.revision,
+      };
+    }
+    const firstFill = plannedFills[0]!;
     const contributionMessageId = deriveNextContributionMessageId(
       producerNode.run_id,
-      gate.gate_id,
-      edge.inputRef,
+      firstFill.gateId,
+      initialEdge.inputRef,
       producerNode.node_id,
     );
     // Durable workflow-run-scoped fence: redelivery after turn-ledger prune is a no-op.
@@ -7001,27 +7126,7 @@ export class SqliteTaskRepository implements TaskRepository {
     if (existingRouted) {
       return empty;
     }
-    const gateProgress = await this.db.get<{
-      required: number;
-      filled: number;
-      current_filled: number;
-    }>(
-      `SELECT
-         (SELECT COUNT(*) FROM workflow_gate_bindings
-           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS required,
-         (SELECT COUNT(*) FROM workflow_gate_fills
-           WHERE workspace_id = ? AND run_id = ? AND gate_id = ?) AS filled,
-         (SELECT COUNT(*) FROM workflow_gate_fills
-           WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?) AS current_filled`,
-      [
-        this.workspaceId, producerNode.run_id, gate.gate_id,
-        this.workspaceId, producerNode.run_id, gate.gate_id,
-        this.workspaceId, producerNode.run_id, gate.gate_id, edge.inputRef,
-      ],
-    );
-    const willSatisfyGate = gate.status === 'open'
-      && Number(gateProgress?.current_filled) === 0
-      && Number(gateProgress?.filled) + 1 >= Number(gateProgress?.required);
+    const willSatisfyGate = activationEdge !== undefined && activationGate !== undefined;
     const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
 
     const statements: SqlStatement[] = [];
@@ -7039,10 +7144,10 @@ export class SqliteTaskRepository implements TaskRepository {
     const routedBody = encodePayload({
       kind: 'next_contribution',
       schema: 1,
-      gateId: gate.gate_id,
-      inputRef: edge.inputRef,
+      gateId: firstFill.gateId,
+      inputRef: initialEdge.inputRef,
       producerNodeId: producerNode.node_id,
-      consumerNodeId: edge.toNodeId,
+      consumerNodeId: initialEdge.toNodeId,
       artifactId,
       artifactRevision: revision,
       change: disposition.change,
@@ -7060,7 +7165,7 @@ export class SqliteTaskRepository implements TaskRepository {
         producerNode.run_id,
         contributionMessageId,
         producerNode.node_id,
-        edge.toNodeId,
+        initialEdge.toNodeId,
         'next_contribution',
         routedBody,
         finishedAt,
@@ -7102,23 +7207,52 @@ export class SqliteTaskRepository implements TaskRepository {
       taskId: command.task.id,
       turnId: command.turn.id,
     }));
-
     statements.push({
-      sql: `INSERT INTO workflow_gate_fills (
-              workspace_id, run_id, gate_id, input_ref, artifact_id, artifact_revision, filled_at
-            ) VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
-            DO NOTHING`,
-      params: [
-        this.workspaceId,
-        producerNode.run_id,
-        gate.gate_id,
-        edge.inputRef,
-        artifactId,
-        revision,
-        finishedAt,
-      ],
+      sql: `UPDATE workflow_nodes
+               SET status = 'succeeded'
+             WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND status = 'active'`,
+      params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
     });
+
+    for (const fill of plannedFills) {
+      statements.push({
+        sql: `INSERT INTO workflow_gate_fills (
+                workspace_id, run_id, gate_id, input_ref, artifact_run_id,
+                artifact_id, artifact_revision, filled_at
+              ) VALUES (?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
+              DO NOTHING`,
+        params: [
+          this.workspaceId,
+          producerNode.run_id,
+          fill.gateId,
+          fill.edge.inputRef,
+          fill.artifactRunId,
+          fill.artifactId,
+          fill.artifactRevision,
+          finishedAt,
+        ],
+      });
+    }
+    for (const gateId of consumedReuseGateIds) {
+      statements.push({
+        sql: `UPDATE workflow_dependency_gates
+                 SET status = 'consumed'
+               WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'open'
+                 AND (SELECT COUNT(DISTINCT input_ref) FROM workflow_gate_fills
+                       WHERE workspace_id = ? AND run_id = ? AND gate_id = ?)
+                     >= (SELECT COUNT(*) FROM workflow_gate_bindings
+                          WHERE workspace_id = ? AND run_id = ? AND gate_id = ?)`,
+        params: [
+          this.workspaceId, producerNode.run_id, gateId,
+          this.workspaceId, producerNode.run_id, gateId,
+          this.workspaceId, producerNode.run_id, gateId,
+        ],
+      });
+    }
+    if (!willSatisfyGate) return { statements, changes };
+    const edge = activationEdge!;
+    const gate = activationGate!;
 
     const aggregateClosureId = deriveRunClosureFenceId(producerNode.run_id, 'failed');
     statements.push({

@@ -245,6 +245,7 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(inspection).toBeTruthy();
       assertBoundedRunInspection(inspection!);
       expect(inspection!.nodes.map((node) => node.nodeId).sort()).toEqual(['consumer', 'p1', 'p2']);
+      expect(inspection!.nodes.find((node) => node.nodeId === 'p1')).not.toHaveProperty('taskId');
       expect(inspection!.activations.map((activation) => activation.nodeId).sort()).toEqual(['p1', 'p2']);
       await expect(
         ctx.repository.inspectWorkflowRun(data.runId, 'different-root'),

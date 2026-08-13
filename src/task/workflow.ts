@@ -231,37 +231,6 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
 }
 
 /**
- * Predecessors of declared reuse targets that the caller did not also bind.
- *
- * Reuse is bind-only: a node is `reused` if and only if the caller supplied an exact
- * source execution for it. An earlier revision instead expanded the declared set over
- * reverse edges and marked every ancestor `reused` with `task_id = NULL`, producing
- * nodes that neither ran nor carried provenance — the graph claimed work was reused
- * while no artifact or execution backed the claim. Callers must bind the whole
- * ancestor chain explicitly so every suppressed node has an auditable source.
- *
- * Checking direct predecessors is sufficient: a declared node forces its immediate
- * predecessors to be declared, which inductively closes the set back to the entries.
- *
- * Returns the offending node ids (sorted) so the caller can report what is missing;
- * empty means the declared set is ancestor-closed.
- */
-export function unboundReuseAncestors(
-  topology: WorkflowTopologyV1,
-  declaredNodeIds: readonly string[],
-): readonly string[] {
-  if (topology.kind !== 'graph_v1') return [];
-  const declared = new Set(declaredNodeIds);
-  const unbound = new Set<string>();
-  for (const edge of topology.edges) {
-    if (declared.has(edge.toNodeId) && !declared.has(edge.fromNodeId)) {
-      unbound.add(edge.fromNodeId);
-    }
-  }
-  return [...unbound].sort();
-}
-
-/**
  * Cross-run entry references intentionally adapt a prior terminal `next_result`
  * into a caller-authored `workflow_input` slot. Mid-tree node reuse has no such
  * adapter: it must satisfy the frozen dependency edge kind exactly.
@@ -1149,7 +1118,6 @@ export function startWorkflowInvalid(
     | 'entry input reference unresolved'
     | 'terminal node cannot be reused'
     | 'node reuse reference unresolved'
-    | 'node reuse closure incomplete'
     | 'reuse artifact kind mismatch'
     | 'reuse aggregate exceeds policy',
   definitionId?: string,

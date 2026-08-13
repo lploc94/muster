@@ -306,7 +306,6 @@ export type StartWorkflowResult =
         | 'entry input reference unresolved'
         | 'terminal node cannot be reused'
         | 'node reuse reference unresolved'
-        | 'node reuse closure incomplete'
         | 'reuse artifact kind mismatch'
         | 'reuse aggregate exceeds policy'
         | 'start fingerprint conflict'
@@ -458,6 +457,8 @@ export interface WorkflowGraphProjection {
 export interface WorkflowRunNodeInspectionProjection {
   nodeId: string;
   status: string;
+  /** Opaque exact execution reference accepted as start_workflow reuse.fromTask. */
+  taskId?: string;
 }
 
 export interface WorkflowRunActivationInspectionProjection

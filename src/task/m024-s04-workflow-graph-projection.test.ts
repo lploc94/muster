@@ -144,9 +144,12 @@ describe('M024 S04 workflow graph projection', () => {
         source_run_id: producer.runId,
         source_node_id: 'four',
         source_task_id: producer.entryTaskId,
+        source_artifact_id: expect.any(String),
+        source_artifact_revision: 1,
       };
       await expect(client.all(
-        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id,
+                source_artifact_id, source_artifact_revision
            FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
@@ -154,6 +157,7 @@ describe('M024 S04 workflow graph projection', () => {
         {
           node_id: 'five', task_id: five!.task_id, status: 'active',
           source_run_id: null, source_node_id: null, source_task_id: null,
+          source_artifact_id: null, source_artifact_revision: null,
         },
         { node_id: 'four', task_id: null, status: 'reused', ...bound },
         { node_id: 'one', task_id: null, status: 'reused', ...bound },

@@ -782,8 +782,9 @@ a `NEXT` route and remains mutually exclusive with the three base workflow outco
 `inspect_workflow_run` is a bounded recovery/diagnostic read, not a routing or polling
 mechanism. It returns semantic workflow/node/activation/feedback/child state and
 integrity codes without policy budgets, routing IDs, artifact coordinates, task trees,
-topology, prompts, artifact bodies, paths, or secrets. Workflow progress shown by the
-host or UI is derived from this durable state; agents do not report percentages.
+topology, prompts, artifact bodies, paths, or secrets. Succeeded materialized nodes expose
+an opaque `taskRef` for exact node reuse. Workflow progress shown by the host or UI is
+derived from this durable state; agents do not report percentages.
 
 `start_workflow` creates the run and a top-level `start_wait` continuation in one
 transaction, then returns an `accepted` tool result. Only after the adapter reports
@@ -799,6 +800,10 @@ Invalid or unauthorized calls remain ordinary tool errors and never suspend the 
 Only one unresolved top-level start wait is allowed per caller task. Workflow
 activations use `invoke_child_workflow` and retain their separate `child_wait`
 continuation semantics. `inspect_workflow_run` is not a normal completion polling loop.
+Optional reuse is exactly `{node, fromRun, fromNode, fromTask}`: `node` is the destination
+in the new workflow, while the other fields come from an owned completed run's `runRef`,
+node name, and succeeded node `taskRef`. Only explicitly bound nodes are `reused`;
+unbound predecessors materialize and route normally before the bound result advances.
 
 A successful backend turn is not the same thing as a sealed task lifecycle. Root
 coordinators remain `open` after each normal or workflow-resume response so the user can

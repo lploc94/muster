@@ -122,6 +122,11 @@ describe('formatToolError', () => {
       message: 'incomplete entry inputs',
       hint: expect.stringContaining('exact source nodeKey and input name'),
     });
+    expect(JSON.parse(formatToolError('invalid start_workflow reuse'))).toEqual({
+      code: 'invalid_workflow_inputs',
+      message: 'invalid start_workflow reuse',
+      hint: expect.stringContaining('{node, fromRun, fromNode, fromTask}'),
+    });
     expect(JSON.parse(formatToolError('definition fingerprint conflict'))).toEqual({
       code: 'workflow_identity_conflict',
       message: 'definition fingerprint conflict',
@@ -456,6 +461,7 @@ describe('MusterBridgeServer auth', () => {
   it('exposes the exact workflow catalog and rejects removed delegate-task tools', async () => {
     const credentials = new CredentialRegistry();
     const handled: Array<{ tool: string; command: unknown }> = [];
+    const reusableWorkflowId = `workflow-${'b'.repeat(32)}`;
     server = new MusterBridgeServer({
       credentials,
       toolHandler: {
@@ -466,11 +472,11 @@ describe('MusterBridgeServer auth', () => {
               ok: true,
               result: {
                 runId: 'wfr-1',
-                definitionId: 'review-flow',
+                definitionId: reusableWorkflowId,
                 definitionVersion: 2,
-                runStatus: 'running',
+                runStatus: 'succeeded',
                 policy: { maxDepth: 8 },
-                nodes: [{ nodeId: 'review', status: 'active' }],
+                nodes: [{ nodeId: 'review', status: 'succeeded', taskId: 'task-review' }],
                 gates: [{ gateId: 'gate-internal', status: 'satisfied' }],
                 activations: [{
                   activationId: 'activation-internal',
@@ -481,6 +487,17 @@ describe('MusterBridgeServer auth', () => {
                 feedbackRounds: [],
                 continuations: [],
                 diagnostics: [],
+              },
+            };
+          }
+          if (tool === 'start_workflow') {
+            return {
+              ok: true,
+              result: {
+                definitionId: reusableWorkflowId,
+                version: 2,
+                runId: 'wfr-reused',
+                changed: true,
               },
             };
           }
@@ -530,9 +547,9 @@ describe('MusterBridgeServer auth', () => {
     const inspectedText = (inspected.result as { content: Array<{ text: string }> }).content[0]!.text;
     expect(JSON.parse(inspectedText)).toEqual({
       runRef: 'wfr-1',
-      workflowRef: 'review-flow@2',
-      status: 'running',
-      nodes: [{ node: 'review', status: 'active' }],
+      workflowRef: `${reusableWorkflowId}@2`,
+      status: 'succeeded',
+      nodes: [{ node: 'review', status: 'succeeded', taskRef: 'task-review' }],
       activations: [{ node: 'review', kind: 'dependency_gate', status: 'running' }],
       feedback: [],
       children: [],
@@ -540,10 +557,55 @@ describe('MusterBridgeServer auth', () => {
     });
     expect(inspectedText).not.toContain('gate-internal');
     expect(inspectedText).not.toContain('maxDepth');
+    const publicInspection = JSON.parse(inspectedText) as {
+      runRef: string;
+      workflowRef: string;
+      nodes: Array<{ node: string; taskRef: string }>;
+    };
+    const reusableNode = publicInspection.nodes[0]!;
+    const reused = await coordinator.request('tools/call', {
+      name: 'start_workflow',
+      arguments: {
+        workflow: publicInspection.workflowRef,
+        inputs: [],
+        reuse: [{
+          node: reusableNode.node,
+          fromRun: publicInspection.runRef,
+          fromNode: reusableNode.node,
+          fromTask: reusableNode.taskRef,
+        }],
+      },
+    });
+    expect(reused.result).toMatchObject({
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          runRef: 'wfr-reused',
+          workflowRef: `${reusableWorkflowId}@2`,
+          replay: false,
+          status: 'accepted',
+        }),
+      }],
+    });
     expect(handled).toEqual([
       {
         tool: 'inspect_workflow_run',
         command: { kind: 'inspect_workflow_run', runId: 'wfr-1' },
+      },
+      {
+        tool: 'start_workflow',
+        command: expect.objectContaining({
+          kind: 'start_workflow',
+          definitionId: reusableWorkflowId,
+          version: 2,
+          entryInputs: [],
+          reuse: [{
+            destinationNodeId: 'review',
+            sourceRunId: 'wfr-1',
+            sourceNodeId: 'review',
+            sourceTaskId: 'task-review',
+          }],
+        }),
       },
     ]);
     for (const name of REMOVED_MCP_TOOLS) {
@@ -557,7 +619,7 @@ describe('MusterBridgeServer auth', () => {
         isError: true,
       });
     }
-    expect(handled).toHaveLength(1);
+    expect(handled).toHaveLength(2);
   });
 
   it('accepts valid token with loopback host and absent origin on initialize', async () => {

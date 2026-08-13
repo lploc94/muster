@@ -192,16 +192,19 @@ actions stay available.
 
 ---
 
-## 8. Schema v4 and reset-only notes
+## 8. Schema v5 and reset-only notes
 
-- Current owned schema is **v4**. Muster has no in-place migration framework: opening an owned store
+- Current owned schema is **v5**. Muster has no in-place migration framework: opening an owned store
   with any incompatible version fails closed with reset guidance and never rewrites user data.
-- Schema v4 includes workflow definition/run/node/gate tables, the writer-version UDF, and write-guard
+- Schema v5 includes workflow definition/run/node/gate tables, the writer-version UDF, and write-guard
   triggers. An already-open stale writer fails closed with terminal `schema_changed` and must reload.
 - **v3 to v4** added reuse provenance to `workflow_nodes` (`source_run_id`, `source_node_id`,
   `source_task_id`), recording which exact prior execution a `reused` node was bound to. Because the
   store is reset-only, a v3 store is rejected rather than upgraded: there is no in-place path that
   preserves existing task or chat history.
+- **v4 to v5** makes reused-node status and provenance immutable, pins the exact source artifact
+  coordinates, and requires provenance exactly when `status = 'reused'`. A v4 store is rejected
+  rather than rewritten.
 - A Developer Reset creates an empty current-schema store; it is destructive replacement, not a
   data-preserving migration. Back up first when existing task or chat history matters.
 - Diagnostics never expose database paths, SQL/parameters, credentials, prompt text, or artifact bodies.

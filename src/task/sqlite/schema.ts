@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 4 as const;
+export const SQLITE_SCHEMA_VERSION = 5 as const;
 
 /**
  * Core task-store tables.
@@ -507,14 +507,14 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
   )`,
 
   /**
-   * `source_*` records which exact prior execution a `reused` node was bound to at start.
+   * `source_*` records which exact prior execution and artifact a `reused` node was bound to at start.
    * Without it a reused node is only `task_id IS NULL` plus a status string, so nothing
    * durable proves the caller authorized that specific source rather than the engine
    * having guessed a matching row.
    *
    * Deliberately no FK on `source_task_id`: provenance is a historical record that must
-   * outlive the source run, and M023 retention deletes tasks outright (`deleteTasks`),
-   * which an enforced reference would either block or silently blank.
+   * outlive source-task cleanup. The artifact FK pins the source run itself, while an
+   * enforced task reference would block M023 deletion or silently blank the accepted identity.
    */
   `CREATE TABLE IF NOT EXISTS workflow_nodes (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -525,15 +525,23 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     source_run_id TEXT,
     source_node_id TEXT,
     source_task_id TEXT,
+    source_artifact_id TEXT,
+    source_artifact_revision INTEGER,
     PRIMARY KEY (workspace_id, run_id, node_id),
     CHECK (
-      (source_run_id IS NULL AND source_node_id IS NULL AND source_task_id IS NULL)
-      OR (source_run_id IS NOT NULL AND source_node_id IS NOT NULL AND source_task_id IS NOT NULL)
+      (status = 'reused' AND task_id IS NULL
+        AND source_run_id IS NOT NULL AND source_node_id IS NOT NULL AND source_task_id IS NOT NULL
+        AND source_artifact_id IS NOT NULL AND source_artifact_revision IS NOT NULL)
+      OR (status <> 'reused'
+        AND source_run_id IS NULL AND source_node_id IS NULL AND source_task_id IS NULL
+        AND source_artifact_id IS NULL AND source_artifact_revision IS NULL)
     ),
     FOREIGN KEY (workspace_id, run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, task_id)
-      REFERENCES tasks(workspace_id, id) ON DELETE SET NULL
+      REFERENCES tasks(workspace_id, id) ON DELETE SET NULL,
+    FOREIGN KEY (workspace_id, source_run_id, source_artifact_id, source_artifact_revision)
+      REFERENCES workflow_artifacts(workspace_id, run_id, artifact_id, revision)
   )`,
 
   `CREATE TABLE IF NOT EXISTS workflow_dependency_gates (
@@ -1083,6 +1091,12 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
                AND gate_fill.run_id <> ${alias}.run_id
           )
           AND NOT EXISTS (
+            SELECT 1 FROM workflow_nodes reused_node
+             WHERE reused_node.workspace_id = ${alias}.workspace_id
+               AND reused_node.source_run_id = ${alias}.run_id
+               AND reused_node.run_id <> ${alias}.run_id
+          )
+          AND NOT EXISTS (
             SELECT 1 FROM workflow_return_gates return_gate_artifact
              WHERE return_gate_artifact.workspace_id = ${alias}.workspace_id
                AND return_gate_artifact.result_run_id = ${alias}.run_id
@@ -1177,12 +1191,7 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
           AND artifact.artifact_id = NEW.artifact_id
           AND artifact.revision = NEW.artifact_revision
           AND artifact.kind = binding.required_kind
-         JOIN workflow_artifact_sources source
-           ON source.workspace_id = artifact.workspace_id
-          AND source.run_id = artifact.run_id
-          AND source.artifact_id = artifact.artifact_id
-          AND source.artifact_revision = artifact.revision
-        WHERE binding.workspace_id = NEW.workspace_id
+         WHERE binding.workspace_id = NEW.workspace_id
           AND binding.run_id = NEW.run_id
           AND binding.gate_id = NEW.gate_id
           AND binding.input_ref = NEW.input_ref
@@ -1190,9 +1199,17 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
             binding.producer_node_id IS NULL
             OR (
               -- Live contribution: the producing node of this run filled its own edge.
-              source.source_kind = 'workflow_node'
+              artifact.run_id = NEW.run_id
               AND artifact.producer_node_id = binding.producer_node_id
-              AND source.producer_node_id = binding.producer_node_id
+              AND EXISTS (
+                SELECT 1 FROM workflow_artifact_sources source
+                 WHERE source.workspace_id = artifact.workspace_id
+                   AND source.run_id = artifact.run_id
+                   AND source.artifact_id = artifact.artifact_id
+                   AND source.artifact_revision = artifact.revision
+                   AND source.source_kind = 'workflow_node'
+                   AND source.producer_node_id = binding.producer_node_id
+              )
             )
             OR (
               -- Cross-run reuse: the artifact was produced by a node in another run whose
@@ -1200,8 +1217,7 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
               -- differently-named source unusable, collapsing source and destination onto
               -- one id. Authority comes from the destination node's recorded provenance,
               -- so an unbound or mismatched source is still rejected here.
-              source.source_kind = 'workflow_node'
-              AND EXISTS (
+              EXISTS (
                 SELECT 1
                   FROM workflow_nodes destination
                  WHERE destination.workspace_id = NEW.workspace_id
@@ -1210,8 +1226,9 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
                    AND destination.status = 'reused'
                    AND destination.source_run_id = artifact.run_id
                    AND destination.source_node_id = artifact.producer_node_id
-                   AND destination.source_task_id = source.producer_task_id
-              )
+                   AND destination.source_artifact_id = artifact.artifact_id
+                   AND destination.source_artifact_revision = artifact.revision
+               )
             )
           )
      )
@@ -1255,6 +1272,42 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
      BEFORE UPDATE ON workflow_artifacts
      BEGIN
        SELECT RAISE(ABORT, 'workflow_artifact_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_node_reuse_authority
+     BEFORE INSERT ON workflow_nodes
+     WHEN NEW.status = 'reused' AND NOT EXISTS (
+       SELECT 1
+         FROM workflow_artifacts artifact
+         JOIN workflow_artifact_sources source
+           ON source.workspace_id = artifact.workspace_id
+          AND source.run_id = artifact.run_id
+          AND source.artifact_id = artifact.artifact_id
+          AND source.artifact_revision = artifact.revision
+        WHERE artifact.workspace_id = NEW.workspace_id
+          AND artifact.run_id = NEW.source_run_id
+          AND artifact.artifact_id = NEW.source_artifact_id
+          AND artifact.revision = NEW.source_artifact_revision
+          AND artifact.producer_node_id = NEW.source_node_id
+          AND artifact.kind = 'next_result'
+          AND source.source_kind = 'workflow_node'
+          AND source.producer_run_id = NEW.source_run_id
+          AND source.producer_node_id = NEW.source_node_id
+          AND source.producer_task_id = NEW.source_task_id
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_node_reuse_invalid');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_node_reuse_immutable
+     BEFORE UPDATE OF status, source_run_id, source_node_id, source_task_id,
+                      source_artifact_id, source_artifact_revision ON workflow_nodes
+     WHEN OLD.source_run_id IS NOT NEW.source_run_id
+       OR OLD.source_node_id IS NOT NEW.source_node_id
+       OR OLD.source_task_id IS NOT NEW.source_task_id
+       OR OLD.source_artifact_id IS NOT NEW.source_artifact_id
+       OR OLD.source_artifact_revision IS NOT NEW.source_artifact_revision
+       OR (OLD.status = 'reused') <> (NEW.status = 'reused')
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_node_reuse_immutable');
      END`,
   `CREATE TRIGGER IF NOT EXISTS trg_workflow_artifact_source_immutable
      BEFORE UPDATE ON workflow_artifact_sources

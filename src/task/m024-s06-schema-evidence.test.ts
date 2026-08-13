@@ -27,10 +27,10 @@ afterEach(() => {
 });
 
 describe('M024 S06 schema evidence baseline', () => {
-  it('uses schema v4 and requires an explicit reset for an incompatible owned store', () => {
-    // Bumped to 4 by the reuse-provenance columns on workflow_nodes. Reset-only
-    // semantics are unchanged: an older store is rejected, never migrated.
-    expect(SQLITE_SCHEMA_VERSION).toBe(4);
+  it('uses schema v5 and requires an explicit reset for an incompatible owned store', () => {
+    // Bumped to 5 by immutable workflow-node reuse provenance and exact artifact pins.
+    // Reset-only semantics are unchanged: an older store is rejected, never migrated.
+    expect(SQLITE_SCHEMA_VERSION).toBe(5);
 
     const dbPath = tempDbPath();
     const current = openStoreDatabase({ path: dbPath });

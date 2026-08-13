@@ -135,7 +135,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   },
   inspect_workflow_run: {
     type: 'object',
-    description: 'Read bounded diagnostic state for one owned workflow run.',
+    description: 'Read bounded diagnostic state for one owned workflow run. Materialized nodes include taskRef for exact reuse bindings.',
     required: ['runRef'],
     properties: {
       runRef: { ...OP_ID, description: 'Opaque runRef returned by start_workflow.' },
@@ -286,7 +286,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   },
   start_workflow: {
     type: 'object',
-    description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one literal value or one prior-run result reference for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none. Optionally reuse a completed prior-run result for a non-terminal graph node with reuse: [{node, fromRun}].',
+    description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one literal value or one prior-run result reference for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none. Optionally bind an exact completed prior execution to a non-terminal graph node with reuse: [{node, fromRun, fromNode, fromTask}].',
     required: ['workflow'],
     properties: {
       workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
@@ -323,7 +323,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
       reuse: {
         type: 'array',
         maxItems: WORKFLOW_GRAPH_MAX_NODES,
-        description: 'Optional prior-execution bindings for reusable non-terminal graph nodes. Each item is exactly {node, fromRun, fromNode, fromTask}: node is the destination in this workflow, while fromRun/fromNode/fromTask name the exact completed prior execution whose result is bound. Every predecessor of a reused node must also be bound, otherwise the start is rejected.',
+        description: 'Optional prior-execution bindings for reusable non-terminal graph nodes. Each item is exactly {node, fromRun, fromNode, fromTask}: node is the destination in this workflow, while fromRun/fromNode/fromTask name the exact completed prior execution whose result is bound. Unbound predecessors execute normally before the bound result crosses the reused node.',
         items: {
           type: 'object',
           required: ['node', 'fromRun', 'fromNode', 'fromTask'],
@@ -344,14 +344,14 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
 const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   get_host_context: 'Refresh trusted workspace, caller, workflow rules, available tools, and task-type context. Use when the current host block is missing or may be stale. Read-only; takes no arguments.',
   list_task_types: 'List configured semantic task profiles for workflow nodes. Call before define_workflow when the current task-type list is absent or stale. Select an exact returned id; do not invent backend, model, role, capability, or policy fields.',
-  inspect_workflow_run: 'Inspect bounded durable state for one owned workflow using the opaque runRef returned by start_workflow. Use only for recovery and diagnosis after uncertainty; do not poll for normal routing or pass task/gate/activation ids.',
+  inspect_workflow_run: 'Inspect bounded durable state for one owned workflow using the opaque runRef returned by start_workflow. Materialized nodes include a taskRef that can be passed as reuse.fromTask with this runRef and the node name. Use only for recovery and diagnosis after uncertainty; do not poll for normal routing or pass gate/activation ids.',
   workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
   workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
   workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide an optional concise diagnostic reason. This is a terminal disposition for the current turn.',
   invoke_child_workflow: 'Invoke a saved child workflow from the current live activation using a workflowRef returned by define_workflow. Bind every required child source input to an exact current-activation input name; never provide artifact ids, revisions, or idempotency keys.',
   upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
-  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run result reference for every input declared by define_workflow. Optionally use reuse [{node, fromRun}] to reuse a completed result at a non-terminal graph node. Inside a workflow activation use invoke_child_workflow instead.',
+  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run result reference for every input declared by define_workflow. Optionally use reuse [{node, fromRun, fromNode, fromTask}] to bind an exact completed execution at a non-terminal graph node. Inside a workflow activation use invoke_child_workflow instead.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -397,7 +397,7 @@ export function formatToolError(error: string): string {
       code: 'invalid_workflow_inputs',
       message: error,
       hint: error === 'invalid start_workflow reuse'
-        ? 'Supply reuse only as unique {node, fromRun} references for graph nodes.'
+        ? 'Supply reuse only as unique {node, fromRun, fromNode, fromTask} bindings. Get fromRun, fromNode, and fromTask from inspect_workflow_run runRef, node, and taskRef fields.'
         : 'Supply exactly one value for every input declared by define_workflow, using the exact source nodeKey and input name.',
     });
   }
@@ -503,7 +503,13 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
     if (typeof value.runId !== 'string') return value;
     const ref = workflowRef(value.definitionId, value.definitionVersion);
     const nodes = Array.isArray(value.nodes)
-      ? value.nodes.filter(isObject).map((node) => ({ node: node.nodeId, status: node.status }))
+      ? value.nodes.filter(isObject).map((node) => ({
+          node: node.nodeId,
+          status: node.status,
+          ...(node.status === 'succeeded' && typeof node.taskId === 'string'
+            ? { taskRef: node.taskId }
+            : {}),
+        }))
       : [];
     const activations = Array.isArray(value.activations)
       ? value.activations.filter(isObject).map((activation) => ({

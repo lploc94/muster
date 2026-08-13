@@ -127,7 +127,9 @@ describe('terminal workflow metadata reclamation', () => {
            JOIN workflow_gate_bindings binding
              ON binding.workspace_id = gate.workspace_id AND binding.run_id = gate.run_id
             AND binding.gate_id = gate.gate_id
-          WHERE gate.workspace_id = ? AND gate.run_id = ? LIMIT 1`,
+          WHERE gate.workspace_id = ? AND gate.run_id = ?
+            AND binding.producer_node_id = 'p1'
+          LIMIT 1`,
         [WORKSPACE_ID, pinConsumerRunId],
       );
       expect(consumerGate).toBeTruthy();
@@ -156,6 +158,25 @@ describe('terminal workflow metadata reclamation', () => {
                  LIMIT 1`,
           params: [WORKSPACE_ID, pinnedProducerRunId, 'cross-run-pinned-artifact', pinnedProducerRunId,
             WORKSPACE_ID, pinnedProducerRunId],
+        },
+        {
+          sql: `DELETE FROM workflow_nodes
+                 WHERE workspace_id = ? AND run_id = ? AND node_id = 'p1'`,
+          params: [WORKSPACE_ID, pinConsumerRunId],
+        },
+        {
+          sql: `INSERT INTO workflow_nodes (
+                  workspace_id, run_id, node_id, task_id, status,
+                  source_run_id, source_node_id, source_task_id,
+                  source_artifact_id, source_artifact_revision
+                )
+                SELECT ?, ?, 'p1', NULL, 'reused', ?, 'p1', source.task_id, ?, 1
+                  FROM workflow_nodes source
+                 WHERE source.workspace_id = ? AND source.run_id = ? AND source.node_id = 'p1'`,
+          params: [
+            WORKSPACE_ID, pinConsumerRunId, pinnedProducerRunId,
+            'cross-run-pinned-artifact', WORKSPACE_ID, pinnedProducerRunId,
+          ],
         },
         {
           sql: `INSERT INTO workflow_gate_fills (

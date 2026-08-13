@@ -20,10 +20,10 @@ import { normalizeSchemaSql } from './schema-fingerprint';
 const TRIGGER_NAME = 'trg_terminal_workflow_history_prune_before_turn_delete';
 
 /** Captured from the M024 cross-run artifact pin safety predicate. */
-const PINNED_NORMALIZED_LENGTH = 2732;
+const PINNED_NORMALIZED_LENGTH = 2952;
 const PINNED_NORMALIZED_SHA256 =
-  '5890228060541eab3d10a31f9937f22d8041907a49ca0adeca4bace1461f794a';
-const PINNED_TRIGGER_COUNT = 138;
+  'ab740f5bd2b25fcbf85400601ca4dd07d0540b470686e6f23e4d205b22660fc7';
+const PINNED_TRIGGER_COUNT = 140;
 
 function openCurrentSchema(): DatabaseSync {
   const db = new DatabaseSync(':memory:');
@@ -76,9 +76,9 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
     expect(predicate).not.toContain('workflow_runs.run_id');
   });
 
-  it('emits all seven liveness and two cross-run artifact-pin guards', () => {
+  it('emits all seven liveness and three cross-run artifact-pin guards', () => {
     const predicate = terminalWorkflowRunSafetyPredicate('run');
-    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(9);
+    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(10);
     for (const table of [
       'workflow_runs child',
       'workflow_nodes node',
@@ -88,6 +88,7 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
       'workflow_continuations continuation',
       'workflow_return_gates return_gate',
       'workflow_gate_fills gate_fill',
+      'workflow_nodes reused_node',
       'workflow_return_gates return_gate_artifact',
     ]) {
       expect(predicate).toContain(table);

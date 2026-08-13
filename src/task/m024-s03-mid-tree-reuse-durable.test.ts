@@ -101,18 +101,22 @@ describe('M024 S03 durable mid-tree reuse', () => {
         repository, client, producer.entryTaskId, producer.activationTurnId,
         { kind: 'workflow_next', change: 'updated', result: 'four reusable result' }, '2026-08-01T00:00:01.000Z',
       )).resolves.toMatchObject({ ok: true, changed: true });
+      const producerInspection = await repository.inspectWorkflowRun(producer.runId, 'root-1');
+      expect(producerInspection?.nodes).toEqual([
+        { nodeId: 'produce', status: 'succeeded', taskId: producer.entryTaskId },
+      ]);
+      const reusableTaskId = producerInspection!.nodes[0]!.taskId!;
 
       const consumerStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
         startIdempotencyKey: 'consumer-five-chain', createdAt: '2026-08-01T00:00:02.000Z',
-        // Every suppressed node is bound explicitly to the exact producing execution.
-        // Binding only `four` is rejected (see the closure test): an unbound ancestor
-        // would otherwise be marked reused while nothing produced its result.
+        // Every suppressed node is bound explicitly to the exact producing execution;
+        // the partial-reuse fixture separately proves unbound ancestors materialize.
         reuse: ['one', 'two', 'three', 'four'].map((destinationNodeId) => ({
           destinationNodeId,
           sourceRunId: producer.runId,
           sourceNodeId: 'produce',
-          sourceTaskId: producer.entryTaskId,
+          sourceTaskId: reusableTaskId,
         })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
@@ -125,8 +129,10 @@ describe('M024 S03 durable mid-tree reuse', () => {
       const nodes = await client.all<{
         node_id: string; task_id: string | null; status: string;
         source_run_id: string | null; source_node_id: string | null; source_task_id: string | null;
+        source_artifact_id: string | null; source_artifact_revision: number | null;
       }>(
-        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id,
+                source_artifact_id, source_artifact_revision
            FROM workflow_nodes
          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
@@ -136,12 +142,15 @@ describe('M024 S03 durable mid-tree reuse', () => {
       const boundSource = {
         source_run_id: producer.runId,
         source_node_id: 'produce',
-        source_task_id: producer.entryTaskId,
+        source_task_id: reusableTaskId,
+        source_artifact_id: expect.any(String),
+        source_artifact_revision: 1,
       };
       expect(nodes).toEqual([
         {
           node_id: 'five', task_id: expect.any(String), status: 'active',
           source_run_id: null, source_node_id: null, source_task_id: null,
+          source_artifact_id: null, source_artifact_revision: null,
         },
         { node_id: 'four', task_id: null, status: 'reused', ...boundSource },
         { node_id: 'one', task_id: null, status: 'reused', ...boundSource },
@@ -189,7 +198,7 @@ describe('M024 S03 durable mid-tree reuse', () => {
       const inspection = await repository.inspectWorkflowRun(consumer.runId, 'root-1');
       const status = await repository.getWorkflowStatusForTask(five!.task_id);
       expect(inspection?.nodes).toEqual([
-        { nodeId: 'five', status: 'succeeded' },
+        { nodeId: 'five', status: 'succeeded', taskId: five!.task_id },
         { nodeId: 'four', status: 'reused' },
         { nodeId: 'one', status: 'reused' },
         { nodeId: 'three', status: 'reused' },
@@ -198,6 +207,18 @@ describe('M024 S03 durable mid-tree reuse', () => {
       expect(status).toMatchObject({ runId: consumer.runId, nodeId: 'five', runStatus: 'succeeded' });
       expect(forbiddenProjectionLeak(inspection)).toEqual([]);
       expect(forbiddenProjectionLeak(status)).toEqual([]);
+      expect(inspection?.diagnostics).not.toContainEqual({ code: 'terminal_run_has_live_gate' });
+      await expect(client.all(
+        `SELECT consumer_node_id, status FROM workflow_dependency_gates
+          WHERE workspace_id = ? AND run_id = ? ORDER BY consumer_node_id`,
+        [WORKSPACE_ID, consumer.runId],
+      )).resolves.toEqual([
+        { consumer_node_id: 'five', status: 'consumed' },
+        { consumer_node_id: 'four', status: 'consumed' },
+        { consumer_node_id: 'one', status: 'consumed' },
+        { consumer_node_id: 'three', status: 'consumed' },
+        { consumer_node_id: 'two', status: 'consumed' },
+      ]);
 
       // The reused producer artifact stays addressable across a reclamation pass:
       // the shared pin predicate excludes runs whose artifacts another run references.

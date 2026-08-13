@@ -111,9 +111,11 @@ alone cannot authorize a contextual workflow disposition.
 authorized workflow route. The repository requires that run to belong to the
 credential's root task. Its bounded result contains workflow status, semantic node
 state, recoverable activation state, feedback progress, child state, and integrity
-diagnostic codes. It never returns policy budgets, gate/activation/round/continuation
-IDs, artifact coordinates, a generic task tree, topology, prompts, artifact bodies,
-paths, or secrets and must not be used as a polling loop.
+diagnostic codes. A succeeded materialized node includes an opaque `taskRef`; together
+with the response `runRef` and node name, that is the exact source execution accepted by
+`start_workflow` reuse. It never returns policy budgets, gate/activation/round/
+continuation IDs, artifact coordinates, a generic task tree, topology, prompts, artifact
+bodies, paths, or secrets and must not be used as a polling loop.
 
 `start_workflow` returns a successful `accepted` result only after the run and a
 top-level `start_wait` continuation are durable. After that successful tool result is
@@ -127,6 +129,10 @@ drains the same resolver, so a terminal result cannot be lost or resumed twice.
 Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid or
 unauthorized starts return ordinary tool errors and do not suspend the caller. A live
 workflow activation must use `invoke_child_workflow` rather than `start_workflow`.
+Optional node reuse uses exact bindings
+`{node, fromRun, fromNode, fromTask}`. Read `fromRun`, `fromNode`, and `fromTask` from
+an owned completed run's `runRef`, node name, and `taskRef`; unbound predecessors execute
+normally before the bound result crosses the reused node.
 The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
 

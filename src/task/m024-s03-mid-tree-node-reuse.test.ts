@@ -33,11 +33,7 @@ function rootTask(createdAt: string): MusterTask {
   };
 }
 
-/**
- * Reuse is bind-only, so a caller reusing `middle` must also bind its predecessor
- * `source`; otherwise the start is rejected as an incomplete closure. Both bind to the
- * same prior execution, which is exactly what the producer run made available.
- */
+/** Bind a fully reused prefix to the same exact prior execution. */
 function boundAncestors(prior: { runId: string; entryTaskId: string }) {
   return ['source', 'middle'].map((destinationNodeId) => ({
     destinationNodeId,
@@ -311,10 +307,7 @@ describe('start_workflow mid-tree node reuse', () => {
         ['ws', 'wf-budget-boundary'],
       )).resolves.toEqual([]);
 
-      // Binding `middle` alone leaves its predecessor `source` unbound. Suppressing it
-      // would mark a node reused with no task and no source: a claim that work was
-      // reused when nothing produced it. Reuse is bind-only, so this fails closed.
-      await expect(repository.execute({
+      const partialStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
         startIdempotencyKey: 'unbound-ancestor', createdAt: '2026-08-01T00:00:00.950Z',
         reuse: [{
@@ -322,14 +315,18 @@ describe('start_workflow mid-tree node reuse', () => {
           sourceNodeId: 'middle', sourceTaskId: prior.entryTaskId,
         }],
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'turn-1',
-      })).resolves.toMatchObject({
-        ok: false, conflict: true, reason: 'node reuse closure incomplete',
       });
+      expect(partialStart).toMatchObject({ ok: true, changed: true });
+      const partial = partialStart.operation!.result.data as { runId: string; entryTaskId: string; activationTurnId: string };
       await expect(client.all(
-        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
-        ['ws', 'wf-graph'],
-      )).resolves.toEqual([]);
-
+        `SELECT node_id, task_id, status FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+        ['ws', partial.runId],
+      )).resolves.toEqual([
+        { node_id: 'middle', task_id: null, status: 'reused' },
+        { node_id: 'sink', task_id: null, status: 'pending' },
+        { node_id: 'source', task_id: partial.entryTaskId, status: 'active' },
+      ]);
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
         startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:01.000Z',
@@ -338,14 +335,73 @@ describe('start_workflow mid-tree node reuse', () => {
       });
       expect(started).toMatchObject({ ok: true, changed: true });
       const consumer = started.operation!.result.data as { runId: string };
-
       const bound = {
         source_run_id: prior.runId,
         source_node_id: 'middle',
         source_task_id: prior.entryTaskId,
+        source_artifact_id: expect.any(String),
+        source_artifact_revision: 1,
       };
+      await expect(repository.execute({
+        kind: 'deleteTaskSubtree', workspaceId: 'ws', rootTaskId: prior.entryTaskId,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(repository.getTask(prior.entryTaskId)).resolves.toBeUndefined();
+      await expect(client.get(
+        `SELECT 1 AS present FROM workflow_artifact_sources
+          WHERE workspace_id = ? AND run_id = ? AND producer_task_id = ?`,
+        ['ws', prior.runId, prior.entryTaskId],
+      )).resolves.toBeUndefined();
+      await expect(client.get(
+        `SELECT artifact.artifact_id
+           FROM workflow_nodes reused
+           JOIN workflow_artifacts artifact
+             ON artifact.workspace_id = reused.workspace_id
+            AND artifact.run_id = reused.source_run_id
+            AND artifact.artifact_id = reused.source_artifact_id
+            AND artifact.revision = reused.source_artifact_revision
+          WHERE reused.workspace_id = ? AND reused.run_id = ? AND reused.node_id = 'middle'`,
+        ['ws', partial.runId],
+      )).resolves.toMatchObject({ artifact_id: expect.any(String) });
+      const partialSourceTurn = await repository.getTurn(partial.activationTurnId);
+      const partialSourceTask = await repository.getTask(partial.entryTaskId);
+      await client.run(
+        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+        ['2026-08-01T00:00:00.960Z', 'ws', partial.activationTurnId],
+      );
+      const runningPartialSourceTurn = await repository.getTurn(partial.activationTurnId);
+      const partialDisposition = {
+        kind: 'workflow_next' as const,
+        change: 'updated' as const,
+        result: 'materialized source result',
+      };
+      await stageDispositionForSettlement(repository, runningPartialSourceTurn!, partialDisposition);
+      await expect(repository.execute({
+        kind: 'settleTurnAndApplyEffects', workspaceId: 'ws', expectedTaskRevision: partialSourceTask!.revision,
+        task: { ...partialSourceTask!, lifecycle: 'succeeded', updatedAt: '2026-08-01T00:00:00.975Z' },
+        turn: {
+          ...runningPartialSourceTurn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:00.975Z',
+          disposition: partialDisposition,
+        },
+        expectedStatuses: ['running'], relatedTurns: [], messages: [],
+      })).resolves.toMatchObject({ ok: true, changed: true, affectedTaskIds: expect.any(Array) });
       await expect(client.all(
-        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id
+        `SELECT node.node_id, node.status, gate.status AS gate_status
+           FROM workflow_nodes node
+           JOIN workflow_dependency_gates gate
+             ON gate.workspace_id = node.workspace_id AND gate.run_id = node.run_id
+            AND gate.consumer_node_id = node.node_id
+          WHERE node.workspace_id = ? AND node.run_id = ? AND node.node_id IN ('middle', 'sink', 'source')
+          ORDER BY node.node_id`,
+        ['ws', partial.runId],
+      )).resolves.toEqual([
+        { node_id: 'middle', status: 'reused', gate_status: 'consumed' },
+        { node_id: 'sink', status: 'active', gate_status: 'satisfied' },
+        { node_id: 'source', status: 'succeeded', gate_status: 'consumed' },
+      ]);
+
+      await expect(client.all(
+        `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id,
+                source_artifact_id, source_artifact_revision
            FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         ['ws', consumer.runId],
@@ -354,6 +410,7 @@ describe('start_workflow mid-tree node reuse', () => {
         {
           node_id: 'sink', task_id: expect.any(String), status: 'active',
           source_run_id: null, source_node_id: null, source_task_id: null,
+          source_artifact_id: null, source_artifact_revision: null,
         },
         { node_id: 'source', task_id: null, status: 'reused', ...bound },
       ]);
@@ -397,6 +454,15 @@ describe('start_workflow mid-tree node reuse', () => {
         required_kind: 'next_result', artifact_run_id: prior.runId,
         artifact_id: expect.any(String), artifact_revision: 1,
       });
+      await expect(client.all(
+        `SELECT consumer_node_id, status FROM workflow_dependency_gates
+          WHERE workspace_id = ? AND run_id = ? ORDER BY consumer_node_id`,
+        ['ws', consumer.runId],
+      )).resolves.toEqual([
+        { consumer_node_id: 'middle', status: 'consumed' },
+        { consumer_node_id: 'sink', status: 'satisfied' },
+        { consumer_node_id: 'source', status: 'consumed' },
+      ]);
       await expect(client.get(
         `SELECT node.task_id, node.status, gate.status AS gate_status,
                 activation.status AS activation_status, turn.status AS turn_status

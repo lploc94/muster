@@ -37,9 +37,24 @@ describe('M024 S04 agent-facing workflow graph boundary', () => {
     const inspection = interfaceBody(types, 'WorkflowRunInspectionProjection');
 
     for (const publicProjection of [status, inspection]) {
-      expect(publicProjection).not.toMatch(/\b(topology|edges|label|taskId|artifactId|artifactRevision)\s*[?:]/);
+      expect(publicProjection).not.toMatch(/\b(topology|edges|label|artifactId|artifactRevision)\s*[?:]/);
     }
+    expect(status).not.toMatch(/\btaskId\s*[?:]/);
+    expect(types).toMatch(/export interface WorkflowRunNodeInspectionProjection[\s\S]*?\btaskId\?\s*:/);
     expect(status).not.toContain('WorkflowGraph');
     expect(inspection).not.toContain('WorkflowGraph');
+  });
+
+  it('pins exact reuse guidance across the active public surfaces', () => {
+    const exactBinding = '{node, fromRun, fromNode, fromTask}';
+    for (const relativePath of [
+      'src/bridge/server.ts',
+      'docs/MUSTER-BRIDGE.md',
+      'docs/TASK-MANAGEMENT.md',
+    ]) {
+      const source = readSource(relativePath);
+      expect(source).toContain(exactBinding);
+      expect(source).not.toContain('reuse [{node, fromRun}]');
+    }
   });
 });
