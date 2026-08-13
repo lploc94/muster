@@ -109,6 +109,9 @@ describe('terminal workflow metadata reclamation', () => {
         version: definition.version, name: definition.name, topology: definition.topology, createdAt: NOW,
       });
       const safeRunId = await startWorkflowRun(repository, 'safe');
+      const secondSafeRunId = await startWorkflowRun(repository, 'safe-second');
+      const pinnedProducerRunId = await startWorkflowRun(repository, 'pinned-producer');
+      const pinConsumerRunId = await startWorkflowRun(repository, 'pin-consumer');
       const liveGateRunId = await startWorkflowRun(repository, 'live-gate');
       const liveActivationRunId = await startWorkflowRun(repository, 'live-activation');
 
@@ -116,7 +119,54 @@ describe('terminal workflow metadata reclamation', () => {
       // terminal integrity drift; a queued activation remains on a running run because
       // schema triggers correctly forbid terminal runs with live activations.
       await terminalizeRun(client, repository, safeRunId);
+      await terminalizeRun(client, repository, secondSafeRunId);
       await terminalizeRun(client, repository, liveGateRunId);
+      const consumerGate = await client.get<{ gate_id: string; input_ref: string }>(
+        `SELECT gate.gate_id, binding.input_ref
+           FROM workflow_dependency_gates gate
+           JOIN workflow_gate_bindings binding
+             ON binding.workspace_id = gate.workspace_id AND binding.run_id = gate.run_id
+            AND binding.gate_id = gate.gate_id
+          WHERE gate.workspace_id = ? AND gate.run_id = ? LIMIT 1`,
+        [WORKSPACE_ID, pinConsumerRunId],
+      );
+      expect(consumerGate).toBeTruthy();
+      await client.transaction([
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)`,
+          params: [WORKSPACE_ID, pinnedProducerRunId, 'cross-run-pinned-artifact', 'p1',
+            'result', 1, 'next_result', '{}', NOW],
+        },
+        {
+          sql: `INSERT INTO workflow_artifact_sources (
+                  workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                  producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                  producing_activation_id, caller_task_id, caller_turn_id,
+                  engine_start_operation_key
+                )
+                SELECT ?, ?, ?, 1, 'workflow_node', ?, 'p1', node.task_id, activation.execution_turn_id,
+                       activation.activation_id, NULL, NULL, NULL
+                  FROM workflow_nodes node
+                  JOIN workflow_activations activation
+                    ON activation.workspace_id = node.workspace_id AND activation.run_id = node.run_id
+                 WHERE node.workspace_id = ? AND node.run_id = ? AND node.node_id = 'p1'
+                 LIMIT 1`,
+          params: [WORKSPACE_ID, pinnedProducerRunId, 'cross-run-pinned-artifact', pinnedProducerRunId,
+            WORKSPACE_ID, pinnedProducerRunId],
+        },
+        {
+          sql: `INSERT INTO workflow_gate_fills (
+                  workspace_id, run_id, gate_id, input_ref, artifact_run_id,
+                  artifact_id, artifact_revision, filled_at
+                ) VALUES (?,?,?,?,?,?,?,?)`,
+          params: [WORKSPACE_ID, pinConsumerRunId, consumerGate!.gate_id, consumerGate!.input_ref,
+            pinnedProducerRunId, 'cross-run-pinned-artifact', 1, NOW],
+        },
+      ]);
+      await terminalizeRun(client, repository, pinnedProducerRunId);
       const liveGate = await client.get<{ gate_id: string }>(
         `SELECT gate_id FROM workflow_dependency_gates WHERE workspace_id = ? AND run_id = ? LIMIT 1`,
         [WORKSPACE_ID, liveGateRunId],
@@ -139,10 +189,21 @@ describe('terminal workflow metadata reclamation', () => {
       const result = await repository.execute({ kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID });
 
       expect(result).toMatchObject({ ok: true, changed: true, strippedWorkflowMessageBodies: 1 });
+      // Retention strips only routed transport bodies. It deliberately preserves
+      // every workflow run: deleting a terminal run cascades its start claim while
+      // the operation ledger remains, which breaks idempotent replay. Cross-run
+      // artifact pins remain durable alongside the producer and consumer runs.
       await expect(client.all<{ run_id: string }>(
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? ORDER BY run_id`, [WORKSPACE_ID],
-      )).resolves.toEqual([safeRunId, liveActivationRunId, liveGateRunId]
-        .sort((left, right) => left.localeCompare(right)).map((run_id) => ({ run_id })));
+      )).resolves.toEqual([
+        safeRunId, secondSafeRunId, pinnedProducerRunId, pinConsumerRunId,
+        liveGateRunId, liveActivationRunId,
+      ].sort((left, right) => left.localeCompare(right)).map((run_id) => ({ run_id })));
+      await expect(client.get<{ artifact_id: string }>(
+        `SELECT artifact_id FROM workflow_artifacts
+          WHERE workspace_id = ? AND run_id = ? AND artifact_id = ?`,
+        [WORKSPACE_ID, pinnedProducerRunId, 'cross-run-pinned-artifact'],
+      )).resolves.toEqual({ artifact_id: 'cross-run-pinned-artifact' });
       // This fixture starts a workspace-scoped run (no claim row). Its operation
       // ledger and run still survive, so replay never points at a deleted target.
       await expect(client.get<{ count: number }>(

@@ -254,11 +254,16 @@ function tryOpenExistingCurrent(
   if (userVersion !== 0) {
     throw new IncompatibleSchemaError(userVersion);
   }
-  // A fresh SQLite file has no schema and auto_vacuum NONE. Any existing
-  // schema object (including sqlite_sequence) or non-default vacuum mode is
-  // foreign residue, not a blank Muster candidate. Reject before setting any
-  // durable pragma so a foreign DB can never be mutated during preflight.
-  if (readScalar(db, 'auto_vacuum') !== 0 || hasSchemaObjects(db)) {
+  // A fresh SQLite file normally has no schema and auto_vacuum NONE. Muster's
+  // concurrent first-open path must set INCREMENTAL before BEGIN because SQLite
+  // ignores that change after schema pages exist; another contender can therefore
+  // observe an empty file in exactly that intermediate state. Treat only an empty
+  // NONE/INCREMENTAL file as claimable. FULL mode or any schema object remains
+  // foreign residue until ownership markers prove otherwise.
+  const autoVacuum = readScalar(db, 'auto_vacuum');
+  const hasObjects = hasSchemaObjects(db);
+  if (!hasObjects && (autoVacuum === 0 || autoVacuum === 2)) return false;
+  if (autoVacuum !== 0 || hasObjects) {
     // Re-read markers once — peer commit can expose schema before header markers.
     const appAgain = readScalar(db, 'application_id');
     const verAgain = readScalar(db, 'user_version');
@@ -266,8 +271,16 @@ function tryOpenExistingCurrent(
       assertCurrentSchemaComplete(db);
       return 'current';
     }
-    if (opts.allowConcurrentNonemptyRetry && appAgain === 0 && verAgain === 0) {
-      throw new ConcurrentOpenStateChanged();
+    if (appAgain === 0 && verAgain === 0) {
+      // A concurrent peer can publish its full schema pages before this connection
+      // observes application_id/user_version. This worker may be arriving after the
+      // blank preflight (so `sawBlankPreflight` is false), therefore object presence
+      // alone is insufficient to distinguish the race from a foreign DB. Retry only
+      // when the *entire* exact Muster fingerprint is visible; foreign, partial, or
+      // modified schemas fail closed below without any retry or mutation.
+      if (opts.allowConcurrentNonemptyRetry || !findSchemaFingerprintFailure(db)) {
+        throw new ConcurrentOpenStateChanged();
+      }
     }
     if (appAgain !== 0 && appAgain !== MUSTER_APPLICATION_ID) {
       throw new ForeignDatabaseError(appAgain);
@@ -296,8 +309,10 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
   let attempt = 0;
   /** After a blank preflight, concurrent schema-without-markers may retry. */
   let sawBlankPreflight = false;
-  /** Bounded fingerprint retries for concurrent current-marker visibility. */
+  /** Bounded retries for concurrent schema/marker visibility. */
+  let concurrentStateRetries = 0;
   let fingerprintRetries = 0;
+  const MAX_CONCURRENT_STATE_RETRIES = 3;
   const MAX_FINGERPRINT_RETRIES = 6;
 
   for (;;) {
@@ -341,10 +356,15 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
         }
       }
       if (error instanceof ConcurrentOpenStateChanged) {
-        if (Date.now() >= retryDeadline) {
-          // Stable non-empty without Muster markers after bounded retries.
+        if (
+          concurrentStateRetries >= MAX_CONCURRENT_STATE_RETRIES ||
+          Date.now() >= retryDeadline
+        ) {
+          // A real peer publishes markers quickly. A stable exact schema without
+          // ownership markers is unclaimed and must not consume the full deadline.
           throw new NonEmptyUnclaimedDatabaseError();
         }
+        concurrentStateRetries += 1;
         waitBeforeOpenRetry(attempt);
         attempt += 1;
         continue;

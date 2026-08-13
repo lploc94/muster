@@ -2369,3 +2369,58 @@ describe('M021 S04 protocol outsideWorkspace marker', () => {
     ).toBe(false);
   });
 });
+
+describe('isExtMessage workflowGraphResult (M024/S05)', () => {
+  it('accepts a shared-contract-valid graph result', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowGraphResult',
+        requestId: 'request-1',
+        taskId: 'task-1',
+        ok: true,
+        graph: {
+          runId: 'run-1',
+          nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
+          edges: [],
+          feedbackRounds: [],
+          childRuns: [],
+          reuse: { nodeCount: 0, edgeCount: 0 },
+          diagnostics: [],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed and extra-field graph results fail-closed', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowGraphResult',
+        requestId: 'request-1',
+        taskId: 'task-1',
+        ok: false,
+        code: 'unavailable',
+        message: 'untrusted host detail',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workflowGraphResult',
+        requestId: 'request-1',
+        taskId: 'task-1',
+        ok: true,
+        graph: { runId: 'run-1', nodes: 'not-an-array' },
+      }),
+    ).toBe(false);
+  });
+
+  it('posts the correlated request workflow graph shape', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = {
+      type: 'requestWorkflowGraph',
+      requestId: 'request-1',
+      taskId: 'task-1',
+    };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+  });
+});

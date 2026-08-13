@@ -38,7 +38,9 @@ Thumbs.db
 
 # Test / temp runtime (MCP ask spikes)
 .tmp/
+.tmp-context.txt
 tmp/
+artifacts/
 
 # Coverage
 coverage/

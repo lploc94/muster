@@ -286,7 +286,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   },
   start_workflow: {
     type: 'object',
-    description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one value for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none.',
+    description: 'Start a saved workflow and suspend this caller after durable acceptance. Supply exactly one literal value or one prior-run result reference for every input declared by define_workflow, using the same source nodeKey and input name; omit inputs only when the definition declares none. Optionally reuse a completed prior-run result for a non-terminal graph node with reuse: [{node, fromRun}].',
     required: ['workflow'],
     properties: {
       workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
@@ -294,14 +294,44 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
       inputs: {
         type: 'array',
         maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX,
-        description: 'Complete values for all declared workflow inputs. Node and input names must exactly match define_workflow.inputs.',
+        description: 'Complete bindings for all declared workflow inputs. Each item is exactly one literal {node, input, value} or prior workflow result reference {node, input, fromRun}. Node and input names must exactly match define_workflow.inputs.',
+        items: {
+          oneOf: [
+            {
+              type: 'object',
+              required: ['node', 'input', 'value'],
+              properties: {
+                node: { ...PRESENTATION_ID, description: 'Declared source nodeKey.' },
+                input: { type: 'string', minLength: 1, maxLength: 128, description: 'Declared input name on that source node.' },
+                value: { type: 'string', maxLength: TASK_RESULT_MAX_BYTES, description: 'Literal input value for this run.' },
+              },
+              additionalProperties: false,
+            },
+            {
+              type: 'object',
+              required: ['node', 'input', 'fromRun'],
+              properties: {
+                node: { ...PRESENTATION_ID, description: 'Declared source nodeKey.' },
+                input: { type: 'string', minLength: 1, maxLength: 128, description: 'Declared input name on that source node.' },
+                fromRun: { ...OP_ID, description: 'Opaque runRef returned by an earlier terminal start_workflow call.' },
+              },
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+      reuse: {
+        type: 'array',
+        maxItems: WORKFLOW_GRAPH_MAX_NODES,
+        description: 'Optional prior-execution bindings for reusable non-terminal graph nodes. Each item is exactly {node, fromRun, fromNode, fromTask}: node is the destination in this workflow, while fromRun/fromNode/fromTask name the exact completed prior execution whose result is bound. Every predecessor of a reused node must also be bound, otherwise the start is rejected.',
         items: {
           type: 'object',
-          required: ['node', 'input', 'value'],
+          required: ['node', 'fromRun', 'fromNode', 'fromTask'],
           properties: {
-            node: { ...PRESENTATION_ID, description: 'Declared source nodeKey.' },
-            input: { type: 'string', minLength: 1, maxLength: 128, description: 'Declared input name on that source node.' },
-            value: { type: 'string', maxLength: TASK_RESULT_MAX_BYTES, description: 'Input value for this run.' },
+            node: { ...PRESENTATION_ID, description: 'Non-terminal graph nodeKey in this workflow that receives the reused result.' },
+            fromRun: { ...OP_ID, description: 'Opaque prior workflow run reference that produced the result.' },
+            fromNode: { ...PRESENTATION_ID, description: 'nodeKey in the prior run that produced the result. Need not match node.' },
+            fromTask: { ...OP_ID, description: 'Exact completed prior task execution whose result is bound.' },
           },
           additionalProperties: false,
         },
@@ -321,7 +351,7 @@ const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   invoke_child_workflow: 'Invoke a saved child workflow from the current live activation using a workflowRef returned by define_workflow. Bind every required child source input to an exact current-activation input name; never provide artifact ids, revisions, or idempotency keys.',
   upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
-  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one value for every input declared by define_workflow. Inside a workflow activation use invoke_child_workflow instead.',
+  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run result reference for every input declared by define_workflow. Optionally use reuse [{node, fromRun}] to reuse a completed result at a non-terminal graph node. Inside a workflow activation use invoke_child_workflow instead.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -360,12 +390,15 @@ export function formatToolError(error: string): string {
     error === 'incomplete entry inputs' ||
     error === 'entry input contract mismatch' ||
     error === 'invalid entry input' ||
-    error === 'invalid start_workflow inputs'
+    error === 'invalid start_workflow inputs' ||
+    error === 'invalid start_workflow reuse'
   ) {
     return JSON.stringify({
       code: 'invalid_workflow_inputs',
       message: error,
-      hint: 'Supply exactly one value for every input declared by define_workflow, using the exact source nodeKey and input name.',
+      hint: error === 'invalid start_workflow reuse'
+        ? 'Supply reuse only as unique {node, fromRun} references for graph nodes.'
+        : 'Supply exactly one value for every input declared by define_workflow, using the exact source nodeKey and input name.',
     });
   }
   if (error === 'definition fingerprint conflict') {

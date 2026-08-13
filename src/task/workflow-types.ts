@@ -142,12 +142,44 @@ export interface DefineWorkflowInput {
   createdAt: string;
 }
 
-/** Caller-authored value bound to one exact entry contract at start. */
-export interface StartWorkflowEntryInput {
+/** Caller-authored literal value bound to one exact entry contract at start. */
+export interface StartWorkflowEntryLiteralInput {
   entryNodeId: string;
   inputRef: string;
   kind: string;
   value: string;
+}
+
+/** Caller-authorized reference to a prior workflow run's terminal result. */
+export interface StartWorkflowEntryRunReferenceInput {
+  entryNodeId: string;
+  inputRef: string;
+  fromRun: string;
+}
+
+/** Exactly one literal value or prior-run result reference for an entry contract. */
+export type StartWorkflowEntryInput =
+  | StartWorkflowEntryLiteralInput
+  | StartWorkflowEntryRunReferenceInput;
+
+/**
+ * Caller-authorized reuse of one exact completed prior execution for one graph node.
+ *
+ * Source and destination are separate identities on purpose: the artifact was produced
+ * by `sourceNodeId` in `sourceRunId` (possibly under a different definition, so that id
+ * need not exist in this run's topology), and is bound to `destinationNodeId` here.
+ * `sourceTaskId` pins the exact execution, because one node id maps to a different task
+ * in every run, so "latest matching row" is a guess rather than a caller authorization.
+ */
+export interface StartWorkflowNodeReuse {
+  /** Node in this run's frozen topology that receives the reused artifact. */
+  destinationNodeId: string;
+  /** Prior run that produced the artifact. */
+  sourceRunId: string;
+  /** Node in the prior run's topology that produced the artifact. */
+  sourceNodeId: string;
+  /** Exact completed task execution whose artifact is bound. */
+  sourceTaskId: string;
 }
 
 /**
@@ -180,6 +212,8 @@ export interface StartWorkflowInput {
   backend?: string;
   /** Exact caller values for every declared entry contract. */
   entryInputs?: readonly StartWorkflowEntryInput[];
+  /** Prior-run references for graph nodes reused by this start. */
+  reuse?: readonly StartWorkflowNodeReuse[];
   /** Frozen definition contracts loaded by the repository. */
   entryContracts?: readonly WorkflowEntryContractV1[];
   /** Caller/root authority included in fingerprint and identity derivation. */
@@ -269,6 +303,12 @@ export type StartWorkflowResult =
       reason:
         | 'definition not found'
         | 'invalid start'
+        | 'entry input reference unresolved'
+        | 'terminal node cannot be reused'
+        | 'node reuse reference unresolved'
+        | 'node reuse closure incomplete'
+        | 'reuse artifact kind mismatch'
+        | 'reuse aggregate exceeds policy'
         | 'start fingerprint conflict'
         | 'invalid identity';
       definitionId?: string;
@@ -371,6 +411,47 @@ export interface WorkflowTaskStatusProjection {
   activation?: WorkflowActivationStatusProjection;
   feedbackRounds: readonly WorkflowFeedbackRoundProjection[];
   continuations: readonly WorkflowContinuationStatusProjection[];
+  diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
+}
+
+/** Host-only bounded workflow graph node state. Never exposed through agent tools. */
+export interface WorkflowGraphNodeProjection {
+  nodeId: string;
+  status: string;
+}
+
+/** Host-only durable definition edge for an instantiated workflow run. */
+export interface WorkflowGraphEdgeProjection {
+  fromNodeId: string;
+  toNodeId: string;
+  inputRef: string;
+}
+
+/** Direct nested workflow run visible from a host graph read. */
+export interface WorkflowGraphChildRunProjection {
+  runId: string;
+  status: string;
+}
+
+/** Reuse density derived from the bounded run graph. */
+export interface WorkflowGraphReuseProjection {
+  nodeCount: number;
+  edgeCount: number;
+}
+
+/**
+ * Host-only bounded workflow graph for the run containing a task.
+ * Unlike agent-facing workflow status projections, this intentionally exposes
+ * durable node topology but never prompts, artifact bodies, secrets, or paths.
+ */
+export interface WorkflowGraphProjection {
+  runId: string;
+  nodes: readonly WorkflowGraphNodeProjection[];
+  edges: readonly WorkflowGraphEdgeProjection[];
+  activeGate?: WorkflowGateStatusProjection;
+  feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
+  childRuns: readonly WorkflowGraphChildRunProjection[];
+  reuse: WorkflowGraphReuseProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }
 

@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { SQLITE_SCHEMA_VERSION as TREE_SCHEMA_VERSION } from '../src/task/sqlite/schema';
 
 interface PackagedReclaimResult {
   mode: 'incremental' | 'full' | 'refused' | 'noop';
@@ -115,10 +116,16 @@ export async function run(): Promise<void> {
     await client.open(dbPath);
     assert.equal(await client.pragma('application_id'), 0x4d555354);
     assert.equal(await client.pragma('foreign_keys'), 1);
+    // Compared against the tree this VSIX was built from, not a hardcoded version.
+    // A literal here had to be hand-edited on every schema bump, and because this job
+    // runs outside vitest, forgetting it only surfaced as a packaged-host CI failure.
+    // Deliberate acknowledgment of a bump stays machine-enforced in the local suite
+    // (m024-s06-schema-evidence.test.ts pins the literal); this assertion's own job is
+    // to catch a packaged artifact that disagrees with its source tree.
     assert.equal(
       schema.SQLITE_SCHEMA_VERSION,
-      2,
-      'packaged schema version drifted from expected current (v2)',
+      TREE_SCHEMA_VERSION,
+      'packaged schema version drifted from the tree it was built from',
     );
     assert.equal(await client.pragma('user_version'), schema.SQLITE_SCHEMA_VERSION);
     assert.deepEqual(await client.get<{ journal_mode: string }>('PRAGMA journal_mode'), {

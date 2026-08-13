@@ -104,7 +104,7 @@ describe('M023 S03 retention byte and schema invariants', () => {
         }]),
       });
 
-      expect(SQLITE_SCHEMA_VERSION).toBe(2);
+      expect(SQLITE_SCHEMA_VERSION).toBe(4);
       expect(await client.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);
       const durableRowsBefore = await rowCounts(client);
       const reportBefore = await client.storageReport();
@@ -126,7 +126,7 @@ describe('M023 S03 retention byte and schema invariants', () => {
       expect(reclaim.mode).toBe('incremental');
       expect(reclaim.fileBytesAfter).toBeLessThan(reclaim.fileBytesBefore);
       expect(await client.pragma('user_version')).toBe(SQLITE_SCHEMA_VERSION);
-      expect(SQLITE_SCHEMA_VERSION).toBe(2);
+      expect(SQLITE_SCHEMA_VERSION).toBe(4);
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

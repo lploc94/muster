@@ -13,6 +13,8 @@ import {
   type DefineWorkflowInput,
   type GraphTopologyV1,
   type OneNodeTopologyV1,
+  type StartWorkflowEntryInput,
+  type StartWorkflowNodeReuse,
   type WorkflowDefinitionV1,
   type WorkflowDependencyEdgeV1,
   type WorkflowEntryContractV1,
@@ -74,6 +76,62 @@ function isNonEmptyString(value: unknown, max: number): value is string {
 }
 
 const WORKFLOW_ENTRY_AGGREGATE_PREFIX = '[workflow-entry]';
+
+export function fingerprintStartEntryInputs(
+  entryInputs: readonly StartWorkflowEntryInput[],
+): readonly (
+  | {
+      type: 'literal';
+      entryNodeId: string;
+      inputRef: string;
+      kind: string;
+      valueSha256: string;
+    }
+  | {
+      type: 'prior_run_result';
+      entryNodeId: string;
+      inputRef: string;
+      fromRun: string;
+    }
+)[] {
+  return entryInputs.map((entryInput) => (
+    'value' in entryInput
+      ? {
+          type: 'literal',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          kind: entryInput.kind,
+          valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
+        }
+      : {
+          type: 'prior_run_result',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          fromRun: entryInput.fromRun,
+        }
+  ));
+}
+
+export function fingerprintStartNodeReuse(
+  reuse: readonly StartWorkflowNodeReuse[],
+): readonly {
+  destinationNodeId: string;
+  sourceRunId: string;
+  sourceNodeId: string;
+  sourceTaskId: string;
+}[] {
+  // All four identities are fingerprinted: two starts binding different source
+  // executions to the same destination node are different starts, so they must not
+  // collide on the start idempotency ledger.
+  return [...reuse]
+    .map(({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId }) => ({
+      destinationNodeId,
+      sourceRunId,
+      sourceNodeId,
+      sourceTaskId,
+    }))
+    .sort((left, right) => left.destinationNodeId.localeCompare(right.destinationNodeId));
+}
 
 export function formatWorkflowEntryAggregate(
   inputs: readonly { inputRef: string; value: string }[],

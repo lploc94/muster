@@ -11,6 +11,8 @@ import {
   DEFAULT_WORKFLOW_POLICY,
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
+  fingerprintStartEntryInputs,
+  fingerprintStartNodeReuse,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
@@ -19,6 +21,8 @@ import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
   GraphTopologyV1,
+  StartWorkflowEntryInput,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -47,6 +51,7 @@ export type {
   DefineWorkflowResult,
   GraphTopologyV1,
   OneNodeTopologyV1,
+  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -223,6 +228,52 @@ export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
   }
   const outgoing = new Set(topology.edges.map((e) => e.fromNodeId));
   return topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
+}
+
+/**
+ * Predecessors of declared reuse targets that the caller did not also bind.
+ *
+ * Reuse is bind-only: a node is `reused` if and only if the caller supplied an exact
+ * source execution for it. An earlier revision instead expanded the declared set over
+ * reverse edges and marked every ancestor `reused` with `task_id = NULL`, producing
+ * nodes that neither ran nor carried provenance — the graph claimed work was reused
+ * while no artifact or execution backed the claim. Callers must bind the whole
+ * ancestor chain explicitly so every suppressed node has an auditable source.
+ *
+ * Checking direct predecessors is sufficient: a declared node forces its immediate
+ * predecessors to be declared, which inductively closes the set back to the entries.
+ *
+ * Returns the offending node ids (sorted) so the caller can report what is missing;
+ * empty means the declared set is ancestor-closed.
+ */
+export function unboundReuseAncestors(
+  topology: WorkflowTopologyV1,
+  declaredNodeIds: readonly string[],
+): readonly string[] {
+  if (topology.kind !== 'graph_v1') return [];
+  const declared = new Set(declaredNodeIds);
+  const unbound = new Set<string>();
+  for (const edge of topology.edges) {
+    if (declared.has(edge.toNodeId) && !declared.has(edge.fromNodeId)) {
+      unbound.add(edge.fromNodeId);
+    }
+  }
+  return [...unbound].sort();
+}
+
+/**
+ * Cross-run entry references intentionally adapt a prior terminal `next_result`
+ * into a caller-authored `workflow_input` slot. Mid-tree node reuse has no such
+ * adapter: it must satisfy the frozen dependency edge kind exactly.
+ */
+export function isReusableArtifactKindCompatible(
+  expectedKind: string,
+  artifactKind: string,
+  target: 'entry' | 'node',
+): boolean {
+  return expectedKind === artifactKind || (
+    target === 'entry' && expectedKind === 'workflow_input' && artifactKind === 'next_result'
+  );
 }
 
 /** Return the sole terminal for callers that explicitly require a single-sink topology. */
@@ -820,7 +871,8 @@ export function fingerprintStartWorkflow(input: {
   ownerRootTaskId?: string;
   callerTaskId?: string;
   callerTurnId?: string;
-  entryInputs?: readonly { entryNodeId: string; inputRef: string; kind: string; value: string }[];
+  entryInputs?: readonly StartWorkflowEntryInput[];
+  reuse?: readonly StartWorkflowNodeReuse[];
   policy?: WorkflowPolicyV1;
 }): string {
   const payload = JSON.stringify({
@@ -832,12 +884,8 @@ export function fingerprintStartWorkflow(input: {
     backend: input.backend,
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
-    entryInputs: (input.entryInputs ?? []).map((entryInput) => ({
-      entryNodeId: entryInput.entryNodeId,
-      inputRef: entryInput.inputRef,
-      kind: entryInput.kind,
-      valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
-    })),
+    entryInputs: fingerprintStartEntryInputs(input.entryInputs ?? []),
+    reuse: fingerprintStartNodeReuse(input.reuse ?? []),
     policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
@@ -860,6 +908,7 @@ export function validateStartWorkflow(
       goal: string;
       backend: string;
       entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
+      reuse: readonly StartWorkflowNodeReuse[];
       entryContracts: readonly WorkflowEntryContractV1[];
       policy: WorkflowPolicyV1;
       ownerRootTaskId?: string;
@@ -922,6 +971,25 @@ export function validateStartWorkflow(
   }
   const contracts = input.entryContracts ?? [];
   const entryInputs = input.entryInputs ?? [];
+  const reuse = input.reuse ?? [];
+  const reuseNodeIds = new Set<string>();
+  for (const item of reuse) {
+    if (
+      !isNonEmptyBounded(item.destinationNodeId, 128) ||
+      !isNonEmptyBounded(item.sourceRunId, 128) ||
+      !isNonEmptyBounded(item.sourceNodeId, 128) ||
+      !isNonEmptyBounded(item.sourceTaskId, 128) ||
+      reuseNodeIds.has(item.destinationNodeId) ||
+      // A destination outside this topology can never be applied; accepting it would
+      // silently start a run that executes every node.
+      !allNodeIds.includes(item.destinationNodeId)
+    ) {
+      return { ok: false, reason: 'invalid reuse' };
+    }
+    // `sourceNodeId` is intentionally not checked against this topology: the artifact
+    // may come from a different definition whose node names do not appear here.
+    reuseNodeIds.add(item.destinationNodeId);
+  }
   const contractByKey = new Map<string, WorkflowEntryContractV1>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
   );
@@ -929,20 +997,27 @@ export function validateStartWorkflow(
   for (const entryInput of entryInputs) {
     if (
       !isNonEmptyBounded(entryInput.entryNodeId, 128) ||
-      !isNonEmptyBounded(entryInput.inputRef, 128) ||
-      !isNonEmptyBounded(entryInput.kind, 128) ||
-      typeof entryInput.value !== 'string'
+      !isNonEmptyBounded(entryInput.inputRef, 128)
     ) {
       return { ok: false, reason: 'invalid entry input' };
     }
     const key = `${entryInput.entryNodeId}\0${entryInput.inputRef}`;
     if (inputByKey.has(key)) return { ok: false, reason: 'duplicate entry input' };
     const contract = contractByKey.get(key);
-    if (!contract || contract.expectedArtifactKind !== entryInput.kind) {
-      return { ok: false, reason: 'entry input contract mismatch' };
-    }
-    if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
-      return { ok: false, reason: 'entry artifact too large' };
+    if (!contract) return { ok: false, reason: 'entry input contract mismatch' };
+    if ('value' in entryInput) {
+      if (
+        !isNonEmptyBounded(entryInput.kind, 128) ||
+        typeof entryInput.value !== 'string' ||
+        contract.expectedArtifactKind !== entryInput.kind
+      ) {
+        return { ok: false, reason: 'entry input contract mismatch' };
+      }
+      if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
+        return { ok: false, reason: 'entry artifact too large' };
+      }
+    } else if (!isNonEmptyBounded(entryInput.fromRun, 128)) {
+      return { ok: false, reason: 'invalid entry input' };
     }
     inputByKey.set(key, entryInput);
   }
@@ -986,6 +1061,7 @@ export function validateStartWorkflow(
     ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
     ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
     entryInputs: orderedEntryInputs,
+    reuse,
     policy,
   });
   return {
@@ -998,6 +1074,7 @@ export function validateStartWorkflow(
     goal,
     backend,
     entryInputs: orderedEntryInputs,
+    reuse,
     entryContracts: contracts,
     policy,
     ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
@@ -1065,7 +1142,16 @@ export function startWorkflowConflict(
 
 /** Shape a start validation / missing-definition failure. */
 export function startWorkflowInvalid(
-  reason: 'definition not found' | 'invalid start' | 'invalid identity',
+  reason:
+    | 'definition not found'
+    | 'invalid start'
+    | 'invalid identity'
+    | 'entry input reference unresolved'
+    | 'terminal node cannot be reused'
+    | 'node reuse reference unresolved'
+    | 'node reuse closure incomplete'
+    | 'reuse artifact kind mismatch'
+    | 'reuse aggregate exceeds policy',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {

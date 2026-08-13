@@ -39,6 +39,8 @@ import {
   maximumWorkflowEntryAggregateBytes,
   terminalNodeIds,
   terminalNodeId,
+  unboundReuseAncestors,
+  isReusableArtifactKindCompatible,
   validateDefineWorkflow,
 } from './workflow';
 import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from './workflow-types';
@@ -263,6 +265,32 @@ describe('workflow domain (graph_v1 multi-node topology)', () => {
     expect(decodeTopology(makeGraphFanInDefinition().topology).ok).toBe(true);
     expect(decodeTopology(makeOneNodeDefinition().topology).ok).toBe(true);
     expect(decodeStoredTopologyJson(JSON.stringify(makeGraphFanInDefinition().topology)).ok).toBe(true);
+  });
+
+  it('keeps reuse closure boundaries fail-closed and artifact-kind adaptation explicit', () => {
+    const widenedTopology = {
+      kind: 'graph_v1' as const,
+      nodes: ['source', 'middle', 'sink'].map((nodeId) => ({ nodeId })),
+      edges: [
+        { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'middle_input' },
+        { fromNodeId: 'source', toNodeId: 'sink', inputRef: 'direct_input' },
+        { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'middle_result' },
+      ],
+    };
+    // Reuse is bind-only, so binding `middle` without its predecessor is rejected rather
+    // than silently expanding the reused set to a node with no source and no execution.
+    expect(unboundReuseAncestors(widenedTopology, ['middle'])).toEqual(['source']);
+    expect(unboundReuseAncestors(widenedTopology, ['source', 'middle'])).toEqual([]);
+    expect(unboundReuseAncestors(widenedTopology, ['sink'])).toEqual(['middle', 'source']);
+    // Fan-out is safe under bind-only reuse: `source` is bound while `middle` and `sink`
+    // stay live, and each live consumer's edge from `source` is prefilled at start. The
+    // superseded closure expansion is what made a widened topology unsound.
+    expect(unboundReuseAncestors(widenedTopology, ['source'])).toEqual([]);
+
+    expect(isReusableArtifactKindCompatible('next_result', 'next_result', 'node')).toBe(true);
+    expect(isReusableArtifactKindCompatible('workflow_input', 'next_result', 'entry')).toBe(true);
+    expect(isReusableArtifactKindCompatible('workflow_input', 'next_result', 'node')).toBe(false);
+    expect(isReusableArtifactKindCompatible('text', 'next_result', 'entry')).toBe(false);
   });
 
   it('define path freezes graph_v1 without persisting rows on invalid shapes', () => {

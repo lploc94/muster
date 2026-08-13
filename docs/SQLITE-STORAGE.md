@@ -101,6 +101,7 @@ Command Palette: **Muster: Developer Reset Global Database**
   successful reset hard-quiesce and offer **Reload Window** — they must not keep writing a stale
   projection.
 - **Never automatic:** activation, open, or write failures do **not** auto-reset the database.
+- **Schema v3 and later:** the store remains **reset-only**. An incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
 
 ---
 
@@ -191,19 +192,25 @@ actions stay available.
 
 ---
 
-## 8. Schema v8 and migration notes
+## 8. Schema v4 and reset-only notes
 
-- Current owned schema is **v8**. Opening a populated **v7** store migrates under `BEGIN EXCLUSIVE`
-  with commit-boundary rollback; injected migration failure leaves readable v7 unchanged.
-- v8 adds workflow definition/run/node/gate tables and registers writer-version UDF + write-guard
-  triggers so already-open v7 connections fail closed with terminal `schema_changed` (Reload Window).
+- Current owned schema is **v4**. Muster has no in-place migration framework: opening an owned store
+  with any incompatible version fails closed with reset guidance and never rewrites user data.
+- Schema v4 includes workflow definition/run/node/gate tables, the writer-version UDF, and write-guard
+  triggers. An already-open stale writer fails closed with terminal `schema_changed` and must reload.
+- **v3 to v4** added reuse provenance to `workflow_nodes` (`source_run_id`, `source_node_id`,
+  `source_task_id`), recording which exact prior execution a `reused` node was bound to. Because the
+  store is reset-only, a v3 store is rejected rather than upgraded: there is no in-place path that
+  preserves existing task or chat history.
+- A Developer Reset creates an empty current-schema store; it is destructive replacement, not a
+  data-preserving migration. Back up first when existing task or chat history matters.
 - Diagnostics never expose database paths, SQL/parameters, credentials, prompt text, or artifact bodies.
 
 ## 9. Verification (contributors)
 
 ```bash
 npm run test:sqlite-storage-docs
-npx vitest run src/task/sqlite/privacy-redaction.test.ts src/task/sqlite/migration-v8.test.ts
+npx vitest run src/task/m024-s06-schema-evidence.test.ts src/task/sqlite/reset.test.ts src/task/sqlite/privacy-redaction.test.ts
 npm run test:source-boundary && npm run test:source-boundary:fixtures
 ```
 

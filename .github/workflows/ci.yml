@@ -52,6 +52,7 @@ jobs:
       - run: npm run test:source-boundary
       - run: npm run test:evidence
       - run: npm run test:m023-evidence-gate
+      - run: npm run test:m024-s06-gate
       - run: npm run test:source-boundary:fixtures
       - run: npm run test:settings-docs
       - run: npm run test:settings-live-evidence
@@ -90,6 +91,30 @@ jobs:
         env:
           MUSTER_VSCODE_VERSION: ${{ matrix.vscode-version }}
           MUSTER_EXPECT_INCOMPATIBLE: ${{ matrix.expect-incompatible }}
+
+  workflow-graph-native-host:
+    name: Workflow graph native host evidence
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - run: xvfb-run -a npm run test:m024-s06-workflow-graph-live-uat
+        env:
+          MUSTER_UAT_EVIDENCE_OUT: ${{ runner.temp }}/m024-s06-workflow-graph-evidence.json
+
+      - name: Upload workflow graph native-host evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m024-s06-workflow-graph-native-host-evidence
+          path: ${{ runner.temp }}/m024-s06-workflow-graph-evidence.json
+          if-no-files-found: warn
 
   packaging-gate:
     name: Packaging gate (Extension Host)
