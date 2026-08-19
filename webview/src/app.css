@@ -421,6 +421,18 @@ body {
   white-space: nowrap;
 }
 
+.task-tree-panel__orchestration {
+  flex-shrink: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  line-height: 1.2;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.9;
+}
+
 .task-tree-panel__row--focused .task-tree-panel__goal {
   font-weight: 600;
 }

@@ -294,6 +294,12 @@ export interface MusterTask {
    */
   committedSessionId?: string;
   /**
+   * Latest context-window usage for this task (ephemeral but now persisted for
+   * reload). `used`/`size` from `usage_update` or `compacted` flag. Mirrors
+   * webview `TaskThread.contextUsage`.
+   */
+  contextUsage?: { used?: number; size?: number; compacted: boolean };
+  /**
    * Monotonic runtime binding generation. Every queued turn is pinned to the
    * generation it was created under; late events from an older runtime must not
    * bind a session after a model/backend switch.

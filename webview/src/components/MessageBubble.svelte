@@ -9,8 +9,54 @@
     text: string;
     streaming?: boolean;
     showFooter?: boolean;
+    contextUsage?: { used?: number; size?: number; compacted: boolean } | null;
   }
-  let { role, text, streaming = false, showFooter = true }: Props = $props();
+  let { role, text, streaming = false, showFooter = true, contextUsage = null }: Props = $props();
+
+  function formatCompact(n: number): string {
+    if (n >= 1_000_000) {
+      const v = n / 1_000_000;
+      const s = v >= 10 ? Math.round(v).toString() : (Math.round(v * 10) / 10).toString();
+      return s.replace('.', ',') + 'M';
+    }
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return n.toLocaleString();
+  }
+
+  const ctxInfo = $derived.by(() => {
+    if (!contextUsage) return null;
+    if (contextUsage.used !== undefined && contextUsage.size !== undefined && contextUsage.size > 0) {
+      const used = contextUsage.used;
+      const size = contextUsage.size;
+      const remaining = Math.max(0, size - used);
+      const pctUsed = Math.min(100, Math.max(0, Math.round((used / size) * 100)));
+      const pctRemaining = 100 - pctUsed;
+      return {
+        used,
+        size,
+        remaining,
+        pctUsed,
+        pctRemaining,
+        compacted: contextUsage.compacted,
+        labelShort: `${pctUsed}% • ${formatCompact(used)}/${formatCompact(size)}${contextUsage.compacted ? ' • compacted' : ''}`,
+        labelFull: `${used.toLocaleString()} / ${size.toLocaleString()} used (${pctUsed}%, ${remaining.toLocaleString()} remaining)${contextUsage.compacted ? ' (compacted)' : ''}`,
+      };
+    }
+    if (contextUsage.compacted) {
+      return {
+        used: 0,
+        size: 0,
+        remaining: 0,
+        pctUsed: 0,
+        pctRemaining: 100,
+        compacted: true,
+        labelShort: 'compacted',
+        labelFull: 'Context compacted by Codex',
+      };
+    }
+    return null;
+  });
+  const circumference = 2 * Math.PI * 6; // r=6
 
   const rendered = $derived(role === 'assistant' && !streaming ? renderMarkdown(text) : '');
   const userHtml = $derived(role === 'user' ? renderUserTextWithMentions(text) : '');
@@ -130,17 +176,73 @@
     </div>
 
     {#if !streaming && showFooter}
-      <div class="flex justify-start mt-1 pl-1">
+      <div class="flex items-center justify-between mt-1 pl-1 gap-2 min-w-0">
         <button
           type="button"
-          class="icon-btn text-xs opacity-60 hover:opacity-100"
+          class="icon-btn text-xs opacity-60 hover:opacity-100 flex-shrink-0"
           aria-label={copied ? 'Copied!' : 'Copy message'}
           use:tip={copied ? 'Copied!' : 'Copy message'}
           onclick={copyMessage}
         >
           <span class="codicon {copied ? 'codicon-check' : 'codicon-copy'}"></span>
         </button>
+
+        {#if ctxInfo}
+          <div
+            class="flex items-center gap-1.5 text-[10px] opacity-60 ml-auto min-w-0"
+            data-testid="context-usage"
+            title={ctxInfo.labelFull + (ctxInfo.compacted ? ' (compacted)' : '')}
+            use:tip={ctxInfo.labelFull + (ctxInfo.compacted ? ' (compacted)' : '')}
+          >
+            <!-- circular progress: only this remains visible on narrow -->
+            <svg
+              width="14"
+              height="14"
+              viewBox="0 0 14 14"
+              class="flex-shrink-0"
+              aria-hidden="true"
+            >
+              <circle
+                cx="7"
+                cy="7"
+                r="6"
+                fill="none"
+                stroke="var(--vscode-panel-border)"
+                stroke-width="1.8"
+                opacity="0.35"
+              />
+              <circle
+                cx="7"
+                cy="7"
+                r="6"
+                fill="none"
+                stroke={ctxInfo.pctUsed > 80
+                  ? 'var(--vscode-errorForeground)'
+                  : ctxInfo.pctUsed > 60
+                    ? 'var(--vscode-charts-orange, #ff8800)'
+                    : 'var(--vscode-progressBar-background, #0e639c)'}
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-dasharray={`${(ctxInfo.pctUsed / 100) * circumference} ${circumference}`}
+                transform="rotate(-90 7 7)"
+                opacity="0.9"
+              />
+            </svg>
+            <span class="context-inline-text truncate">
+              {ctxInfo.labelShort}
+            </span>
+          </div>
+        {/if}
       </div>
     {/if}
   </div>
 {/if}
+
+<style>
+  /* Khi không đủ chỗ (sidebar hẹp) chỉ hiện vòng tròn */
+  @media (max-width: 360px) {
+    :global(.context-inline-text) {
+      display: none;
+    }
+  }
+</style>

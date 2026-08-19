@@ -597,6 +597,15 @@
                       <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
                     </button>
                   </div>
+                  {#if row.task.childOrchestration?.label}
+                    <div
+                      class="task-tree-panel__orchestration"
+                      style={`margin-left: ${30 + Math.min(row.depth, 4) * 12}px`}
+                      use:tip={row.task.childOrchestration.label}
+                    >
+                      {row.task.childOrchestration.label}
+                    </div>
+                  {/if}
                   {#if menuOpen}
                     <div
                       class="task-tree-panel__status-menu"
@@ -676,6 +685,11 @@
                   <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
                 </button>
               </div>
+              {#if row.task.childOrchestration?.label}
+                <div class="task-tree-panel__orchestration" style="margin-left: 30px" use:tip={row.task.childOrchestration.label}>
+                  {row.task.childOrchestration.label}
+                </div>
+              {/if}
               {#if menuOpen}
                 <div
                   class="task-tree-panel__status-menu"

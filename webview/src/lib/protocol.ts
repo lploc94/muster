@@ -118,6 +118,8 @@ export interface TaskSummary {
     needsParentInput: number;
     label: string;
   };
+  /** Latest context-window usage for inline badge (persisted). */
+  contextUsage?: { used?: number; size?: number; compacted: boolean };
 }
 
 export interface TranscriptItem {
@@ -241,6 +243,8 @@ export interface SnapshotMessage {
   queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: PendingAsk;
+  /** Persisted context usage for focused task (badge survives reload). */
+  contextUsage?: { used?: number; size?: number; compacted: boolean };
 }
 
 export type RunLimitSetting = '15m' | '30m' | '1h' | '2h' | '4h' | '8h';
@@ -1178,6 +1182,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
       'model',
       'continuationOf',
       'childOrchestration',
+      'contextUsage',
     ])
   ) {
     return false;
@@ -1246,7 +1251,13 @@ function isTaskSummary(v: unknown): v is TaskSummary {
         isNonNegativeSafeInteger(v.childOrchestration.terminal) &&
         isNonNegativeSafeInteger(v.childOrchestration.awaitingParentSeal) &&
         isNonNegativeSafeInteger(v.childOrchestration.needsParentInput) &&
-        isString(v.childOrchestration.label)))
+        isString(v.childOrchestration.label))) &&
+    (v.contextUsage === undefined ||
+      (isRecord(v.contextUsage) &&
+        hasOnlyKeys(v.contextUsage, ['used', 'size', 'compacted']) &&
+        (v.contextUsage.used === undefined || isNonNegativeSafeInteger(v.contextUsage.used)) &&
+        (v.contextUsage.size === undefined || isNonNegativeSafeInteger(v.contextUsage.size)) &&
+        typeof v.contextUsage.compacted === 'boolean'))
   );
 }
 
@@ -1644,6 +1655,7 @@ export function isExtMessage(data: unknown): data is ExtMessage {
             'queuedTurns',
             'pendingAsk',
             'storeRevision',
+            'contextUsage',
           ]) &&
           isNumber(data.protocolVersion) &&
           Array.isArray(data.rootTasks) &&
@@ -1660,7 +1672,13 @@ export function isExtMessage(data: unknown): data is ExtMessage {
               isString(data.pendingAsk.turnId) &&
               isString(data.pendingAsk.askId) &&
               Array.isArray(data.pendingAsk.questions) &&
-              data.pendingAsk.questions.every(isQuestion)))
+              data.pendingAsk.questions.every(isQuestion))) &&
+          (data.contextUsage === undefined ||
+            (isRecord(data.contextUsage) &&
+              hasOnlyKeys(data.contextUsage, ['used', 'size', 'compacted']) &&
+              (data.contextUsage.used === undefined || isNonNegativeSafeInteger(data.contextUsage.used)) &&
+              (data.contextUsage.size === undefined || isNonNegativeSafeInteger(data.contextUsage.size)) &&
+              typeof data.contextUsage.compacted === 'boolean'))
         )
       ) {
         return false;

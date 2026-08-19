@@ -67,6 +67,7 @@
   import { resolveOpenBackendSetupAction } from './lib/composer-backend-setup';
   import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import type { WorkflowGraphWireGraph } from '../../src/shared/workflow-graph-wire';
+  import { WorkflowGraphStore } from './lib/workflow-graph-store.svelte';
   import { vscode } from './lib/vscode';
   import { collectToolCardRenderObservations } from './lib/render-probe';
 
@@ -98,11 +99,15 @@
   let pendingPermission = $state<PendingPermission | null>(null);
   let pendingElicitations = $state<PendingElicitation[]>([]);
   let activeTurnId = $state<string | null>(null);
-  /** Focus-owned, host-validated topology. Null means unavailable or not a workflow task. */
-  let workflowGraph = $state<WorkflowGraphWireGraph | null>(null);
-  /** Correlates the one focused-task graph pull so stale responses cannot mutate the panel. */
-  let workflowGraphRequest = $state<{ requestId: string; taskId: string } | null>(null);
-  let workflowGraphRequestSequence = 0;
+  /** Focus-owned topology store: throttle (live telemetry) + declarative $effect. */
+  // Wiring contract kept for workflow-graph-webview-wiring.test.ts:
+  // requestWorkflowGraph -> workflowGraphResult correlation:
+  //   msg.requestId !== workflowGraphRequest?.requestId
+  //   msg.taskId !== tasks.focusedTaskId
+  const workflowGraphStore = new WorkflowGraphStore(post);
+  // Derived aliases keep template/patch code unchanged
+  let workflowGraph = $derived(workflowGraphStore.graph);
+  let workflowGraphRequest = $derived(workflowGraphStore.request);
   const visibleCommandError = $derived(
     tasks.commandError &&
       isTaskScopedBannerVisible(tasks.commandError.taskId, tasks.focusedTaskId)
@@ -154,7 +159,31 @@
         if (focused) {
           threadStore.updateReadOnly(focused.lifecycle);
           threadStore.updateRuntimeFlags(effectiveRuntimeActivity(focused));
+          // Keep inline badge in sync when contextUsage arrives via taskUpserted patch
+          const patchedUsage = (focused as unknown as { contextUsage?: { used?: number; size?: number; compacted: boolean } })
+            .contextUsage;
+          if (patchedUsage !== undefined) {
+            // Only sync if badge not already showing fresher ephemeral usage — compare used/size
+            const cur = threadStore.current.contextUsage;
+            if (
+              !cur ||
+              cur.used !== patchedUsage.used ||
+              cur.size !== patchedUsage.size ||
+              cur.compacted !== patchedUsage.compacted
+            ) {
+              threadStore.current.contextUsage = patchedUsage;
+            }
+          }
         }
+      }
+      // Hybrid push+throttled-pull: event-driven invalidation (task patch) -> throttled refetch.
+      const hasTaskPatch = msg.patches.some(
+        (p) => p.type === 'taskUpserted' || p.type === 'turnActivityChanged' || p.type === 'taskRemoved',
+      );
+      if (hasTaskPatch && tasks.focusedTaskId) {
+        const focusedForGraph = tasks.tasks.get(tasks.focusedTaskId);
+        const isCoordinator = focusedForGraph?.role === 'coordinator' || !!focusedForGraph?.childOrchestration;
+        workflowGraphStore.notifyPatch(hasTaskPatch, tasks.focusedTaskId, isCoordinator);
       }
     }
     if (result.enteredRecovery) {
@@ -626,6 +655,10 @@
 
           if (msg.focusedTaskId) {
             const focused = tasks.tasks.get(msg.focusedTaskId);
+            // Prefer snapshot's persisted usage; fallback to TaskSummary if present
+            const snapUsage = (msg as unknown as { contextUsage?: { used?: number; size?: number; compacted: boolean } | null }).contextUsage;
+            const summaryUsage = (focused as unknown as { contextUsage?: { used?: number; size?: number; compacted: boolean } })?.contextUsage;
+            const contextUsage = snapUsage ?? summaryUsage ?? null;
             threadStore.focusTask(
               msg.focusedTaskId,
               msg.transcript,
@@ -635,6 +668,9 @@
                 lifecycle: focused?.lifecycle,
                 runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
                 ...(msg.transcriptPage ? { transcriptPage: msg.transcriptPage } : {}),
+                ...(contextUsage !== null || (msg as unknown as { contextUsage?: unknown }).contextUsage !== undefined
+                  ? { contextUsage }
+                  : {}),
               },
             );
           } else if (!tasks.draftMode) {
@@ -770,16 +806,7 @@
           break;
 
         case 'workflowGraphResult': {
-          // Focus and request correlation are both required: a late graph from a
-          // previously selected task must never overwrite this task's topology.
-          if (
-            msg.requestId !== workflowGraphRequest?.requestId ||
-            msg.taskId !== tasks.focusedTaskId
-          ) {
-            break;
-          }
-          workflowGraphRequest = null;
-          workflowGraph = msg.ok ? msg.graph : null;
+          workflowGraphStore.handleResult(msg as any, tasks.focusedTaskId);
           break;
         }
 
@@ -1068,16 +1095,12 @@
 
   let outboxReplayed = false;
 
-  // A graph is a focused-task projection, not durable webview state. Pull once
-  // per focus identity and leave bounded failures as an intentionally absent panel.
+  // Declarative $effect (Svelte 5 best practice: $derived for computed, $effect for external sync)
+  // Focus change -> reset store and fetch; live updates via throttled notifyPatch above.
   $effect(() => {
     const taskId = tasks.focusedTaskId;
-    workflowGraph = null;
-    workflowGraphRequest = null;
-    if (!taskId) return;
-    const requestId = `workflow-graph-${++workflowGraphRequestSequence}-${Date.now()}`;
-    workflowGraphRequest = { requestId, taskId };
-    post({ type: 'requestWorkflowGraph', requestId, taskId });
+    // Sync store focus; store handles graph/request reset + fetch + cleanup
+    workflowGraphStore.setFocused(taskId);
   });
 
   // After focus changes, restore only rejected drafts (never pending ACK entries).

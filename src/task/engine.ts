@@ -4749,10 +4749,46 @@ export class TaskEngine {
           continue;
         }
 
-        // Ephemeral usage only — durable assistant/reasoning/tool UI posts only
-        // after successful appendTranscriptBatch (P4-W8 durable-before-visible).
+        // Usage: still emit ephemerally, but also persist latest context window
+        // usage on the task so the badge survives webview/host reloads.
         if (event.type === 'usage') {
           this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
+          // Persist only context-relevant keys (used/size/compacted)
+          const u = event.usage as Record<string, unknown>;
+          const usedRaw = u.used;
+          const sizeRaw = u.size;
+          const compactedRaw = u.compacted;
+          const used = typeof usedRaw === 'number' && Number.isFinite(usedRaw) ? usedRaw : undefined;
+          const size = typeof sizeRaw === 'number' && Number.isFinite(sizeRaw) && sizeRaw > 0 ? sizeRaw : undefined;
+          const compacted = compactedRaw === true;
+          if (used !== undefined || size !== undefined || compacted) {
+            const file = this.store.getFile();
+            const task = file.tasks[turn.taskId];
+            if (task) {
+              const prev = task.contextUsage ?? { compacted: false };
+              const next: { used?: number; size?: number; compacted: boolean } = {
+                compacted: compacted || prev.compacted,
+                ...(used !== undefined ? { used } : prev.used !== undefined ? { used: prev.used } : {}),
+                ...(size !== undefined ? { size } : prev.size !== undefined ? { size: prev.size } : {}),
+              };
+              const changed =
+                next.used !== prev.used || next.size !== prev.size || next.compacted !== prev.compacted;
+              if (changed) {
+                const updatedAt = nowIso(this.clock);
+                const updatedTask = {
+                  ...task,
+                  contextUsage: next,
+                  updatedAt,
+                  revision: task.revision + 1,
+                };
+                // optimistic in-memory so next snapshot sees it immediately
+                file.tasks[turn.taskId] = updatedTask;
+                void this.repository
+                  .execute({ kind: 'upsertTask', workspaceId: this.workspaceId, task: updatedTask })
+                  .catch(() => undefined);
+              }
+            }
+          }
         }
 
         switch (event.type) {

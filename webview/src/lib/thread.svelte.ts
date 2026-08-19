@@ -168,6 +168,7 @@ export class TaskThread {
       lifecycle?: string;
       runtimeActivity?: TaskRuntimeActivity | null;
       transcriptPage?: TranscriptPageState;
+      contextUsage?: { used?: number; size?: number; compacted: boolean } | null;
     },
   ): void {
     // Keep the live streaming buffer only if it belongs to the still-active turn and
@@ -207,6 +208,11 @@ export class TaskThread {
     this.lastAppliedRequestId = undefined;
     const runtime = opts?.runtimeActivity ?? (viewStatus === 'running' || viewStatus === 'waiting_user' ? viewStatus : null);
     this.running = runtime === 'running' || runtime === 'waiting_user';
+    // Persisted context usage survives reload (snapshot.contextUsage). Restore it here;
+    // live usage events will still update it via applyEvent.
+    if (opts && 'contextUsage' in opts) {
+      this.contextUsage = opts.contextUsage ?? null;
+    }
     // Restore "had a process" after reload: live/recovery runtime, or any transcript
     // (implies a prior turn). Composer also treats committedSessionId as hadProcess.
     if (this.running || runtime === 'needs_recovery' || next.length > 0) {
@@ -600,6 +606,7 @@ class ThreadStore {
       lifecycle?: string;
       runtimeActivity?: TaskRuntimeActivity | null;
       transcriptPage?: TranscriptPageState;
+      contextUsage?: { used?: number; size?: number; compacted: boolean } | null;
     },
   ): void {
     const thread = this.getOrCreate(taskId);

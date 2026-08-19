@@ -86,6 +86,8 @@ export interface TaskSummary {
     needsParentInput: number;
     label: string;
   };
+  /** Latest context-window usage for inline badge (persisted on MusterTask). */
+  contextUsage?: { used?: number; size?: number; compacted: boolean };
 }
 
 /** Optional ACP diff-block evidence projected to the webview (M020 / M021 S04). */
@@ -227,6 +229,8 @@ export interface TaskSnapshot {
   queuedTurns?: QueuedTurnProjection[];
   storeRevision: number;
   pendingAsk?: { turnId: string; askId: string; questions: Question[] };
+  /** Persisted context usage for the focused task (so badge survives reload). */
+  contextUsage?: { used?: number; size?: number; compacted: boolean };
 }
 
 export interface PendingAskOverlay {
@@ -497,6 +501,7 @@ export function projectTaskSummary(file: EngineProjection, taskId: string): Task
     model: task.model,
     continuationOf: task.continuationOf,
     ...(childOrchestration ? { childOrchestration } : {}),
+    ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
   };
 }
 
@@ -746,6 +751,11 @@ export function buildSnapshot(
       askId: pending.askId,
       questions: pending.questions,
     };
+  }
+
+  const focusedTask = effectiveFocusId ? file.tasks[effectiveFocusId] : undefined;
+  if (focusedTask?.contextUsage) {
+    snapshot.contextUsage = focusedTask.contextUsage;
   }
 
   return snapshot;

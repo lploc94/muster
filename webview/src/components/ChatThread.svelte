@@ -838,15 +838,53 @@
     };
   }
 
-  function contextUsageLabel(): string {
-    const usage = thread.contextUsage;
-    if (!usage) return '';
-    if (usage.used !== undefined && usage.size !== undefined) {
-      const remaining = Math.max(0, usage.size - usage.used);
-      return `Context ${remaining.toLocaleString()} / ${usage.size.toLocaleString()} tokens remaining${usage.compacted ? ' (compacted)' : ''}`;
+  // compact helper: 1_048_576 -> 1M, 125_000 -> 125K
+  function formatCompactTokens(n: number): string {
+    if (n >= 1_000_000) {
+      const v = n / 1_000_000;
+      const s = v >= 10 ? Math.round(v).toString() : (Math.round(v * 10) / 10).toString();
+      return s.replace('.', ',') + 'M';
     }
-    return usage.compacted ? 'Context compacted by Codex' : '';
+    if (n >= 1000) return Math.round(n / 1000) + 'K';
+    return n.toLocaleString();
   }
+
+  const footerContextInfo = $derived.by(() => {
+    const usage = thread.contextUsage;
+    if (!usage) return null;
+    if (usage.used !== undefined && usage.size !== undefined && usage.size > 0) {
+      const used = usage.used;
+      const size = usage.size;
+      const remaining = Math.max(0, size - used);
+      const pctUsed = Math.min(100, Math.max(0, Math.round((used / size) * 100)));
+      return {
+        used,
+        size,
+        remaining,
+        pctUsed,
+        compacted: usage.compacted,
+        labelShort: `${pctUsed}% • ${formatCompactTokens(used)}/${formatCompactTokens(size)}${usage.compacted ? ' • compacted' : ''}`,
+        labelFull: `${used.toLocaleString()} / ${size.toLocaleString()} used (${pctUsed}%, ${remaining.toLocaleString()} remaining)${usage.compacted ? ' (compacted)' : ''}`,
+      };
+    }
+    if (usage.compacted) {
+      return {
+        used: 0,
+        size: 0,
+        remaining: 0,
+        pctUsed: 0,
+        compacted: true,
+        labelShort: 'compacted',
+        labelFull: 'Context compacted by Codex',
+      };
+    }
+    return null;
+  });
+  const footerCircumference = 2 * Math.PI * 6;
+  // footer fallback when inline badge not visible (no last assistant) or during streaming (inline is on previous bubble)
+  const showFooterContext = $derived(
+    !!footerContextInfo && (!lastAssistantIdValue || !!thread.streaming),
+  );
 </script>
 
 <div class="relative flex-1 min-h-0 flex flex-col">
@@ -924,6 +962,7 @@
                   role="assistant"
                   text={item.text}
                   showFooter={item.id === lastAssistantIdValue}
+                  contextUsage={item.id === lastAssistantIdValue ? thread.contextUsage : null}
                 />
               {:else if item.kind === 'tool'}
                 <ToolCard tool={item} />
@@ -971,12 +1010,38 @@
       {#if thread.items.length === 0 && !thread.streaming}
         <div class="text-center mt-4" style="opacity: 0.6;">No messages yet.</div>
       {/if}
-      {#if contextUsageLabel()}
+      {#if showFooterContext && footerContextInfo}
         <div
-          class="mt-1 text-right text-[10px] opacity-60"
+          class="mt-1 flex justify-end"
           data-testid="context-usage"
-          title="Latest context-window usage reported by the backend"
-        >{contextUsageLabel()}</div>
+          title={footerContextInfo.labelFull}
+        >
+          <div
+            class="flex items-center gap-1.5 text-[10px] opacity-60"
+            use:tip={footerContextInfo.labelFull}
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" class="flex-shrink-0" aria-hidden="true">
+              <circle cx="7" cy="7" r="6" fill="none" stroke="var(--vscode-panel-border)" stroke-width="1.8" opacity="0.35" />
+              <circle
+                cx="7"
+                cy="7"
+                r="6"
+                fill="none"
+                stroke={footerContextInfo.pctUsed > 80
+                  ? 'var(--vscode-errorForeground)'
+                  : footerContextInfo.pctUsed > 60
+                    ? 'var(--vscode-charts-orange, #ff8800)'
+                    : 'var(--vscode-progressBar-background, #0e639c)'}
+                stroke-width="1.8"
+                stroke-linecap="round"
+                stroke-dasharray={`${(footerContextInfo.pctUsed / 100) * footerCircumference} ${footerCircumference}`}
+                transform="rotate(-90 7 7)"
+                opacity="0.9"
+              />
+            </svg>
+            <span class="context-inline-text truncate">{footerContextInfo.labelShort}</span>
+          </div>
+        </div>
       {/if}
     </div>
   </div>
@@ -994,3 +1059,11 @@
     </button>
   {/if}
 </div>
+
+<style>
+  @media (max-width: 360px) {
+    :global(.context-inline-text) {
+      display: none;
+    }
+  }
+</style>
