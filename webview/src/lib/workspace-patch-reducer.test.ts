@@ -568,6 +568,51 @@ describe('workspace-patch-reducer', () => {
     );
     expect(result.state.tasks.get('task-1')).toEqual(next);
   });
+
+  it('preserves repository workflow status until a refreshed snapshot replaces it', () => {
+    let state = applySnapshotToPatchView(emptyWorkspacePatchViewState(), focusedSnapshot(1));
+    const existing = state.tasks.get('task-1')!;
+    const withWorkflow = {
+      ...existing,
+      workflowNodeStatus: 'active',
+      ownerWorkflowStatus: 'running',
+    };
+    state = {
+      ...state,
+      tasks: new Map(state.tasks).set('task-1', withWorkflow),
+      subtree: state.subtree.map((entry) => entry.id === 'task-1' ? withWorkflow : entry),
+    };
+
+    const result = applyWorkspacePatchBatch(
+      state,
+      batch(2, [{ type: 'turnActivityChanged', task: task('task-1', { runtimeActivity: 'running' }) }]),
+    );
+    expect(result.state.tasks.get('task-1')?.workflowNodeStatus).toBe('active');
+    expect(result.state.tasks.get('task-1')?.ownerWorkflowStatus).toBe('running');
+  });
+
+  it('keeps loaded transcript pages on an equal-revision metadata refresh', () => {
+    let state = applySnapshotToPatchView(emptyWorkspacePatchViewState(), focusedSnapshot(4));
+    const older = { id: 'older-user', kind: 'user' as const, text: 'older' };
+    state = {
+      ...state,
+      transcriptItems: [older, ...state.transcriptItems],
+      loadedTranscriptIds: new Set([...state.loadedTranscriptIds, older.id]),
+      transcriptWorkspaceRevision: 4,
+    };
+
+    const refreshed = focusedSnapshot(4);
+    refreshed.rootTasks[0] = {
+      ...refreshed.rootTasks[0],
+      ownerWorkflowStatus: 'succeeded',
+    };
+    refreshed.subtree![0] = refreshed.rootTasks[0];
+    const next = applySnapshotToPatchView(state, refreshed);
+
+    expect(next.transcriptItems[0]).toEqual(older);
+    expect(next.loadedTranscriptIds.has(older.id)).toBe(true);
+    expect(next.tasks.get('task-1')?.ownerWorkflowStatus).toBe('succeeded');
+  });
 });
 
 

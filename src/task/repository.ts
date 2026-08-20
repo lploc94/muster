@@ -791,6 +791,17 @@ export interface TaskRepository {
   getWorkflowStatusForTask(taskId: string): Promise<WorkflowTaskStatusProjection | undefined>;
   /** Host-only bounded topology and lifecycle graph for the run containing taskId. */
   getWorkflowGraphForTask(taskId: string): Promise<WorkflowGraphProjection | undefined>;
+  /** Batch workflow node status for per-node task chrome (succeeded while lifecycle open). */
+  getWorkflowNodeStatusesForTasks(taskIds: readonly string[]): Promise<ReadonlyMap<string, string>>;
+  /** Batch owner workflow run status for coordinator roots (succeeded run but task still open). */
+  getOwnerWorkflowRunStatusesForTasks(taskIds: readonly string[]): Promise<ReadonlyMap<string, string>>;
+  /** Global composer selection (applies to all workspaces) */
+  getGlobalComposerSelection(): Promise<{ backend: string; model: string | null } | null>;
+  setGlobalComposerSelection(selection: { backend: string; model: string | null }): Promise<void>;
+  /** Global backend verification (Test Connection) */
+  getGlobalBackendVerification(backendId: string): Promise<{ verified: boolean; version: string | null; checkedAt: string } | null>;
+  setGlobalBackendVerification(backendId: string, verified: boolean, version: string | null, checkedAt: string): Promise<void>;
+  listGlobalBackendVerifications(): Promise<ReadonlyMap<string, { verified: boolean; version: string | null; checkedAt: string }>>;
   /** Bounded public diagnostic projection for a workflow run owned by the caller root. */
   inspectWorkflowRun(
     runId: string,
@@ -2675,6 +2686,120 @@ export class SqliteTaskRepository implements TaskRepository {
       },
       diagnostics: diagnostics.slice(0, 8),
     };
+  }
+
+  async getWorkflowNodeStatusesForTasks(taskIds: readonly string[]): Promise<ReadonlyMap<string, string>> {
+    if (taskIds.length === 0) return new Map();
+    const placeholders = taskIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ task_id: string; status: string }>(
+      `SELECT task_id, status FROM workflow_nodes
+         WHERE workspace_id = ? AND task_id IN (${placeholders}) AND task_id IS NOT NULL`,
+      [this.workspaceId, ...taskIds],
+    );
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      if (typeof row.task_id === 'string' && typeof row.status === 'string') {
+        map.set(row.task_id, row.status);
+      }
+    }
+    return map;
+  }
+
+  async getOwnerWorkflowRunStatusesForTasks(taskIds: readonly string[]): Promise<ReadonlyMap<string, string>> {
+    if (taskIds.length === 0) return new Map();
+    const placeholders = taskIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ owner_root_task_id: string; status: string }>(
+      `SELECT owner_root_task_id, status
+         FROM (
+           SELECT owner_root_task_id, status,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY owner_root_task_id
+                    ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+                             updated_at DESC,
+                             run_id DESC
+                  ) AS rank
+             FROM workflow_runs
+            WHERE workspace_id = ?
+              AND owner_root_task_id IN (${placeholders})
+              AND owner_root_task_id IS NOT NULL
+              AND parent_run_id IS NULL
+         ) ranked
+        WHERE rank = 1`,
+      [this.workspaceId, ...taskIds],
+    );
+    const map = new Map<string, string>();
+    for (const row of rows) {
+      if (typeof row.owner_root_task_id === 'string' && typeof row.status === 'string') {
+        map.set(row.owner_root_task_id, row.status);
+      }
+    }
+    return map;
+  }
+
+  private async ownerTaskChangesForRuns(runIds: readonly string[]): Promise<ChangeRecord[]> {
+    if (runIds.length === 0) return [];
+    const placeholders = runIds.map(() => '?').join(',');
+    const rows = await this.db.all<{ owner_root_task_id: string | null }>(
+      `SELECT owner_root_task_id FROM workflow_runs WHERE workspace_id = ? AND run_id IN (${placeholders})`,
+      [this.workspaceId, ...runIds],
+    );
+    const changes: ChangeRecord[] = [];
+    for (const row of rows) {
+      if (typeof row.owner_root_task_id === 'string' && row.owner_root_task_id.length > 0) {
+        changes.push({ kind: 'task', id: row.owner_root_task_id, change: 'effect' });
+      }
+    }
+    return changes;
+  }
+
+  async getGlobalComposerSelection(): Promise<{ backend: string; model: string | null } | null> {
+    const row = await this.db.get<{ backend: string; model: string | null }>(
+      `SELECT backend, model FROM global_composer_selection WHERE id = 1`,
+    );
+    if (!row || typeof row.backend !== 'string') return null;
+    return { backend: row.backend, model: row.model ?? null };
+  }
+
+  async setGlobalComposerSelection(selection: { backend: string; model: string | null }): Promise<void> {
+    await this.db.run(
+      `INSERT INTO global_composer_selection (id, backend, model, updated_at)
+         VALUES (1, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET backend = excluded.backend, model = excluded.model, updated_at = excluded.updated_at`,
+      [selection.backend, selection.model, new Date().toISOString()],
+    );
+  }
+
+  async getGlobalBackendVerification(backendId: string): Promise<{ verified: boolean; version: string | null; checkedAt: string } | null> {
+    const row = await this.db.get<{ verified: number; version: string | null; checked_at: string }>(
+      `SELECT verified, version, checked_at FROM global_backend_verification WHERE backend_id = ?`,
+      [backendId],
+    );
+    if (!row) return null;
+    return { verified: row.verified === 1, version: row.version ?? null, checkedAt: row.checked_at };
+  }
+
+  async setGlobalBackendVerification(backendId: string, verified: boolean, version: string | null, checkedAt: string): Promise<void> {
+    await this.db.run(
+      `INSERT INTO global_backend_verification (backend_id, verified, version, checked_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(backend_id) DO UPDATE SET
+           verified = excluded.verified,
+           version = excluded.version,
+           checked_at = excluded.checked_at
+         WHERE excluded.checked_at >= global_backend_verification.checked_at`,
+      [backendId, verified ? 1 : 0, version, checkedAt],
+    );
+  }
+
+  async listGlobalBackendVerifications(): Promise<ReadonlyMap<string, { verified: boolean; version: string | null; checkedAt: string }>> {
+    const rows = await this.db.all<{ backend_id: string; verified: number; version: string | null; checked_at: string }>(
+      `SELECT backend_id, verified, version, checked_at FROM global_backend_verification`,
+    );
+    const map = new Map<string, { verified: boolean; version: string | null; checkedAt: string }>();
+    for (const row of rows) {
+      map.set(row.backend_id, { verified: row.verified === 1, version: row.version ?? null, checkedAt: row.checked_at });
+    }
+    return map;
   }
 
   async inspectWorkflowRun(
@@ -6750,15 +6875,6 @@ export class SqliteTaskRepository implements TaskRepository {
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
   ): Promise<WorkflowEffectPlan> {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
-    const disposition = command.turn.disposition;
-    if (
-      !disposition ||
-      disposition.kind !== 'workflow_next' ||
-      disposition.route !== undefined ||
-      command.turn.status !== 'succeeded'
-    ) {
-      return empty;
-    }
 
     const producerNode = await this.db.get<{ run_id: string; node_id: string }>(
       `SELECT run_id, node_id FROM workflow_nodes
@@ -6768,6 +6884,14 @@ export class SqliteTaskRepository implements TaskRepository {
     if (!producerNode || typeof producerNode.run_id !== 'string' || typeof producerNode.node_id !== 'string') {
       return empty;
     }
+
+    const disposition = command.turn.disposition;
+    if (
+      !disposition ||
+      disposition.kind !== 'workflow_next' ||
+      disposition.route !== undefined ||
+      command.turn.status !== 'succeeded'
+    ) return empty;
 
     const run = await this.db.get<{
       run_id: string;
@@ -6803,7 +6927,8 @@ export class SqliteTaskRepository implements TaskRepository {
     ) {
       return empty;
     }
-    if (disposition.change === 'unchanged') {
+    if (!disposition) return empty;
+    if ((disposition as any).change === 'unchanged') {
       return this.planWorkflowFailClosure({
         runId: producerNode.run_id,
         reasonCode: 'invalid_route',
@@ -6873,7 +6998,7 @@ export class SqliteTaskRepository implements TaskRepository {
             producerNode.node_id,
             'engine',
             'terminal_next',
-            encodePayload({ kind: 'terminal_next', sourceTurnId: command.turn.id, change: disposition.change }),
+            encodePayload({ kind: 'terminal_next', sourceTurnId: command.turn.id, change: (disposition as any).change }),
             finishedAt,
           ],
         },
@@ -6891,7 +7016,7 @@ export class SqliteTaskRepository implements TaskRepository {
             'next_result',
             revision,
             'next_result',
-            encodePayload({ kind: 'next_result', schema: 1, change: disposition.change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
+            encodePayload({ kind: 'next_result', schema: 1, change: (disposition as any).change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
             finishedAt,
           ],
         },
@@ -6911,8 +7036,10 @@ export class SqliteTaskRepository implements TaskRepository {
           params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
         },
       ];
+      // Per-node chrome: even though task lifecycle stays open until run terminal, notify tree so workflowNodeStatus flips live
+      const perNodeWorkflowChange: ChangeRecord[] = [{ kind: 'task', id: command.task.id, change: 'effect' }];
       if (!terminalCompletion.complete) {
-        return { statements, changes: [] };
+        return { statements, changes: perNodeWorkflowChange };
       }
 
       const terminalArtifactId = terminalIds.length > 1
@@ -6936,7 +7063,7 @@ export class SqliteTaskRepository implements TaskRepository {
             encodePayload({
               kind: 'next_result',
               schema: 1,
-              change: disposition.change,
+              change: (disposition as any).change,
               producerNodeId: producerNode.node_id,
               sourceTurnId: command.turn.id,
               result: terminalCompletion.result,
@@ -6981,16 +7108,17 @@ export class SqliteTaskRepository implements TaskRepository {
         ],
       });
       statements.push(...taskClosure.statements);
+      const ownerChange = await this.ownerTaskChangesForRuns([producerNode.run_id]);
       return {
         statements,
-        changes: taskClosure.changes,
+        changes: [...perNodeWorkflowChange, ...taskClosure.changes, ...ownerChange],
       };
     }
     if (topology.kind !== 'graph_v1') return empty;
 
     const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
     // D050 / R027: contribution-scoped revision is deterministic (not priorMax+1).
-    const revision = deriveProducerArtifactRevision(disposition.change);
+    const revision = deriveProducerArtifactRevision((disposition as any).change);
     type PlannedFill = {
       edge: (typeof topology.edges)[number];
       gateId: string;
@@ -7150,7 +7278,7 @@ export class SqliteTaskRepository implements TaskRepository {
       consumerNodeId: initialEdge.toNodeId,
       artifactId,
       artifactRevision: revision,
-      change: disposition.change,
+      change: (disposition as any).change,
       // Identities only — never prompt/result bodies, paths, SQL, or credentials.
       sourceTurnId: command.turn.id,
     });
@@ -7175,7 +7303,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const artifactPayload = encodePayload({
       kind: 'next_result',
       schema: 1,
-      change: disposition.change,
+      change: (disposition as any).change,
       producerNodeId: producerNode.node_id,
       sourceTurnId: command.turn.id,
       ...(resultBody !== undefined ? { result: resultBody } : {}),
@@ -7209,10 +7337,12 @@ export class SqliteTaskRepository implements TaskRepository {
     }));
     statements.push({
       sql: `UPDATE workflow_nodes
-               SET status = 'succeeded'
-             WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND status = 'active'`,
+                SET status = 'succeeded'
+              WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND status = 'active'`,
       params: [this.workspaceId, producerNode.run_id, producerNode.node_id],
     });
+    // Notify task chrome that per-node status changed even though lifecycle stays open (run-level seal)
+    changes.push({ kind: 'task', id: command.task.id, change: 'effect' });
 
     for (const fill of plannedFills) {
       statements.push({
@@ -8338,7 +8468,7 @@ export class SqliteTaskRepository implements TaskRepository {
     // Response contribution: updated feedback creates a new immutable revision;
     // unchanged feedback points at the latest pinned revision.
     const artifactId = deriveProducerArtifactId(targetNode.run_id, matched.targetNodeId);
-    if (disposition.change === 'unchanged' && artifactId !== matched.baseArtifactId) {
+    if ((disposition as any).change === 'unchanged' && artifactId !== matched.baseArtifactId) {
       return this.planWorkflowFailClosure({
         runId: targetNode.run_id,
         reasonCode: 'invalid_route',
@@ -8353,14 +8483,14 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId, targetNode.run_id, artifactId],
     );
     const latestRevision = latestArtifact?.revision ?? 1;
-    const revision = disposition.change === 'unchanged'
+    const revision = (disposition as any).change === 'unchanged'
       ? matched.baseArtifactRevision
       : latestRevision + 1;
-      const resultBody = typeof disposition.result === 'string' ? disposition.result : undefined;
+      const resultBody = typeof (disposition as any).result === 'string' ? (disposition as any).result : undefined;
     const artifactPayload = encodePayload({
       kind: 'next_result',
       schema: 1,
-      change: disposition.change,
+      change: (disposition as any).change,
       producerNodeId: matched.targetNodeId,
       sourceTurnId: command.turn.id,
       feedbackRoundId: matched.roundId,
@@ -8403,7 +8533,7 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
     });
 
-    if (disposition.change === 'updated') {
+    if ((disposition as any).change === 'updated') {
       statements.push({
       sql: `INSERT INTO workflow_artifacts (
               workspace_id, run_id, artifact_id, producer_node_id, logical_name,
@@ -9653,7 +9783,7 @@ export class SqliteTaskRepository implements TaskRepository {
     )) {
       return empty;
     }
-    const resultBody = workflowResultFromSettlement(command, disposition.result);
+    const resultBody = workflowResultFromSettlement(command, (disposition as any).result);
     const terminalCompletion = await this.workflowTerminalCompletion(
       childNode.runId,
       terminalIds,
@@ -9684,7 +9814,7 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTurnId: command.turn.id,
       });
     }
-    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${disposition.change}\n${returnResult ?? ''}`;
+    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${(disposition as any).change}\n${returnResult ?? ''}`;
     const returnLimit = callerAggregatePolicyRun?.max_aggregate_bytes ?? childRun.max_aggregate_bytes;
     if (Buffer.byteLength(returnContent, 'utf8') > returnLimit) {
       return this.planWorkflowFailClosure({
@@ -9761,7 +9891,7 @@ export class SqliteTaskRepository implements TaskRepository {
       resumeTurnId,
       resumeMessageId,
       sourceTurnId: command.turn.id,
-      change: disposition.change,
+      change: (disposition as any).change,
     });
     statements.push({
       sql: `INSERT INTO workflow_routed_messages (
@@ -9785,7 +9915,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const returnPayload = JSON.stringify({
       kind: 'child_return',
       childRunId: childNode.runId,
-      change: disposition.change,
+      change: (disposition as any).change,
       result: returnResult ?? null,
       sourceTurnId: command.turn.id,
     });
@@ -9950,8 +10080,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
     if (
       disposition?.kind === 'workflow_next'
-      && disposition.change === 'updated'
-      && typeof disposition.result === 'string'
+      && (disposition as any).change === 'updated'
+      && typeof (disposition as any).result === 'string'
       && command.turn.status === 'succeeded'
     ) {
       const node = await this.lookupWorkflowNodeForTask(command.task.id);
@@ -9965,7 +10095,7 @@ export class SqliteTaskRepository implements TaskRepository {
         );
         if (
           run
-          && Buffer.byteLength(disposition.result, 'utf8') > run.max_artifact_bytes
+          && Buffer.byteLength((disposition as any).result, 'utf8') > run.max_artifact_bytes
         ) {
           return this.planWorkflowFailClosure({
             runId: node.runId,
@@ -11765,7 +11895,7 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
     `run.status = 'running'`,
     `node.task_id = turns.task_id`,
   ];
-  if (disposition.kind === 'workflow_next' && disposition.change === 'unchanged') {
+  if (disposition.kind === 'workflow_next' && (disposition as any).change === 'unchanged') {
     activationConditions.push(
       `(
          (

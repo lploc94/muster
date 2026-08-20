@@ -128,13 +128,19 @@ async function buildRepositorySnapshotAttempt(
 
   // Bounded turn activity for tree/current summaries (all tasks). Active input
   // messages only for the focused task — no-focus needs no queue previews.
-  const [summaryTurns, activeInputMessages] = await Promise.all([
+  const [summaryTurns, activeInputMessages, workflowNodeStatuses, ownerWorkflowStatuses] = await Promise.all([
     taskIds.length > 0
       ? repository.listTurnActivityForTasks(taskIds)
       : Promise.resolve([]),
     focusedTask
       ? repository.listActiveTurnInputMessages([focusedTask.id])
       : Promise.resolve([]),
+    taskIds.length > 0 && typeof (repository as any).getWorkflowNodeStatusesForTasks === 'function'
+      ? (repository as any).getWorkflowNodeStatusesForTasks(taskIds)
+      : Promise.resolve(new Map<string, string>()),
+    taskIds.length > 0 && typeof (repository as any).getOwnerWorkflowRunStatusesForTasks === 'function'
+      ? (repository as any).getOwnerWorkflowRunStatusesForTasks(taskIds)
+      : Promise.resolve(new Map<string, string>()),
   ]);
 
   // Focused transcript is a single bounded keyset page. Revision travels with
@@ -170,15 +176,27 @@ async function buildRepositorySnapshotAttempt(
     : undefined;
 
   // Focused ⇒ both transcript + transcriptPage required; no-focus ⇒ neither.
-  return {
-    snapshot: buildSnapshot(
-      { getFile: () => observation },
-      effectiveFocusId,
-      activePendingAsks,
-      focusedTask && transcript !== undefined && transcriptPage !== undefined
-        ? { transcript, transcriptPage }
-        : undefined,
-    ),
-    observation,
-  };
+  const snapshot = buildSnapshot(
+    { getFile: () => observation },
+    effectiveFocusId,
+    activePendingAsks,
+    focusedTask && transcript !== undefined && transcriptPage !== undefined
+      ? { transcript, transcriptPage }
+      : undefined,
+  );
+  // Per-node workflow chrome: attach node status so tree can show succeeded/active while lifecycle stays open (run-level seal)
+  if ((workflowNodeStatuses as Map<string, string>).size > 0) {
+    for (const summary of [...snapshot.rootTasks, ...(snapshot.subtree ?? [])]) {
+      const ws = (workflowNodeStatuses as Map<string, string>).get(summary.id);
+      if (ws) summary.workflowNodeStatus = ws;
+    }
+  }
+  // Owner root chrome: coordinator that stays open but its workflow run already succeeded (needs review) should not look like idle open
+  if ((ownerWorkflowStatuses as Map<string, string>).size > 0) {
+    for (const summary of [...snapshot.rootTasks, ...(snapshot.subtree ?? [])]) {
+      const os = (ownerWorkflowStatuses as Map<string, string>).get(summary.id);
+      if (os) summary.ownerWorkflowStatus = os;
+    }
+  }
+  return { snapshot, observation };
 }

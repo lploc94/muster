@@ -1972,6 +1972,37 @@ describe('protocol v9 workspacePatchBatch', () => {
     expect(isExtMessage({ type: 'workspacePatchBatch', revision: 0, patches: [] })).toBe(true);
   });
 
+  it('accepts bounded workflow statuses and rejects unknown status strings', () => {
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 3,
+        patches: [
+          {
+            type: 'taskUpserted',
+            task: {
+              ...summary,
+              workflowNodeStatus: 'active',
+              ownerWorkflowStatus: 'running',
+            },
+          },
+        ],
+      }),
+    ).toBe(true);
+    expect(
+      isExtMessage({
+        type: 'workspacePatchBatch',
+        revision: 3,
+        patches: [
+          {
+            type: 'taskUpserted',
+            task: { ...summary, ownerWorkflowStatus: 'unknown' },
+          },
+        ],
+      }),
+    ).toBe(false);
+  });
+
   it('rejects extra fields, bad revision, and malformed nested payloads', () => {
     expect(isExtMessage({ ...validBatch, extra: 1 })).toBe(false);
     expect(isExtMessage({ type: 'workspacePatchBatch', revision: -1, patches: [] })).toBe(false);

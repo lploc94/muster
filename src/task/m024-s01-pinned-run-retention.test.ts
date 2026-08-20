@@ -24,8 +24,9 @@ describe('M024 pinned terminal workflow run retention', () => {
     expect(predicate).toContain('return_gate_artifact.continuation_run_id <> run.run_id');
   });
 
-  it('bumps the reset-only schema version when the prune predicate changes', () => {
-    // v5 makes workflow-node reuse provenance immutable and pins its source artifact.
-    expect(SQLITE_SCHEMA_VERSION).toBe(5);
+  it('retains the pinned-run predicate in the current schema version', () => {
+    // v5 introduced immutable workflow-node reuse provenance; v6 adds global
+    // preference/verification tables without changing this pinned predicate.
+    expect(SQLITE_SCHEMA_VERSION).toBe(6);
   });
 });

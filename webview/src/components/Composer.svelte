@@ -1300,11 +1300,13 @@
       tasks.pendingHandoffTarget.taskId === focused.id
         ? tasks.pendingHandoffTarget
         : null;
-    return encodePickerValue(
-      pending?.backend ?? focused?.backend ?? currentBackend,
-      pending?.model ?? focused?.model ?? null,
-      tasks.modelsByBackend,
-    );
+    const backend = pending?.backend ?? focused?.backend ?? currentBackend;
+    const model = pending
+      ? pending.model ?? null
+      : focused
+        ? effectiveModelForBackend(focused.backend, focused.model)
+        : effectiveModelForBackend(backend, null);
+    return encodePickerValue(backend, model, tasks.modelsByBackend);
   });
 
   const pickerOptions = $derived.by(() => {
@@ -1393,6 +1395,15 @@
 
   function modelInCatalog(backend: string, model: string): boolean {
     return !!tasks.modelsByBackend?.[backend]?.options.some((o) => o.value === model);
+  }
+
+  function effectiveModelForBackend(
+    backend: string,
+    model: string | null | undefined,
+  ): string | null {
+    if (typeof model === 'string' && model.trim()) return model.trim();
+    const catalog = tasks.modelsByBackend?.[backend];
+    return catalog?.current ?? catalog?.options[0]?.value ?? null;
   }
 
   function encodePickerValue(
@@ -1511,7 +1522,7 @@
     task: TaskSummary | undefined,
   ): boolean {
     if (!task) return false;
-    const taskModel = typeof task.model === 'string' && task.model.trim() ? task.model.trim() : '';
+    const taskModel = effectiveModelForBackend(task.backend, task.model) ?? '';
     const nextModel = typeof model === 'string' && model.trim() ? model.trim() : '';
     return task.backend === backend && taskModel === nextModel;
   }

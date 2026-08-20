@@ -88,6 +88,10 @@ export interface TaskSummary {
   };
   /** Latest context-window usage for inline badge (persisted on MusterTask). */
   contextUsage?: { used?: number; size?: number; compacted: boolean };
+  /** Host workflow node status for per-node task chrome (succeeded while lifecycle stays open). */
+  workflowNodeStatus?: string | null;
+  /** Owner workflow run status for coordinator roots that stay open after run succeeds (needs review). */
+  ownerWorkflowStatus?: string | null;
 }
 
 /** Optional ACP diff-block evidence projected to the webview (M020 / M021 S04). */

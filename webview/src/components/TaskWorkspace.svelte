@@ -15,11 +15,8 @@
   import { tasks } from '../lib/tasks.svelte';
   import { threadStore } from '../lib/thread.svelte';
   import { effectiveRuntimeActivity, post } from '../lib/protocol';
-  import {
-    getLifecyclePresentation,
-    getTaskPresentation,
-  } from '../lib/task-status';
-  import type { PendingAsk, TaskLifecycleState } from '../lib/protocol';
+  import { getTaskPresentation } from '../lib/task-status';
+  import type { PendingAsk, TaskLifecycleState, TaskSummary } from '../lib/protocol';
   import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
@@ -353,23 +350,94 @@
     return `${trimmed.slice(0, 45)}…`;
   }
 
-  function lifecycleClass(lifecycle: string): string {
-    return `task-status task-status--${getLifecyclePresentation(lifecycle).tone}`;
+  function lifecycleClass(task: TaskSummary): string {
+    // A sealed task lifecycle is authoritative even if workflow metadata is stale.
+    if (task.lifecycle !== 'open') {
+      return `task-status task-status--${getTaskPresentation(task).tone}`;
+    }
+    // Workflow per-node status overrides lifecycle tone while task stays open for run-level seal
+    if (task.workflowNodeStatus === 'succeeded' || task.workflowNodeStatus === 'reused') return 'task-status task-status--success';
+    if (task.workflowNodeStatus === 'active' || task.workflowNodeStatus === 'running') return 'task-status task-status--attention';
+    if (task.workflowNodeStatus === 'failed') return 'task-status task-status--danger';
+    if (task.workflowNodeStatus === 'cancelled' || task.workflowNodeStatus === 'skipped') return 'task-status task-status--muted';
+    if (task.workflowNodeStatus === 'pending' || task.workflowNodeStatus === 'queued' || task.workflowNodeStatus === 'blocked') return 'task-status task-status--info';
+    // Coordinator owner run succeeded but task stays open (human-gated) — show success tone in tree without sealing lifecycle
+    if (task.ownerWorkflowStatus === 'succeeded') return 'task-status task-status--success';
+    if (task.ownerWorkflowStatus === 'failed') return 'task-status task-status--danger';
+    if (task.ownerWorkflowStatus === 'cancelled') return 'task-status task-status--muted';
+    return `task-status task-status--${getTaskPresentation(task).tone}`;
   }
 
-  function lifecycleIcon(lifecycle: string): string {
-    switch (lifecycle) {
-      case 'succeeded':
-        return 'codicon-pass-filled';
-      case 'failed':
-        return 'codicon-error';
-      case 'cancelled':
-        return 'codicon-circle-slash';
-      case 'skipped':
-        return 'codicon-debug-step-over';
-      default:
-        return 'codicon-circle-large-outline';
+  /** Distinct icon + spin flag: open→idle/waiting/running, terminal→success/error/stop. */
+  function treeStatusMeta(task: TaskSummary): {
+    icon: string;
+    spin: boolean;
+    label: string;
+  } {
+    const presentation = getTaskPresentation(task);
+    const runtime = effectiveRuntimeActivity(task);
+    const hostState = task.currentTurnActivity?.state;
+
+    // A sealed task lifecycle is authoritative even if workflow metadata is stale.
+    if (task.lifecycle === 'succeeded') return { icon: 'codicon-pass-filled', spin: false, label: presentation.lifecycle.label };
+    if (task.lifecycle === 'failed') return { icon: 'codicon-error', spin: false, label: presentation.lifecycle.label };
+    if (task.lifecycle === 'cancelled') return { icon: 'codicon-circle-slash', spin: false, label: presentation.lifecycle.label };
+    if (task.lifecycle === 'skipped') return { icon: 'codicon-debug-step-over', spin: false, label: presentation.lifecycle.label };
+
+    // Workflow per-node status takes precedence over lifecycle (node succeeded while task stays open)
+    if (task.workflowNodeStatus) {
+      const ws = task.workflowNodeStatus;
+      if (ws === 'succeeded') return { icon: 'codicon-pass-filled', spin: false, label: 'Succeeded' };
+      if (ws === 'reused') return { icon: 'codicon-pass-filled', spin: false, label: 'Reused' };
+      if (ws === 'active' || ws === 'running') return { icon: 'codicon-loading', spin: true, label: 'Running' };
+      if (ws === 'failed') return { icon: 'codicon-error', spin: false, label: 'Failed' };
+      if (ws === 'cancelled') return { icon: 'codicon-circle-slash', spin: false, label: 'Cancelled' };
+      if (ws === 'skipped') return { icon: 'codicon-debug-step-over', spin: false, label: 'Skipped' };
+      if (ws === 'pending') return { icon: 'codicon-clock', spin: false, label: 'Waiting for inputs' };
+      if (ws === 'queued') return { icon: 'codicon-clock', spin: false, label: 'Queued' };
+      if (ws === 'blocked') return { icon: 'codicon-warning', spin: false, label: 'Blocked' };
     }
+
+    // Coordinator owner run terminal — task stays open (human-gated) but workflow already succeeded/failed
+    if (task.ownerWorkflowStatus) {
+      const os = task.ownerWorkflowStatus;
+      if (os === 'succeeded') return { icon: 'codicon-pass-filled', spin: false, label: 'Completed' };
+      if (os === 'failed') return { icon: 'codicon-error', spin: false, label: 'Failed' };
+      if (os === 'cancelled') return { icon: 'codicon-circle-slash', spin: false, label: 'Cancelled' };
+      if (os === 'running') return { icon: 'codicon-loading', spin: true, label: 'Running' };
+    }
+
+    // Open — live runtime drives the chrome
+    if (hostState === 'executing' || runtime === 'running') {
+      return { icon: 'codicon-loading', spin: true, label: presentation.label };
+    }
+    if (hostState === 'queued' || runtime === 'queued') {
+      return { icon: 'codicon-clock', spin: false, label: presentation.label };
+    }
+    if (runtime === 'waiting_prerequisites') {
+      return { icon: 'codicon-clock', spin: false, label: presentation.label };
+    }
+    if (runtime === 'waiting_children') {
+      return { icon: 'codicon-organization', spin: false, label: presentation.label };
+    }
+    if (runtime === 'blocked') {
+      return { icon: 'codicon-warning', spin: false, label: presentation.label };
+    }
+    if (runtime === 'waiting_user') {
+      return { icon: 'codicon-comment-discussion', spin: false, label: presentation.label };
+    }
+    if (runtime === 'awaiting_outcome') {
+      return { icon: 'codicon-unverified', spin: false, label: presentation.label };
+    }
+    if (runtime === 'needs_recovery') {
+      return { icon: 'codicon-warning', spin: false, label: presentation.label };
+    }
+    // idle — open but no active turn
+    return { icon: 'codicon-circle-large-outline', spin: false, label: presentation.label };
+  }
+
+  function isTreeRunning(task: TaskSummary): boolean {
+    return treeStatusMeta(task).spin;
   }
 
   const showResume = $derived(
@@ -511,6 +579,8 @@
               {@const row = treeRows[vRow.index]}
               {#if row}
                 {@const nodePresentation = getTaskPresentation(row.task)}
+                {@const statusMeta = treeStatusMeta(row.task)}
+                {@const isRunning = statusMeta.spin}
                 {@const isFocused = row.task.id === navigationTask?.id}
                 {@const hasChildren = row.children.length > 0}
                 {@const isCollapsed = collapsedIds.has(row.task.id)}
@@ -585,15 +655,40 @@
                     </button>
                     <button
                       type="button"
-                      class={`task-tree-panel__status-btn ${lifecycleClass(row.task.lifecycle)}`}
+                      class={`task-tree-panel__status-btn ${lifecycleClass(row.task)}`}
+                      class:task-tree-panel__status-btn--running={isRunning}
                       data-task-lifecycle={row.task.lifecycle}
+                      data-task-running={isRunning ? 'true' : 'false'}
                       aria-haspopup="menu"
                       aria-expanded={menuOpen ? 'true' : 'false'}
-                      aria-label={`Task status: ${nodePresentation.lifecycle.label}. Change status for ${row.task.goal}.`}
+                      aria-label={`Task status: ${statusMeta.label}. Change status for ${row.task.goal}.`}
                       use:tip={statusButtonTip(row.task)}
                       onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
                     >
-                      <span class={`codicon ${lifecycleIcon(row.task.lifecycle)}`} aria-hidden="true"></span>
+                      {#if isRunning}
+                        <svg
+                          width="14"
+                          height="14"
+                          viewBox="0 0 16 16"
+                          class="task-tree-spinner"
+                          aria-hidden="true"
+                          focusable="false"
+                        >
+                          <circle
+                            cx="8"
+                            cy="8"
+                            r="6"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-dasharray="28 20"
+                            opacity="0.95"
+                          />
+                        </svg>
+                      {:else}
+                        <span class={`codicon ${statusMeta.icon}`} aria-hidden="true"></span>
+                      {/if}
                       <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
                     </button>
                   </div>
@@ -634,6 +729,8 @@
         {:else}
           {#each visibleTreeRows as row (row.task.id)}
             {@const nodePresentation = getTaskPresentation(row.task)}
+            {@const statusMeta = treeStatusMeta(row.task)}
+            {@const isRunning = statusMeta.spin}
             {@const isFocused = row.task.id === navigationTask?.id}
             {@const menuOpen = statusMenuTaskId === row.task.id}
             <div class="task-tree-panel__item">
@@ -673,15 +770,40 @@
                 </button>
                 <button
                   type="button"
-                  class={`task-tree-panel__status-btn ${lifecycleClass(row.task.lifecycle)}`}
+                  class={`task-tree-panel__status-btn ${lifecycleClass(row.task)}`}
+                  class:task-tree-panel__status-btn--running={isRunning}
                   data-task-lifecycle={row.task.lifecycle}
+                  data-task-running={isRunning ? 'true' : 'false'}
                   aria-haspopup="menu"
                   aria-expanded={menuOpen ? 'true' : 'false'}
-                  aria-label={`Task status: ${nodePresentation.lifecycle.label}. Change status for ${row.task.goal}.`}
+                  aria-label={`Task status: ${statusMeta.label}. Change status for ${row.task.goal}.`}
                   use:tip={statusButtonTip(row.task)}
                   onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
                 >
-                  <span class={`codicon ${lifecycleIcon(row.task.lifecycle)}`} aria-hidden="true"></span>
+                  {#if isRunning}
+                    <svg
+                      width="14"
+                      height="14"
+                      viewBox="0 0 16 16"
+                      class="task-tree-spinner"
+                      aria-hidden="true"
+                      focusable="false"
+                    >
+                      <circle
+                        cx="8"
+                        cy="8"
+                        r="6"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-dasharray="28 20"
+                        opacity="0.95"
+                      />
+                    </svg>
+                  {:else}
+                    <span class={`codicon ${statusMeta.icon}`} aria-hidden="true"></span>
+                  {/if}
                   <span class="codicon codicon-chevron-down" aria-hidden="true"></span>
                 </button>
               </div>

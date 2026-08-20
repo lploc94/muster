@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 5 as const;
+export const SQLITE_SCHEMA_VERSION = 6 as const;
 
 /**
  * Core task-store tables.
@@ -41,6 +41,8 @@ const REQUIRED_CORE_TABLES = [
   'send_outbox',
   'presentations',
   'presentation_operations',
+  'global_composer_selection',
+  'global_backend_verification',
 ] as const;
 
 /**
@@ -403,6 +405,21 @@ const CORE_SCHEMA_STATEMENTS: readonly string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_presentation_operations_document
      ON presentation_operations(workspace_id, root_id, presentation_id)`,
+
+  // Global (apply to all workspaces) composer selection and backend verification — survives Extension Host restarts
+  `CREATE TABLE IF NOT EXISTS global_composer_selection (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    backend TEXT NOT NULL,
+    model TEXT,
+    updated_at TEXT NOT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS global_backend_verification (
+    backend_id TEXT PRIMARY KEY,
+    verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+    version TEXT,
+    checked_at TEXT NOT NULL
+  )`,
 ];
 
 function writerGuardTriggerStatements(

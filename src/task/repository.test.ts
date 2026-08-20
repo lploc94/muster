@@ -26,6 +26,35 @@ function makeTask(id: string): MusterTask {
 }
 
 describe('SqliteTaskRepository', () => {
+  it('does not let an older backend verification overwrite a newer observation', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-global-verification-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.setGlobalBackendVerification(
+        'opencode',
+        true,
+        '2.0.0',
+        '2026-08-20T10:00:00.000Z',
+      );
+      await repository.setGlobalBackendVerification(
+        'opencode',
+        false,
+        '1.0.0',
+        '2026-08-20T09:00:00.000Z',
+      );
+      await expect(repository.getGlobalBackendVerification('opencode')).resolves.toEqual({
+        verified: true,
+        version: '2.0.0',
+        checkedAt: '2026-08-20T10:00:00.000Z',
+      });
+    } finally {
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('applies graph create atomically with operation replay/conflict parity', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-graph-sqlite-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });

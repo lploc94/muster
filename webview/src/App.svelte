@@ -640,6 +640,10 @@
 
       switch (msg.type) {
         case 'snapshot': {
+          const metadataRefresh =
+            !patchView.needsRecovery &&
+            msg.storeRevision === patchView.revision &&
+            (msg.focusedTaskId ?? null) === patchView.focusedTaskId;
           const nextPatchView = applySnapshotToPatchView(patchView, msg);
           if (nextPatchView === patchView && msg.storeRevision < patchView.revision) {
             // A focus/recovery read that lost a race with an already-applied
@@ -659,20 +663,27 @@
             const snapUsage = (msg as unknown as { contextUsage?: { used?: number; size?: number; compacted: boolean } | null }).contextUsage;
             const summaryUsage = (focused as unknown as { contextUsage?: { used?: number; size?: number; compacted: boolean } })?.contextUsage;
             const contextUsage = snapUsage ?? summaryUsage ?? null;
-            threadStore.focusTask(
-              msg.focusedTaskId,
-              msg.transcript,
-              msg.activeTurnId,
-              focused?.viewStatus,
-              {
-                lifecycle: focused?.lifecycle,
-                runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
-                ...(msg.transcriptPage ? { transcriptPage: msg.transcriptPage } : {}),
-                ...(contextUsage !== null || (msg as unknown as { contextUsage?: unknown }).contextUsage !== undefined
-                  ? { contextUsage }
-                  : {}),
-              },
-            );
+            if (metadataRefresh) {
+              threadStore.applyPatchView(nextPatchView);
+              threadStore.updateReadOnly(focused?.lifecycle ?? 'open');
+              threadStore.updateRuntimeFlags(focused ? effectiveRuntimeActivity(focused) : null);
+              if (contextUsage !== null) threadStore.current.contextUsage = contextUsage;
+            } else {
+              threadStore.focusTask(
+                msg.focusedTaskId,
+                msg.transcript,
+                msg.activeTurnId,
+                focused?.viewStatus,
+                {
+                  lifecycle: focused?.lifecycle,
+                  runtimeActivity: focused ? effectiveRuntimeActivity(focused) : null,
+                  ...(msg.transcriptPage ? { transcriptPage: msg.transcriptPage } : {}),
+                  ...(contextUsage !== null || (msg as unknown as { contextUsage?: unknown }).contextUsage !== undefined
+                    ? { contextUsage }
+                    : {}),
+                },
+              );
+            }
           } else if (!tasks.draftMode) {
             threadStore.clearFocus();
           }

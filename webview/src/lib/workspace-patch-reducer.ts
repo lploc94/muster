@@ -147,6 +147,10 @@ export function applySnapshotToPatchView(
   // applied. A slower focus/recovery read must never roll the reducer back and
   // make a later duplicate batch mask state that the stale snapshot omitted.
   if (snapshot.storeRevision < state.revision) return state;
+  const metadataRefresh =
+    !state.needsRecovery &&
+    snapshot.storeRevision === state.revision &&
+    (snapshot.focusedTaskId ?? null) === state.focusedTaskId;
 
   const tasks = new Map<string, TaskSummary>();
   for (const task of snapshot.rootTasks) tasks.set(task.id, task);
@@ -171,10 +175,12 @@ export function applySnapshotToPatchView(
     subtree: snapshot.subtree ? [...snapshot.subtree] : [],
     focusedTaskId: snapshot.focusedTaskId ?? null,
     queuedTurns: snapshot.focusedTaskId ? [...(snapshot.queuedTurns ?? [])] : [],
-    transcriptItems,
-    loadedTranscriptIds: loaded,
-    removedTranscriptIds: new Set(),
-    transcriptWorkspaceRevision: snapshot.transcriptPage?.workspaceRevision,
+    transcriptItems: metadataRefresh ? state.transcriptItems : transcriptItems,
+    loadedTranscriptIds: metadataRefresh ? state.loadedTranscriptIds : loaded,
+    removedTranscriptIds: metadataRefresh ? state.removedTranscriptIds : new Set(),
+    transcriptWorkspaceRevision: metadataRefresh
+      ? state.transcriptWorkspaceRevision
+      : snapshot.transcriptPage?.workspaceRevision,
     observedRevision: undefined,
   };
 }
@@ -421,10 +427,24 @@ function applyOnePatch(
   },
   patch: WorkspacePatch,
 ): 'ok' | 'invariant' {
+  const preserveWorkflowStatus = (next: TaskSummary): TaskSummary => {
+    const existing = draft.tasks.get(next.id);
+    if (!existing) return next;
+    return {
+      ...next,
+      ...(next.workflowNodeStatus === undefined && existing.workflowNodeStatus !== undefined
+        ? { workflowNodeStatus: existing.workflowNodeStatus }
+        : {}),
+      ...(next.ownerWorkflowStatus === undefined && existing.ownerWorkflowStatus !== undefined
+        ? { ownerWorkflowStatus: existing.ownerWorkflowStatus }
+        : {}),
+    };
+  };
   switch (patch.type) {
     case 'taskUpserted': {
-      draft.tasks.set(patch.task.id, patch.task);
-      draft.subtree = upsertTaskInSubtree(draft.subtree, patch.task, draft.focusedTaskId);
+      const task = preserveWorkflowStatus(patch.task);
+      draft.tasks.set(task.id, task);
+      draft.subtree = upsertTaskInSubtree(draft.subtree, task, draft.focusedTaskId);
       return 'ok';
     }
     case 'turnActivityChanged': {
@@ -435,8 +455,9 @@ function applyOnePatch(
         draft.subtree = upsertTaskInSubtree(draft.subtree, patch.task, draft.focusedTaskId);
         return 'ok';
       }
-      draft.tasks.set(patch.task.id, patch.task);
-      draft.subtree = upsertTaskInSubtree(draft.subtree, patch.task, draft.focusedTaskId);
+      const task = preserveWorkflowStatus(patch.task);
+      draft.tasks.set(task.id, task);
+      draft.subtree = upsertTaskInSubtree(draft.subtree, task, draft.focusedTaskId);
       return 'ok';
     }
     case 'taskRemoved': {

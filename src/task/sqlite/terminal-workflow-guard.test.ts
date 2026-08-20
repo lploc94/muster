@@ -23,7 +23,7 @@ const TRIGGER_NAME = 'trg_terminal_workflow_history_prune_before_turn_delete';
 const PINNED_NORMALIZED_LENGTH = 2952;
 const PINNED_NORMALIZED_SHA256 =
   'ab740f5bd2b25fcbf85400601ca4dd07d0540b470686e6f23e4d205b22660fc7';
-const PINNED_TRIGGER_COUNT = 140;
+const PINNED_TRIGGER_COUNT = 146;
 
 function openCurrentSchema(): DatabaseSync {
   const db = new DatabaseSync(':memory:');

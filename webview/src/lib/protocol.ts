@@ -120,6 +120,10 @@ export interface TaskSummary {
   };
   /** Latest context-window usage for inline badge (persisted). */
   contextUsage?: { used?: number; size?: number; compacted: boolean };
+  /** Host workflow node status for per-node chrome (succeeded while lifecycle open). */
+  workflowNodeStatus?: string | null;
+  /** Owner workflow run status for coordinators that stay open after run succeeded. */
+  ownerWorkflowStatus?: string | null;
 }
 
 export interface TranscriptItem {
@@ -1183,6 +1187,8 @@ function isTaskSummary(v: unknown): v is TaskSummary {
       'continuationOf',
       'childOrchestration',
       'contextUsage',
+      'workflowNodeStatus',
+      'ownerWorkflowStatus',
     ])
   ) {
     return false;
@@ -1257,7 +1263,25 @@ function isTaskSummary(v: unknown): v is TaskSummary {
         hasOnlyKeys(v.contextUsage, ['used', 'size', 'compacted']) &&
         (v.contextUsage.used === undefined || isNonNegativeSafeInteger(v.contextUsage.used)) &&
         (v.contextUsage.size === undefined || isNonNegativeSafeInteger(v.contextUsage.size)) &&
-        typeof v.contextUsage.compacted === 'boolean'))
+        typeof v.contextUsage.compacted === 'boolean')) &&
+    (v.workflowNodeStatus === undefined ||
+      v.workflowNodeStatus === null ||
+      v.workflowNodeStatus === 'pending' ||
+      v.workflowNodeStatus === 'queued' ||
+      v.workflowNodeStatus === 'blocked' ||
+      v.workflowNodeStatus === 'active' ||
+      v.workflowNodeStatus === 'running' ||
+      v.workflowNodeStatus === 'succeeded' ||
+      v.workflowNodeStatus === 'failed' ||
+      v.workflowNodeStatus === 'cancelled' ||
+      v.workflowNodeStatus === 'skipped' ||
+      v.workflowNodeStatus === 'reused') &&
+    (v.ownerWorkflowStatus === undefined ||
+      v.ownerWorkflowStatus === null ||
+      v.ownerWorkflowStatus === 'running' ||
+      v.ownerWorkflowStatus === 'succeeded' ||
+      v.ownerWorkflowStatus === 'failed' ||
+      v.ownerWorkflowStatus === 'cancelled')
   );
 }
 

@@ -191,7 +191,11 @@ import { TaskEngine, type EngineEvent } from './task/engine';
 import { parseRuntimeFallbackChain } from './task/task-types';
 import type { HostEnvironmentSnapshot } from './task/host-context';
 import type { TaskReadPort } from './task/store-port';
-import { SqliteTaskRepository, type TaskRepository } from './task/repository';
+import {
+  SqliteTaskRepository,
+  isWorkflowTransactionalCommand,
+  type TaskRepository,
+} from './task/repository';
 import { DbClient, resolveWorkerPath } from './task/sqlite/client';
 import { probeNodeSqlite } from './task/sqlite/probe';
 import type { SqliteErrorCode } from './task/sqlite/errors';
@@ -364,7 +368,8 @@ async function ensureBackendReadiness(
   if (!backendReadinessPromise) {
     backendReadinessPromise = (async () => {
       try {
-        return await getBackendReadinessService().refresh(correlationId);
+        const raw = await getBackendReadinessService().refresh(correlationId);
+        return await mergePersistedVerificationIntoSnapshot(raw);
       } catch (err) {
         console.warn(
           'Muster: backend readiness inventory failed:',
@@ -378,7 +383,87 @@ async function ensureBackendReadiness(
   }
   // When a correlated refresh is already in flight without this id, still await
   // the single-flight result and rewrite correlation on delivery in postBackendReadiness.
-  return backendReadinessPromise;
+  const snap = await backendReadinessPromise;
+  // Passive refresh clobbers verified → ready. Rehydrate from durable global table (best-effort).
+  return mergePersistedVerificationIntoSnapshot(snap);
+}
+
+// ── Global composer selection + backend verification (apply to all workspaces) ──
+// Stored in globalStorage muster.sqlite3 global_* tables so Extension Development Host restarts (ephemeral globalState) don't wipe Test Connection.
+function getRepoForGlobalPersist(): import('./task/repository').TaskRepository | undefined {
+  return taskRepository;
+}
+
+async function mergePersistedVerificationIntoSnapshot(
+  snapshot: BackendReadinessSnapshot,
+): Promise<BackendReadinessSnapshot> {
+  const repo = getRepoForGlobalPersist();
+  if (!repo?.listGlobalBackendVerifications) return snapshot;
+  try {
+    const persisted = await repo.listGlobalBackendVerifications();
+    if (persisted.size === 0) return snapshot;
+    let changed = false;
+    const backends = [] as BackendReadinessSnapshot['backends'][number][];
+    for (const rec of snapshot.backends) {
+      const p = persisted.get(rec.backendId);
+      if (!p?.verified) {
+        backends.push(rec);
+        continue;
+      }
+      // Only restore ready if passive says installed_unverified and version hasn't changed (or either side null).
+      if (rec.state !== 'installed_unverified') {
+        backends.push(rec);
+        continue;
+      }
+      if (
+        p.version !== null &&
+        rec.versionEvidence !== null &&
+        p.version !== rec.versionEvidence
+      ) {
+        await repo.setGlobalBackendVerification(
+          rec.backendId,
+          false,
+          rec.versionEvidence,
+          rec.checkedAt,
+        );
+        backends.push(rec);
+        continue;
+      }
+      changed = true;
+      backends.push({
+        ...rec,
+        state: 'ready' as const,
+        code: 'none' as const,
+        recoveryAction: 'none' as const,
+        checkedAt: p.checkedAt,
+      });
+    }
+    return changed ? { ...snapshot, backends } : snapshot;
+  } catch {
+    return snapshot;
+  }
+}
+
+function persistVerifiedBackendsFromSnapshot(snapshot: BackendReadinessSnapshot): void {
+  const repo = getRepoForGlobalPersist();
+  if (!repo?.setGlobalBackendVerification) return;
+  const now = new Date().toISOString();
+  for (const rec of snapshot.backends) {
+    if (rec.state === 'ready') {
+      void repo
+        .setGlobalBackendVerification(rec.backendId, true, rec.versionEvidence, rec.checkedAt ?? now)
+        .catch(() => {});
+    } else if (rec.state === 'installed_unverified') {
+      // Do not clear verified on passive downgrade — keep durable verified until version drift.
+    } else if (
+      rec.state === 'missing' ||
+      rec.state === 'failed' ||
+      rec.state === 'incompatible' ||
+      rec.state === 'auth_required'
+    ) {
+      void repo.setGlobalBackendVerification(rec.backendId, false, rec.versionEvidence, rec.checkedAt ?? now).catch(() => {});
+    }
+  }
 }
 
 function writeHostEnvCache(partial: {
@@ -763,6 +848,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (interleavedResult.kind === 'batches') {
         for (const batch of interleavedResult.batches) {
           if (batch.revision <= this.appliedWorkspaceRevision) continue;
+          // Hydrate off critical path — do not await workflow enrichment here (see ctxe analysis). Full snapshot + WorkflowGraphStore provide owner/node status.
           trackPatches(batch.patches);
           this.post(batch);
           this.appliedWorkspaceRevision = batch.revision;
@@ -792,6 +878,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       if (after.revision > this.appliedWorkspaceRevision) {
         this.appliedWorkspaceRevision = after.revision;
       }
+    }
+
+    // Workflow status is repository-owned metadata, not part of EngineProjection.
+    // Refresh it after publishing the durable revision without extending executeTail.
+    if (isWorkflowTransactionalCommand(ctx.command)) {
+      void this.postSnapshotAsync(this.focusedTaskId, 0, true);
     }
 
     // Ask-clear side channel when a waiting_user turn leaves that state.
@@ -1255,6 +1347,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       ensureReadiness: () => ensureBackendReadiness(false),
       applySnapshot: (snapshot: BackendReadinessSnapshot) => {
         getBackendReadinessService().replaceSnapshot(snapshot);
+        persistVerifiedBackendsFromSnapshot(snapshot);
         // Keep hostEnvCache.availableBackends in sync when probe upgrades to ready.
         writeHostEnvCache({
           availableBackends: derivePassivelySelectableBackendIds(snapshot),
@@ -1337,6 +1430,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       ensureReadiness: () => ensureBackendReadiness(false),
       applySnapshot: (snapshot: BackendReadinessSnapshot) => {
         getBackendReadinessService().replaceSnapshot(snapshot);
+        persistVerifiedBackendsFromSnapshot(snapshot);
         writeHostEnvCache({
           availableBackends: derivePassivelySelectableBackendIds(snapshot),
         });
@@ -1362,12 +1456,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     scheduleRuntimeReadinessInvalidation(signal, this.runtimeInvalidationDeps());
   }
 
-  postComposerSelection(): void {
-    const selection = readComposerSelection({
+  async postComposerSelection(): Promise<void> {
+    let selection = readComposerSelection({
       get: (key) => vscode.workspace.getConfiguration().get(key),
       update: (key, value, target) =>
         vscode.workspace.getConfiguration().update(key, value, target as vscode.ConfigurationTarget),
     });
+    // Fallback to durable global DB when Extension Development Host wiped Global settings.
+    if (!selection) {
+      const repo = getRepoForGlobalPersist();
+      try {
+        const persisted = await repo?.getGlobalComposerSelection?.();
+        if (persisted) selection = parseComposerSelection(persisted);
+      } catch {}
+    }
     if (!selection) return;
     this.post({
       type: 'composerSelection',
@@ -1402,6 +1504,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       selection,
       vscode.ConfigurationTarget.Global,
     );
+    // Durable global fallback so Test Connection choice survives Extension Host restart.
+    const repo = getRepoForGlobalPersist();
+    void repo?.setGlobalComposerSelection?.(selection).catch(() => {});
   }
 
   /**
@@ -1549,7 +1654,11 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    * Awaitable snapshot for poller recovery paths. Resolves after the snapshot is
    * posted (or retries are exhausted) so lastDataVersion is not committed early.
    */
-  private postSnapshotAsync(focusedTaskId?: string, retryAttempt = 0): Promise<boolean> {
+  private postSnapshotAsync(
+    focusedTaskId?: string,
+    retryAttempt = 0,
+    preserveTranscriptOwnership = false,
+  ): Promise<boolean> {
     if (!taskRepository) {
       return Promise.resolve(false);
     }
@@ -1570,7 +1679,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         // First treat as ordinary race (local commit during snapshot). After
         // bounded retries, a still-lower repository revision is external reset.
         if (retryAttempt < 3) {
-          return this.postSnapshotAsync(focus, retryAttempt + 1);
+          return this.postSnapshotAsync(focus, retryAttempt + 1, preserveTranscriptOwnership);
         }
         const highWater = Math.max(
           this.appliedWorkspaceRevision,
@@ -1592,9 +1701,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // Mirror the accepted snapshot, never the stale request argument.
       this.focusedTaskId = projection.snapshot.focusedTaskId;
       // Seed known transcript ids from the bounded focus page only.
-      this.knownTranscriptIds = new Set(
-        (projection.snapshot.transcript ?? []).map((item) => item.id),
-      );
+      const snapshotTranscriptIds = (projection.snapshot.transcript ?? []).map((item) => item.id);
+      if (
+        preserveTranscriptOwnership &&
+        projection.snapshot.focusedTaskId === this.focusedTaskId
+      ) {
+        for (const id of snapshotTranscriptIds) this.knownTranscriptIds.add(id);
+      } else {
+        this.knownTranscriptIds = new Set(snapshotTranscriptIds);
+      }
       // Recovery/bootstrap cursor: poller continues from the accepted snapshot.
       if (projection.snapshot.storeRevision > this.appliedWorkspaceRevision) {
         this.appliedWorkspaceRevision = projection.snapshot.storeRevision;
@@ -1607,7 +1722,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           setTimeout(resolve, 25 * (retryAttempt + 1));
         });
         if (generation === this.snapshotGeneration) {
-          return this.postSnapshotAsync(focus, retryAttempt + 1);
+          return this.postSnapshotAsync(focus, retryAttempt + 1, preserveTranscriptOwnership);
         }
         return false;
       }
@@ -3620,7 +3735,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     // Model enumeration is explicit listModels — no ACP sessions on open.
     void this.postAvailableBackends();
     // Restore last-used backend/model from VS Code Settings (survives restarts).
-    this.postComposerSelection();
+    void this.postComposerSelection();
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {
@@ -3834,7 +3949,7 @@ export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
       if (event.affectsConfiguration('muster.composerSelection')) {
-        provider.postComposerSelection();
+        void provider.postComposerSelection();
       }
     }),
   );
