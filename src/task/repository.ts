@@ -8402,7 +8402,12 @@ export class SqliteTaskRepository implements TaskRepository {
         });
         statements.push(...closure.statements);
         changes.push(...closure.changes);
-        return { statements, changes, settlementGatePreconditions };
+        return {
+          statements,
+          changes,
+          settlementGatePreconditions,
+          settlementClosurePreconditions: closure.settlementClosurePreconditions,
+        };
       }
 
       activation = deriveNodeActivationIdentities(producerNode.run_id, edge.toNodeId);
@@ -9636,7 +9641,11 @@ export class SqliteTaskRepository implements TaskRepository {
       });
       statements.push(...closure.statements);
       changes.push(...closure.changes);
-      return { statements, changes };
+      return {
+        statements,
+        changes,
+        settlementClosurePreconditions: closure.settlementClosurePreconditions,
+      };
     }
 
     if (!willSatisfyRound) return { statements, changes };

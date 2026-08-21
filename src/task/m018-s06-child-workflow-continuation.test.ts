@@ -24,6 +24,7 @@ import { DbClient } from './sqlite/client';
 import type { MusterTask, TaskTurn, TurnDisposition } from './types';
 import {
   DEFAULT_WORKFLOW_POLICY,
+  entryNodeIds,
   maximumWorkflowEntryAggregateBytes,
   type WorkflowPolicyV1,
 } from './workflow';
@@ -59,11 +60,14 @@ const INTERNAL_FAN_IN_CHILD: GraphTopologyV1 = {
     { nodeId: 'right_source' },
     { nodeId: 'join' },
     { nodeId: 'terminal' },
+    { nodeId: 'observer_source' },
+    { nodeId: 'observer_terminal' },
   ],
   edges: [
     { fromNodeId: 'left_source', toNodeId: 'join', inputRef: 'left' },
     { fromNodeId: 'right_source', toNodeId: 'join', inputRef: 'right' },
     { fromNodeId: 'join', toNodeId: 'terminal', inputRef: 'joined' },
+    { fromNodeId: 'observer_source', toNodeId: 'observer_terminal', inputRef: 'observed' },
   ],
 };
 
@@ -153,10 +157,11 @@ async function defineGraphVersion(
     version: 1,
     name,
     topology,
-    entryContracts: [
-      { entryNodeId: 'left_source', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' },
-      { entryNodeId: 'right_source', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' },
-    ],
+    entryContracts: entryNodeIds(topology).map((entryNodeId) => ({
+      entryNodeId,
+      inputRef: 'engine_start',
+      expectedArtifactKind: 'engine_start',
+    })),
     policy,
     createdAt,
   });
@@ -1236,7 +1241,9 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
 
   it('recursively closes the parent component when an internal child fan-in aggregate overflows', async () => {
     const opened = await openRepo('internal-fan-in-overflow');
+    const peerClient = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
     try {
+      await peerClient.open(opened.dbPath);
       const createdAt = '2026-07-20T02:00:00.000Z';
       const maxArtifactBytes = 64;
       const childPolicy = {
@@ -1278,6 +1285,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
             entryBindings: [
               { childEntryNodeId: 'left_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
               { childEntryNodeId: 'right_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
+              { childEntryNodeId: 'observer_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
             ],
             childIdempotencyKey: 'internal-overflow-child',
           },
@@ -1306,8 +1314,48 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       };
       await expect(settleSource('left_source', 'L'.repeat(maxArtifactBytes), '2026-07-20T02:00:02.000Z'))
         .resolves.toMatchObject({ ok: true, changed: true });
-      await expect(settleSource('right_source', 'R'.repeat(maxArtifactBytes), '2026-07-20T02:00:03.000Z'))
-        .resolves.toMatchObject({ ok: true, changed: true });
+      const rightTaskId = childTask('right_source');
+      const rightTurn = (await queuedTurnsForTask(opened.client, rightTaskId))[0]!;
+      const rightDisposition = {
+        kind: 'workflow_next' as const,
+        change: 'updated' as const,
+        result: 'R'.repeat(maxArtifactBytes),
+      };
+      await promoteRunning(opened.client, rightTurn.id, '2026-07-20T02:00:03.000Z');
+      const rightTask = await opened.repository.getTask(rightTaskId);
+      const runningRightTurn = await opened.repository.getTurn(rightTurn.id);
+      await stageDispositionForSettlement(opened.repository, runningRightTurn!, rightDisposition);
+      const observerTaskId = childTask('observer_source');
+      const observerTurn = (await queuedTurnsForTask(opened.client, observerTaskId))[0]!;
+      let promotedBetweenPlanAndCommit = false;
+      const stalePlannerRepository = new SqliteTaskRepository({
+        all: (sql, params) => opened.client.all(sql, params),
+        get: (sql, params) => opened.client.get(sql, params),
+        run: (sql, params) => opened.client.run(sql, params),
+        pragma: (pragma) => opened.client.pragma(pragma),
+        transaction: async (statements, options) => {
+          if (!promotedBetweenPlanAndCommit) {
+            promotedBetweenPlanAndCommit = true;
+            await promoteRunning(peerClient, observerTurn.id, '2026-07-20T02:00:02.500Z');
+          }
+          return opened.client.transaction(statements, options);
+        },
+      }, 'ws');
+      await expect(stalePlannerRepository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: rightTask!.revision,
+        task: { ...rightTask!, updatedAt: '2026-07-20T02:00:03.000Z' },
+        turn: {
+          ...runningRightTurn!,
+          status: 'succeeded',
+          finishedAt: '2026-07-20T02:00:03.000Z',
+          disposition: rightDisposition,
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      })).resolves.toMatchObject({ ok: true, changed: true });
 
       await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
         `SELECT status, terminal_reason_code FROM workflow_runs
@@ -1338,9 +1386,16 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       );
       expect(componentTasks.length).toBeGreaterThan(0);
       expect(componentTasks.every((task) => task.lifecycle === 'failed')).toBe(true);
+      expect(promotedBetweenPlanAndCommit).toBe(true);
+      await expect(opened.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM turn_cancel_requests
+          WHERE workspace_id = 'ws' AND turn_id = ? AND kind = 'interrupt'`,
+        [observerTurn.id],
+      )).resolves.toEqual({ count: 1 });
       expect(await opened.repository.listTurns(childTask('join'))).toHaveLength(0);
       expect(await queuedTurnsForTask(opened.client, caller.entryTaskId)).toHaveLength(0);
     } finally {
+      await peerClient.close().catch(() => undefined);
       await opened.close();
     }
   }, 45_000);
