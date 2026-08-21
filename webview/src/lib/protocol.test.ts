@@ -2411,8 +2411,18 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
         ok: true,
         graph: {
           runId: 'run-1',
-          nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
+          runStatus: 'running',
+          nodes: [{
+            nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'queued',
+            displayState: 'queued', progressBucket: 'queued', reused: false,
+          }],
           edges: [],
+          gates: [],
+          progress: {
+            total: 1, completed: 0, queued: 1, executing: 0, waiting: 0,
+            blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+            frontierNodeIds: ['node-1'], activeNodeIds: [],
+          },
           feedbackRounds: [],
           childRuns: [],
           reuse: { nodeCount: 0, edgeCount: 0 },

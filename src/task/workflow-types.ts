@@ -331,14 +331,33 @@ export interface InvokeChildWorkflowInput {
   childIdempotencyKey?: string;
 }
 
+export type WorkflowRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type WorkflowNodeStatus =
+  | 'pending' | 'active' | 'reused' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+export type WorkflowGateStatus = 'open' | 'satisfied' | 'consumed' | 'failed' | 'cancelled';
+
 /** Bounded workflow gate state (no topology, prompts, artifact bodies, or paths). */
 export interface WorkflowGateStatusProjection {
   gateId: string;
-  status: string;
+  consumerNodeId: string;
+  status: WorkflowGateStatus;
   /** Distinct filled inputRefs. */
   satisfied: number;
   /** Binding count (required inputs). */
   required: number;
+  inputs: readonly WorkflowGateInputStatusProjection[];
+}
+
+export type WorkflowGateInputState =
+  | 'supplied_live'
+  | 'supplied_reused'
+  | 'pending'
+  | 'blocking';
+
+export interface WorkflowGateInputStatusProjection {
+  inputRef: string;
+  producerNodeId: string;
+  state: WorkflowGateInputState;
 }
 
 export interface WorkflowRunPolicyProjection {
@@ -416,7 +435,38 @@ export interface WorkflowTaskStatusProjection {
 /** Host-only bounded workflow graph node state. Never exposed through agent tools. */
 export interface WorkflowGraphNodeProjection {
   nodeId: string;
-  status: string;
+  workflowNodeStatus: WorkflowNodeStatus;
+  executionActivity:
+    | 'none'
+    | 'queued'
+    | 'executing'
+    | 'waiting_feedback'
+    | 'completed'
+    | 'failed'
+    | 'cancelled'
+    | 'skipped';
+  displayState:
+    | 'queued'
+    | 'executing'
+    | 'waiting'
+    | 'completed'
+    | 'reused'
+    | 'blocked'
+    | 'not_started'
+    | 'failed'
+    | 'cancelled'
+    | 'skipped';
+  progressBucket:
+    | 'queued'
+    | 'executing'
+    | 'waiting'
+    | 'completed'
+    | 'blocked'
+    | 'not_started'
+    | 'failed'
+    | 'cancelled'
+    | 'skipped';
+  reason?: 'waiting_for_inputs' | 'run_closed_before_activation' | 'awaiting_workflow_route';
 }
 
 /** Host-only durable definition edge for an instantiated workflow run. */
@@ -424,12 +474,37 @@ export interface WorkflowGraphEdgeProjection {
   fromNodeId: string;
   toNodeId: string;
   inputRef: string;
+  contributionState: WorkflowGateInputState;
+}
+
+export interface WorkflowGraphProgressProjection {
+  total: number;
+  completed: number;
+  queued: number;
+  executing: number;
+  waiting: number;
+  blocked: number;
+  notStarted: number;
+  failed: number;
+  cancelled: number;
+  skipped: number;
+  frontierNodeIds: readonly string[];
+  activeNodeIds: readonly string[];
 }
 
 /** Direct nested workflow run visible from a host graph read. */
 export interface WorkflowGraphChildRunProjection {
   runId: string;
-  status: string;
+  status: WorkflowRunStatus;
+}
+
+export interface WorkflowGraphFeedbackRoundProjection {
+  roundId: string;
+  requesterNodeId: string;
+  status: 'open' | 'satisfied';
+  joinMode: 'all';
+  required: number;
+  responded: number;
 }
 
 /** Reuse density derived from the bounded run graph. */
@@ -445,10 +520,13 @@ export interface WorkflowGraphReuseProjection {
  */
 export interface WorkflowGraphProjection {
   runId: string;
+  runStatus: WorkflowRunStatus;
   nodes: readonly WorkflowGraphNodeProjection[];
   edges: readonly WorkflowGraphEdgeProjection[];
+  gates: readonly WorkflowGateStatusProjection[];
   activeGate?: WorkflowGateStatusProjection;
-  feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
+  progress: WorkflowGraphProgressProjection;
+  feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   childRuns: readonly WorkflowGraphChildRunProjection[];
   reuse: WorkflowGraphReuseProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
@@ -489,7 +567,7 @@ export interface WorkflowNextResultProjection {
 /** Authorized terminal state delivered to a resumed start_workflow caller. */
 export interface WorkflowRunCompletionProjection {
   runId: string;
-  runStatus: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  runStatus: WorkflowRunStatus;
   terminalReason?: string;
   terminalResult?: WorkflowArtifactReferenceProjection;
   workflowNext?: WorkflowNextResultProjection;

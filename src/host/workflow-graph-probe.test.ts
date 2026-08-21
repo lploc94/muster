@@ -11,15 +11,26 @@ const REQUEST_ID = 'workflow-graph-1-1700000000000';
 function graph(overrides: Partial<WorkflowGraphWireGraph> = {}): WorkflowGraphWireGraph {
   return {
     runId: 'wfr-1',
+    runStatus: 'running',
     nodes: [
-      { nodeId: 'one', status: 'reused', reused: true },
-      { nodeId: 'two', status: 'reused', reused: true },
-      { nodeId: 'five', status: 'active', reused: false },
+      { nodeId: 'one', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
+      { nodeId: 'two', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
+      { nodeId: 'four', workflowNodeStatus: 'succeeded', executionActivity: 'completed', displayState: 'completed', progressBucket: 'completed', reused: false },
+      { nodeId: 'five', workflowNodeStatus: 'active', executionActivity: 'queued', displayState: 'queued', progressBucket: 'queued', reused: false },
     ],
     edges: [
-      { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result', reused: true },
-      { fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result', reused: false },
+      { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result', contributionState: 'supplied_reused', reused: true },
+      { fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result', contributionState: 'supplied_live', reused: false },
     ],
+    gates: [
+      { gateId: 'gate-two', consumerNodeId: 'two', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'one_result', producerNodeId: 'one', state: 'supplied_reused' }] },
+      { gateId: 'gate-five', consumerNodeId: 'five', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'four_result', producerNodeId: 'four', state: 'supplied_live' }] },
+    ],
+    progress: {
+      total: 4, completed: 3, queued: 1, executing: 0, waiting: 0,
+      blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+      frontierNodeIds: ['five'], activeNodeIds: [],
+    },
     feedbackRounds: [],
     childRuns: [],
     reuse: { nodeCount: 2, edgeCount: 1 },
@@ -62,13 +73,13 @@ describe('workflow graph probe coordinator', () => {
       ok: true,
       graph: {
         hasRunId: true,
-        nodeCount: 3,
+        nodeCount: 4,
         edgeCount: 2,
         reusedNodeCount: 2,
         reusedEdgeCount: 1,
         reuseNodeCount: 2,
         reuseEdgeCount: 1,
-        nodeStatuses: ['active', 'reused'],
+        nodeStatuses: ['active', 'reused', 'succeeded'],
         childRunCount: 0,
         feedbackRoundCount: 0,
         diagnostics: [],

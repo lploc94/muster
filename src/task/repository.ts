@@ -78,6 +78,12 @@ import type {
   StartWorkflowEntryInput,
   StartWorkflowNodeReuse,
   WorkflowGraphProjection,
+  WorkflowGraphNodeProjection,
+  WorkflowGraphProgressProjection,
+  WorkflowGateStatus,
+  WorkflowGateStatusProjection,
+  WorkflowNodeStatus,
+  WorkflowRunStatus,
   WorkflowRunCompletionProjection,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
@@ -696,6 +702,208 @@ type WorkflowEffectPlan = {
   settlementClosurePreconditions?: WorkflowClosurePrecondition[];
   conflictReason?: string;
 };
+
+function workflowGraphNodeProjection(input: {
+  nodeId: string;
+  workflowNodeStatus: WorkflowNodeStatus;
+  turnStatus: string | null;
+  runStatus: WorkflowRunStatus;
+  gate?: WorkflowGateStatusProjection;
+}): WorkflowGraphNodeProjection {
+  const executionActivity: WorkflowGraphNodeProjection['executionActivity'] =
+    input.turnStatus === 'queued' ? 'queued'
+      : input.turnStatus === 'running' ? 'executing'
+        : input.turnStatus === 'waiting_user' ? 'waiting_feedback'
+          : input.turnStatus === 'succeeded' ? 'completed'
+            : input.turnStatus === 'failed' || input.turnStatus === 'interrupted' ? 'failed'
+              : input.turnStatus === 'cancelled' ? 'cancelled'
+                : 'none';
+  if (executionActivity === 'queued') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'queued',
+      progressBucket: 'queued',
+    };
+  }
+  if (executionActivity === 'executing') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'executing',
+      progressBucket: 'executing',
+    };
+  }
+  if (executionActivity === 'waiting_feedback') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'waiting',
+      progressBucket: 'waiting',
+    };
+  }
+  if (input.workflowNodeStatus === 'reused') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'reused',
+      progressBucket: 'completed',
+    };
+  }
+  if (
+    input.workflowNodeStatus === 'succeeded'
+  ) {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'completed',
+      progressBucket: 'completed',
+    };
+  }
+  if (
+    (input.workflowNodeStatus === 'pending' || input.workflowNodeStatus === 'active')
+    && executionActivity === 'none'
+    && input.runStatus !== 'running'
+  ) {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'not_started',
+      progressBucket: 'not_started',
+      reason: 'run_closed_before_activation',
+    };
+  }
+  if (input.workflowNodeStatus === 'failed') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'failed',
+      progressBucket: 'failed',
+    };
+  }
+  if (input.workflowNodeStatus === 'cancelled') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'cancelled',
+      progressBucket: 'cancelled',
+    };
+  }
+  if (input.workflowNodeStatus === 'skipped') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'skipped',
+      progressBucket: 'skipped',
+    };
+  }
+  if (executionActivity === 'failed') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'failed',
+      progressBucket: 'failed',
+    };
+  }
+  if (executionActivity === 'cancelled') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'cancelled',
+      progressBucket: 'cancelled',
+    };
+  }
+  if (executionActivity === 'completed') {
+    if (input.runStatus === 'failed') {
+      return {
+        nodeId: input.nodeId,
+        workflowNodeStatus: input.workflowNodeStatus,
+        executionActivity,
+        displayState: 'failed',
+        progressBucket: 'failed',
+      };
+    }
+    if (input.runStatus === 'cancelled') {
+      return {
+        nodeId: input.nodeId,
+        workflowNodeStatus: input.workflowNodeStatus,
+        executionActivity,
+        displayState: 'cancelled',
+        progressBucket: 'cancelled',
+      };
+    }
+    if (input.runStatus === 'succeeded') {
+      return {
+        nodeId: input.nodeId,
+        workflowNodeStatus: input.workflowNodeStatus,
+        executionActivity,
+        displayState: 'completed',
+        progressBucket: 'completed',
+      };
+    }
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'waiting',
+      progressBucket: 'waiting',
+      reason: 'awaiting_workflow_route',
+    };
+  }
+  if (input.gate && input.gate.satisfied < input.gate.required) {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'blocked',
+      progressBucket: 'blocked',
+      reason: 'waiting_for_inputs',
+    };
+  }
+  return {
+    nodeId: input.nodeId,
+    workflowNodeStatus: input.workflowNodeStatus,
+    executionActivity,
+    displayState: 'not_started',
+    progressBucket: 'not_started',
+  };
+}
+
+function workflowGraphProgressProjection(
+  nodes: readonly WorkflowGraphNodeProjection[],
+): WorkflowGraphProgressProjection {
+  const count = (bucket: WorkflowGraphNodeProjection['progressBucket']) =>
+    nodes.filter((node) => node.progressBucket === bucket).length;
+  return {
+    total: nodes.length,
+    completed: count('completed'),
+    queued: count('queued'),
+    executing: count('executing'),
+    waiting: count('waiting'),
+    blocked: count('blocked'),
+    notStarted: count('not_started'),
+    failed: count('failed'),
+    cancelled: count('cancelled'),
+    skipped: count('skipped'),
+    frontierNodeIds: nodes
+      .filter((node) => ['queued', 'executing', 'waiting', 'blocked'].includes(node.progressBucket))
+      .map((node) => node.nodeId),
+    activeNodeIds: nodes
+      .filter((node) => node.progressBucket === 'executing')
+      .map((node) => node.nodeId),
+  };
+}
 
 /**
  * Read-side boundary for task data.
@@ -2295,6 +2503,85 @@ export class SqliteTaskRepository implements TaskRepository {
    * Reads relational run, gate, activation, round, continuation, and integrity
    * state without topology, prompts, artifact bodies, or paths.
    */
+  private async readWorkflowGateStatusProjections(
+    runId: string,
+    runStatus: string,
+  ): Promise<{ gates: WorkflowGateStatusProjection[]; truncated: boolean }> {
+    const rows = await this.db.all<{
+      gate_id: string;
+      consumer_node_id: string;
+      gate_status: WorkflowGateStatus;
+      input_ref: string | null;
+      producer_node_id: string | null;
+      supplied: number;
+      producer_status: string | null;
+    }>(
+      `SELECT gate.gate_id, gate.consumer_node_id, gate.status AS gate_status,
+              binding.input_ref,
+              COALESCE(binding.producer_node_id, 'engine_start') AS producer_node_id,
+              CASE WHEN fill.input_ref IS NULL THEN 0 ELSE 1 END AS supplied,
+              producer.status AS producer_status
+         FROM workflow_dependency_gates gate
+         LEFT JOIN workflow_gate_bindings binding
+           ON binding.workspace_id = gate.workspace_id
+          AND binding.run_id = gate.run_id
+          AND binding.gate_id = gate.gate_id
+         LEFT JOIN workflow_gate_fills fill
+           ON fill.workspace_id = binding.workspace_id
+          AND fill.run_id = binding.run_id
+          AND fill.gate_id = binding.gate_id
+          AND fill.input_ref = binding.input_ref
+         LEFT JOIN workflow_nodes producer
+           ON producer.workspace_id = binding.workspace_id
+          AND producer.run_id = binding.run_id
+          AND producer.node_id = binding.producer_node_id
+        WHERE gate.workspace_id = ? AND gate.run_id = ?
+        ORDER BY gate.gate_id, binding.input_ref
+        LIMIT 4097`,
+      [this.workspaceId, runId],
+    );
+    const gatesById = new Map<string, WorkflowGateStatusProjection>();
+    for (const row of rows.slice(0, 4096)) {
+      let gate = gatesById.get(row.gate_id);
+      if (!gate) {
+        gate = {
+          gateId: row.gate_id,
+          consumerNodeId: row.consumer_node_id,
+          status: row.gate_status,
+          required: 0,
+          satisfied: 0,
+          inputs: [],
+        };
+        gatesById.set(row.gate_id, gate);
+      }
+      if (row.input_ref === null || row.producer_node_id === null) continue;
+      const supplied = row.supplied === 1;
+      const state = supplied
+        ? row.producer_status === 'reused' ? 'supplied_reused' as const : 'supplied_live' as const
+        : runStatus !== 'running' || ['failed', 'cancelled', 'skipped'].includes(row.producer_status ?? '')
+          ? 'blocking' as const
+          : 'pending' as const;
+      const inputs = [...gate.inputs, {
+        inputRef: row.input_ref,
+        producerNodeId: row.producer_node_id,
+        state,
+      }];
+      gate = {
+        ...gate,
+        required: inputs.length,
+        satisfied: inputs.filter(
+          (input) => input.state === 'supplied_live' || input.state === 'supplied_reused',
+        ).length,
+        inputs,
+      };
+      gatesById.set(row.gate_id, gate);
+    }
+    return {
+      gates: [...gatesById.values()].slice(0, 64),
+      truncated: rows.length > 4096 || gatesById.size > 64,
+    };
+  }
+
   async getWorkflowStatusForTask(
     taskId: string,
   ): Promise<WorkflowTaskStatusProjection | undefined> {
@@ -2316,7 +2603,7 @@ export class SqliteTaskRepository implements TaskRepository {
       run_id: string;
       definition_id: string;
       definition_version: number;
-      status: string;
+       status: WorkflowRunStatus;
       origin: string;
       parent_run_id: string | null;
       max_feedback_rounds: number;
@@ -2342,35 +2629,12 @@ export class SqliteTaskRepository implements TaskRepository {
       return undefined;
     }
 
-    const gateRows = await this.db.all<{
-      gate_id: string;
-      consumer_node_id: string;
-      status: string;
-      required: number;
-      satisfied: number;
-    }>(
-      `SELECT g.gate_id AS gate_id,
-              g.consumer_node_id AS consumer_node_id,
-              g.status AS status,
-              (SELECT COUNT(*) FROM workflow_gate_bindings b
-                WHERE b.workspace_id = g.workspace_id
-                  AND b.run_id = g.run_id
-                  AND b.gate_id = g.gate_id) AS required,
-              (SELECT COUNT(DISTINCT f.input_ref) FROM workflow_gate_fills f
-                WHERE f.workspace_id = g.workspace_id
-                  AND f.run_id = g.run_id
-                  AND f.gate_id = g.gate_id) AS satisfied
-         FROM workflow_dependency_gates g
-        WHERE g.workspace_id = ? AND g.run_id = ?
-        ORDER BY g.gate_id
-        LIMIT 65`,
-      [this.workspaceId, node.run_id],
-    );
+    const gateRead = await this.readWorkflowGateStatusProjections(node.run_id, run.status);
 
     const activationRows = await this.db.all<{
       activation_id: string;
       kind: string;
-      status: string;
+         status: WorkflowNodeStatus;
       primary_turn_id: string;
       execution_turn_id: string;
       source_gate_id: string | null;
@@ -2398,7 +2662,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const roundRows = await this.db.all<{
       round_id: string;
-      status: string;
+      status: WorkflowRunStatus;
       join_mode: string;
       role: 'requester' | 'target';
       required: number;
@@ -2485,7 +2749,7 @@ export class SqliteTaskRepository implements TaskRepository {
     );
 
     const diagnostics: Array<{ code: string }> = [];
-    const gatesTruncated = gateRows.length > 64;
+    const gatesTruncated = gateRead.truncated;
     const roundsTruncated = roundRows.length > 32;
     const continuationsTruncated = continuationRows.length > 64;
     if (gatesTruncated) diagnostics.push({ code: 'workflow_gates_truncated' });
@@ -2503,17 +2767,12 @@ export class SqliteTaskRepository implements TaskRepository {
       diagnostics.push({ code: 'invalid_terminal_reason' });
     }
 
-    const gates = gateRows.slice(0, 64).map((g) => ({
-      gateId: g.gate_id,
-      status: g.status,
-      required: Number(g.required) || 0,
-      satisfied: Number(g.satisfied) || 0,
-    }));
+    const gates = gateRead.gates;
     const activationRow = activationRows.length === 1 ? activationRows[0] : undefined;
     const activeGateRow = activationRow?.source_gate_id
-      ? gateRows.find((gate) => gate.gate_id === activationRow.source_gate_id)
-      : gateRows.find((gate) =>
-          gate.consumer_node_id === node.node_id && (gate.status === 'open' || gate.status === 'satisfied'));
+      ? gates.find((gate) => gate.gateId === activationRow.source_gate_id)
+      : gates.find((gate) =>
+          gate.consumerNodeId === node.node_id && (gate.status === 'open' || gate.status === 'satisfied'));
 
     const projection: WorkflowTaskStatusProjection = {
       runId: run.run_id,
@@ -2558,14 +2817,7 @@ export class SqliteTaskRepository implements TaskRepository {
     if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
       projection.parentRunId = run.parent_run_id;
     }
-    if (activeGateRow) {
-      projection.activeGate = {
-        gateId: activeGateRow.gate_id,
-        status: activeGateRow.status,
-        required: Number(activeGateRow.required) || 0,
-        satisfied: Number(activeGateRow.satisfied) || 0,
-      };
-    }
+    if (activeGateRow) projection.activeGate = activeGateRow;
     if (activationRow) {
       projection.activation = {
         activationId: activationRow.activation_id,
@@ -2599,10 +2851,11 @@ export class SqliteTaskRepository implements TaskRepository {
       definition_id: string;
       definition_version: number;
       topology_json: string;
+      status: WorkflowRunStatus;
     };
     const nodeRun = await this.db.get<WorkflowGraphRunRow>(
       `SELECT node.run_id, node.node_id, run.definition_id, run.definition_version,
-              definition.topology_json
+              definition.topology_json, run.status
          FROM workflow_nodes node
          JOIN workflow_runs run
            ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
@@ -2615,7 +2868,7 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     const run = nodeRun ?? await this.db.get<WorkflowGraphRunRow>(
       `SELECT run.run_id, NULL AS node_id, run.definition_id, run.definition_version,
-              definition.topology_json
+              definition.topology_json, run.status
          FROM workflow_runs run
          JOIN workflow_definitions definition
            ON definition.workspace_id = run.workspace_id
@@ -2632,10 +2885,30 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     if (!run) return undefined;
 
-    const [nodeRows, edgeRows, gateRows, roundRows, childRows] = await Promise.all([
-      this.db.all<{ node_id: string; status: string }>(
-        `SELECT node_id, status FROM workflow_nodes
-          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id LIMIT 65`,
+    const [nodeRows, edgeRows, gateRead, roundRows, childRows] = await Promise.all([
+      this.db.all<{
+        node_id: string;
+        status: WorkflowNodeStatus;
+        turn_status: string | null;
+      }>(
+        `SELECT node.node_id, node.status,
+                (
+                  SELECT turn.status FROM turns turn
+                   WHERE turn.workspace_id = node.workspace_id
+                     AND turn.task_id = node.task_id
+                   ORDER BY CASE turn.status
+                              WHEN 'running' THEN 0
+                              WHEN 'waiting_user' THEN 1
+                              WHEN 'queued' THEN 2
+                              ELSE 3
+                            END,
+                            turn.sequence DESC,
+                            turn.id DESC
+                   LIMIT 1
+                ) AS turn_status
+           FROM workflow_nodes node
+          WHERE node.workspace_id = ? AND node.run_id = ?
+          ORDER BY node.node_id LIMIT 65`,
         [this.workspaceId, run.run_id],
       ),
       this.db.all<{ source_node_id: string; destination_node_id: string; destination_input_ref: string }>(
@@ -2645,24 +2918,9 @@ export class SqliteTaskRepository implements TaskRepository {
           ORDER BY ordinal, source_node_id LIMIT 129`,
         [this.workspaceId, run.definition_id, run.definition_version],
       ),
-      this.db.all<{ gate_id: string; status: string; required: number; satisfied: number }>(
-        `SELECT gate.gate_id, gate.status,
-                (SELECT COUNT(*) FROM workflow_gate_bindings binding
-                  WHERE binding.workspace_id = gate.workspace_id AND binding.run_id = gate.run_id
-                    AND binding.gate_id = gate.gate_id) AS required,
-                (SELECT COUNT(DISTINCT fill.input_ref) FROM workflow_gate_fills fill
-                  WHERE fill.workspace_id = gate.workspace_id AND fill.run_id = gate.run_id
-                    AND fill.gate_id = gate.gate_id) AS satisfied
-           FROM workflow_dependency_gates gate
-          WHERE gate.workspace_id = ? AND gate.run_id = ?
-            AND (? IS NULL OR gate.consumer_node_id = ?)
-          ORDER BY CASE WHEN gate.status IN ('open', 'satisfied') THEN 0 ELSE 1 END,
-                   gate.gate_id
-          LIMIT 2`,
-        [this.workspaceId, run.run_id, run.node_id, run.node_id],
-      ),
+      this.readWorkflowGateStatusProjections(run.run_id, run.status),
       this.db.all<{
-        round_id: string; requester_node_id: string; status: string; join_mode: string;
+        round_id: string; requester_node_id: string; status: 'open' | 'satisfied'; join_mode: 'all';
         required: number; responded: number;
       }>(
         `SELECT round.round_id, round.requester_node_id, round.status, round.join_mode,
@@ -2677,7 +2935,7 @@ export class SqliteTaskRepository implements TaskRepository {
           ORDER BY round.created_at, round.round_id LIMIT 33`,
         [this.workspaceId, run.run_id],
       ),
-      this.db.all<{ run_id: string; status: string }>(
+       this.db.all<{ run_id: string; status: WorkflowRunStatus }>(
         `SELECT run_id, status FROM workflow_runs
           WHERE workspace_id = ? AND parent_run_id = ? ORDER BY created_at, run_id LIMIT 65`,
         [this.workspaceId, run.run_id],
@@ -2695,27 +2953,47 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_graph_nodes_truncated' });
     if (edgeRows.length > 128) diagnostics.push({ code: 'workflow_graph_edges_truncated' });
+    if (gateRead.truncated) diagnostics.push({ code: 'workflow_graph_gates_truncated' });
     if (childRows.length > 64) diagnostics.push({ code: 'workflow_graph_child_runs_truncated' });
 
-    const nodes = nodeRows.slice(0, 64).map((node) => ({ nodeId: node.node_id, status: node.status }));
+    const gateByConsumer = new Map(gateRead.gates.map((gate) => [gate.consumerNodeId, gate]));
+    const nodes = nodeRows.slice(0, 64).map((node) => workflowGraphNodeProjection({
+      nodeId: node.node_id,
+      workflowNodeStatus: node.status,
+      turnStatus: node.turn_status,
+      runStatus: run.status,
+      gate: gateByConsumer.get(node.node_id),
+    }));
+    const contributionByEdge = new Map(
+      gateRead.gates.flatMap((gate) => gate.inputs.map((input) => [
+        `${gate.consumerNodeId}\0${input.inputRef}`,
+        input.state,
+      ] as const)),
+    );
     const edges = edgeRows.slice(0, 128).map((edge) => ({
       fromNodeId: edge.source_node_id,
       toNodeId: edge.destination_node_id,
       inputRef: edge.destination_input_ref,
+      contributionState: contributionByEdge.get(
+        `${edge.destination_node_id}\0${edge.destination_input_ref}`,
+      ) ?? (run.status === 'running' ? 'pending' as const : 'blocking' as const),
     }));
-    const reusedNodeIds = new Set(nodes.filter((node) => node.status === 'reused').map((node) => node.nodeId));
-    const activeGateRow = gateRows.find((gate) => gate.status === 'open' || gate.status === 'satisfied');
+    const reusedNodeIds = new Set(
+      nodes.filter((node) => node.workflowNodeStatus === 'reused').map((node) => node.nodeId),
+    );
+    const activeGate = gateRead.gates.find(
+      (gate) => gate.status === 'open' || gate.status === 'satisfied',
+    );
+    const progress = workflowGraphProgressProjection(nodes);
 
     return {
       runId: run.run_id,
+      runStatus: run.status,
       nodes,
       edges,
-      ...(activeGateRow ? { activeGate: {
-        gateId: activeGateRow.gate_id,
-        status: activeGateRow.status,
-        required: Number(activeGateRow.required) || 0,
-        satisfied: Number(activeGateRow.satisfied) || 0,
-      } } : {}),
+      gates: gateRead.gates,
+      ...(activeGate ? { activeGate } : {}),
+      progress,
       feedbackRounds: roundRows.slice(0, 32).map((round) => ({
         roundId: round.round_id,
         requesterNodeId: round.requester_node_id,
@@ -2903,28 +3181,7 @@ export class SqliteTaskRepository implements TaskRepository {
         LIMIT 65`,
       [this.workspaceId, runId],
     );
-    const gateRows = await this.db.all<{
-      gate_id: string;
-      status: string;
-      required: number;
-      satisfied: number;
-    }>(
-      `SELECT g.gate_id AS gate_id,
-              g.status AS status,
-              (SELECT COUNT(*) FROM workflow_gate_bindings binding
-                WHERE binding.workspace_id = g.workspace_id
-                  AND binding.run_id = g.run_id
-                  AND binding.gate_id = g.gate_id) AS required,
-              (SELECT COUNT(DISTINCT fill.input_ref) FROM workflow_gate_fills fill
-                WHERE fill.workspace_id = g.workspace_id
-                  AND fill.run_id = g.run_id
-                  AND fill.gate_id = g.gate_id) AS satisfied
-         FROM workflow_dependency_gates g
-        WHERE g.workspace_id = ? AND g.run_id = ?
-        ORDER BY g.gate_id
-        LIMIT 65`,
-      [this.workspaceId, runId],
-    );
+    const gateRead = await this.readWorkflowGateStatusProjections(runId, run.status);
     const activationRows = await this.db.all<{
       node_id: string;
       activation_id: string;
@@ -3028,7 +3285,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const diagnostics: Array<{ code: string }> = [];
     if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_nodes_truncated' });
-    if (gateRows.length > 64) diagnostics.push({ code: 'workflow_gates_truncated' });
+    if (gateRead.truncated) diagnostics.push({ code: 'workflow_gates_truncated' });
     if (activationRows.length > 64) diagnostics.push({ code: 'workflow_activations_truncated' });
     if (roundRows.length > 32) diagnostics.push({ code: 'workflow_feedback_rounds_truncated' });
     if (continuationRows.length > 64) diagnostics.push({ code: 'workflow_continuations_truncated' });
@@ -3079,12 +3336,7 @@ export class SqliteTaskRepository implements TaskRepository {
         status: node.status,
         ...(node.status === 'succeeded' && node.task_id ? { taskId: node.task_id } : {}),
       })),
-      gates: gateRows.slice(0, 64).map((gate) => ({
-        gateId: gate.gate_id,
-        status: gate.status,
-        required: Number(gate.required) || 0,
-        satisfied: Number(gate.satisfied) || 0,
-      })),
+      gates: gateRead.gates,
       activations: activationRows.slice(0, 64).map((activation) => ({
         nodeId: activation.node_id,
         activationId: activation.activation_id,

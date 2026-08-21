@@ -9,8 +9,18 @@ function deps(overrides?: Partial<WorkflowGraphRouteDeps>): WorkflowGraphRouteDe
     getFocused: () => ({ taskId: 'task-1', generation: 1 }),
     buildWorkflowGraph: async () => ({
       runId: 'run-1',
-      nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
+      runStatus: 'running',
+      nodes: [{
+        nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'executing',
+        displayState: 'executing', progressBucket: 'executing', reused: false,
+      }],
       edges: [],
+      gates: [],
+      progress: {
+        total: 1, completed: 0, queued: 0, executing: 1, waiting: 0,
+        blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+        frontierNodeIds: ['node-1'], activeNodeIds: ['node-1'],
+      },
       feedbackRounds: [],
       childRuns: [],
       reuse: { nodeCount: 0, edgeCount: 0 },
@@ -102,7 +112,13 @@ describe('routeRequestWorkflowGraph', () => {
       { type: 'requestWorkflowGraph', requestId: 'request-1', taskId: 'task-1' },
       deps({
         buildWorkflowGraph: async () => ({
-          runId: 'run-1', nodes: [], edges: [], feedbackRounds: [], childRuns: [],
+          runId: 'run-1', runStatus: 'running', nodes: [], edges: [], gates: [],
+          progress: {
+            total: 0, completed: 0, queued: 0, executing: 0, waiting: 0,
+            blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+            frontierNodeIds: [], activeNodeIds: [],
+          },
+          feedbackRounds: [], childRuns: [],
           reuse: { nodeCount: 0, edgeCount: 0 },
           diagnostics: [
             { code: 'workflow_graph_nodes_truncated' },
@@ -137,8 +153,18 @@ describe('routeRequestWorkflowGraph', () => {
         ok: true,
         graph: {
           runId: 'run-1',
-          nodes: [{ nodeId: 'node-1', status: 'active', reused: false }],
+          runStatus: 'running',
+          nodes: [{
+            nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'executing',
+            displayState: 'executing', progressBucket: 'executing', reused: false,
+          }],
           edges: [],
+          gates: [],
+          progress: {
+            total: 1, completed: 0, queued: 0, executing: 1, waiting: 0,
+            blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+            frontierNodeIds: ['node-1'], activeNodeIds: ['node-1'],
+          },
           feedbackRounds: [],
           childRuns: [],
           reuse: { nodeCount: 0, edgeCount: 0 },

@@ -7,6 +7,13 @@ export const WORKFLOW_GRAPH_REQUEST_ID_MAX = 128;
 export const WORKFLOW_GRAPH_TASK_ID_MAX = 512;
 export const WORKFLOW_GRAPH_ID_MAX = 512;
 export const WORKFLOW_GRAPH_COLLECTION_MAX = 128;
+export const WORKFLOW_GRAPH_NODES_MAX = 64;
+export const WORKFLOW_GRAPH_EDGES_MAX = 128;
+export const WORKFLOW_GRAPH_GATES_MAX = 64;
+export const WORKFLOW_GRAPH_GATE_INPUTS_MAX = 64;
+export const WORKFLOW_GRAPH_FEEDBACK_ROUNDS_MAX = 32;
+export const WORKFLOW_GRAPH_CHILD_RUNS_MAX = 64;
+export const WORKFLOW_GRAPH_DIAGNOSTICS_MAX = 8;
 
 export const WORKFLOW_GRAPH_ERROR_CODES = [
   'invalidRequest',
@@ -20,27 +27,83 @@ export const WORKFLOW_GRAPH_DIAGNOSTIC_CODES = [
   'workflow_graph_topology_undecodable',
   'workflow_graph_nodes_truncated',
   'workflow_graph_edges_truncated',
+  'workflow_graph_gates_truncated',
   'workflow_graph_child_runs_truncated',
 ] as const;
 export type WorkflowGraphDiagnosticCode = (typeof WORKFLOW_GRAPH_DIAGNOSTIC_CODES)[number];
 
-export interface WorkflowGraphWireNode { nodeId: string; status: string; reused: boolean; }
-export interface WorkflowGraphWireEdge { fromNodeId: string; toNodeId: string; inputRef: string; reused: boolean; }
-export interface WorkflowGraphWireGate { gateId: string; status: string; satisfied: number; required: number; }
+export type WorkflowGraphWireInputState = 'supplied_live' | 'supplied_reused' | 'pending' | 'blocking';
+export type WorkflowGraphWireRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+export type WorkflowGraphWireNodeStatus =
+  | 'pending' | 'active' | 'reused' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
+export type WorkflowGraphWireGateStatus = 'open' | 'satisfied' | 'consumed' | 'failed' | 'cancelled';
+export type WorkflowGraphWireExecutionActivity =
+  | 'none' | 'queued' | 'executing' | 'waiting_feedback'
+  | 'completed' | 'failed' | 'cancelled' | 'skipped';
+export type WorkflowGraphWireDisplayState =
+  | 'queued' | 'executing' | 'waiting' | 'completed' | 'reused'
+  | 'blocked' | 'not_started' | 'failed' | 'cancelled' | 'skipped';
+export type WorkflowGraphWireProgressBucket = Exclude<WorkflowGraphWireDisplayState, 'reused'>;
+export interface WorkflowGraphWireNode {
+  nodeId: string;
+  workflowNodeStatus: WorkflowGraphWireNodeStatus;
+  executionActivity: WorkflowGraphWireExecutionActivity;
+  displayState: WorkflowGraphWireDisplayState;
+  progressBucket: WorkflowGraphWireProgressBucket;
+  reason?: 'waiting_for_inputs' | 'run_closed_before_activation' | 'awaiting_workflow_route';
+  reused: boolean;
+}
+export interface WorkflowGraphWireEdge {
+  fromNodeId: string;
+  toNodeId: string;
+  inputRef: string;
+  contributionState: WorkflowGraphWireInputState;
+  reused: boolean;
+}
+export interface WorkflowGraphWireGateInput {
+  inputRef: string;
+  producerNodeId: string;
+  state: WorkflowGraphWireInputState;
+}
+export interface WorkflowGraphWireGate {
+  gateId: string;
+  consumerNodeId: string;
+  status: WorkflowGraphWireGateStatus;
+  satisfied: number;
+  required: number;
+  inputs: WorkflowGraphWireGateInput[];
+}
+export interface WorkflowGraphWireProgress {
+  total: number;
+  completed: number;
+  queued: number;
+  executing: number;
+  waiting: number;
+  blocked: number;
+  notStarted: number;
+  failed: number;
+  cancelled: number;
+  skipped: number;
+  frontierNodeIds: string[];
+  activeNodeIds: string[];
+}
 export interface WorkflowGraphWireFeedbackRound {
   roundId: string;
   requesterNodeId: string;
-  status: string;
-  joinMode: string;
+  status: 'open' | 'satisfied';
+  joinMode: 'all';
   required: number;
   responded: number;
 }
-export interface WorkflowGraphWireChildRun { runId: string; status: string; }
+export interface WorkflowGraphWireChildRun { runId: string; status: WorkflowGraphWireRunStatus; }
 export interface WorkflowGraphWireGraph {
   runId: string;
+  runStatus: WorkflowGraphWireRunStatus;
   nodes: WorkflowGraphWireNode[];
   edges: WorkflowGraphWireEdge[];
+  gates: WorkflowGraphWireGate[];
   activeGate?: WorkflowGraphWireGate;
+  progress: WorkflowGraphWireProgress;
   feedbackRounds: WorkflowGraphWireFeedbackRound[];
   childRuns: WorkflowGraphWireChildRun[];
   reuse: { nodeCount: number; edgeCount: number };
@@ -60,6 +123,28 @@ export type ParsedRequestWorkflowGraph =
 
 const ERROR_CODES = new Set<string>(WORKFLOW_GRAPH_ERROR_CODES);
 const DIAGNOSTIC_CODES = new Set<string>(WORKFLOW_GRAPH_DIAGNOSTIC_CODES);
+const INPUT_STATES = new Set<string>(['supplied_live', 'supplied_reused', 'pending', 'blocking']);
+const RUN_STATUSES = new Set<string>(['running', 'succeeded', 'failed', 'cancelled']);
+const NODE_STATUSES = new Set<string>([
+  'pending', 'active', 'reused', 'succeeded', 'failed', 'cancelled', 'skipped',
+]);
+const GATE_STATUSES = new Set<string>(['open', 'satisfied', 'consumed', 'failed', 'cancelled']);
+const FEEDBACK_ROUND_STATUSES = new Set<string>(['open', 'satisfied']);
+const FEEDBACK_JOIN_MODES = new Set<string>(['all']);
+const EXECUTION_ACTIVITIES = new Set<string>([
+  'none', 'queued', 'executing', 'waiting_feedback', 'completed', 'failed', 'cancelled', 'skipped',
+]);
+const DISPLAY_STATES = new Set<string>([
+  'queued', 'executing', 'waiting', 'completed', 'reused',
+  'blocked', 'not_started', 'failed', 'cancelled', 'skipped',
+]);
+const PROGRESS_BUCKETS = new Set<string>([
+  'queued', 'executing', 'waiting', 'completed',
+  'blocked', 'not_started', 'failed', 'cancelled', 'skipped',
+]);
+const NODE_REASONS = new Set<string>([
+  'waiting_for_inputs', 'run_closed_before_activation', 'awaiting_workflow_route',
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -73,8 +158,12 @@ function isBoundedString(value: unknown, max = WORKFLOW_GRAPH_ID_MAX): value is 
 function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }
-function parseList<T>(value: unknown, parse: (item: unknown) => T | null): T[] | null {
-  if (!Array.isArray(value) || value.length > WORKFLOW_GRAPH_COLLECTION_MAX) return null;
+function parseList<T>(
+  value: unknown,
+  maximum: number,
+  parse: (item: unknown) => T | null,
+): T[] | null {
+  if (!Array.isArray(value) || value.length > maximum) return null;
   const result: T[] = [];
   for (const item of value) {
     const parsed = parse(item);
@@ -107,24 +196,146 @@ export function parseRequestWorkflowGraph(raw: unknown): Omit<RequestWorkflowGra
 }
 
 function parseNode(raw: unknown): WorkflowGraphWireNode | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['nodeId', 'status', 'reused']) || !isBoundedString(raw.nodeId) || !isBoundedString(raw.status) || typeof raw.reused !== 'boolean') return null;
-  return { nodeId: raw.nodeId, status: raw.status, reused: raw.reused };
+  if (!isRecord(raw)) return null;
+  const baseKeys = [
+    'nodeId', 'workflowNodeStatus', 'executionActivity', 'displayState', 'progressBucket', 'reused',
+  ];
+  if (!hasExactKeys(raw, 'reason' in raw ? [...baseKeys, 'reason'] : baseKeys)
+    || !isBoundedString(raw.nodeId) || typeof raw.workflowNodeStatus !== 'string'
+    || !NODE_STATUSES.has(raw.workflowNodeStatus)
+    || typeof raw.executionActivity !== 'string' || !EXECUTION_ACTIVITIES.has(raw.executionActivity)
+    || typeof raw.displayState !== 'string' || !DISPLAY_STATES.has(raw.displayState)
+    || typeof raw.progressBucket !== 'string' || !PROGRESS_BUCKETS.has(raw.progressBucket)
+    || typeof raw.reused !== 'boolean'
+    || ('reason' in raw && (typeof raw.reason !== 'string' || !NODE_REASONS.has(raw.reason)))) return null;
+  const node: WorkflowGraphWireNode = {
+    nodeId: raw.nodeId,
+    workflowNodeStatus: raw.workflowNodeStatus as WorkflowGraphWireNodeStatus,
+    executionActivity: raw.executionActivity as WorkflowGraphWireExecutionActivity,
+    displayState: raw.displayState as WorkflowGraphWireDisplayState,
+    progressBucket: raw.progressBucket as WorkflowGraphWireProgressBucket,
+    ...('reason' in raw ? { reason: raw.reason as WorkflowGraphWireNode['reason'] } : {}),
+    reused: raw.reused,
+  };
+  return node;
+}
+function validNodeTuple(node: WorkflowGraphWireNode, runStatus: WorkflowGraphWireRunStatus): boolean {
+  const expectedBucket = node.displayState === 'reused' ? 'completed' : node.displayState;
+  if (node.progressBucket !== expectedBucket) return false;
+  if (node.workflowNodeStatus === 'reused') {
+    return node.executionActivity === 'none' && node.displayState === 'reused'
+      && node.reason === undefined;
+  }
+  if (node.executionActivity === 'queued') {
+    return node.displayState === 'queued' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'executing') {
+    return node.displayState === 'executing' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'waiting_feedback') {
+    return node.displayState === 'waiting' && node.reason === undefined;
+  }
+  if (node.workflowNodeStatus === 'succeeded') {
+    return node.displayState === 'completed' && node.reason === undefined;
+  }
+  if (
+    (node.workflowNodeStatus === 'pending' || node.workflowNodeStatus === 'active')
+    && node.executionActivity === 'none'
+    && node.reason === 'run_closed_before_activation'
+  ) {
+    return runStatus !== 'running' && node.displayState === 'not_started';
+  }
+  if (node.workflowNodeStatus === 'failed') {
+    return node.displayState === 'failed' && node.reason === undefined;
+  }
+  if (node.workflowNodeStatus === 'cancelled') {
+    return node.displayState === 'cancelled' && node.reason === undefined;
+  }
+  if (node.workflowNodeStatus === 'skipped') {
+    return node.displayState === 'skipped' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'failed') {
+    return node.displayState === 'failed' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'cancelled') {
+    return node.displayState === 'cancelled' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'skipped') {
+    return node.displayState === 'skipped' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'completed') {
+    if (runStatus === 'failed') {
+      return node.displayState === 'failed' && node.reason === undefined;
+    }
+    if (runStatus === 'cancelled') {
+      return node.displayState === 'cancelled' && node.reason === undefined;
+    }
+    if (runStatus === 'succeeded') {
+      return node.displayState === 'completed' && node.reason === undefined;
+    }
+    return node.displayState === 'waiting' && node.reason === 'awaiting_workflow_route';
+  }
+  if (node.reason === 'waiting_for_inputs') {
+    return runStatus === 'running' && node.displayState === 'blocked';
+  }
+  return node.executionActivity === 'none'
+    && runStatus === 'running'
+    && node.displayState === 'not_started'
+    && node.reason === undefined;
 }
 function parseEdge(raw: unknown): WorkflowGraphWireEdge | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['fromNodeId', 'toNodeId', 'inputRef', 'reused']) || !isBoundedString(raw.fromNodeId) || !isBoundedString(raw.toNodeId) || !isBoundedString(raw.inputRef) || typeof raw.reused !== 'boolean') return null;
-  return { fromNodeId: raw.fromNodeId, toNodeId: raw.toNodeId, inputRef: raw.inputRef, reused: raw.reused };
+  if (!isRecord(raw) || !hasExactKeys(raw, ['fromNodeId', 'toNodeId', 'inputRef', 'contributionState', 'reused']) || !isBoundedString(raw.fromNodeId) || !isBoundedString(raw.toNodeId) || !isBoundedString(raw.inputRef) || typeof raw.contributionState !== 'string' || !INPUT_STATES.has(raw.contributionState) || typeof raw.reused !== 'boolean') return null;
+  return { fromNodeId: raw.fromNodeId, toNodeId: raw.toNodeId, inputRef: raw.inputRef, contributionState: raw.contributionState as WorkflowGraphWireInputState, reused: raw.reused };
+}
+function parseGateInput(raw: unknown): WorkflowGraphWireGateInput | null {
+  if (!isRecord(raw) || !hasExactKeys(raw, ['inputRef', 'producerNodeId', 'state']) || !isBoundedString(raw.inputRef) || !isBoundedString(raw.producerNodeId) || typeof raw.state !== 'string' || !INPUT_STATES.has(raw.state)) return null;
+  return { inputRef: raw.inputRef, producerNodeId: raw.producerNodeId, state: raw.state as WorkflowGraphWireInputState };
 }
 function parseGate(raw: unknown): WorkflowGraphWireGate | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['gateId', 'status', 'satisfied', 'required']) || !isBoundedString(raw.gateId) || !isBoundedString(raw.status) || !isCount(raw.satisfied) || !isCount(raw.required) || raw.satisfied > raw.required) return null;
-  return { gateId: raw.gateId, status: raw.status, satisfied: raw.satisfied, required: raw.required };
+  if (!isRecord(raw) || !hasExactKeys(raw, ['gateId', 'consumerNodeId', 'status', 'satisfied', 'required', 'inputs']) || !isBoundedString(raw.gateId) || !isBoundedString(raw.consumerNodeId) || typeof raw.status !== 'string' || !GATE_STATUSES.has(raw.status) || !isCount(raw.satisfied) || !isCount(raw.required) || raw.satisfied > raw.required) return null;
+  const inputs = parseList(raw.inputs, WORKFLOW_GRAPH_GATE_INPUTS_MAX, parseGateInput);
+  const inputRefs = inputs ? new Set(inputs.map((input) => input.inputRef)) : undefined;
+  if (!inputs || inputRefs?.size !== inputs.length || inputs.length !== raw.required || inputs.filter((input) => input.state === 'supplied_live' || input.state === 'supplied_reused').length !== raw.satisfied) return null;
+  if ((raw.status === 'satisfied' || raw.status === 'consumed') && raw.satisfied !== raw.required) return null;
+  if (raw.status === 'open' && raw.satisfied >= raw.required) return null;
+  return { gateId: raw.gateId, consumerNodeId: raw.consumerNodeId, status: raw.status as WorkflowGraphWireGateStatus, satisfied: raw.satisfied, required: raw.required, inputs };
+}
+function parseProgress(raw: unknown, nodeCount: number): WorkflowGraphWireProgress | null {
+  if (!isRecord(raw) || !hasExactKeys(raw, [
+    'total', 'completed', 'queued', 'executing', 'waiting', 'blocked', 'notStarted',
+    'failed', 'cancelled', 'skipped', 'frontierNodeIds', 'activeNodeIds',
+  ])) return null;
+  const countKeys = ['total', 'completed', 'queued', 'executing', 'waiting', 'blocked', 'notStarted', 'failed', 'cancelled', 'skipped'] as const;
+  if (countKeys.some((key) => !isCount(raw[key]))) return null;
+  const frontierNodeIds = parseList(raw.frontierNodeIds, WORKFLOW_GRAPH_NODES_MAX, (value) => isBoundedString(value) ? value : null);
+  const activeNodeIds = parseList(raw.activeNodeIds, WORKFLOW_GRAPH_NODES_MAX, (value) => isBoundedString(value) ? value : null);
+  if (!frontierNodeIds || !activeNodeIds || raw.total !== nodeCount) return null;
+  const sum = countKeys.slice(1).reduce((total, key) => total + (raw[key] as number), 0);
+  if (sum !== raw.total) return null;
+  return {
+    total: raw.total as number,
+    completed: raw.completed as number,
+    queued: raw.queued as number,
+    executing: raw.executing as number,
+    waiting: raw.waiting as number,
+    blocked: raw.blocked as number,
+    notStarted: raw.notStarted as number,
+    failed: raw.failed as number,
+    cancelled: raw.cancelled as number,
+    skipped: raw.skipped as number,
+    frontierNodeIds,
+    activeNodeIds,
+  };
 }
 function parseFeedbackRound(raw: unknown): WorkflowGraphWireFeedbackRound | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['roundId', 'requesterNodeId', 'status', 'joinMode', 'required', 'responded']) || !isBoundedString(raw.roundId) || !isBoundedString(raw.requesterNodeId) || !isBoundedString(raw.status) || !isBoundedString(raw.joinMode) || !isCount(raw.required) || !isCount(raw.responded) || raw.responded > raw.required) return null;
-  return { roundId: raw.roundId, requesterNodeId: raw.requesterNodeId, status: raw.status, joinMode: raw.joinMode, required: raw.required, responded: raw.responded };
+  if (!isRecord(raw) || !hasExactKeys(raw, ['roundId', 'requesterNodeId', 'status', 'joinMode', 'required', 'responded']) || !isBoundedString(raw.roundId) || !isBoundedString(raw.requesterNodeId) || typeof raw.status !== 'string' || !FEEDBACK_ROUND_STATUSES.has(raw.status) || typeof raw.joinMode !== 'string' || !FEEDBACK_JOIN_MODES.has(raw.joinMode) || !isCount(raw.required) || raw.required > WORKFLOW_GRAPH_NODES_MAX || !isCount(raw.responded) || raw.responded > raw.required) return null;
+  if (raw.status === 'satisfied' && raw.responded !== raw.required) return null;
+  if (raw.status === 'open' && raw.responded >= raw.required) return null;
+  return { roundId: raw.roundId, requesterNodeId: raw.requesterNodeId, status: raw.status as WorkflowGraphWireFeedbackRound['status'], joinMode: raw.joinMode as WorkflowGraphWireFeedbackRound['joinMode'], required: raw.required, responded: raw.responded };
 }
 function parseChildRun(raw: unknown): WorkflowGraphWireChildRun | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['runId', 'status']) || !isBoundedString(raw.runId) || !isBoundedString(raw.status)) return null;
-  return { runId: raw.runId, status: raw.status };
+  if (!isRecord(raw) || !hasExactKeys(raw, ['runId', 'status']) || !isBoundedString(raw.runId) || typeof raw.status !== 'string' || !RUN_STATUSES.has(raw.status)) return null;
+  return { runId: raw.runId, status: raw.status as WorkflowGraphWireRunStatus };
 }
 function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | null {
   if (!isRecord(raw) || !hasExactKeys(raw, ['code']) || typeof raw.code !== 'string' || !DIAGNOSTIC_CODES.has(raw.code)) return null;
@@ -132,17 +343,112 @@ function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | 
 }
 function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
   if (!isRecord(raw)) return null;
-  const baseKeys = ['runId', 'nodes', 'edges', 'feedbackRounds', 'childRuns', 'reuse', 'diagnostics'];
-  if (!hasExactKeys(raw, 'activeGate' in raw ? [...baseKeys, 'activeGate'] : baseKeys) || !isBoundedString(raw.runId)) return null;
-  const nodes = parseList(raw.nodes, parseNode);
-  const edges = parseList(raw.edges, parseEdge);
-  const feedbackRounds = parseList(raw.feedbackRounds, parseFeedbackRound);
-  const childRuns = parseList(raw.childRuns, parseChildRun);
-  const diagnostics = parseList(raw.diagnostics, parseDiagnostic);
-  if (!nodes || !edges || !feedbackRounds || !childRuns || !diagnostics || !isRecord(raw.reuse) || !hasExactKeys(raw.reuse, ['nodeCount', 'edgeCount']) || !isCount(raw.reuse.nodeCount) || !isCount(raw.reuse.edgeCount)) return null;
+  const baseKeys = ['runId', 'runStatus', 'nodes', 'edges', 'gates', 'progress', 'feedbackRounds', 'childRuns', 'reuse', 'diagnostics'];
+  if (!hasExactKeys(raw, 'activeGate' in raw ? [...baseKeys, 'activeGate'] : baseKeys) || !isBoundedString(raw.runId) || typeof raw.runStatus !== 'string' || !RUN_STATUSES.has(raw.runStatus)) return null;
+  const nodes = parseList(raw.nodes, WORKFLOW_GRAPH_NODES_MAX, parseNode);
+  const edges = parseList(raw.edges, WORKFLOW_GRAPH_EDGES_MAX, parseEdge);
+  const gates = parseList(raw.gates, WORKFLOW_GRAPH_GATES_MAX, parseGate);
+  const feedbackRounds = parseList(raw.feedbackRounds, WORKFLOW_GRAPH_FEEDBACK_ROUNDS_MAX, parseFeedbackRound);
+  const childRuns = parseList(raw.childRuns, WORKFLOW_GRAPH_CHILD_RUNS_MAX, parseChildRun);
+  const diagnostics = parseList(raw.diagnostics, WORKFLOW_GRAPH_DIAGNOSTICS_MAX, parseDiagnostic);
+  if (!nodes || !edges || !gates || !feedbackRounds || !childRuns || !diagnostics || !isRecord(raw.reuse) || !hasExactKeys(raw.reuse, ['nodeCount', 'edgeCount']) || !isCount(raw.reuse.nodeCount) || !isCount(raw.reuse.edgeCount)) return null;
+  const progress = parseProgress(raw.progress, nodes.length);
+  if (!progress) return null;
+  const nodeIds = new Set(nodes.map((node) => node.nodeId));
+  const gateIds = new Set(gates.map((gate) => gate.gateId));
+  const gateConsumers = new Set(gates.map((gate) => gate.consumerNodeId));
+  const edgeKeys = new Set(edges.map((edge) => `${edge.toNodeId}\0${edge.inputRef}`));
+  const feedbackRoundIds = new Set(feedbackRounds.map((round) => round.roundId));
+  const childRunIds = new Set(childRuns.map((run) => run.runId));
+  if (
+    nodeIds.size !== nodes.length
+    || gateIds.size !== gates.length
+    || gateConsumers.size !== gates.length
+    || edgeKeys.size !== edges.length
+    || feedbackRoundIds.size !== feedbackRounds.length
+    || childRunIds.size !== childRuns.length
+    || nodes.some((node) => !validNodeTuple(node, raw.runStatus as WorkflowGraphWireRunStatus))
+    || gates.some((gate) => !nodeIds.has(gate.consumerNodeId))
+    || edges.some((edge) => !nodeIds.has(edge.fromNodeId) || !nodeIds.has(edge.toNodeId))
+    || feedbackRounds.some((round) => !nodeIds.has(round.requesterNodeId))
+  ) return null;
+  const bucketCounts = new Map<WorkflowGraphWireProgressBucket, number>();
+  for (const node of nodes) {
+    bucketCounts.set(node.progressBucket, (bucketCounts.get(node.progressBucket) ?? 0) + 1);
+  }
+  if (
+    progress.completed !== (bucketCounts.get('completed') ?? 0)
+    || progress.queued !== (bucketCounts.get('queued') ?? 0)
+    || progress.executing !== (bucketCounts.get('executing') ?? 0)
+    || progress.waiting !== (bucketCounts.get('waiting') ?? 0)
+    || progress.blocked !== (bucketCounts.get('blocked') ?? 0)
+    || progress.notStarted !== (bucketCounts.get('not_started') ?? 0)
+    || progress.failed !== (bucketCounts.get('failed') ?? 0)
+    || progress.cancelled !== (bucketCounts.get('cancelled') ?? 0)
+    || progress.skipped !== (bucketCounts.get('skipped') ?? 0)
+  ) return null;
+  const expectedFrontier = nodes
+    .filter((node) => ['queued', 'executing', 'waiting', 'blocked'].includes(node.progressBucket))
+    .map((node) => node.nodeId);
+  const expectedActive = nodes
+    .filter((node) => node.progressBucket === 'executing')
+    .map((node) => node.nodeId);
+  if (
+    JSON.stringify(progress.frontierNodeIds) !== JSON.stringify(expectedFrontier)
+    || JSON.stringify(progress.activeNodeIds) !== JSON.stringify(expectedActive)
+  ) return null;
+  const edgeByInput = new Map(edges.map((edge) => [`${edge.toNodeId}\0${edge.inputRef}`, edge] as const));
+  const nodeById = new Map(nodes.map((node) => [node.nodeId, node] as const));
+  const gateByConsumer = new Map(gates.map((gate) => [gate.consumerNodeId, gate] as const));
+  for (const node of nodes) {
+    const gate = gateByConsumer.get(node.nodeId);
+    const hasIncompleteGate = gate !== undefined && gate.satisfied < gate.required;
+    const mustBeBlocked = raw.runStatus === 'running'
+      && (node.workflowNodeStatus === 'pending' || node.workflowNodeStatus === 'active')
+      && node.executionActivity === 'none'
+      && hasIncompleteGate;
+    if ((node.displayState === 'blocked') !== mustBeBlocked) return null;
+  }
+  for (const gate of gates) {
+    for (const input of gate.inputs) {
+      const edge = edgeByInput.get(`${gate.consumerNodeId}\0${input.inputRef}`);
+      if (input.producerNodeId === 'engine_start' && !edge) {
+        if (input.state === 'supplied_reused') return null;
+        continue;
+      }
+      const producer = nodeById.get(input.producerNodeId);
+      if (
+        !producer
+        || !edge
+        || edge.fromNodeId !== input.producerNodeId
+        || edge.contributionState !== input.state
+        || (input.state === 'supplied_reused') !== producer.reused
+      ) {
+        return null;
+      }
+    }
+  }
+  for (const edge of edges) {
+    const gate = gateByConsumer.get(edge.toNodeId);
+    const input = gate?.inputs.find((candidate) => candidate.inputRef === edge.inputRef);
+    if (!input || input.producerNodeId !== edge.fromNodeId || input.state !== edge.contributionState) {
+      return null;
+    }
+  }
   const activeGate = raw.activeGate === undefined ? undefined : parseGate(raw.activeGate);
   if ('activeGate' in raw && !activeGate) return null;
-  return { runId: raw.runId, nodes, edges, ...(activeGate ? { activeGate } : {}), feedbackRounds, childRuns, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, diagnostics };
+  if (activeGate) {
+    const matchingGate = gates.find((gate) => gate.gateId === activeGate.gateId);
+    if (!matchingGate || JSON.stringify(matchingGate) !== JSON.stringify(activeGate)) return null;
+  }
+  if (nodes.some((node) => node.reused !== (node.workflowNodeStatus === 'reused'))) return null;
+  const reusedNodeIds = new Set(nodes.filter((node) => node.reused).map((node) => node.nodeId));
+  if (
+    raw.reuse.nodeCount !== reusedNodeIds.size
+    || raw.reuse.edgeCount !== edges.filter((edge) => edge.reused).length
+    || edges.some((edge) => edge.reused !== reusedNodeIds.has(edge.fromNodeId))
+  ) return null;
+  return { runId: raw.runId, runStatus: raw.runStatus as WorkflowGraphWireRunStatus, nodes, edges, gates, ...(activeGate ? { activeGate } : {}), progress, feedbackRounds, childRuns, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, diagnostics };
 }
 
 /** Fail-closed host→webview parser: any malformed or extra field rejects the whole result. */

@@ -168,25 +168,67 @@ describe('M024 S04 workflow graph projection', () => {
       const graph = await repository.getWorkflowGraphForTask(five!.task_id);
       expect(graph).toEqual({
         runId: consumer.runId,
+        runStatus: 'running',
         nodes: [
-          { nodeId: 'five', status: 'active' },
-          { nodeId: 'four', status: 'reused' },
-          { nodeId: 'one', status: 'reused' },
-          { nodeId: 'three', status: 'reused' },
-          { nodeId: 'two', status: 'reused' },
+          {
+            nodeId: 'five', workflowNodeStatus: 'active', executionActivity: 'queued',
+            displayState: 'queued', progressBucket: 'queued',
+          },
+          {
+            nodeId: 'four', workflowNodeStatus: 'reused', executionActivity: 'none',
+            displayState: 'reused', progressBucket: 'completed',
+          },
+          {
+            nodeId: 'one', workflowNodeStatus: 'reused', executionActivity: 'none',
+            displayState: 'reused', progressBucket: 'completed',
+          },
+          {
+            nodeId: 'three', workflowNodeStatus: 'reused', executionActivity: 'none',
+            displayState: 'reused', progressBucket: 'completed',
+          },
+          {
+            nodeId: 'two', workflowNodeStatus: 'reused', executionActivity: 'none',
+            displayState: 'reused', progressBucket: 'completed',
+          },
         ],
         edges: [
-          { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result' },
-          { fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result' },
-          { fromNodeId: 'three', toNodeId: 'four', inputRef: 'three_result' },
-          { fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result' },
+          {
+            fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result',
+            contributionState: 'supplied_reused',
+          },
+          {
+            fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result',
+            contributionState: 'supplied_reused',
+          },
+          {
+            fromNodeId: 'three', toNodeId: 'four', inputRef: 'three_result',
+            contributionState: 'supplied_reused',
+          },
+          {
+            fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result',
+            contributionState: 'supplied_reused',
+          },
         ],
+        gates: expect.arrayContaining([
+          expect.objectContaining({
+            consumerNodeId: 'five', status: 'satisfied', required: 1, satisfied: 1,
+            inputs: [{
+              inputRef: 'four_result', producerNodeId: 'four', state: 'supplied_reused',
+            }],
+          }),
+        ]),
         activeGate: expect.objectContaining({ status: 'satisfied', required: 1, satisfied: 1 }),
+        progress: {
+          total: 5, completed: 4, queued: 1, executing: 0, waiting: 0,
+          blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ['five'], activeNodeIds: [],
+        },
         feedbackRounds: [],
         childRuns: expect.arrayContaining([{ runId: 'child-run-001', status: 'running' }]),
         reuse: { nodeCount: 4, edgeCount: 4 },
         diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
       });
+      expect(JSON.stringify(graph)).not.toMatch(/payload_json|body_json|prompt|\/tmp\/|api[_-]?key|secret/i);
       await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toEqual(graph);
       const hostGraph = await buildWorkflowGraphView(repository, five!.task_id);
       const outcome = await routeRequestWorkflowGraph(

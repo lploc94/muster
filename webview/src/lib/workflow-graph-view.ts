@@ -71,6 +71,10 @@ const STATUS_LABELS: Readonly<Record<string, string>> = {
   pending: "Waiting for inputs",
   satisfied: "Satisfied",
   queued: "Queued",
+  executing: "Executing",
+  waiting: "Waiting",
+  completed: "Completed",
+  not_started: "Not started",
   active: "Running",
   running: "Running",
   reused: "Reused",
@@ -90,6 +94,7 @@ const DIAGNOSTIC_LABELS: Readonly<Record<WorkflowGraphDiagnosticCode, string>> =
       "Workflow topology could not be decoded",
     workflow_graph_nodes_truncated: "Workflow nodes were truncated",
     workflow_graph_edges_truncated: "Workflow edges were truncated",
+    workflow_graph_gates_truncated: "Workflow gates were truncated",
     workflow_graph_child_runs_truncated: "Child workflow runs were truncated",
   };
 
@@ -130,17 +135,17 @@ function reduceDegradedRead(
 export function buildWorkflowGraphPanelView(
   graph: WorkflowGraphWireGraph,
 ): WorkflowGraphPanelView {
-  const activeNodeId =
-    graph.nodes.find((node) => node.status === "active")?.nodeId ?? null;
+  const activeNodeIds = new Set(graph.progress.activeNodeIds);
+  const activeNodeId = graph.progress.activeNodeIds[0] ?? null;
 
   return {
     runId: graph.runId,
     nodes: graph.nodes.map((node) => ({
       id: node.nodeId,
-      status: node.status,
-      statusLabel: workflowGraphStatusLabel(node.status),
+      status: node.displayState,
+      statusLabel: workflowGraphStatusLabel(node.displayState),
       reused: node.reused,
-      active: node.nodeId === activeNodeId,
+      active: activeNodeIds.has(node.nodeId),
       provenanceLabel: node.reused ? "Supplied from a prior result" : "",
     })),
     activeNodeId,

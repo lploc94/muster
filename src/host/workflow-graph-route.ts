@@ -53,27 +53,48 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
 
   return {
     runId: graph.runId,
+    runStatus: graph.runStatus,
     nodes: graph.nodes.map((node) => ({
       nodeId: node.nodeId,
-      status: node.status,
+      workflowNodeStatus: node.workflowNodeStatus,
+      executionActivity: node.executionActivity,
+      displayState: node.displayState,
+      progressBucket: node.progressBucket,
+      ...(node.reason ? { reason: node.reason } : {}),
       reused: node.reused,
     })),
     edges: graph.edges.map((edge) => ({
       fromNodeId: edge.fromNodeId,
       toNodeId: edge.toNodeId,
       inputRef: edge.inputRef,
+      contributionState: edge.contributionState,
       reused: edge.reused,
+    })),
+    gates: graph.gates.map((gate) => ({
+      gateId: gate.gateId,
+      consumerNodeId: gate.consumerNodeId,
+      status: gate.status,
+      satisfied: gate.satisfied,
+      required: gate.required,
+      inputs: gate.inputs.map((input) => ({ ...input })),
     })),
     ...(graph.activeGate
       ? {
           activeGate: {
             gateId: graph.activeGate.gateId,
+            consumerNodeId: graph.activeGate.consumerNodeId,
             status: graph.activeGate.status,
             satisfied: graph.activeGate.satisfied,
             required: graph.activeGate.required,
+            inputs: graph.activeGate.inputs.map((input) => ({ ...input })),
           },
         }
       : {}),
+    progress: {
+      ...graph.progress,
+      frontierNodeIds: [...graph.progress.frontierNodeIds],
+      activeNodeIds: [...graph.progress.activeNodeIds],
+    },
     feedbackRounds: graph.feedbackRounds.map((round) => ({
       roundId: round.roundId,
       requesterNodeId: round.requesterNodeId,

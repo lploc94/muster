@@ -76,7 +76,7 @@ type Pending = {
 };
 
 function summarizeGraph(graph: WorkflowGraphWireGraph): WorkflowGraphProbeGraphObservation {
-  const statuses = [...new Set(graph.nodes.map((node) => node.status))].sort();
+  const statuses = [...new Set(graph.nodes.map((node) => node.workflowNodeStatus))].sort();
   return {
     hasRunId: typeof graph.runId === 'string' && graph.runId.length > 0,
     nodeCount: graph.nodes.length,

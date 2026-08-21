@@ -2,12 +2,14 @@ import type { TaskRepository } from '../task/repository';
 import type {
   WorkflowGraphChildRunProjection,
   WorkflowGraphEdgeProjection,
+  WorkflowGraphFeedbackRoundProjection,
   WorkflowGraphNodeProjection,
   WorkflowGraphProjection,
+  WorkflowGraphProgressProjection,
   WorkflowGraphReuseProjection,
   WorkflowGateStatusProjection,
   WorkflowIntegrityDiagnosticProjection,
-  WorkflowRunFeedbackRoundInspectionProjection,
+  WorkflowRunStatus,
 } from '../task/workflow-types';
 
 /** A graph node enriched for host rendering without exposing durable task ids. */
@@ -29,10 +31,13 @@ export interface WorkflowGraphViewEdge extends WorkflowGraphEdgeProjection {
  */
 export interface WorkflowGraphView {
   runId: string;
+  runStatus: WorkflowRunStatus;
   nodes: readonly WorkflowGraphViewNode[];
   edges: readonly WorkflowGraphViewEdge[];
+  gates: readonly WorkflowGateStatusProjection[];
   activeGate?: WorkflowGateStatusProjection;
-  feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
+  progress: WorkflowGraphProgressProjection;
+  feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   childRuns: readonly WorkflowGraphChildRunProjection[];
   reuse: WorkflowGraphReuseProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
@@ -55,7 +60,9 @@ export async function buildWorkflowGraphView(
 /** Converts the durable graph projection to its renderer-oriented host shape. */
 export function projectWorkflowGraphView(graph: WorkflowGraphProjection): WorkflowGraphView {
   const reusedNodeIds = new Set(
-    graph.nodes.filter((node) => node.status === 'reused').map((node) => node.nodeId),
+    graph.nodes
+      .filter((node) => node.workflowNodeStatus === 'reused')
+      .map((node) => node.nodeId),
   );
 
   return {

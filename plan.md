@@ -119,7 +119,7 @@ When a workflow run is created—including a child workflow run—every new/unbo
 - Commit: `feat(workflow): materialize inert task shells at start`
 
 ## Phase 2: Expose complete workflow execution and dependency state
-- Status: pending
+- Status: completed
 - Depends on: Phase 1
 - Goal: Make the host graph data model explain which nodes are executing, waiting, completed, reused, or not started, and which consumer/input gates are blocking progress.
 - Current behavior: `WorkflowGraphProjection`/`WorkflowGraphWireGraph` expose `status: string`, topology edges, reuse density, feedback/child runs, and one optional `activeGate`. `getWorkflowGraphForTask` reads at most two gates and selects one open/satisfied row; the gate has no consumer node ID or input details. The UI treats the first node with `status === 'active'` as the only active node, although entry node rows can be `active` while their turn is still `queued`.
@@ -153,11 +153,11 @@ When a workflow run is created—including a child workflow run—every new/unbo
   - Implement and test the explicit state precedence and exclusive progress-bucket truth table; derive progress/frontier from authoritative node/activity/gate state, not from array order or UI heuristics. Preserve reuse density and feedback/child-run data.
   - Update host and webview tests together so no caller can silently accept an older graph shape.
 - Acceptance criteria:
-  - [ ] AC-1: A graph response identifies all nodes, all bounded consumer gates, each gate's progress, and the exact missing/supplied incoming input state - proven by the fan-in repository and wire tests.
-  - [ ] AC-2: Queued, executing, waiting, completed, reused, failed, cancelled/skipped, and not-started states are distinguishable with explicit cross-axis precedence; live feedback overrides stale terminal display for that node, while unrelated succeeded upstream nodes remain green and never-activated closed-run shells remain not-started - proven by the activity/state matrix tests.
-  - [ ] AC-3: Multiple concurrently executing nodes and multiple live gates are represented simultaneously - proven by concurrent repository/protocol tests.
-  - [ ] AC-4: Root-owner and worker-focused graph requests return the same bounded state for the selected run, with no sensitive payload leakage - proven by host route and privacy assertions.
-  - [ ] AC-5: Progress/frontier counts are deterministic, bounded, mutually exclusive, and sum to total nodes across partial gate fills, reuse, feedback, and failure/closure states - proven by projection tests.
+  - [x] AC-1: A graph response identifies all nodes, all bounded consumer gates, each gate's progress, and the exact missing/supplied incoming input state - proven by the fan-in repository and wire tests.
+  - [x] AC-2: Queued, executing, waiting, completed, reused, failed, cancelled/skipped, and not-started states are distinguishable with explicit cross-axis precedence; live feedback overrides stale terminal display for that node, while unrelated succeeded upstream nodes remain green and never-activated closed-run shells remain not-started - proven by the activity/state matrix tests.
+  - [x] AC-3: Multiple concurrently executing nodes and multiple live gates are represented simultaneously - proven by concurrent repository/protocol tests.
+  - [x] AC-4: Root-owner and worker-focused graph requests return the same bounded state for the selected run, with no sensitive payload leakage - proven by host route and privacy assertions.
+  - [x] AC-5: Progress/frontier counts are deterministic, bounded, mutually exclusive, and sum to total nodes across partial gate fills, reuse, feedback, and failure/closure states - proven by projection tests.
 - Focused verification:
   - `npx vitest run src/task/m018-s07-workflow-status-projection.test.ts src/task/m024-s04-workflow-graph-projection.test.ts src/host/workflow-graph.test.ts src/host/workflow-graph-route.test.ts src/shared/workflow-graph-wire.test.ts`
 - Phase gates:
@@ -226,5 +226,5 @@ When a workflow run is created—including a child workflow run—every new/unbo
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
 | 1 | completed | this phase commit (`feat(workflow): materialize inert task shells at start`) | compile; svelte-check; focused 10 files/91 tests; phase gate 6 files/84 tests; broader 14 files/138 tests; focused Playwright | codex-impl-review round 9 APPROVE |
-| 2 | pending | N/A | pending | pending |
+| 2 | completed | this phase commit (`feat(workflow): expose complete gate and execution state`) | compile; svelte-check; focused 5 files/34 tests; supplemental 3 files/115 tests | codex-impl-review round 6 APPROVE; 19 issues fixed |
 | 3 | pending | N/A | pending | pending |

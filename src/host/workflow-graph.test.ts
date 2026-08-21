@@ -13,14 +13,38 @@ describe('buildWorkflowGraphView', () => {
   it('adapts the bounded host-only graph for a graph viewer and derives reused edges', async () => {
     const repository = repositoryFor({
       runId: 'run-1',
+      runStatus: 'running',
       nodes: [
-        { nodeId: 'reused-producer', status: 'reused' },
-        { nodeId: 'live-consumer', status: 'active' },
+        {
+          nodeId: 'reused-producer', workflowNodeStatus: 'reused', executionActivity: 'none',
+          displayState: 'reused', progressBucket: 'completed',
+        },
+        {
+          nodeId: 'live-consumer', workflowNodeStatus: 'active', executionActivity: 'executing',
+          displayState: 'executing', progressBucket: 'executing',
+        },
       ],
       edges: [
-        { fromNodeId: 'reused-producer', toNodeId: 'live-consumer', inputRef: 'source' },
+        {
+          fromNodeId: 'reused-producer', toNodeId: 'live-consumer', inputRef: 'source',
+          contributionState: 'supplied_reused',
+        },
       ],
-      activeGate: { gateId: 'gate-1', status: 'pending', required: 1, satisfied: 0 },
+      gates: [{
+        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        required: 1, satisfied: 1,
+        inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
+      }],
+      activeGate: {
+        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        required: 1, satisfied: 1,
+        inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
+      },
+      progress: {
+        total: 2, completed: 1, queued: 0, executing: 1, waiting: 0,
+        blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+        frontierNodeIds: ['live-consumer'], activeNodeIds: ['live-consumer'],
+      },
       feedbackRounds: [],
       childRuns: [{ runId: 'child-1', status: 'running' }],
       reuse: { nodeCount: 1, edgeCount: 1 },
@@ -29,19 +53,41 @@ describe('buildWorkflowGraphView', () => {
 
     await expect(buildWorkflowGraphView(repository, 'task-1')).resolves.toEqual({
       runId: 'run-1',
+      runStatus: 'running',
       nodes: [
-        { nodeId: 'reused-producer', status: 'reused', reused: true },
-        { nodeId: 'live-consumer', status: 'active', reused: false },
+        {
+          nodeId: 'reused-producer', workflowNodeStatus: 'reused', executionActivity: 'none',
+          displayState: 'reused', progressBucket: 'completed', reused: true,
+        },
+        {
+          nodeId: 'live-consumer', workflowNodeStatus: 'active', executionActivity: 'executing',
+          displayState: 'executing', progressBucket: 'executing', reused: false,
+        },
       ],
       edges: [
         {
           fromNodeId: 'reused-producer',
           toNodeId: 'live-consumer',
           inputRef: 'source',
+          contributionState: 'supplied_reused',
           reused: true,
         },
       ],
-      activeGate: { gateId: 'gate-1', status: 'pending', required: 1, satisfied: 0 },
+      gates: [{
+        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        required: 1, satisfied: 1,
+        inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
+      }],
+      activeGate: {
+        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        required: 1, satisfied: 1,
+        inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
+      },
+      progress: {
+        total: 2, completed: 1, queued: 0, executing: 1, waiting: 0,
+        blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+        frontierNodeIds: ['live-consumer'], activeNodeIds: ['live-consumer'],
+      },
       feedbackRounds: [],
       childRuns: [{ runId: 'child-1', status: 'running' }],
       reuse: { nodeCount: 1, edgeCount: 1 },

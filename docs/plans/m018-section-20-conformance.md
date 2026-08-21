@@ -712,7 +712,9 @@ Required work:
 
 - Pin turns/messages/operations/artifacts referenced by non-consumed workflow activations, rounds, and continuations.
 - Allow retention only after the workflow references are consumed or terminal and diagnostics policy permits deletion.
-- Project bounded run policy/status/reason, exact active gate, round progress, activation, and all continuation states needed for recovery.
+- Project bounded run policy/status/reason, every dependency gate with consumer/input progress, round progress, activations, and all continuation states needed for recovery.
+- Keep workflow-node status, live turn/activation activity, and the derived display/progress bucket as separate axes. Queued, executing, feedback-waiting, completed, reused, failed, cancelled, skipped, blocked, and closed-before-activation states must follow one deterministic precedence table.
+- Derive a bounded, mutually exclusive run progress summary and frontier from those authoritative axes; every node belongs to exactly one bucket and all bucket counts sum to the bounded node total.
 - Keep artifact bodies and prompt text out of status projection.
 - Add integrity diagnostics for impossible or corrupt workflow states.
 
@@ -721,6 +723,8 @@ Mandatory pass conditions:
 - Retention cannot delete a turn or idempotency record referenced by an open/satisfied activation, round, or continuation.
 - Reload distinguishes unresolved, resolved, consumed, failed, and cancelled continuation states.
 - Projection never selects an arbitrary round or continuation when multiple historical rows exist.
+- Projection identifies every bounded gate by consumer and every input as supplied, reused, pending, or blocking without exposing artifact contents.
+- Live activity overrides stale terminal display for the same node, while unrelated succeeded nodes remain completed and never-activated shells in a closed run remain not-started.
 - Projection remains bounded and does not leak topology, payload bodies, SQL, paths, credentials, or secrets.
 - Corrupt states produce bounded attention and no automatic work.
 

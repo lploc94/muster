@@ -11,39 +11,65 @@ function graph(
 ): WorkflowGraphWireGraph {
   return {
     runId: "run-parent",
+    runStatus: "running",
     nodes: [
-      { nodeId: "one", status: "reused", reused: true },
-      { nodeId: "two", status: "reused", reused: true },
-      { nodeId: "three", status: "reused", reused: true },
-      { nodeId: "four", status: "reused", reused: true },
-      { nodeId: "five", status: "active", reused: false },
+      { nodeId: "one", workflowNodeStatus: "reused", executionActivity: "none", displayState: "reused", progressBucket: "completed", reused: true },
+      { nodeId: "two", workflowNodeStatus: "reused", executionActivity: "none", displayState: "reused", progressBucket: "completed", reused: true },
+      { nodeId: "three", workflowNodeStatus: "reused", executionActivity: "none", displayState: "reused", progressBucket: "completed", reused: true },
+      { nodeId: "four", workflowNodeStatus: "reused", executionActivity: "none", displayState: "reused", progressBucket: "completed", reused: true },
+      { nodeId: "five", workflowNodeStatus: "active", executionActivity: "executing", displayState: "executing", progressBucket: "executing", reused: false },
     ],
     edges: [
-      { fromNodeId: "one", toNodeId: "two", inputRef: "source", reused: true },
+      { fromNodeId: "one", toNodeId: "two", inputRef: "source", contributionState: "supplied_reused", reused: true },
       {
         fromNodeId: "two",
         toNodeId: "three",
         inputRef: "source",
+        contributionState: "supplied_reused",
         reused: true,
       },
       {
         fromNodeId: "three",
         toNodeId: "four",
         inputRef: "source",
+        contributionState: "supplied_reused",
         reused: true,
       },
       {
         fromNodeId: "four",
         toNodeId: "five",
         inputRef: "source",
+        contributionState: "supplied_reused",
         reused: true,
       },
     ],
+    gates: [{
+      gateId: "gate-five", consumerNodeId: "five", status: "open",
+      satisfied: 3, required: 4,
+      inputs: [
+        { inputRef: "one", producerNodeId: "one", state: "supplied_reused" },
+        { inputRef: "two", producerNodeId: "two", state: "supplied_reused" },
+        { inputRef: "three", producerNodeId: "three", state: "supplied_reused" },
+        { inputRef: "four", producerNodeId: "four", state: "pending" },
+      ],
+    }],
     activeGate: {
       gateId: "gate-five",
-      status: "pending",
+      consumerNodeId: "five",
+      status: "open",
       satisfied: 3,
       required: 4,
+      inputs: [
+        { inputRef: "one", producerNodeId: "one", state: "supplied_reused" },
+        { inputRef: "two", producerNodeId: "two", state: "supplied_reused" },
+        { inputRef: "three", producerNodeId: "three", state: "supplied_reused" },
+        { inputRef: "four", producerNodeId: "four", state: "pending" },
+      ],
+    },
+    progress: {
+      total: 5, completed: 4, queued: 0, executing: 1, waiting: 0,
+      blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+      frontierNodeIds: ["five"], activeNodeIds: ["five"],
     },
     feedbackRounds: [
       {
@@ -107,8 +133,8 @@ describe("buildWorkflowGraphPanelView", () => {
       },
       {
         id: "five",
-        status: "active",
-        statusLabel: "Running",
+        status: "executing",
+        statusLabel: "Executing",
         reused: false,
         active: true,
         provenanceLabel: "",
@@ -117,8 +143,8 @@ describe("buildWorkflowGraphPanelView", () => {
     expect(view.activeNodeId).toBe("five");
     expect(view.activeGate).toEqual({
       id: "gate-five",
-      status: "pending",
-      statusLabel: "Waiting for inputs",
+      status: "open",
+      statusLabel: "Open",
       satisfied: 3,
       required: 4,
       progressLabel: "3 of 4 required inputs supplied",
@@ -159,9 +185,14 @@ describe("buildWorkflowGraphPanelView", () => {
     const view = buildWorkflowGraphPanelView(
       graph({
         nodes: [
-          { nodeId: "later", status: "queued", reused: false },
-          { nodeId: "earlier", status: "succeeded", reused: false },
+          { nodeId: "later", workflowNodeStatus: "active", executionActivity: "queued", displayState: "queued", progressBucket: "queued", reused: false },
+          { nodeId: "earlier", workflowNodeStatus: "succeeded", executionActivity: "completed", displayState: "completed", progressBucket: "completed", reused: false },
         ],
+        progress: {
+          total: 2, completed: 1, queued: 1, executing: 0, waiting: 0,
+          blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ["later"], activeNodeIds: [],
+        },
         activeGate: undefined,
         feedbackRounds: [],
         childRuns: [],

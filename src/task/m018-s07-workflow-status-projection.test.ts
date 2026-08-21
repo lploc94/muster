@@ -17,6 +17,7 @@ import type { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import { executeToolCommand, type GraphEngineDeps } from './engine-graph';
 import { SqliteTaskRepository } from './repository';
+import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
 import type { TaskStoreFile } from './types';
 import { makeGraphFanInDefinition, entryNodeIds } from './workflow';
@@ -129,10 +130,12 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
   expect(Array.isArray(w.diagnostics)).toBe(true);
   for (const g of w.gates) {
     expect(typeof g.gateId).toBe('string');
+    expect(typeof g.consumerNodeId).toBe('string');
     expect(typeof g.status).toBe('string');
     expect(typeof g.required).toBe('number');
     expect(typeof g.satisfied).toBe('number');
     expect(g.satisfied).toBeLessThanOrEqual(g.required || g.satisfied);
+    expect(Array.isArray(g.inputs)).toBe(true);
   }
   // No forbidden fields on the projection object itself.
   expect(w).not.toHaveProperty('topology');
@@ -226,6 +229,15 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(projection!.nodeId).toBe('p1');
       // Fan-in: entry gates satisfied (engine_start), consumer gate open with 2 required.
       expect(projection!.gates.length).toBeGreaterThanOrEqual(1);
+      expect(projection!.gates.find((g) => g.consumerNodeId === 'consumer')).toMatchObject({
+        status: 'open',
+        required: 2,
+        satisfied: 0,
+        inputs: [
+          { inputRef: 'from_p1', producerNodeId: 'p1', state: 'pending' },
+          { inputRef: 'from_p2', producerNodeId: 'p2', state: 'pending' },
+        ],
+      });
       const p1Gate = projection!.gates.find((g) => g.gateId === p1.gateId);
       expect(p1Gate).toBeTruthy();
       expect(p1Gate!.status).toBe('satisfied');
@@ -570,19 +582,227 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(graph).toMatchObject({
         runId: data.runId,
         nodes: expect.arrayContaining([
-          { nodeId: 'p1', status: 'active' },
-          { nodeId: 'p2', status: 'active' },
-          { nodeId: 'consumer', status: 'pending' },
+          {
+            nodeId: 'p1', workflowNodeStatus: 'active', executionActivity: 'queued',
+            displayState: 'queued', progressBucket: 'queued',
+          },
+          {
+            nodeId: 'p2', workflowNodeStatus: 'active', executionActivity: 'queued',
+            displayState: 'queued', progressBucket: 'queued',
+          },
+          {
+            nodeId: 'consumer', workflowNodeStatus: 'pending', executionActivity: 'none',
+            displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
+          },
         ]),
         edges: expect.arrayContaining([
-          { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
-          { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
+          {
+            fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1',
+            contributionState: 'pending',
+          },
+          {
+            fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2',
+            contributionState: 'pending',
+          },
+        ]),
+        gates: expect.arrayContaining([
+          expect.objectContaining({
+            consumerNodeId: 'consumer', required: 2, satisfied: 0,
+            inputs: expect.arrayContaining([
+              { inputRef: 'from_p1', producerNodeId: 'p1', state: 'pending' },
+              { inputRef: 'from_p2', producerNodeId: 'p2', state: 'pending' },
+            ]),
+          }),
         ]),
         activeGate: expect.objectContaining({ gateId: p1.gateId, status: 'satisfied' }),
+        progress: {
+          total: 3, completed: 0, queued: 2, executing: 0, waiting: 0,
+          blocked: 1, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ['consumer', 'p1', 'p2'], activeNodeIds: [],
+        },
         feedbackRounds: [],
         childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
+      });
+
+      await ctx.client.run(
+        `UPDATE turns SET status = 'succeeded', settled_at = ?,
+                          payload_json = json_set(payload_json, '$.status', 'succeeded')
+          WHERE workspace_id = 'ws' AND id = ?`,
+        ['2026-08-01T00:00:00.500Z', p1.activationTurnId],
+      );
+      const awaitingRoute = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(awaitingRoute?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+        workflowNodeStatus: 'active', executionActivity: 'completed',
+        displayState: 'waiting', progressBucket: 'waiting', reason: 'awaiting_workflow_route',
+      });
+      expect(awaitingRoute?.progress).toMatchObject({ completed: 0, waiting: 1 });
+      expect(awaitingRoute?.progress.frontierNodeIds).toEqual(['consumer', 'p1', 'p2']);
+      await ctx.client.run(
+        `UPDATE turns SET status = 'interrupted',
+                          payload_json = json_set(payload_json, '$.status', 'interrupted')
+          WHERE workspace_id = 'ws' AND id = ?`,
+        [p1.activationTurnId],
+      );
+      const interrupted = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(interrupted?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+        executionActivity: 'failed', displayState: 'failed', progressBucket: 'failed',
+      });
+      for (const workflowNodeStatus of ['cancelled', 'skipped'] as const) {
+        await ctx.client.run(
+          `UPDATE workflow_nodes SET status = ?
+            WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'p1'`,
+          [workflowNodeStatus, data.runId],
+        );
+        const authoritativeTerminalNode = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+        expect(authoritativeTerminalNode?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+          workflowNodeStatus,
+          executionActivity: 'failed',
+          displayState: workflowNodeStatus,
+          progressBucket: workflowNodeStatus,
+        });
+      }
+      await ctx.client.run(
+        `UPDATE workflow_nodes SET status = 'active'
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'p1'`,
+        [data.runId],
+      );
+      await ctx.client.run(
+        `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL,
+                          payload_json = json_set(payload_json, '$.status', 'running')
+          WHERE workspace_id = 'ws' AND id = ?`,
+        ['2026-08-01T00:00:01.000Z', p1.activationTurnId],
+      );
+      const p2 = data.entries.find((entry) => entry.nodeId === 'p2')!;
+      await ctx.client.run(
+        `UPDATE turns SET status = 'running', started_at = ?
+          WHERE workspace_id = 'ws' AND id = ?`,
+        ['2026-08-01T00:00:01.000Z', p2.activationTurnId],
+      );
+      const concurrentlyExecuting = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(concurrentlyExecuting?.progress.activeNodeIds).toEqual(['p1', 'p2']);
+      expect(concurrentlyExecuting?.progress.executing).toBe(2);
+      await ctx.client.run(
+        `UPDATE turns SET status = 'waiting_user'
+          WHERE workspace_id = 'ws' AND id = ?`,
+        [p2.activationTurnId],
+      );
+      const executing = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(executing?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+        workflowNodeStatus: 'active',
+        executionActivity: 'executing',
+        displayState: 'executing',
+        progressBucket: 'executing',
+      });
+      expect(executing?.progress.activeNodeIds).toEqual(['p1']);
+      expect(executing?.nodes.find((node) => node.nodeId === 'p2')).toMatchObject({
+        executionActivity: 'waiting_feedback',
+        displayState: 'waiting',
+        progressBucket: 'waiting',
+      });
+      expect(executing?.progress.frontierNodeIds).toEqual(['consumer', 'p1', 'p2']);
+
+      await ctx.client.run(
+        `UPDATE workflow_nodes SET status = 'succeeded'
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id IN ('p1','p2')`,
+        [data.runId],
+      );
+      await ctx.client.run(
+        `UPDATE turns SET status = 'succeeded', settled_at = ?,
+                          payload_json = json_set(payload_json, '$.status', 'succeeded')
+          WHERE workspace_id = 'ws' AND id = ?`,
+        ['2026-08-01T00:00:02.000Z', p2.activationTurnId],
+      );
+      const crossAxis = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(crossAxis?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+        workflowNodeStatus: 'succeeded',
+        executionActivity: 'executing',
+        displayState: 'executing',
+      });
+      expect(crossAxis?.nodes.find((node) => node.nodeId === 'p2')).toMatchObject({
+        workflowNodeStatus: 'succeeded',
+        executionActivity: 'completed',
+        displayState: 'completed',
+      });
+      expect(crossAxis?.nodes.find((node) => node.nodeId === 'consumer')).toMatchObject({
+        workflowNodeStatus: 'pending',
+        executionActivity: 'none',
+        displayState: 'blocked',
+        progressBucket: 'blocked',
+        reason: 'waiting_for_inputs',
+      });
+      expect(crossAxis?.progress).toMatchObject({
+        total: 3, completed: 1, executing: 1, notStarted: 0,
+        queued: 0, waiting: 0, blocked: 1, failed: 0, cancelled: 0, skipped: 0,
+      });
+
+      const consumer = await ctx.client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+        [data.runId],
+      );
+      for (const lifecycle of ['cancelled', 'skipped'] as const) {
+        await ctx.client.transaction([
+          {
+            sql: `UPDATE workflow_nodes SET status = ?
+                   WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+            params: [lifecycle, data.runId],
+          },
+          {
+            sql: `UPDATE tasks SET lifecycle = ?,
+                           payload_json = json_set(payload_json, '$.lifecycle', ?)
+                   WHERE workspace_id = 'ws' AND id = ?`,
+            params: [lifecycle, lifecycle, consumer!.task_id],
+          },
+        ]);
+        const state = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+        expect(state?.nodes.find((node) => node.nodeId === 'consumer')?.displayState).toBe(lifecycle);
+      }
+      await ctx.client.transaction([
+        {
+          sql: `UPDATE workflow_nodes SET status = 'pending'
+                 WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+          params: [data.runId],
+        },
+        {
+          sql: `UPDATE tasks SET lifecycle = 'open',
+                         payload_json = json_set(payload_json, '$.lifecycle', 'open')
+                 WHERE workspace_id = 'ws' AND id = ?`,
+          params: [consumer!.task_id],
+        },
+      ]);
+      await ctx.client.run(
+        `UPDATE workflow_nodes SET status = 'active'
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'p1'`,
+        [data.runId],
+      );
+      const p1Task = await ctx.repository.getTask(p1.taskId);
+      const p1Turn = await ctx.repository.getTurn(p1.activationTurnId);
+      const failureDisposition = { kind: 'workflow_fail' as const, reason: 'matrix failure' };
+      await stageDispositionForSettlement(ctx.repository, p1Turn!, failureDisposition);
+      await expect(ctx.repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: p1Task!.revision,
+        task: { ...p1Task!, updatedAt: '2026-08-01T00:00:03.000Z' },
+        turn: {
+          ...p1Turn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:03.000Z',
+          disposition: failureDisposition,
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      })).resolves.toMatchObject({ changed: true });
+      const terminalMatrix = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(terminalMatrix?.nodes.map((node) => [node.nodeId, node.displayState])).toEqual([
+        ['consumer', 'not_started'],
+        ['p1', 'failed'],
+        ['p2', 'completed'],
+      ]);
+      expect(terminalMatrix?.progress).toMatchObject({
+        total: 3, completed: 1, queued: 0, executing: 0, waiting: 0,
+        blocked: 0, notStarted: 1, failed: 1, cancelled: 0, skipped: 0,
       });
     } finally {
       await ctx.close();
