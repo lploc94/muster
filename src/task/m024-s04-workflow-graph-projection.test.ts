@@ -113,6 +113,35 @@ describe('M024 S04 workflow graph projection', () => {
         runId: expect.any(String),
       });
       expect(graphNodeReads).toBe(2);
+
+      graphNodeReads = 0;
+      let forcedRaces = 0;
+      (client as unknown as { all: typeof client.all }).all = async (sql, params) => {
+        if (sql.includes('FROM workflow_nodes node') && sql.includes('ORDER BY node.node_id LIMIT 65')) {
+          graphNodeReads += 1;
+          forcedRaces += 1;
+          const root = await peerRepository.getTask('root-1');
+          await peerRepository.execute({
+            kind: 'renameTask', workspaceId: WORKSPACE_ID, taskId: 'root-1',
+            goal: `forced revision race ${forcedRaces}`,
+            updatedAt: `2026-08-01T00:00:0${forcedRaces + 1}.000Z`,
+            expectedTaskRevision: root!.revision,
+          });
+        }
+        return originalAll(sql, params);
+      };
+      const outcome = await routeRequestWorkflowGraph(
+        { type: 'requestWorkflowGraph', requestId: 'unstable-read', taskId: 'root-1' },
+        {
+          getFocused: () => ({ taskId: 'root-1', generation: 1 }),
+          buildWorkflowGraph: () => buildWorkflowGraphView(repository, 'root-1'),
+        },
+      );
+      expect(outcome).toMatchObject({
+        kind: 'message',
+        message: { ok: false, code: 'unavailable' },
+      });
+      expect(graphNodeReads).toBe(3);
     } finally {
       await client.close().catch(() => {});
       await peer.close().catch(() => {});

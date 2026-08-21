@@ -52,6 +52,21 @@ const MULTI_TERMINAL_CHILD: GraphTopologyV1 = {
   ],
 };
 
+const INTERNAL_FAN_IN_CHILD: GraphTopologyV1 = {
+  kind: 'graph_v1',
+  nodes: [
+    { nodeId: 'left_source' },
+    { nodeId: 'right_source' },
+    { nodeId: 'join' },
+    { nodeId: 'terminal' },
+  ],
+  edges: [
+    { fromNodeId: 'left_source', toNodeId: 'join', inputRef: 'left' },
+    { fromNodeId: 'right_source', toNodeId: 'join', inputRef: 'right' },
+    { fromNodeId: 'join', toNodeId: 'terminal', inputRef: 'joined' },
+  ],
+};
+
 type OneNodeStart = {
   runId: string;
   entryTaskId: string;
@@ -1170,11 +1185,21 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
           WHERE workspace_id = 'ws' AND run_id = ?`,
         [childRun!.run_id],
       )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [caller.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
       await expect(opened.client.get<{ status: string; reason_code: string }>(
         `SELECT status, reason_code FROM workflow_continuations
           WHERE workspace_id = 'ws' AND child_run_id = ?`,
         [childRun!.run_id],
       )).resolves.toEqual({ status: 'failed', reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun!.run_id],
+      )).resolves.toEqual({ status: 'failed' });
       const childTasks = await opened.client.all<{ task_id: string; lifecycle: string }>(
         `SELECT task.id AS task_id, task.lifecycle
            FROM tasks task
@@ -1185,6 +1210,15 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       );
       expect(childTasks.length).toBeGreaterThan(0);
       expect(childTasks.every((task) => task.lifecycle === 'failed')).toBe(true);
+      const componentTasks = await opened.client.all<{ task_id: string; lifecycle: string }>(
+        `SELECT task.id AS task_id, task.lifecycle
+           FROM tasks task
+           JOIN workflow_nodes node
+             ON node.workspace_id = task.workspace_id AND node.task_id = task.id
+          WHERE node.workspace_id = 'ws' AND node.run_id IN (?, ?)`,
+        [caller.runId, childRun!.run_id],
+      );
+      expect(componentTasks.every((task) => task.lifecycle === 'failed')).toBe(true);
       const revision = await opened.repository.getWorkspaceRevision();
       const taskEffects = await opened.client.all<{ entity_id: string }>(
         `SELECT entity_id FROM change_log
@@ -1192,9 +1226,120 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         [revision],
       );
       expect(taskEffects.map((row) => row.entity_id)).toEqual(
-        expect.arrayContaining(childTasks.map((task) => task.task_id)),
+        expect.arrayContaining(componentTasks.map((task) => task.task_id)),
       );
       await expect(queuedTurnsForTask(opened.client, caller.entryTaskId)).resolves.toHaveLength(0);
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
+  it('recursively closes the parent component when an internal child fan-in aggregate overflows', async () => {
+    const opened = await openRepo('internal-fan-in-overflow');
+    try {
+      const createdAt = '2026-07-20T02:00:00.000Z';
+      const maxArtifactBytes = 64;
+      const childPolicy = {
+        ...DEFAULT_WORKFLOW_POLICY,
+        maxArtifactBytes,
+        maxAggregateBytes: maximumWorkflowEntryAggregateBytes(
+          [{ inputRef: 'engine_start' }],
+          maxArtifactBytes,
+        ),
+      };
+      await defineVersion(opened.repository, createdAt, 'wf-internal-overflow-caller', 'caller');
+      await defineGraphVersion(
+        opened.repository,
+        createdAt,
+        'wf-internal-overflow-child',
+        'internal overflow child',
+        INTERNAL_FAN_IN_CHILD,
+        childPolicy,
+      );
+      const caller = await startOneNode(
+        opened.repository,
+        createdAt,
+        'wf-internal-overflow-caller',
+        'internal-overflow-caller',
+        'internal overflow caller',
+      );
+      await expect(settleSucceeded(
+        opened.repository,
+        opened.client,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-internal-overflow-child',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              { childEntryNodeId: 'left_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
+              { childEntryNodeId: 'right_source', inputRef: 'engine_start', artifactId: caller.startArtifactId, artifactRevision: 1 },
+            ],
+            childIdempotencyKey: 'internal-overflow-child',
+          },
+        },
+        '2026-07-20T02:00:01.000Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+
+      const childRun = (await childRunsForParent(opened.client, caller.runId))[0]!;
+      const childNodes = await opened.client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND task_id IS NOT NULL`,
+        [childRun.run_id],
+      );
+      const childTask = (nodeId: string) => childNodes.find((node) => node.node_id === nodeId)!.task_id;
+      const settleSource = async (nodeId: 'left_source' | 'right_source', result: string, at: string) => {
+        const taskId = childTask(nodeId);
+        const turn = (await queuedTurnsForTask(opened.client, taskId))[0]!;
+        return settleSucceeded(
+          opened.repository,
+          opened.client,
+          taskId,
+          turn.id,
+          { kind: 'workflow_next', change: 'updated', result },
+          at,
+        );
+      };
+      await expect(settleSource('left_source', 'L'.repeat(maxArtifactBytes), '2026-07-20T02:00:02.000Z'))
+        .resolves.toMatchObject({ ok: true, changed: true });
+      await expect(settleSource('right_source', 'R'.repeat(maxArtifactBytes), '2026-07-20T02:00:03.000Z'))
+        .resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [childRun.run_id],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [caller.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string; reason_code: string }>(
+        `SELECT status, reason_code FROM workflow_continuations
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun.run_id],
+      )).resolves.toEqual({ status: 'failed', reason_code: 'aggregate_too_large' });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_return_gates
+          WHERE workspace_id = 'ws' AND child_run_id = ?`,
+        [childRun.run_id],
+      )).resolves.toEqual({ status: 'failed' });
+      const componentTasks = await opened.client.all<{ lifecycle: string }>(
+        `SELECT task.lifecycle FROM tasks task
+          JOIN workflow_nodes node
+            ON node.workspace_id = task.workspace_id AND node.task_id = task.id
+         WHERE node.workspace_id = 'ws' AND node.run_id IN (?, ?)`,
+        [caller.runId, childRun.run_id],
+      );
+      expect(componentTasks.length).toBeGreaterThan(0);
+      expect(componentTasks.every((task) => task.lifecycle === 'failed')).toBe(true);
+      expect(await opened.repository.listTurns(childTask('join'))).toHaveLength(0);
+      expect(await queuedTurnsForTask(opened.client, caller.entryTaskId)).toHaveLength(0);
     } finally {
       await opened.close();
     }

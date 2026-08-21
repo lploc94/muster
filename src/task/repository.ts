@@ -2850,7 +2850,7 @@ export class SqliteTaskRepository implements TaskRepository {
       const revisionAfter = await this.getWorkspaceRevision();
       if (revisionBefore === revisionAfter) return projection;
     }
-    return undefined;
+    throw new Error('workflow graph changed during every bounded read attempt');
   }
 
   private async getWorkflowGraphForTaskAttempt(taskId: string): Promise<WorkflowGraphProjection | undefined> {
@@ -8362,17 +8362,6 @@ export class SqliteTaskRepository implements TaskRepository {
 
     let activation: ReturnType<typeof deriveNodeActivationIdentities> | undefined;
     if (edge && gate) {
-      const aggregateClosureId = deriveRunClosureFenceId(producerNode.run_id, 'failed');
-      if (dependencyAggregateOverflow) {
-        statements.push({
-          sql: `UPDATE workflow_runs
-                   SET terminal_reason_code = 'aggregate_too_large', closure_id = ?, updated_at = ?
-                 WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                   AND terminal_reason_code IS NULL`,
-          params: [aggregateClosureId, finishedAt, this.workspaceId, producerNode.run_id],
-        });
-      }
-
       // Atomic open→satisfied only when all required inputRefs are filled (incl. this fill).
       statements.push({
         sql: `UPDATE workflow_dependency_gates
@@ -8407,8 +8396,9 @@ export class SqliteTaskRepository implements TaskRepository {
       if (dependencyAggregateOverflow) {
         const closure = await this.planWorkflowAggregateOverflowClosure({
           runId: producerNode.run_id,
-          closureId: aggregateClosureId,
           at: finishedAt,
+          sourceTaskId: command.task.id,
+          sourceTurnId: command.turn.id,
         });
         statements.push(...closure.statements);
         changes.push(...closure.changes);
@@ -9607,17 +9597,6 @@ export class SqliteTaskRepository implements TaskRepository {
         'utf8',
       ) > run.max_aggregate_bytes;
     }
-    const aggregateClosureId = deriveRunClosureFenceId(targetNode.run_id, 'failed');
-    if (feedbackAggregateOverflow) {
-      statements.push({
-        sql: `UPDATE workflow_runs
-                 SET terminal_reason_code = 'aggregate_too_large', closure_id = ?, updated_at = ?
-               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                 AND terminal_reason_code IS NULL`,
-        params: [aggregateClosureId, finishedAt, this.workspaceId, targetNode.run_id],
-      });
-    }
-
     // Atomic open→satisfied only when every target has responded (incl. this one).
     // Exclude this target from the pending check so the UPDATE does not depend on
     // statement ordering within the same transaction.
@@ -9651,8 +9630,9 @@ export class SqliteTaskRepository implements TaskRepository {
     if (feedbackAggregateOverflow) {
       const closure = await this.planWorkflowAggregateOverflowClosure({
         runId: targetNode.run_id,
-        closureId: aggregateClosureId,
         at: finishedAt,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
       });
       statements.push(...closure.statements);
       changes.push(...closure.changes);
@@ -11648,46 +11628,17 @@ export class SqliteTaskRepository implements TaskRepository {
 
   private async planWorkflowAggregateOverflowClosure(input: {
     runId: string;
-    closureId: string;
     at: string;
+    sourceTaskId: string;
+    sourceTurnId: string;
   }): Promise<WorkflowEffectPlan> {
-    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
+    return this.planWorkflowRecursiveClosure({
       runIds: [input.runId],
-      lifecycle: 'failed',
-      at: input.at,
       reasonCode: 'aggregate_too_large',
+      at: input.at,
+      sourceTaskId: input.sourceTaskId,
+      sourceTurnId: input.sourceTurnId,
     });
-    const turns = await this.db.all<{ id: string; task_id: string }>(
-      `SELECT turn.id, turn.task_id
-         FROM turns turn
-         JOIN workflow_nodes node
-           ON node.workspace_id = turn.workspace_id AND node.task_id = turn.task_id
-        WHERE turn.workspace_id = ? AND node.run_id = ?
-          AND turn.status IN ('queued', 'running', 'waiting_user')`,
-      [this.workspaceId, input.runId],
-    );
-    const ownerChanges = await this.ownerTaskChangesForRuns([input.runId]);
-    return {
-      statements: [
-        ...workflowAggregateOverflowClosureStatements({
-          workspaceId: this.workspaceId,
-          runId: input.runId,
-          closureId: input.closureId,
-          at: input.at,
-        }),
-        ...taskClosure.statements,
-      ],
-      changes: [
-        ...taskClosure.changes,
-        ...turns.map((turn) => ({
-          kind: 'turn' as const,
-          id: turn.id,
-          taskId: turn.task_id,
-          change: 'effect',
-        })),
-        ...ownerChanges,
-      ],
-    };
   }
 
   private async planWorkflowClosureFromTasks(input: {
@@ -13391,133 +13342,6 @@ function workflowNodeArtifactSourceStatement(input: {
       input.turnId,
     ],
   };
-}
-
-function workflowAggregateOverflowClosureStatements(input: {
-  workspaceId: string;
-  runId: string;
-  closureId: string;
-  at: string;
-}): SqlStatement[] {
-  const markerParams = [input.workspaceId, input.runId, input.closureId];
-  return [
-    {
-      sql: `UPDATE turns
-               SET status = 'cancelled', settled_at = ?,
-                   payload_json = json_set(payload_json, '$.error', 'aggregate_too_large')
-             WHERE workspace_id = ? AND status = 'queued'
-               AND task_id IN (
-                 SELECT task_id FROM workflow_nodes
-                  WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
-               )
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [
-        input.at,
-        input.workspaceId,
-        input.workspaceId,
-        input.runId,
-        ...markerParams,
-      ],
-    },
-    {
-      sql: `INSERT INTO turn_cancel_requests (
-              workspace_id, turn_id, task_id, kind, op_id, requested_by, requested_at, payload_json
-            )
-            SELECT turn.workspace_id, turn.id, turn.task_id, 'interrupt', ?, 'engine', ?,
-                   json_object('kind', 'interrupt', 'by', 'engine', 'opId', ?, 'at', ?,
-                               'reason', 'aggregate_too_large')
-              FROM turns turn
-             WHERE turn.workspace_id = ? AND turn.status IN ('running', 'waiting_user')
-               AND turn.task_id IN (
-                 SELECT task_id FROM workflow_nodes
-                  WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
-               )
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )
-            ON CONFLICT(workspace_id, turn_id) DO NOTHING`,
-      params: [
-        input.closureId,
-        input.at,
-        input.closureId,
-        input.at,
-        input.workspaceId,
-        input.workspaceId,
-        input.runId,
-        ...markerParams,
-      ],
-    },
-    {
-      sql: `UPDATE workflow_dependency_gates
-               SET status = 'failed'
-             WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [input.workspaceId, input.runId, ...markerParams],
-    },
-    {
-      sql: `UPDATE workflow_feedback_rounds
-               SET status = 'failed', updated_at = ?
-             WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [input.at, input.workspaceId, input.runId, ...markerParams],
-    },
-    {
-      sql: `UPDATE workflow_return_gates
-               SET status = 'failed', updated_at = ?
-             WHERE workspace_id = ? AND caller_run_id = ? AND status IN ('open', 'satisfied')
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [input.at, input.workspaceId, input.runId, ...markerParams],
-    },
-    {
-      sql: `UPDATE workflow_continuations
-               SET status = 'failed', outcome = 'failed', reason_code = 'aggregate_too_large',
-                   resolved_at = COALESCE(resolved_at, ?), updated_at = ?
-             WHERE workspace_id = ? AND caller_run_id = ? AND status IN ('pending', 'resolved')
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [input.at, input.at, input.workspaceId, input.runId, ...markerParams],
-    },
-    {
-      sql: `UPDATE workflow_activations
-               SET status = 'cancelled', updated_at = ?
-             WHERE workspace_id = ? AND run_id = ?
-               AND status IN ('queued', 'running', 'failed', 'interrupted')
-               AND EXISTS (
-                 SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?
-               )`,
-      params: [input.at, input.workspaceId, input.runId, ...markerParams],
-    },
-    {
-      sql: `UPDATE workflow_runs
-               SET status = 'failed', updated_at = ?
-             WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-               AND terminal_reason_code = 'aggregate_too_large' AND closure_id = ?`,
-      params: [input.at, input.workspaceId, input.runId, input.closureId],
-    },
-  ];
 }
 
 function sessionBindingStatements(
