@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
@@ -16,6 +16,7 @@
     isProtocolCompatible,
     isTaskScopedBannerVisible,
     post,
+    postDebug,
   } from './lib/protocol';
   import type {
     PendingAsk,
@@ -68,6 +69,7 @@
   import type { BackendReadinessId } from '../../src/shared/backend-readiness';
   import type { WorkflowGraphWireGraph } from '../../src/shared/workflow-graph-wire';
   import { WorkflowGraphStore } from './lib/workflow-graph-store.svelte';
+  import WorkflowGraphModal from './components/WorkflowGraphModal.svelte';
   import { vscode } from './lib/vscode';
   import { collectToolCardRenderObservations } from './lib/render-probe';
 
@@ -104,10 +106,12 @@
   // requestWorkflowGraph -> workflowGraphResult correlation:
   //   msg.requestId !== workflowGraphRequest?.requestId
   //   msg.taskId !== tasks.focusedTaskId
-  const workflowGraphStore = new WorkflowGraphStore(post);
+  const workflowGraphStore = new WorkflowGraphStore(post, postDebug);
   // Derived aliases keep template/patch code unchanged
   let workflowGraph = $derived(workflowGraphStore.graph);
   let workflowGraphRequest = $derived(workflowGraphStore.request);
+  let workflowGraphError = $derived(workflowGraphStore.error);
+  let taskSnapshotHydrated = $state(false);
   const visibleCommandError = $derived(
     tasks.commandError &&
       isTaskScopedBannerVisible(tasks.commandError.taskId, tasks.focusedTaskId)
@@ -196,6 +200,7 @@
   const inChat = $derived(tasks.draftMode || !!tasks.focusedTaskId);
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
+  let workflowGraphOpen = $state(false);
   /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
   let backendsFocusRequest = $state(0);
   let settingsSnapshot = $state<RuntimeStorageSettingsSnapshot | null>(null);
@@ -375,6 +380,7 @@
 
   function openSettings(opts?: { topicId?: SettingsTopicId; focusBackends?: boolean }) {
     historyOpen = false;
+    workflowGraphOpen = false;
     settingsOpen = true;
     if (opts?.topicId) {
       setSettingsActiveTopicId(opts.topicId);
@@ -446,6 +452,7 @@
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
+    workflowGraphOpen = false;
     // Tell the host we left the chat so it drops its focus; otherwise a later
     // snapshot (e.g. after Clear history) would re-open the stale chat.
     post({ type: 'blurTask' });
@@ -571,6 +578,10 @@
   onMount(() => {
     function onMessage(e: MessageEvent) {
       const msg = e.data;
+      const isWorkflowGraphResult =
+        msg &&
+        typeof msg === 'object' &&
+        (msg as { type?: unknown }).type === 'workflowGraphResult';
 
       // This response is intentionally outside the production protocol: the
       // host can issue its paired request only through the UAT-gated command.
@@ -602,6 +613,16 @@
       }
 
       if (!isExtMessage(msg)) {
+        if (isWorkflowGraphResult) {
+          const raw = msg as Record<string, unknown>;
+          postDebug('workflow_graph.webview_parser_drop', {
+            requestId: raw.requestId,
+            taskId: raw.taskId,
+            ok: raw.ok,
+            code: raw.code,
+            keys: Object.keys(raw),
+          });
+        }
         // A current-host patch envelope with an invalid nested shape or duplicate
         // identity is a projection invariant failure, not a message to drop
         // silently. Recover once from a bounded snapshot so a final bad revision
@@ -651,6 +672,7 @@
             break;
           }
           tasks.applySnapshot(msg);
+          taskSnapshotHydrated = true;
           patchView = nextPatchView;
           recoveryInFlight = false;
           pendingAsk = msg.pendingAsk ?? null;
@@ -817,6 +839,13 @@
           break;
 
         case 'workflowGraphResult': {
+          postDebug('workflow_graph.webview_result_accepted', {
+            requestId: msg.requestId,
+            taskId: msg.taskId,
+            ok: msg.ok,
+            code: msg.ok ? undefined : msg.code,
+            graphRunId: msg.ok ? msg.graph.runId : undefined,
+          });
           workflowGraphStore.handleResult(msg as any, tasks.focusedTaskId);
           break;
         }
@@ -1091,6 +1120,9 @@
     window.addEventListener('message', onMessage);
     window.addEventListener('muster:prefill-applied', onPrefillApplied);
     window.addEventListener('muster:open-backend-setup', onOpenBackendSetupEvent);
+    // Host hydration must start only after this listener exists; otherwise an
+    // extension reload can post the durable task snapshot into a dead webview.
+    post({ type: 'ready' });
     // Passive readiness inventory (M019): correlated request; host also posts
     // derived backendsAvailable. listBackends remains for transitional hosts.
     post({ type: 'requestBackendReadiness', requestId: `init-${Date.now()}` });
@@ -1106,12 +1138,16 @@
 
   let outboxReplayed = false;
 
-  // Declarative $effect (Svelte 5 best practice: $derived for computed, $effect for external sync)
-  // Focus change -> reset store and fetch; live updates via throttled notifyPatch above.
+  // Declarative $effect — workflow graph is on-demand via the View Workflow button next to History.
+  // It is NOT fetched automatically on focus (saves vertical space + avoids worktree-like duplication).
+  // When the modal is open, sync focus+open to the store so it fetches and stays live via notifyPatch.
   $effect(() => {
     const taskId = tasks.focusedTaskId;
-    // Sync store focus; store handles graph/request reset + fetch + cleanup
-    workflowGraphStore.setFocused(taskId);
+    const open = workflowGraphOpen;
+    if (!taskId) {
+      workflowGraphOpen = false;
+    }
+    untrack(() => workflowGraphStore.setOpen(open && Boolean(taskId), taskId));
   });
 
   // After focus changes, restore only rejected drafts (never pending ACK entries).
@@ -1302,12 +1338,14 @@
       </button>
     </div>
     <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
-    <FirstRunJourney
-      snapshot={tasks.backendReadinessSnapshot}
-      taskCount={firstRunTaskCount}
-      onOpenBackendSetup={openBackendSetup}
-      onStartFirstTask={startFirstTaskFromJourney}
-    />
+    {#if taskSnapshotHydrated}
+      <FirstRunJourney
+        snapshot={tasks.backendReadinessSnapshot}
+        taskCount={firstRunTaskCount}
+        onOpenBackendSetup={openBackendSetup}
+        onStartFirstTask={startFirstTaskFromJourney}
+      />
+    {/if}
     <TaskHistoryList
       variant="full"
       onSelect={(id) => { selectTask(id); historyOpen = false; }}
@@ -1344,6 +1382,23 @@
         use:tip={'History (previous coordinator tasks)'}
       >
         <span class="codicon codicon-history"></span>
+      </button>
+
+      <button
+        type="button"
+        class="icon-btn"
+        disabled={!tasks.focusedTaskId}
+        onclick={() => {
+          if (!tasks.focusedTaskId) return;
+          historyOpen = false;
+          workflowGraphOpen = !workflowGraphOpen;
+        }}
+        aria-label="View workflow graph"
+        aria-pressed={workflowGraphOpen}
+        data-testid="view-workflow-graph"
+        use:tip={'View workflow graph'}
+      >
+        <span class="codicon codicon-graph"></span>
       </button>
 
       <button
@@ -1390,7 +1445,6 @@
     <TaskWorkspace
       {pendingAsk}
       {activeTurnId}
-      {workflowGraph}
       submissionError={askSubmissionError}
       submissionVersion={askSubmissionVersion}
     />
@@ -1415,6 +1469,10 @@
         </div>
         <TaskHistoryList variant="dropdown" onSelect={(id) => { selectTask(id); }} />
       </div>
+    {/if}
+
+    {#if workflowGraphOpen}
+      <WorkflowGraphModal graph={workflowGraph} request={workflowGraphRequest} error={workflowGraphError} onClose={() => (workflowGraphOpen = false)} onRetry={() => workflowGraphStore.retry()} />
     {/if}
   </div>
 {/if}

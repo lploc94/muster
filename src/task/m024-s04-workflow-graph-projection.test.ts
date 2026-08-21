@@ -187,6 +187,7 @@ describe('M024 S04 workflow graph projection', () => {
         reuse: { nodeCount: 4, edgeCount: 4 },
         diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
       });
+      await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toEqual(graph);
       const hostGraph = await buildWorkflowGraphView(repository, five!.task_id);
       const outcome = await routeRequestWorkflowGraph(
         { type: 'requestWorkflowGraph', requestId: 'graph-request-1', taskId: five!.task_id },

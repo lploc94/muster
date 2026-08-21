@@ -2563,19 +2563,21 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   /**
-   * Host-only graph read. This intentionally exposes durable topology while
-   * remaining bounded and excluding all artifact/prompt/body fields.
+   * Host-only graph read. Resolves either a workflow node task or the root task
+   * that owns a top-level run, while remaining bounded and excluding all
+   * artifact/prompt/body fields.
    */
   async getWorkflowGraphForTask(taskId: string): Promise<WorkflowGraphProjection | undefined> {
     if (typeof taskId !== 'string' || taskId.length === 0) return undefined;
 
-    const run = await this.db.get<{
+    type WorkflowGraphRunRow = {
       run_id: string;
-      node_id: string;
+      node_id: string | null;
       definition_id: string;
       definition_version: number;
       topology_json: string;
-    }>(
+    };
+    const nodeRun = await this.db.get<WorkflowGraphRunRow>(
       `SELECT node.run_id, node.node_id, run.definition_id, run.definition_version,
               definition.topology_json
          FROM workflow_nodes node
@@ -2586,6 +2588,23 @@ export class SqliteTaskRepository implements TaskRepository {
           AND definition.definition_id = run.definition_id
           AND definition.version = run.definition_version
         WHERE node.workspace_id = ? AND node.task_id = ?`,
+      [this.workspaceId, taskId],
+    );
+    const run = nodeRun ?? await this.db.get<WorkflowGraphRunRow>(
+      `SELECT run.run_id, NULL AS node_id, run.definition_id, run.definition_version,
+              definition.topology_json
+         FROM workflow_runs run
+         JOIN workflow_definitions definition
+           ON definition.workspace_id = run.workspace_id
+          AND definition.definition_id = run.definition_id
+          AND definition.version = run.definition_version
+        WHERE run.workspace_id = ?
+          AND run.owner_root_task_id = ?
+          AND run.parent_run_id IS NULL
+        ORDER BY CASE WHEN run.status = 'running' THEN 0 ELSE 1 END,
+                 run.updated_at DESC,
+                 run.run_id DESC
+        LIMIT 1`,
       [this.workspaceId, taskId],
     );
     if (!run) return undefined;
@@ -2612,9 +2631,12 @@ export class SqliteTaskRepository implements TaskRepository {
                   WHERE fill.workspace_id = gate.workspace_id AND fill.run_id = gate.run_id
                     AND fill.gate_id = gate.gate_id) AS satisfied
            FROM workflow_dependency_gates gate
-          WHERE gate.workspace_id = ? AND gate.run_id = ? AND gate.consumer_node_id = ?
-          ORDER BY gate.gate_id LIMIT 2`,
-        [this.workspaceId, run.run_id, run.node_id],
+          WHERE gate.workspace_id = ? AND gate.run_id = ?
+            AND (? IS NULL OR gate.consumer_node_id = ?)
+          ORDER BY CASE WHEN gate.status IN ('open', 'satisfied') THEN 0 ELSE 1 END,
+                   gate.gate_id
+          LIMIT 2`,
+        [this.workspaceId, run.run_id, run.node_id, run.node_id],
       ),
       this.db.all<{
         round_id: string; requester_node_id: string; status: string; join_mode: string;

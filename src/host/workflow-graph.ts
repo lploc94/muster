@@ -39,7 +39,7 @@ export interface WorkflowGraphView {
 }
 
 /**
- * Reads and adapts the bounded graph containing taskId for host presentation.
+ * Reads and adapts the bounded graph containing or owned by taskId for host presentation.
  * Missing workflow membership remains undefined; repository failures propagate.
  */
 export async function buildWorkflowGraphView(

@@ -632,6 +632,7 @@ export type AskAnswer = { selected: string[]; freeText: string | null };
 
 // Webview -> extension host (protocol v2)
 export type OutMessage =
+  | { type: 'ready' }
   | {
       type: 'send';
       taskId?: string;

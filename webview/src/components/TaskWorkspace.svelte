@@ -17,8 +17,6 @@
   import { getTaskPresentation } from '../lib/task-status';
   import { workflowGraphStatusLabel } from '../lib/workflow-graph-view';
   import type { PendingAsk, TaskLifecycleState, TaskSummary } from '../lib/protocol';
-  import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
-  import WorkflowGraphPanel from './WorkflowGraphPanel.svelte';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
   import {
@@ -39,7 +37,6 @@
   interface Props {
     pendingAsk: PendingAsk | null;
     activeTurnId: string | null;
-    workflowGraph?: WorkflowGraphWireGraph | null;
     submissionError?: string;
     submissionVersion?: number;
   }
@@ -47,7 +44,6 @@
   let {
     pendingAsk = null,
     activeTurnId = null,
-    workflowGraph = null,
     submissionError,
     submissionVersion = 0,
   }: Props = $props();
@@ -1012,10 +1008,6 @@
         </div>
       {/if}
     </div>
-
-    {#if workflowGraph}
-      <WorkflowGraphPanel graph={workflowGraph} />
-    {/if}
 
     <ChatThread />
 

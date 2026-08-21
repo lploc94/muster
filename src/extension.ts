@@ -1695,6 +1695,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       // Stamp the wire version on the bootstrap message so the webview can detect
       // host<->webview drift once (and show a reload banner) instead of silently
       // dropping mismatched messages.
+      debugMuster('snapshot.host_posted', {
+        generation,
+        storeRevision: projection.snapshot.storeRevision,
+        rootTaskCount: projection.snapshot.rootTasks.length,
+        subtreeTaskCount: projection.snapshot.subtree?.length ?? 0,
+        focusedTaskId: projection.snapshot.focusedTaskId,
+      });
       this.post({ type: 'snapshot', protocolVersion: PROTOCOL_VERSION, ...projection.snapshot });
       this.replayPendingElicitations();
       // The repository normalizes a deleted/stale requested focus to no-focus.
@@ -2551,6 +2558,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    */
   private async handleRequestWorkflowGraph(data: unknown): Promise<void> {
     const repository = taskRepository;
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+    debugMuster('workflow_graph.host_request', {
+      requestId: raw.requestId,
+      taskId: raw.taskId,
+      focusedTaskId: this.focusedTaskId,
+      focusGeneration: this.snapshotGeneration,
+      repositoryReady: Boolean(repository),
+      keys: Object.keys(raw),
+    });
     const outcome = await routeRequestWorkflowGraph(data, {
       getFocused: () => ({
         taskId: this.focusedTaskId,
@@ -2558,10 +2574,49 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }),
       buildWorkflowGraph: async (taskId: string) => {
         if (!repository) throw new Error('task repository not ready');
-        return buildWorkflowGraphView(repository, taskId);
+        try {
+          const graph = await buildWorkflowGraphView(repository, taskId);
+          debugMuster('workflow_graph.host_build_result', {
+            requestId: raw.requestId,
+            taskId,
+            found: Boolean(graph),
+            runId: graph?.runId,
+            nodeCount: graph?.nodes.length,
+            edgeCount: graph?.edges.length,
+          });
+          return graph;
+        } catch (error) {
+          debugMuster('workflow_graph.host_build_error', {
+            requestId: raw.requestId,
+            taskId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          throw error;
+        }
       },
     });
-    if (outcome.kind === 'message') this.post(outcome.message);
+    debugMuster('workflow_graph.host_outcome', {
+      requestId: raw.requestId,
+      taskId: raw.taskId,
+      kind: outcome.kind,
+      focusedTaskId: this.focusedTaskId,
+      focusGeneration: this.snapshotGeneration,
+      ...(outcome.kind === 'message'
+        ? {
+            ok: outcome.message.ok,
+            code: outcome.message.ok ? undefined : outcome.message.code,
+            runId: outcome.message.ok ? outcome.message.graph.runId : undefined,
+          }
+        : {}),
+    });
+    if (outcome.kind === 'message') {
+      this.post(outcome.message);
+      debugMuster('workflow_graph.host_posted', {
+        requestId: outcome.message.requestId,
+        taskId: outcome.message.taskId,
+        ok: outcome.message.ok,
+      });
+    }
   }
 
   /**
@@ -3076,6 +3131,18 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         });
       }
       switch (data?.type) {
+        case 'ready':
+          debugMuster('snapshot.webview_ready', {
+            focusedTaskId: this.focusedTaskId,
+            focusGeneration: this.snapshotGeneration,
+          });
+          // The Svelte message listener is now mounted. Hydrate only after this
+          // handshake so extension reloads cannot lose the initial durable state.
+          await this.postSendOutboxSnapshot();
+          await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
+          void this.postAvailableBackends();
+          void this.postComposerSelection();
+          break;
         case 'send': {
           const parsed = parseHostSendRequest(data);
           if (!parsed.ok) {
@@ -3724,18 +3791,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       }
     });
 
-    // Do not auto-focus on open — entry UI shows previous tasks list (per redesign)
-    // User selects from list or New task to enter chat.
-    // Outbox must hydrate before snapshot so pending replay after snapshot sees rows.
-    void (async () => {
-      await this.postSendOutboxSnapshot();
-      await this.hydrateSnapshotAndResumePolling(this.focusedTaskId);
-    })();
-    // Passive readiness inventory only on panel resolve (M019 S01).
-    // Model enumeration is explicit listModels — no ACP sessions on open.
-    void this.postAvailableBackends();
-    // Restore last-used backend/model from VS Code Settings (survives restarts).
-    void this.postComposerSelection();
+    // Durable initialization is owned by the `ready` case above. Posting here
+    // races the new document's message listener during extension-host reload.
   }
 
   private _getHtmlForWebview(webview: vscode.Webview): string {

@@ -129,6 +129,12 @@ export async function openMusterWebview(
   });
 
   await page.goto('/');
+  await expect
+    .poll(async () =>
+      (await page.evaluate(() => window.__musterPostedMessages ?? []))
+        .some((message) => (message as { type?: unknown }).type === 'ready'),
+    )
+    .toBe(true);
   await page.evaluate(() => {
     window.__musterPostedMessages = [];
   });

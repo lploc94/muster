@@ -31,13 +31,44 @@ describe("workflow graph webview wiring", () => {
       "msg.requestId !== workflowGraphRequest?.requestId",
     );
     expect(appSource).toContain("msg.taskId !== tasks.focusedTaskId");
-    expect(workspaceSource).toContain("WorkflowGraphPanel");
-    expect(workspaceSource).toContain("graph={workflowGraph}");
-    // Status overlay shows per-node detail for the clicked node (lifecycle/runtime/workflow labels)
+    // On-demand modal next to History: no auto-fetch on focus, only when View Workflow is opened
+    expect(appSource).toContain("WorkflowGraphModal");
+    expect(appSource).toContain('data-testid="view-workflow-graph"');
+    expect(appSource).toContain("workflowGraphOpen");
+    expect(appSource).toContain("setOpen");
+    expect(appSource).toContain("untrack(() => workflowGraphStore.setOpen");
+    // TaskWorkspace no longer auto-renders the panel (modal is App-owned, saves vertical space)
+    expect(workspaceSource).not.toContain("WorkflowGraphPanel");
+    expect(workspaceSource).not.toContain("graph={workflowGraph}");
+    // Status overlay still shows per-node detail for the clicked node
     expect(workspaceSource).toContain("task-status-overlay");
     expect(workspaceSource).toContain('data-testid="node-status-detail"');
     expect(workspaceSource).toContain('data-testid="node-status-badge"');
     expect(workspaceSource).toContain("workflowGraphStatusLabel");
     expect(workspaceSource).toContain("formatUpdatedAt");
+  });
+
+  it("renders workflow as a DAG canvas with modal pan/zoom (not a plain list)", () => {
+    const modalSource = readFileSync(
+      resolve(root, "webview/src/components/WorkflowGraphModal.svelte"),
+      "utf8",
+    );
+    const canvasSource = readFileSync(
+      resolve(root, "webview/src/components/WorkflowGraphCanvas.svelte"),
+      "utf8",
+    );
+    const layoutSource = readFileSync(
+      resolve(root, "webview/src/lib/workflow-graph-layout.ts"),
+      "utf8",
+    );
+    expect(modalSource).toContain('data-testid="workflow-graph-modal"');
+    expect(modalSource).toContain("WorkflowGraphCanvas");
+    expect(modalSource).toContain('role="dialog"');
+    expect(canvasSource).toContain("computeWorkflowGraphLayout");
+    expect(canvasSource).toContain('data-testid="workflow-graph-canvas"');
+    expect(canvasSource).toContain("data-node-id");
+    expect(canvasSource).toContain("data-edge-from");
+    expect(layoutSource).toContain("computeWorkflowGraphLayout");
+    expect(layoutSource).toContain("NODE_W");
   });
 });

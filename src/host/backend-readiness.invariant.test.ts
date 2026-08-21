@@ -196,22 +196,22 @@ describe('M019 S01 zero-side-effect invariant (T06)', () => {
       expect(body).not.toMatch(/session\/prompt/);
     });
 
-    it('panel resolve posts passive backends only — no automatic listModels/enumerateModels', () => {
+    it('panel resolve waits for explicit webview inventory requests', () => {
       const content = readRepoFile('src/extension.ts');
-      // Isolate the panel resolve tail that posts initial host state.
-      const marker = 'Passive readiness inventory only on panel resolve';
-      const start = content.indexOf(marker);
+      const start = content.indexOf('public resolveWebviewView');
       expect(start).toBeGreaterThanOrEqual(0);
-      const end = content.indexOf('private _getHtmlForWebview', start);
-      expect(end).toBeGreaterThan(start);
-      const body = content.slice(start, end);
-      expect(body).toMatch(/postAvailableBackends/);
-      expect(body).not.toMatch(/\bpostAvailableModels\b/);
-      expect(body).not.toMatch(/\benumerateModels\b/);
-      // Comment may name listModels as the explicit path; forbid call/post sites only.
-      expect(body).not.toMatch(/case\s+'listModels'/);
-      expect(body).not.toMatch(/type:\s*['"]listModels['"]/);
-      expect(body).not.toMatch(/\bpostAvailableModels\s*\(/);
+      const dispatcherStart = content.indexOf('webviewView.webview.onDidReceiveMessage', start);
+      expect(dispatcherStart).toBeGreaterThan(start);
+      const panelSetup = content.slice(start, dispatcherStart);
+      expect(panelSetup).not.toMatch(/\bpostAvailableBackends\b/);
+      expect(panelSetup).not.toMatch(/\bpostAvailableModels\b/);
+      expect(panelSetup).not.toMatch(/\benumerateModels\b/);
+
+      const end = content.indexOf('private _getHtmlForWebview', dispatcherStart);
+      expect(end).toBeGreaterThan(dispatcherStart);
+      const dispatcher = content.slice(dispatcherStart, end);
+      expect(dispatcher).toMatch(/case\s+'listBackends':[\s\S]*?postAvailableBackends\(\)/);
+      expect(dispatcher).toMatch(/case\s+'listModels':[\s\S]*?postAvailableModels\(\)/);
     });
 
     it('enumerateModels is only reachable from the explicit listModels message handler path', () => {

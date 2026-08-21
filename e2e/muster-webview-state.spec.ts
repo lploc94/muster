@@ -10988,6 +10988,14 @@ test.describe('M019 S05 Assembled First Run', () => {
       storeRevision: 1,
     });
 
+    // Workflow is on-demand via the View Workflow button next to History (no auto-fetch on focus)
+    await expect(page.getByTestId('workflow-graph-modal')).toHaveCount(0);
+    await expect(page.getByTestId('workflow-graph-panel')).toHaveCount(0);
+    // No request yet before opening the modal
+    let preMessages = await postedMessages(page);
+    expect(preMessages.find((m) => (m as { type?: string }).type === 'requestWorkflowGraph')).toBeUndefined();
+    await page.getByTestId('view-workflow-graph').click();
+
     await expect.poll(async () => {
       const messages = await postedMessages(page);
       return messages.find((message) => (message as { type?: string }).type === 'requestWorkflowGraph');
@@ -11027,19 +11035,24 @@ test.describe('M019 S05 Assembled First Run', () => {
       },
     });
 
-    const panel = page.getByTestId('workflow-graph-panel');
-    await expect(panel).toBeVisible();
-    await expect(panel.locator('[data-node-id]')).toHaveCount(5);
-    await expect(panel.getByText('Supplied from a prior result', { exact: true })).toHaveCount(4);
-    await expect(panel.locator('[data-node-id="node-5"]')).toContainText('Active node');
-    await expect(panel).toContainText('4 reused nodes · 3 reused edges');
-    await expect(panel.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Blocked');
-    await expect(panel.locator('[data-gate-id="gate-m024-s05"]')).toContainText('1 of 2 required inputs supplied');
-    await expect(panel).toContainText('Feedback rounds');
-    await expect(panel).toContainText('1 of 2 responses received');
-    await expect(panel.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
-    await expect(panel.getByRole('status')).toContainText('Workflow graph may be incomplete');
-    await expect(panel).toContainText('Workflow nodes were truncated');
+    const modal = page.getByTestId('workflow-graph-modal');
+    await expect(modal).toBeVisible();
+    // Canvas DAG (not a plain list) — nodes positioned via layout, edges as SVG paths
+    const canvas = page.getByTestId('workflow-graph-canvas');
+    await expect(canvas).toBeVisible();
+    await expect(canvas.locator('[data-node-id]')).toHaveCount(5);
+    await expect(canvas.locator('[data-edge-from="node-1"][data-edge-to="node-2"]')).toHaveCount(1);
+    await expect(modal).toContainText('4 reused nodes · 3 reused edges');
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('active');
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Blocked');
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('1 of 2 required inputs supplied');
+    await expect(modal).toContainText('Feedback rounds');
+    await expect(modal).toContainText('1 of 2 responses received');
+    await expect(modal.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
+    await expect(modal.getByRole('status')).toContainText('Workflow graph may be incomplete');
+    await expect(modal).toContainText('Workflow nodes were truncated');
+    await modal.getByRole('button', { name: 'Close workflow graph' }).click();
+    await expect(modal).toHaveCount(0);
 
     // Status overlay shows per-node detail for the clicked node (lifecycle/runtime/workflow labels)
     await expect(page.getByTestId('node-status-detail')).toHaveCount(0);
@@ -11052,6 +11065,54 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(page.getByTestId('task-status-overlay')).toBeVisible();
     await expect(page.getByTestId('task-status-overlay').getByText('Mark done')).toBeVisible();
     await expect(page.getByTestId('task-status-overlay').getByText('Mark failed')).toBeVisible();
+  });
+
+  test('M024 S05 workflow graph: terminal error stays settled until explicit retry', async ({ page }) => {
+    const taskId = 'task-m024-s05-workflow-error';
+    await openWebview(page);
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [task({ id: taskId, goal: 'Inspect workflow error', viewStatus: 'running' })],
+      focusedTaskId: taskId,
+      subtree: [task({ id: taskId, goal: 'Inspect workflow error', viewStatus: 'running' })],
+      transcript: [],
+      transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
+      storeRevision: 1,
+    });
+
+    await page.getByTestId('view-workflow-graph').click();
+    await expect.poll(async () => (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ).length).toBe(1);
+
+    const firstRequest = (await postedMessages(page)).find(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ) as { requestId: string; taskId: string };
+    await postRawHostMessage(page, {
+      type: 'workflowGraphResult',
+      requestId: firstRequest.requestId,
+      taskId,
+      ok: false,
+      code: 'notInWorkflow',
+    });
+
+    await expect(page.getByTestId('workflow-graph-error')).toContainText(
+      'This task is not part of a workflow run.',
+    );
+    await page.waitForTimeout(400);
+    expect((await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    )).toHaveLength(1);
+
+    await page.getByTestId('workflow-graph-retry').click();
+    await expect.poll(async () => (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ).length).toBe(2);
+    const requests = (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ) as Array<{ requestId: string }>;
+    expect(requests[1]!.requestId).not.toBe(firstRequest.requestId);
   });
 
 });
