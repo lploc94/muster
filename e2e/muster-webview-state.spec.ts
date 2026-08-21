@@ -7666,6 +7666,48 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByText(/will run automatically when its workflow inputs are ready/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Stop this turn' })).toHaveCount(0);
+    await expect(page.locator('textarea.composer-input__textarea, textarea').last()).toBeDisabled();
+    expect((await postedMessages(page)).filter((message) => (message as { type?: string }).type === 'send')).toHaveLength(0);
+
+    const activatedConsumer = task({
+      ...consumerShell,
+      viewStatus: 'queued',
+      runtimeActivity: 'queued',
+      currentTurnActivity: { state: 'queued', turnId: 'workflow-consumer-turn' },
+    });
+    await postRawHostMessage(page, {
+      type: 'workspacePatchBatch',
+      revision: 902,
+      patches: [{ type: 'taskUpserted', task: activatedConsumer }],
+    });
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(4);
+    await expect(page.locator('[data-testid="task-tree-row"][data-task-id="workflow-consumer-shell"]')).toContainText('Review release evidence');
+    await expect(page.getByText(/will run automatically when its workflow inputs are ready/i)).toHaveCount(0);
+    const activatedComposer = page.locator('textarea.composer-input__textarea, textarea').last();
+    await expect(activatedComposer).toBeEnabled();
+    await activatedComposer.fill('Follow up after workflow activation');
+    await page.getByRole('button', { name: 'Send', exact: true }).click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      taskId: consumerShell.id,
+      text: 'Follow up after workflow activation',
+    });
+
+    await page.reload();
+    await expect(page.getByText('New task')).toBeVisible();
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [coordinator],
+      focusedTaskId: activatedConsumer.id,
+      subtree: [coordinator, producer, activatedConsumer, terminalShell],
+      transcript: [],
+      storeRevision: 903,
+    });
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(4);
+    await expect(page.locator('[data-testid="task-tree-row"][data-task-id="workflow-consumer-shell"]')).toHaveCount(1);
+    await expect(page.locator('[data-testid="task-tree-row"][data-task-id="workflow-terminal-shell"]')).toHaveCount(1);
   });
 
   test('collapsed tree is the selected-task header and expands without duplicate context', async ({
@@ -11030,7 +11072,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(durableBlob).not.toContain('../../etc');
   });
 
-  test('M024 S05 workflow graph: focused host result renders reuse, active gate, feedback, child run, and degraded state', async ({
+  test('M024 S05 workflow graph: focused host result renders all gates, frontier, fit, feedback, child run, and degraded state', async ({
     page,
   }) => {
     const taskId = 'task-m024-s05-workflow';
@@ -11063,34 +11105,64 @@ test.describe('M019 S05 Assembled First Run', () => {
       (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
     ) as { requestId: string; taskId: string };
 
+    const graphPayload = {
+        runId: 'run-m024-s05',
+        runStatus: 'running',
+        nodes: [
+          { nodeId: 'node-1', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
+          { nodeId: 'node-2', workflowNodeStatus: 'succeeded', executionActivity: 'completed', displayState: 'completed', progressBucket: 'completed', reused: false },
+          { nodeId: 'node-3', workflowNodeStatus: 'active', executionActivity: 'executing', displayState: 'executing', progressBucket: 'executing', reused: false },
+          { nodeId: 'node-4', workflowNodeStatus: 'active', executionActivity: 'executing', displayState: 'executing', progressBucket: 'executing', reused: false },
+          { nodeId: 'node-5', workflowNodeStatus: 'pending', executionActivity: 'none', displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs', reused: false },
+        ],
+        edges: [
+          { fromNodeId: 'node-1', toNodeId: 'node-5', inputRef: 'reuse_result', contributionState: 'supplied_reused', reused: true },
+          { fromNodeId: 'node-2', toNodeId: 'node-5', inputRef: 'live_result', contributionState: 'supplied_live', reused: false },
+          { fromNodeId: 'node-3', toNodeId: 'node-5', inputRef: 'pending_three', contributionState: 'pending', reused: false },
+          { fromNodeId: 'node-4', toNodeId: 'node-5', inputRef: 'pending_four', contributionState: 'pending', reused: false },
+        ],
+        gates: [
+          { gateId: 'gate-node-1', consumerNodeId: 'node-1', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { gateId: 'gate-node-2', consumerNodeId: 'node-2', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { gateId: 'gate-node-3', consumerNodeId: 'node-3', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { gateId: 'gate-node-4', consumerNodeId: 'node-4', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          {
+            gateId: 'gate-m024-s05', consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
+            inputs: [
+              { inputRef: 'reuse_result', producerNodeId: 'node-1', state: 'supplied_reused' },
+              { inputRef: 'live_result', producerNodeId: 'node-2', state: 'supplied_live' },
+              { inputRef: 'pending_three', producerNodeId: 'node-3', state: 'pending' },
+              { inputRef: 'pending_four', producerNodeId: 'node-4', state: 'pending' },
+            ],
+          },
+        ],
+        activeGate: {
+          gateId: 'gate-m024-s05', consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
+          inputs: [
+            { inputRef: 'reuse_result', producerNodeId: 'node-1', state: 'supplied_reused' },
+            { inputRef: 'live_result', producerNodeId: 'node-2', state: 'supplied_live' },
+            { inputRef: 'pending_three', producerNodeId: 'node-3', state: 'pending' },
+            { inputRef: 'pending_four', producerNodeId: 'node-4', state: 'pending' },
+          ],
+        },
+        progress: {
+          total: 5, completed: 2, queued: 0, executing: 2, waiting: 0,
+          blocked: 1, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ['node-3', 'node-4', 'node-5'], activeNodeIds: ['node-3', 'node-4'],
+        },
+        feedbackRounds: [
+          { roundId: 'feedback-m024-s05', requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
+        ],
+        childRuns: [{ runId: 'child-run-m024-s05', status: 'running' }],
+        reuse: { nodeCount: 1, edgeCount: 1 },
+        diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
+    };
     await postRawHostMessage(page, {
       type: 'workflowGraphResult',
       requestId: request.requestId,
       taskId: request.taskId,
       ok: true,
-      graph: {
-        runId: 'run-m024-s05',
-        nodes: [
-          { nodeId: 'node-1', status: 'succeeded', reused: true },
-          { nodeId: 'node-2', status: 'succeeded', reused: true },
-          { nodeId: 'node-3', status: 'succeeded', reused: true },
-          { nodeId: 'node-4', status: 'succeeded', reused: true },
-          { nodeId: 'node-5', status: 'active', reused: false },
-        ],
-        edges: [
-          { fromNodeId: 'node-1', toNodeId: 'node-2', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-2', toNodeId: 'node-3', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-3', toNodeId: 'node-4', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-4', toNodeId: 'node-5', inputRef: 'result', reused: false },
-        ],
-        activeGate: { gateId: 'gate-m024-s05', status: 'blocked', satisfied: 1, required: 2 },
-        feedbackRounds: [
-          { roundId: 'feedback-m024-s05', requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
-        ],
-        childRuns: [{ runId: 'child-run-m024-s05', status: 'running' }],
-        reuse: { nodeCount: 4, edgeCount: 3 },
-        diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
-      },
+      graph: graphPayload,
     });
 
     const modal = page.getByTestId('workflow-graph-modal');
@@ -11099,16 +11171,53 @@ test.describe('M019 S05 Assembled First Run', () => {
     const canvas = page.getByTestId('workflow-graph-canvas');
     await expect(canvas).toBeVisible();
     await expect(canvas.locator('[data-node-id]')).toHaveCount(5);
-    await expect(canvas.locator('[data-edge-from="node-1"][data-edge-to="node-2"]')).toHaveCount(1);
-    await expect(modal).toContainText('4 reused nodes · 3 reused edges');
-    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('active');
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Blocked');
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('1 of 2 required inputs supplied');
+    await expect(canvas.locator('[data-edge-from="node-1"][data-edge-to="node-5"][data-input-state="supplied_reused"]')).toHaveCount(1);
+    await expect(canvas.locator('[data-edge-from="node-3"][data-edge-to="node-5"][data-input-state="pending"]')).toHaveCount(1);
+    await expect(modal).toContainText('1 reused node · 1 reused edge');
+    await expect(modal.locator('.workflow-modal__legend-item.is-active')).toHaveCount(2);
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('Blocked');
+    await expect(modal.getByTestId('workflow-progress-summary')).toContainText('2 of 5 completed · 2 executing · 1 blocked');
+    await expect(modal.getByTestId('workflow-frontier-summary')).toContainText('Frontier: node-3, node-4, node-5');
+    await expect(modal.locator('[data-gate-id]')).toHaveCount(5);
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('node-5');
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('2 of 4 required inputs supplied');
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"] [data-input-ref="pending_three"]')).toContainText('Pending');
+    await modal.getByRole('button', { name: 'Reset view' }).click();
+    await expect(modal.locator('.workflow-modal__scale')).toHaveText('100%');
+    await modal.getByRole('button', { name: 'Fit view' }).click();
+    await expect(modal.locator('.workflow-modal__scale')).not.toHaveText('100%');
+    const wrapBox = await page.getByTestId('workflow-graph-canvas-wrap').boundingBox();
+    const canvasBox = await canvas.locator('svg').boundingBox();
+    expect(wrapBox).not.toBeNull();
+    expect(canvasBox).not.toBeNull();
+    expect(canvasBox!.x).toBeGreaterThanOrEqual(wrapBox!.x - 1);
+    expect(canvasBox!.y).toBeGreaterThanOrEqual(wrapBox!.y - 1);
+    expect(canvasBox!.x + canvasBox!.width).toBeLessThanOrEqual(wrapBox!.x + wrapBox!.width + 1);
+    expect(canvasBox!.y + canvasBox!.height).toBeLessThanOrEqual(wrapBox!.y + wrapBox!.height + 1);
     await expect(modal).toContainText('Feedback rounds');
     await expect(modal).toContainText('1 of 2 responses received');
     await expect(modal.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
     await expect(modal.getByRole('status')).toContainText('Workflow graph may be incomplete');
     await expect(modal).toContainText('Workflow nodes were truncated');
+    await modal.getByRole('button', { name: 'Close workflow graph' }).click();
+    await expect(modal).toHaveCount(0);
+
+    await page.getByTestId('view-workflow-graph').click();
+    await expect.poll(async () => (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ).length).toBe(2);
+    const reopenedRequest = (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    )[1] as { requestId: string; taskId: string };
+    await postRawHostMessage(page, {
+      type: 'workflowGraphResult',
+      requestId: reopenedRequest.requestId,
+      taskId: reopenedRequest.taskId,
+      ok: true,
+      graph: graphPayload,
+    });
+    await expect(modal).toBeVisible();
+    await expect(modal.locator('.workflow-modal__scale')).not.toHaveText('100%');
     await modal.getByRole('button', { name: 'Close workflow graph' }).click();
     await expect(modal).toHaveCount(0);
 

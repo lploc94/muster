@@ -15,6 +15,8 @@ export interface LayoutEdge {
   from: string;
   to: string;
   reused: boolean;
+  inputRef: string;
+  contributionState: WorkflowGraphWireGraph['edges'][number]['contributionState'];
   fromPos: { x: number; y: number };
   toPos: { x: number; y: number };
   path: string;
@@ -27,11 +29,35 @@ export interface WorkflowGraphLayout {
   height: number;
 }
 
+export interface WorkflowGraphFit {
+  scale: number;
+  x: number;
+  y: number;
+}
+
+export interface WorkflowGraphViewport {
+  width: number;
+  height: number;
+}
+
 const NODE_W = 148;
 const NODE_H = 44;
 const X_GAP = 72;
 const Y_GAP = 24;
 const PADDING = 24;
+const FIT_PADDING = 16;
+export const WORKFLOW_GRAPH_FIT_MIN_SCALE = 0.01;
+export const WORKFLOW_GRAPH_FIT_MAX_SCALE = 2.5;
+export const WORKFLOW_GRAPH_ZOOM_MIN_SCALE = 0.05;
+
+export function decreaseWorkflowGraphScale(currentScale: number, delta: number): number {
+  if (!Number.isFinite(currentScale) || !Number.isFinite(delta) || delta <= 0) return currentScale;
+  if (currentScale <= WORKFLOW_GRAPH_ZOOM_MIN_SCALE) return currentScale;
+  return Math.max(
+    WORKFLOW_GRAPH_ZOOM_MIN_SCALE,
+    Number((currentScale - delta).toFixed(2)),
+  );
+}
 
 export function computeWorkflowGraphLayout(graph: WorkflowGraphWireGraph): WorkflowGraphLayout {
   const nodes = graph.nodes;
@@ -127,6 +153,8 @@ export function computeWorkflowGraphLayout(graph: WorkflowGraphWireGraph): Workf
       from: e.fromNodeId,
       to: e.toNodeId,
       reused: e.reused,
+      inputRef: e.inputRef,
+      contributionState: e.contributionState,
       fromPos: { x: sx, y: sy },
       toPos: { x: tx, y: ty },
       path,
@@ -134,6 +162,37 @@ export function computeWorkflowGraphLayout(graph: WorkflowGraphWireGraph): Workf
   }
 
   return { nodes: layoutNodes, edges: layoutEdges, width, height };
+}
+
+export function computeWorkflowGraphFit(
+  layout: Pick<WorkflowGraphLayout, 'width' | 'height'>,
+  viewport: WorkflowGraphViewport,
+): WorkflowGraphFit {
+  if (
+    !Number.isFinite(layout.width)
+    || !Number.isFinite(layout.height)
+    || !Number.isFinite(viewport.width)
+    || !Number.isFinite(viewport.height)
+    || layout.width <= 0
+    || layout.height <= 0
+    || viewport.width <= 0
+    || viewport.height <= 0
+  ) return { scale: 1, x: 0, y: 0 };
+  const availableWidth = Math.max(1, viewport.width - FIT_PADDING * 2);
+  const availableHeight = Math.max(1, viewport.height - FIT_PADDING * 2);
+  const requestedScale = Math.min(
+    WORKFLOW_GRAPH_FIT_MAX_SCALE,
+    Math.max(
+      WORKFLOW_GRAPH_FIT_MIN_SCALE,
+      Math.min(availableWidth / layout.width, availableHeight / layout.height),
+    ),
+  );
+  const scale = Math.floor(requestedScale * 10_000) / 10_000;
+  return {
+    scale,
+    x: Number(((viewport.width - layout.width * scale) / 2).toFixed(2)),
+    y: Number(((viewport.height - layout.height * scale) / 2).toFixed(2)),
+  };
 }
 
 export const LAYOUT_NODE_W = NODE_W;

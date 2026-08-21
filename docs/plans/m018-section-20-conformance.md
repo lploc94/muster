@@ -715,6 +715,9 @@ Required work:
 - Project bounded run policy/status/reason, every dependency gate with consumer/input progress, round progress, activations, and all continuation states needed for recovery.
 - Keep workflow-node status, live turn/activation activity, and the derived display/progress bucket as separate axes. Queued, executing, feedback-waiting, completed, reused, failed, cancelled, skipped, blocked, and closed-before-activation states must follow one deterministic precedence table.
 - Derive a bounded, mutually exclusive run progress summary and frontier from those authoritative axes; every node belongs to exactly one bucket and all bucket counts sum to the bounded node total.
+- Present the complete bounded graph as one deterministic layered operator view: every executing node is highlighted, every gate/input is associated with its consumer and incoming contribution, and progress/frontier copy comes only from the authoritative projection.
+- Fit the measured graph bounds into the available viewport with clamped scale and centered translation; reset remains a distinct deterministic transform, and pan/zoom/reopen preserve accessibility and reduced-motion behavior.
+- Pending workflow task shells remain inspect-only in the worktree with explicit waiting copy and no composer send path; activation preserves the same task identity and transitions it to ordinary queued workflow execution.
 - Keep artifact bodies and prompt text out of status projection.
 - Add integrity diagnostics for impossible or corrupt workflow states.
 
@@ -726,6 +729,9 @@ Mandatory pass conditions:
 - Projection identifies every bounded gate by consumer and every input as supplied, reused, pending, or blocking without exposing artifact contents.
 - Live activity overrides stale terminal display for the same node, while unrelated succeeded nodes remain completed and never-activated shells in a closed run remain not-started.
 - Projection remains bounded and does not leak topology, payload bodies, SQL, paths, credentials, or secrets.
+- The graph view renders all bounded nodes and gates with truthful semantic states, exposes every simultaneous executing node, and keeps incomplete consumers visibly blocked/not executed.
+- Fit-to-bounds changes the transform for graphs larger than the viewport and keeps the complete bounded graph inside the measured viewport across resize and reopen; reset is not an alias for fit.
+- A pending shell is visible immediately after start, cannot emit a manual send, and activates in place without a duplicate worktree row.
 - Corrupt states produce bounded attention and no automatic work.
 
 Forbidden shortcuts:

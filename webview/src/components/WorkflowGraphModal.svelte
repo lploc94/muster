@@ -3,10 +3,17 @@
   import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
   import WorkflowGraphCanvas from './WorkflowGraphCanvas.svelte';
   import { buildWorkflowGraphPanelView } from '../lib/workflow-graph-view';
+  import {
+    WORKFLOW_GRAPH_FIT_MAX_SCALE,
+    computeWorkflowGraphFit,
+    computeWorkflowGraphLayout,
+    decreaseWorkflowGraphScale,
+  } from '../lib/workflow-graph-layout';
   import type { WorkflowGraphRequest } from '../lib/workflow-graph-store.svelte';
   interface Props { graph: WorkflowGraphWireGraph | null; request?: WorkflowGraphRequest | null; error?: string | null; onClose: () => void; onRetry?: () => void; }
   let { graph, request = null, error = null, onClose, onRetry }: Props = $props();
   const view = $derived(graph ? buildWorkflowGraphPanelView(graph) : null);
+  const layout = $derived(graph ? computeWorkflowGraphLayout(graph) : null);
   let scale = $state(1);
   let tx = $state(0);
   let ty = $state(0);
@@ -14,10 +21,19 @@
   let panStart = $state({ x: 0, y: 0 });
   let panOrigin = $state({ x: 0, y: 0 });
   let canvasContainer: HTMLDivElement | undefined = $state();
-  function zoomIn() { scale = Math.min(2.5, +(scale + 0.15).toFixed(2)); }
-  function zoomOut() { scale = Math.max(0.4, +(scale - 0.15).toFixed(2)); }
+  function zoomIn() { scale = Math.min(WORKFLOW_GRAPH_FIT_MAX_SCALE, +(scale + 0.15).toFixed(2)); }
+  function zoomOut() { scale = decreaseWorkflowGraphScale(scale, 0.15); }
   function resetView() { scale = 1; tx = 0; ty = 0; }
-  function fitView() { scale = 1; tx = 0; ty = 0; }
+  function fitView() {
+    if (!layout || !canvasContainer) return;
+    const fit = computeWorkflowGraphFit(layout, {
+      width: canvasContainer.clientWidth,
+      height: canvasContainer.clientHeight,
+    });
+    scale = fit.scale;
+    tx = fit.x;
+    ty = fit.y;
+  }
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     if (e.target instanceof Element && e.target.closest('button, a, input, select, textarea, [role="button"]')) return;
@@ -28,7 +44,13 @@
   }
   function onPointerMove(e: PointerEvent) { if (!isPanning) return; tx = panOrigin.x + (e.clientX - panStart.x); ty = panOrigin.y + (e.clientY - panStart.y); }
   function onPointerUp(e: PointerEvent) { isPanning = false; try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch {} }
-  function onWheel(e: WheelEvent) { if (!e.ctrlKey && !e.metaKey) return; e.preventDefault(); const delta = e.deltaY > 0 ? -0.08 : 0.08; scale = Math.min(2.5, Math.max(0.4, +(scale + delta).toFixed(2))); }
+  function onWheel(e: WheelEvent) {
+    if (!e.ctrlKey && !e.metaKey) return;
+    e.preventDefault();
+    scale = e.deltaY > 0
+      ? decreaseWorkflowGraphScale(scale, 0.08)
+      : Math.min(WORKFLOW_GRAPH_FIT_MAX_SCALE, +(scale + 0.08).toFixed(2));
+  }
   let modalEl: HTMLDivElement | undefined = $state();
   let prevActiveEl: HTMLElement | null = null;
   onMount(() => {
@@ -41,10 +63,18 @@
       if (e.key === '0') { e.preventDefault(); resetView(); }
     }
     window.addEventListener('keydown', onKey, true);
+    const resizeObserver = new ResizeObserver(() => fitView());
+    if (canvasContainer) resizeObserver.observe(canvasContainer);
     return () => {
       window.removeEventListener('keydown', onKey, true);
+      resizeObserver.disconnect();
       prevActiveEl?.focus();
     };
+  });
+  $effect(() => {
+    if (!layout || !canvasContainer) return;
+    const frame = requestAnimationFrame(() => fitView());
+    return () => cancelAnimationFrame(frame);
   });
 </script>
 
@@ -72,6 +102,7 @@
       </div>
       {#if view}
         <div class="workflow-modal__reuse">{view.reuseSummary.label}</div>
+        <div class="workflow-modal__progress" data-testid="workflow-progress-summary">{view.progress.summaryLabel}</div>
       {/if}
     </div>
     <div class="workflow-modal__actions">
@@ -145,9 +176,10 @@
         <div class="workflow-modal__node-legend">
           {#each view.nodes as n (n.id)}
             <span class="workflow-modal__legend-item {n.active ? 'is-active' : ''}" data-node-id={n.id} title={`${n.id} — ${n.statusLabel}${n.reused ? ' · reused' : ''}`}>
-              <span class="codicon {n.active ? 'codicon-loading' : n.status === 'succeeded' || n.status==='reused' ? 'codicon-pass-filled' : n.status==='failed' ? 'codicon-error' : 'codicon-circle-large-outline'}" aria-hidden="true"></span>
+              <span class="codicon {n.active ? 'codicon-loading' : n.status === 'completed' || n.status==='reused' ? 'codicon-pass-filled' : n.status==='failed' ? 'codicon-error' : n.status === 'blocked' ? 'codicon-warning' : 'codicon-circle-large-outline'}" aria-hidden="true"></span>
               {n.id}
               <span class="workflow-modal__badge">{n.statusLabel}</span>
+              {#if n.reasonLabel}<span class="workflow-modal__reason">{n.reasonLabel}</span>{/if}
               {#if n.reused}<span class="workflow-modal__reused">reused</span>{/if}
               {#if n.active}<span class="workflow-modal__active">active</span>{/if}
             </span>
@@ -155,12 +187,32 @@
         </div>
       </div>
 
-      {#if view.activeGate}
-        <div class="workflow-modal__section" data-gate-id={view.activeGate.id}>
-          <div class="workflow-modal__section-title">Active gate — {view.activeGate.id}</div>
-          <div class="workflow-modal__summary-line">
-            <span>{view.activeGate.statusLabel}</span>
-            <span>{view.activeGate.progressLabel}</span>
+      <div class="workflow-modal__section" data-testid="workflow-frontier-summary">
+        <div class="workflow-modal__section-title">Progress and frontier</div>
+        <div class="workflow-modal__summary-line"><span>{view.progress.summaryLabel}</span><span>{view.progress.frontierLabel}</span></div>
+      </div>
+
+      {#if view.gates.length > 0}
+        <div class="workflow-modal__section">
+          <div class="workflow-modal__section-title">Dependency gates — {view.gates.length}</div>
+          <div class="workflow-modal__gates">
+            {#each view.gates as gate (gate.id)}
+              <div class="workflow-modal__gate" data-gate-id={gate.id} data-consumer-node-id={gate.consumerNodeId}>
+                <div class="workflow-modal__summary-line">
+                  <strong>{gate.consumerNodeId}</strong>
+                  <span>{gate.statusLabel} · {gate.progressLabel}</span>
+                </div>
+                <div class="workflow-modal__gate-blocking">{gate.blockingLabel}</div>
+                <ul class="workflow-modal__plain-list">
+                  {#each gate.inputs as input (input.inputRef)}
+                    <li data-input-ref={input.inputRef} data-input-state={input.state} class:workflow-modal__input--missing={input.missing}>
+                      <span>{input.inputRef} from {input.producerNodeId}</span>
+                      <span>{input.stateLabel}</span>
+                    </li>
+                  {/each}
+                </ul>
+              </div>
+            {/each}
           </div>
         </div>
       {/if}
@@ -227,6 +279,7 @@
   .workflow-modal__eyebrow { font-size: 10px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--vscode-descriptionForeground, #9ca3af); }
   .workflow-modal__title { font-size: 13px; font-weight: 700; color: var(--vscode-foreground, #cccccc); overflow-wrap: anywhere; font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
   .workflow-modal__reuse { font-size: 11px; color: var(--vscode-descriptionForeground, #9ca3af); background: color-mix(in srgb, var(--vscode-badge-background, #616061) 28%, transparent); border: 1px solid color-mix(in srgb, var(--vscode-panel-border) 70%, transparent); padding: 1px 6px; border-radius: 999px; display: inline-block; width: fit-content; margin-top: 2px; }
+  .workflow-modal__progress { font-size: 10px; color: var(--vscode-descriptionForeground, #9ca3af); }
   .workflow-modal__actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
   .workflow-modal__zoom { display: flex; align-items: center; gap: 4px; padding: 2px 6px; border: 1px solid var(--vscode-panel-border, #3c3c3c); border-radius: 6px; background: var(--vscode-editor-background, #1e1e1e); }
   .workflow-modal__scale { font-size: 11px; min-width: 36px; text-align: center; color: var(--vscode-descriptionForeground, #9ca3af); }
@@ -261,6 +314,11 @@
   .workflow-modal__badge { padding: 1px 6px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 28%, transparent); background: color-mix(in srgb, currentColor 12%, transparent); font-size: 10px; }
   .workflow-modal__reused { font-size: 10px; font-style: italic; color: var(--vscode-charts-blue, #3794ff); }
   .workflow-modal__active { font-size: 10px; font-weight: 700; color: var(--vscode-focusBorder, #3794ff); }
+  .workflow-modal__reason { font-size: 10px; color: var(--vscode-editorWarning-foreground, #cca700); }
+  .workflow-modal__gates { display: grid; gap: 8px; margin-top: 6px; }
+  .workflow-modal__gate { padding: 6px; border: 1px solid var(--vscode-panel-border, #3c3c3c); border-radius: 5px; }
+  .workflow-modal__gate-blocking { margin-top: 3px; font-size: 10px; color: var(--vscode-descriptionForeground, #9ca3af); }
+  .workflow-modal__input--missing { color: var(--vscode-editorWarning-foreground, #cca700); }
   .workflow-modal__summary-line, .workflow-modal__plain-list li { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; font-size: 11px; }
   .workflow-modal__plain-list { list-style: none; margin: 6px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
   .workflow-modal__plain-list li { padding: 4px 6px; border-radius: 4px; background: color-mix(in srgb, var(--vscode-foreground) 4%, transparent); }

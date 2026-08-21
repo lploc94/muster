@@ -168,7 +168,7 @@ When a workflow run is created—including a child workflow run—every new/unbo
 - Commit: `feat(workflow): expose complete gate and execution state`
 
 ## Phase 3: Deliver an operational graph view and end-to-end worktree journey
-- Status: pending
+- Status: completed
 - Depends on: Phase 2
 - Goal: Let an operator understand the full workflow at a glance: all nodes are visible, statuses are truthful and visually distinct, blockers/frontier are obvious, progress is summarized, and the graph fits the available modal.
 - Current behavior: `WorkflowGraphCanvas.svelte` renders a real layered DAG and basic status styling, but `workflow-graph-view.ts` marks only the first `active` node, the modal displays one detached gate, there is no workflow progress summary, and `fitView()` is identical to reset. The canvas exposes node buttons without wiring `onNodeClick` to a meaningful action.
@@ -199,11 +199,11 @@ When a workflow run is created—including a child workflow run—every new/unbo
   - Decide and test the pending-shell focus UX: no transcript fabrication, composer/lifecycle guard while pending, clear waiting message, and normal task behavior after activation.
   - Update E2E fixtures to seed durable start state through repository-shaped messages rather than mocking only a successful graph result; retain the existing protocol correlation and error tests.
 - Acceptance criteria:
-  - [ ] AC-1: The owner scenario is visually observable in one graph: completed inputs are green, live execution nodes are accurately marked, blocked downstream gates identify the consumer and missing input, and not-yet-executed nodes remain visibly pending - proven by reducer and Playwright assertions.
-  - [ ] AC-2: All workflow task shells appear in the worktree immediately after workflow creation and later execution only changes their status/activity, not membership - proven by the end-to-end worktree journey.
-  - [ ] AC-3: Workflow progress/frontier summary and simultaneous active-node rendering remain correct for fan-in/concurrent graphs - proven by pure view and E2E tests.
-  - [ ] AC-4: Fit view genuinely fits the bounded graph while reset/pan/zoom/reopen continue to work - proven by layout/UI tests.
-  - [ ] AC-5: Pending shells cannot be accidentally executed from the worktree, and activated shells transition to ordinary workflow execution without duplicate task rows - proven by interaction and repository tests.
+  - [x] AC-1: The owner scenario is visually observable in one graph: completed inputs are green, live execution nodes are accurately marked, blocked downstream gates identify the consumer and missing input, and not-yet-executed nodes remain visibly pending - proven by reducer and Playwright assertions.
+  - [x] AC-2: All workflow task shells appear in the worktree immediately after workflow creation and later execution only changes their status/activity, not membership - proven by the end-to-end worktree journey.
+  - [x] AC-3: Workflow progress/frontier summary and simultaneous active-node rendering remain correct for fan-in/concurrent graphs - proven by pure view and E2E tests.
+  - [x] AC-4: Fit view genuinely fits the bounded graph while reset/pan/zoom/reopen continue to work - proven by layout/UI tests.
+  - [x] AC-5: Pending shells cannot be accidentally executed from the worktree, and activated shells transition to ordinary workflow execution without duplicate task rows - proven by interaction and repository tests.
 - Focused verification:
   - `npx vitest run webview/src/lib/workflow-graph-view.test.ts webview/src/lib/workflow-graph-layout.test.ts src/task/workflow-graph-webview-wiring.test.ts src/host/snapshot.test.ts src/host/workspace-patch.test.ts`
   - `npx playwright test e2e/muster-webview-state.spec.ts --grep "M024 S05 workflow graph|workflow shell|assembled journey"`
@@ -227,4 +227,4 @@ When a workflow run is created—including a child workflow run—every new/unbo
 |---|---|---|---|---|
 | 1 | completed | this phase commit (`feat(workflow): materialize inert task shells at start`) | compile; svelte-check; focused 10 files/91 tests; phase gate 6 files/84 tests; broader 14 files/138 tests; focused Playwright | codex-impl-review round 9 APPROVE |
 | 2 | completed | this phase commit (`feat(workflow): expose complete gate and execution state`) | compile; svelte-check; focused 5 files/34 tests; supplemental 3 files/115 tests | codex-impl-review round 6 APPROVE; 19 issues fixed |
-| 3 | pending | N/A | pending | pending |
+| 3 | completed | this phase commit (`feat(workflow): complete operational graph visualization`) | compile; svelte-check; focused 5 files/45 tests; full 221 files/2720 tests; focused Playwright 4/4 | codex-impl-review round 3 APPROVE; 3 issues fixed |

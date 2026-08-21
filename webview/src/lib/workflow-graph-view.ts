@@ -11,20 +11,48 @@ import type {
 
 export interface WorkflowGraphNodeView {
   id: string;
-  status: string;
+  status: WorkflowGraphWireGraph["nodes"][number]["displayState"];
   statusLabel: string;
   reused: boolean;
   active: boolean;
   provenanceLabel: string;
+  reasonLabel?: string;
+}
+
+export interface WorkflowGraphEdgeView {
+  fromNodeId: string;
+  toNodeId: string;
+  inputRef: string;
+  state: WorkflowGraphWireGraph["edges"][number]["contributionState"];
+  stateLabel: string;
+  reused: boolean;
+}
+
+export interface WorkflowGraphGateInputView {
+  inputRef: string;
+  producerNodeId: string;
+  state: WorkflowGraphWireGraph["gates"][number]["inputs"][number]["state"];
+  stateLabel: string;
+  missing: boolean;
 }
 
 export interface WorkflowGraphGateView {
   id: string;
+  consumerNodeId: string;
   status: string;
   statusLabel: string;
   satisfied: number;
   required: number;
   progressLabel: string;
+  blockingLabel: string;
+  inputs: WorkflowGraphGateInputView[];
+}
+
+export interface WorkflowGraphProgressView extends Omit<WorkflowGraphWireGraph["progress"], "frontierNodeIds" | "activeNodeIds"> {
+  frontierNodeIds: string[];
+  activeNodeIds: string[];
+  summaryLabel: string;
+  frontierLabel: string;
 }
 
 export interface WorkflowGraphFeedbackRoundView {
@@ -56,9 +84,15 @@ export interface WorkflowGraphDegradedReadView {
   diagnostics: string[];
 }
 
+export type WorkflowGraphNodeTone =
+  | "success" | "attention" | "info" | "warning" | "danger" | "muted" | "neutral";
+
 export interface WorkflowGraphPanelView {
   runId: string;
   nodes: WorkflowGraphNodeView[];
+  edges: WorkflowGraphEdgeView[];
+  gates: WorkflowGraphGateView[];
+  progress: WorkflowGraphProgressView;
   activeNodeId: string | null;
   activeGate: WorkflowGraphGateView | null;
   feedbackRounds: WorkflowGraphFeedbackRoundView[];
@@ -108,6 +142,16 @@ export function workflowGraphDiagnosticLabel(
   return DIAGNOSTIC_LABELS[code];
 }
 
+export function workflowGraphNodeTone(status: WorkflowGraphWireGraph["nodes"][number]["displayState"]): WorkflowGraphNodeTone {
+  if (status === "completed" || status === "reused") return "success";
+  if (status === "executing") return "attention";
+  if (status === "queued" || status === "waiting") return "info";
+  if (status === "blocked") return "warning";
+  if (status === "failed") return "danger";
+  if (status === "cancelled" || status === "skipped") return "muted";
+  return "neutral";
+}
+
 function plural(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
@@ -131,12 +175,76 @@ function reduceDegradedRead(
   };
 }
 
+const INPUT_STATE_LABELS: Readonly<Record<WorkflowGraphWireGraph["gates"][number]["inputs"][number]["state"], string>> = {
+  supplied_live: "Supplied live",
+  supplied_reused: "Supplied reused",
+  pending: "Pending",
+  blocking: "Blocking",
+};
+
+const NODE_REASON_LABELS: Readonly<Record<NonNullable<WorkflowGraphWireGraph["nodes"][number]["reason"]>, string>> = {
+  waiting_for_inputs: "Waiting for workflow inputs",
+  run_closed_before_activation: "Run closed before activation",
+  awaiting_workflow_route: "Waiting for workflow routing",
+};
+
+function reduceGate(gate: WorkflowGraphWireGraph["gates"][number]): WorkflowGraphGateView {
+  const inputs = gate.inputs.map((input) => ({
+    inputRef: input.inputRef,
+    producerNodeId: input.producerNodeId,
+    state: input.state,
+    stateLabel: INPUT_STATE_LABELS[input.state],
+    missing: input.state === "pending" || input.state === "blocking",
+  }));
+  const pendingRefs = inputs.filter((input) => input.state === "pending").map((input) => input.inputRef);
+  const blockingRefs = inputs.filter((input) => input.state === "blocking").map((input) => input.inputRef);
+  const blockingParts: string[] = [];
+  if (pendingRefs.length > 0) blockingParts.push(`Waiting on ${pendingRefs.join(", ")}`);
+  if (blockingRefs.length > 0) blockingParts.push(`Blocked by ${blockingRefs.join(", ")}`);
+  return {
+    id: gate.gateId,
+    consumerNodeId: gate.consumerNodeId,
+    status: gate.status,
+    statusLabel: workflowGraphStatusLabel(gate.status),
+    satisfied: gate.satisfied,
+    required: gate.required,
+    progressLabel: `${gate.satisfied} of ${gate.required} required inputs supplied`,
+    blockingLabel: blockingParts.length > 0 ? blockingParts.join(" · ") : "All inputs supplied",
+    inputs,
+  };
+}
+
+function reduceProgress(progress: WorkflowGraphWireGraph["progress"]): WorkflowGraphProgressView {
+  const parts = [`${progress.completed} of ${progress.total} completed`];
+  const counts: Array<[number, string]> = [
+    [progress.queued, "queued"],
+    [progress.executing, "executing"],
+    [progress.waiting, "waiting"],
+    [progress.blocked, "blocked"],
+    [progress.notStarted, "not started"],
+    [progress.failed, "failed"],
+    [progress.cancelled, "cancelled"],
+    [progress.skipped, "skipped"],
+  ];
+  for (const [count, label] of counts) if (count > 0) parts.push(`${count} ${label}`);
+  return {
+    ...progress,
+    frontierNodeIds: [...progress.frontierNodeIds],
+    activeNodeIds: [...progress.activeNodeIds],
+    summaryLabel: parts.join(" · "),
+    frontierLabel: progress.frontierNodeIds.length > 0
+      ? `Frontier: ${progress.frontierNodeIds.join(", ")}`
+      : "Frontier clear",
+  };
+}
+
 /** Reduces a validated wire graph without sorting, filtering, or fabricating topology. */
 export function buildWorkflowGraphPanelView(
   graph: WorkflowGraphWireGraph,
 ): WorkflowGraphPanelView {
   const activeNodeIds = new Set(graph.progress.activeNodeIds);
   const activeNodeId = graph.progress.activeNodeIds[0] ?? null;
+  const gates = graph.gates.map(reduceGate);
 
   return {
     runId: graph.runId,
@@ -147,18 +255,20 @@ export function buildWorkflowGraphPanelView(
       reused: node.reused,
       active: activeNodeIds.has(node.nodeId),
       provenanceLabel: node.reused ? "Supplied from a prior result" : "",
+      ...(node.reason ? { reasonLabel: NODE_REASON_LABELS[node.reason] } : {}),
     })),
+    edges: graph.edges.map((edge) => ({
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      inputRef: edge.inputRef,
+      state: edge.contributionState,
+      stateLabel: INPUT_STATE_LABELS[edge.contributionState],
+      reused: edge.reused,
+    })),
+    gates,
+    progress: reduceProgress(graph.progress),
     activeNodeId,
-    activeGate: graph.activeGate
-      ? {
-          id: graph.activeGate.gateId,
-          status: graph.activeGate.status,
-          statusLabel: workflowGraphStatusLabel(graph.activeGate.status),
-          satisfied: graph.activeGate.satisfied,
-          required: graph.activeGate.required,
-          progressLabel: `${graph.activeGate.satisfied} of ${graph.activeGate.required} required inputs supplied`,
-        }
-      : null,
+    activeGate: graph.activeGate ? reduceGate(graph.activeGate) : null,
     feedbackRounds: graph.feedbackRounds.map((round) => ({
       id: round.roundId,
       requesterNodeId: round.requesterNodeId,
