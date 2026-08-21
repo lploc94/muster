@@ -63,7 +63,7 @@ When a workflow run is created—including a child workflow run—every new/unbo
 - Open issues: None. Round 1 issues 1-3 were accepted and fixed; round 2 re-read the saved plan and approved it.
 
 ## Phase 1: Materialize complete workflow task shells safely
-- Status: pending
+- Status: completed
 - Depends on: None
 - Goal: Make every unbound workflow node visible in the owning worktree immediately after start without making pending nodes executable.
 - Current behavior: `startWorkflowRun` creates only executable entry task rows and later inserts consumer task rows when gates complete; `workflow_nodes` pending rows have `task_id = NULL`, so `listTasks`/`buildRepositorySnapshot`/`buildTaskTree` cannot render them. Existing fan-in tests intentionally assert this lazy behavior. The separate `invokeChildGraphTask` transaction has the same omission for child workflow consumers, so fixing only top-level start would leave child-run nodes appearing late.
@@ -104,11 +104,11 @@ When a workflow run is created—including a child workflow run—every new/unbo
   - Define and implement safe delete/cancel behavior for shells, including workflow-node/gate/run consistency and `PRAGMA foreign_key_check` coverage.
   - Keep the existing start transaction, idempotency ledger, revision/change-log, retention, and host task-count/depth policy behavior intact.
 - Acceptance criteria:
-  - [ ] AC-1: Immediately after starting a nontrivial top-level or child workflow, the owning worktree snapshot contains one visible shell task for every unbound topology node, including not-yet-executable consumers and unbound terminal nodes - proven by the new SQLite/repository snapshot test, child-continuation test, and the Playwright worktree journey.
-  - [ ] AC-2: The same start creates no turn/message/session/activation for pending shells and no shell is scheduler-runnable or manually sendable - proven by readiness/scheduler/turn-route tests and SQL assertions.
-  - [ ] AC-3: Completing a gate updates the pre-existing shell and creates exactly one activation/message/turn without changing its task ID - proven by durable fan-in activation tests.
-  - [ ] AC-4: Reused destinations remain taskless and source-pinned while all unbound nodes are visible; terminal reuse remains rejected - proven by M024 reuse regressions.
-  - [ ] AC-5: Start, activation, reload, and external patch reconciliation preserve all shell membership/statuses without duplicate or stale rows; each successful top-level or child start publishes exactly one revision/change-log batch and replay publishes none - proven by projection, patch, two-repository reconciliation, reload, and idempotency tests.
+  - [x] AC-1: Immediately after starting a nontrivial top-level or child workflow, the owning worktree snapshot contains one visible shell task for every unbound topology node, including not-yet-executable consumers and unbound terminal nodes - proven by the new SQLite/repository snapshot test, child-continuation test, and the Playwright worktree journey.
+  - [x] AC-2: The same start creates no turn/message/session/activation for pending shells and no shell is scheduler-runnable or manually sendable - proven by readiness/scheduler/turn-route tests and SQL assertions.
+  - [x] AC-3: Completing a gate updates the pre-existing shell and creates exactly one activation/message/turn without changing its task ID - proven by durable fan-in activation tests.
+  - [x] AC-4: Reused destinations remain taskless and source-pinned while all unbound nodes are visible; terminal reuse remains rejected - proven by M024 reuse regressions.
+  - [x] AC-5: Start, activation, reload, and external patch reconciliation preserve all shell membership/statuses without duplicate or stale rows; each successful top-level or child start publishes exactly one revision/change-log batch and replay publishes none - proven by projection, patch, two-repository reconciliation, reload, and idempotency tests.
 - Focused verification:
   - `npx vitest run src/task/m018-s02-fan-in-next.test.ts src/task/m018-s06-child-workflow-continuation.test.ts src/task/m024-s03-mid-tree-node-reuse.test.ts src/task/m024-s03-mid-tree-reuse-durable.test.ts src/task/m024-s03-fan-in-reuse-durable.test.ts src/task/repository-projection.test.ts src/host/repository-snapshot.test.ts src/host/workspace-patch.test.ts src/task/readiness.test.ts src/task/scheduler.test.ts`
 - Phase gates:
@@ -225,6 +225,6 @@ When a workflow run is created—including a child workflow run—every new/unbo
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
-| 1 | pending | N/A | pending | pending |
+| 1 | completed | this phase commit (`feat(workflow): materialize inert task shells at start`) | compile; svelte-check; focused 10 files/91 tests; phase gate 6 files/84 tests; broader 14 files/138 tests; focused Playwright | codex-impl-review round 9 APPROVE |
 | 2 | pending | N/A | pending | pending |
 | 3 | pending | N/A | pending | pending |

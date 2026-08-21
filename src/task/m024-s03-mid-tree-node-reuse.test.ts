@@ -33,6 +33,30 @@ function rootTask(createdAt: string): MusterTask {
   };
 }
 
+async function settleNext(
+  repository: SqliteTaskRepository,
+  client: DbClient,
+  taskId: string,
+  turnId: string,
+  result: string,
+  finishedAt: string,
+) {
+  await client.run(
+    `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+    [finishedAt, 'ws', turnId],
+  );
+  const task = await repository.getTask(taskId);
+  const turn = await repository.getTurn(turnId);
+  const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+  await stageDispositionForSettlement(repository, turn!, disposition);
+  return repository.execute({
+    kind: 'settleTurnAndApplyEffects', workspaceId: 'ws', expectedTaskRevision: task!.revision,
+    task: { ...task!, lifecycle: 'succeeded', updatedAt: finishedAt },
+    turn: { ...turn!, status: 'succeeded', finishedAt, disposition },
+    expectedStatuses: ['running'], relatedTurns: [], messages: [],
+  });
+}
+
 /** Bind a fully reused prefix to the same exact prior execution. */
 function boundAncestors(prior: { runId: string; entryTaskId: string }) {
   return ['source', 'middle'].map((destinationNodeId) => ({
@@ -263,6 +287,75 @@ describe('start_workflow mid-tree node reuse', () => {
       })).resolves.toMatchObject({ ok: true, changed: true });
 
       await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-multi-hop-gates', version: 1,
+        name: 'multi hop gates', topology: {
+          kind: 'graph_v1',
+          nodes: ['source', 'other', 'middle', 'middle2', 'sink'].map((nodeId) => ({ nodeId })),
+          edges: [
+            { fromNodeId: 'source', toNodeId: 'middle', inputRef: 'source_result' },
+            { fromNodeId: 'middle', toNodeId: 'middle2', inputRef: 'middle_result' },
+            { fromNodeId: 'other', toNodeId: 'middle2', inputRef: 'other_result' },
+            { fromNodeId: 'middle2', toNodeId: 'sink', inputRef: 'middle2_result' },
+          ],
+        }, createdAt,
+      });
+      const multiStart = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-multi-hop-gates', version: 1,
+        startIdempotencyKey: 'multi-hop-gates', createdAt: '2026-08-01T00:00:00.800Z',
+        reuse: ['middle', 'middle2'].map((destinationNodeId) => ({
+          destinationNodeId,
+          sourceRunId: prior.runId,
+          sourceNodeId: 'middle',
+          sourceTaskId: prior.entryTaskId,
+        })),
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'turn-1',
+      });
+      expect(multiStart).toMatchObject({ ok: true, changed: true });
+      const multi = multiStart.operation!.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+      };
+      const multiEntries = new Map(multi.entries.map((entry) => [entry.nodeId, entry]));
+      const sourceEntry = multiEntries.get('source')!;
+      await expect(settleNext(
+        repository, client, sourceEntry.taskId, sourceEntry.activationTurnId,
+        'source result', '2026-08-01T00:00:00.850Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(client.all(
+        `SELECT consumer_node_id, status FROM workflow_dependency_gates
+          WHERE workspace_id = ? AND run_id = ? ORDER BY consumer_node_id`,
+        ['ws', multi.runId],
+      )).resolves.toEqual([
+        { consumer_node_id: 'middle', status: 'consumed' },
+        { consumer_node_id: 'middle2', status: 'open' },
+        { consumer_node_id: 'other', status: 'satisfied' },
+        { consumer_node_id: 'sink', status: 'open' },
+        { consumer_node_id: 'source', status: 'consumed' },
+      ]);
+      const sinkBefore = await client.get<{ task_id: string; status: string }>(
+        `SELECT task_id, status FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = 'sink'`,
+        ['ws', multi.runId],
+      );
+      expect(sinkBefore?.status).toBe('pending');
+      expect(await repository.listTurns(sinkBefore!.task_id)).toHaveLength(0);
+      const otherEntry = multiEntries.get('other')!;
+      await expect(settleNext(
+        repository, client, otherEntry.taskId, otherEntry.activationTurnId,
+        'other result', '2026-08-01T00:00:00.900Z',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(client.all(
+        `SELECT consumer_node_id, status FROM workflow_dependency_gates
+          WHERE workspace_id = ? AND run_id = ? AND consumer_node_id IN ('middle2','sink')
+          ORDER BY consumer_node_id`,
+        ['ws', multi.runId],
+      )).resolves.toEqual([
+        { consumer_node_id: 'middle2', status: 'consumed' },
+        { consumer_node_id: 'sink', status: 'satisfied' },
+      ]);
+      expect(await repository.listTurns(sinkBefore!.task_id)).toHaveLength(1);
+
+      await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-kind-mismatch', version: 1,
         name: 'kind mismatch', topology: {
           kind: 'graph_v1',
@@ -324,9 +417,16 @@ describe('start_workflow mid-tree node reuse', () => {
         ['ws', partial.runId],
       )).resolves.toEqual([
         { node_id: 'middle', task_id: null, status: 'reused' },
-        { node_id: 'sink', task_id: null, status: 'pending' },
+        { node_id: 'sink', task_id: expect.any(String), status: 'pending' },
         { node_id: 'source', task_id: partial.entryTaskId, status: 'active' },
       ]);
+      const sinkNode = await client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'sink'`,
+        ['ws', partial.runId],
+      );
+      const sinkTask = await repository.getTask(sinkNode!.task_id);
+      expect(sinkTask?.workflowShell).toMatchObject({ runId: partial.runId, nodeId: 'sink' });
+      expect(await repository.listTurns(sinkNode!.task_id)).toHaveLength(0);
       const started = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-graph', version: 1,
         startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:01.000Z',

@@ -361,6 +361,9 @@ export function projectWorkspacePatches(args: ProjectWorkspacePatchesArgs): Work
   }
 
   const affected = collectAffectedTaskIds(command, before, after);
+  if (args.result.affectedTaskIds) {
+    for (const id of args.result.affectedTaskIds) affected.add(id);
+  }
   const removals: WorkspacePatch[] = [];
   const upserts: WorkspacePatch[] = [];
   const activities: WorkspacePatch[] = [];

@@ -71,10 +71,13 @@ async function terminalizeRun(client: DbClient, repository: SqliteTaskRepository
   for (const { task_id } of nodes) {
     const task = await repository.getTask(task_id);
     expect(task).toBeTruthy();
-    await repository.execute({
-      kind: 'upsertTask', workspaceId: WORKSPACE_ID,
-      task: { ...task!, lifecycle: 'succeeded', finishedAt: NOW, updatedAt: NOW, revision: task!.revision + 1 },
-    });
+    // Reclamation fixture closes tasks that may include pending workflow shells.
+    // Use raw SQL to bypass the shell-protection guard on generic upsertTask, which
+    // intentionally fails closed for shell tasks outside the workflow closure path.
+    await client.run(
+      `UPDATE tasks SET lifecycle = 'succeeded', updated_at = ?, revision = revision + 1 WHERE workspace_id = ? AND id = ?`,
+      [NOW, WORKSPACE_ID, task_id],
+    );
   }
 }
 

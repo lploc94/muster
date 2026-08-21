@@ -13,6 +13,7 @@ import {
 
 type TaskRuntimeActivity =
   | 'waiting_dependencies'
+  | 'waiting_workflow'
   | 'queued'
   | 'running'
   | 'waiting_user'
@@ -7610,6 +7611,63 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
 });
 
 test.describe('Task-tree chrome navigation', () => {
+  test('renders every pending workflow shell and blocks manual composer sends', async ({ page }) => {
+    await openWebview(page);
+
+    const coordinator = task({
+      id: 'workflow-owner',
+      role: 'coordinator',
+      goal: 'Coordinate release workflow',
+      viewStatus: 'running',
+      runtimeActivity: 'running',
+    });
+    const producer = task({
+      id: 'workflow-producer',
+      parentId: 'workflow-owner',
+      role: 'worker',
+      goal: 'Produce release evidence',
+      viewStatus: 'running',
+      runtimeActivity: 'running',
+    });
+    const consumerShell = task({
+      id: 'workflow-consumer-shell',
+      parentId: 'workflow-owner',
+      role: 'worker',
+      goal: 'Review release evidence',
+      viewStatus: 'waiting_workflow',
+      runtimeActivity: 'waiting_workflow',
+      currentTurnActivity: null,
+    });
+    const terminalShell = task({
+      id: 'workflow-terminal-shell',
+      parentId: 'workflow-owner',
+      role: 'worker',
+      goal: 'Publish release result',
+      viewStatus: 'waiting_workflow',
+      runtimeActivity: 'waiting_workflow',
+      currentTurnActivity: null,
+    });
+
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [coordinator],
+      focusedTaskId: consumerShell.id,
+      subtree: [coordinator, producer, consumerShell, terminalShell],
+      transcript: [],
+      storeRevision: 901,
+    });
+
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByTestId('task-tree-row')).toHaveCount(4);
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: consumerShell.goal })).toBeVisible();
+    await expect(page.getByTestId('task-tree-row').filter({ hasText: terminalShell.goal })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Waiting for workflow/i })).toHaveCount(2);
+    await page.getByTestId('task-tree-summary').click();
+    await expect(page.getByText(/will run automatically when its workflow inputs are ready/i)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Stop this turn' })).toHaveCount(0);
+  });
+
   test('collapsed tree is the selected-task header and expands without duplicate context', async ({
     page,
   }) => {

@@ -1516,7 +1516,15 @@ describe('SqliteTaskRepository', () => {
         'SELECT id FROM tasks WHERE workspace_id = ? ORDER BY id',
         ['ws'],
       );
-      expect(tasks).toHaveLength(2);
+      expect(tasks).toHaveLength(3);
+      const consumerTaskIdBefore = (await client.get<{ task_id: string }>(
+        'SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?',
+        ['ws', data.runId, 'consumer'],
+      ))?.task_id;
+      expect(consumerTaskIdBefore).toEqual(expect.any(String));
+      const consumerShellTask = await repository.getTask(consumerTaskIdBefore!);
+      expect(consumerShellTask?.workflowShell).toMatchObject({ runId: data.runId, nodeId: 'consumer' });
+      expect(await repository.listTurns(consumerTaskIdBefore!)).toHaveLength(0);
 
       const nodes = await client.all(
         'SELECT node_id, task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? ORDER BY node_id',
@@ -1526,7 +1534,7 @@ describe('SqliteTaskRepository', () => {
         expect.arrayContaining([
           expect.objectContaining({ node_id: 'p1', status: 'active' }),
           expect.objectContaining({ node_id: 'p2', status: 'active' }),
-          expect.objectContaining({ node_id: 'consumer', task_id: null, status: 'pending' }),
+          expect.objectContaining({ node_id: 'consumer', task_id: expect.any(String), status: 'pending' }),
         ]),
       );
 
@@ -1570,7 +1578,7 @@ describe('SqliteTaskRepository', () => {
       });
       expect(replay.ok).toBe(true);
       expect(replay.changed).toBe(false);
-      expect(await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws'])).toHaveLength(2);
+      expect(await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws'])).toHaveLength(3);
       expect(await client.all('SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'])).toHaveLength(1);
     } finally {
       await client.close();
@@ -1672,12 +1680,16 @@ describe('SqliteTaskRepository', () => {
         ['ws', data.runId, consumerGate.gateId],
       );
       expect(gateAfterFirst).toMatchObject({ status: 'open' });
-      expect(await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws'])).toHaveLength(2);
+      expect(await client.all('SELECT id FROM tasks WHERE workspace_id = ?', ['ws'])).toHaveLength(3);
       const consumerNodeAfterFirst = await client.get(
         'SELECT task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?',
         ['ws', data.runId, 'consumer'],
       );
-      expect(consumerNodeAfterFirst).toMatchObject({ task_id: null, status: 'pending' });
+      expect(consumerNodeAfterFirst?.task_id).toEqual(expect.any(String));
+      expect(consumerNodeAfterFirst).toMatchObject({ status: 'pending' });
+      const shellTaskAfterFirst = await repository.getTask(consumerNodeAfterFirst!.task_id as string);
+      expect(shellTaskAfterFirst?.workflowShell).toMatchObject({ runId: data.runId, nodeId: 'consumer' });
+      expect(await repository.listTurns(shellTaskAfterFirst!.id)).toHaveLength(0);
 
       // Producer lifecycle stays open after NEXT.
       const p1Task = await repository.getTask(p1.taskId);

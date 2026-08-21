@@ -42,6 +42,7 @@ export const TASK_LIFECYCLE_STATES = [
 
 export const TASK_RUNTIME_ACTIVITIES = [
   'waiting_prerequisites',
+  'waiting_workflow',
   'queued',
   'running',
   'waiting_user',
@@ -123,6 +124,15 @@ export const RUNTIME_PRESENTATIONS = {
     workspaceHeadline: 'Waiting on prerequisites',
     workspaceDetail: 'Runtime cannot start until prerequisite tasks settle.',
     composerGuidance: 'You can review the plan; progress is blocked on prerequisites.',
+  },
+  waiting_workflow: {
+    key: 'waiting_workflow',
+    label: 'Waiting for workflow',
+    tone: 'info',
+    listCopy: 'Waiting for workflow inputs',
+    workspaceHeadline: 'Waiting for workflow inputs',
+    workspaceDetail: 'This workflow task is pending until its dependency gate is satisfied.',
+    composerGuidance: 'This task will run automatically when its workflow inputs are ready — no manual send needed.',
   },
   queued: {
     key: 'queued',
@@ -390,5 +400,5 @@ export function taskStatusLabel(status: TaskViewStatus | string | null | undefin
  */
 export function runtimeBlocksComposer(activity: TaskRuntimeActivity | null | undefined): boolean {
   if (!activity) return false;
-  return activity === 'waiting_user';
+  return activity === 'waiting_user' || activity === 'waiting_workflow';
 }

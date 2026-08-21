@@ -24,6 +24,7 @@ export type ReadinessCode =
   | 'needs_attention'
   | 'waiting_children'
   | 'waiting_external'
+  | 'waiting_workflow'
   | 'handoff_active'
   | 'terminal'
   | 'not_found';
@@ -178,6 +179,14 @@ export function evaluateTaskReadiness(file: EngineProjection, taskId: string): T
     });
   }
 
+  if (task.workflowShell) {
+    reasons.push({
+      code: 'waiting_workflow',
+      message: `waiting for workflow inputs (run ${task.workflowShell.runId} node ${task.workflowShell.nodeId})`,
+      detail: { runId: task.workflowShell.runId, nodeId: task.workflowShell.nodeId, gateId: task.workflowShell.gateId },
+    });
+  }
+
   const hasPromotableQueued = queued.some((t) => t.holdAutoPromote !== true);
   // Held follow-ups must not block a later non-held safe auto-retry (scheduler FIFO).
   if (queued.length > 0 && !hasPromotableQueued) {
@@ -192,12 +201,14 @@ export function evaluateTaskReadiness(file: EngineProjection, taskId: string): T
   const hardBlock =
     task.releaseState === 'draft' ||
     inputReasons.length > 0 ||
+    Boolean(task.workflowShell) ||
     reasons.some((r) =>
       (
         [
           'waiting_prerequisites',
           'waiting_children',
           'waiting_external',
+          'waiting_workflow',
           'handoff_active',
           'held_after_failure',
           'held_reload',
@@ -252,6 +263,8 @@ export function readinessToPromoteReason(readiness: TaskReadiness): string | und
       return 'waiting on child tasks';
     case 'waiting_external':
       return 'waiting on external blocker';
+    case 'waiting_workflow':
+      return 'waiting for workflow inputs';
     case 'handoff_active':
       return 'runtime handoff in progress';
     case 'held_after_failure':

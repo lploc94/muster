@@ -53,6 +53,7 @@ export type TaskLifecycleState = 'open' | 'succeeded' | 'failed' | 'cancelled' |
 /** Derived prerequisite/process/wait activity while open — secondary chrome. */
 export type TaskRuntimeActivity =
   | 'waiting_prerequisites'
+  | 'waiting_workflow'
   | 'queued'
   | 'running'
   | 'waiting_user'
@@ -1203,6 +1204,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
   const runtimeActivity =
     v.runtimeActivity === null ||
     v.runtimeActivity === 'waiting_prerequisites' ||
+    v.runtimeActivity === 'waiting_workflow' ||
     v.runtimeActivity === 'queued' ||
     v.runtimeActivity === 'running' ||
     v.runtimeActivity === 'waiting_user' ||
@@ -1218,6 +1220,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
     v.viewStatus === 'cancelled' ||
     v.viewStatus === 'skipped' ||
     v.viewStatus === 'waiting_prerequisites' ||
+    v.viewStatus === 'waiting_workflow' ||
     v.viewStatus === 'queued' ||
     v.viewStatus === 'running' ||
     v.viewStatus === 'waiting_user' ||

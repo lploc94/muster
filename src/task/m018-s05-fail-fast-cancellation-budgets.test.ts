@@ -440,6 +440,75 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
     }
   }, 30_000);
 
+  it('re-plans an invalid PREV closure when a sibling turn becomes live before commit', async () => {
+    const opened = await openRepo('invalid-prev-stale-closure');
+    try {
+      const createdAt = '2026-07-22T14:00:00.000Z';
+      const data = await defineAndStartFanIn(
+        opened.repository,
+        createdAt,
+        's05-invalid-prev-stale-closure',
+      );
+      const entries = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+      const p1 = entries.get('p1')!;
+      const p2 = entries.get('p2')!;
+      await promoteRunning(opened.client, p1.activationTurnId, '2026-07-22T14:01:00.000Z');
+      const p1Task = await opened.repository.getTask(p1.taskId);
+      const p1Turn = await opened.repository.getTurn(p1.activationTurnId);
+      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const };
+      await stageDispositionForSettlement(opened.repository, p1Turn!, disposition);
+      let promotedBetweenPlanAndCommit = false;
+      const stalePlannerRepository = new SqliteTaskRepository({
+        all: (sql, params) => opened.client.all(sql, params),
+        get: (sql, params) => opened.client.get(sql, params),
+        run: (sql, params) => opened.client.run(sql, params),
+        pragma: (pragma) => opened.client.pragma(pragma),
+        transaction: async (statements, options) => {
+          if (!promotedBetweenPlanAndCommit) {
+            promotedBetweenPlanAndCommit = true;
+            await promoteRunning(
+              opened.client,
+              p2.activationTurnId,
+              '2026-07-22T14:01:30.000Z',
+            );
+          }
+          return opened.client.transaction(statements, options);
+        },
+      }, 'ws');
+
+      const settlement = await stalePlannerRepository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: p1Task!.revision,
+        task: { ...p1Task!, updatedAt: '2026-07-22T14:02:00.000Z' },
+        turn: {
+          ...p1Turn!,
+          status: 'succeeded',
+          finishedAt: '2026-07-22T14:02:00.000Z',
+          disposition,
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settlement.changed, JSON.stringify(settlement)).toBe(true);
+
+      expect(promotedBetweenPlanAndCommit).toBe(true);
+      await expect(opened.client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'invalid_route' });
+      await expect(opened.client.get(
+        `SELECT COUNT(*) AS count FROM turn_cancel_requests
+          WHERE workspace_id = 'ws' AND turn_id = ? AND kind = 'interrupt'`,
+        [p2.activationTurnId],
+      )).resolves.toEqual({ count: 1 });
+    } finally {
+      await opened.close();
+    }
+  }, 30_000);
+
   it('run_timeout termination closes the run and owned task', async () => {
     const opened = await openRepo('timeout');
     try {
@@ -749,14 +818,17 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       );
       expect(late.ok).toBe(true);
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
-      // Consumer must not have been activated after closure.
-      const consumerNode = await opened.client.get<{ task_id: string | null }>(
-        `SELECT task_id FROM workflow_nodes
+      // Consumer must not have been activated after closure; shell remains pending.
+      const consumerNode = await opened.client.get<{ task_id: string | null; status: string }>(
+        `SELECT task_id, status FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
         ['ws', data.runId, 'consumer'],
       );
-      // Fan-in consumer is not an entry — remains unactivated (null task_id) after late NEXT.
-      expect(consumerNode?.task_id == null || consumerNode?.task_id === '').toBe(true);
+      expect(consumerNode?.task_id).toEqual(expect.any(String));
+      expect(consumerNode?.status).toBe('pending');
+      const shellTask = await opened.repository.getTask(consumerNode!.task_id!);
+      expect(shellTask?.workflowShell).toBeTruthy();
+      expect(await opened.repository.listTurns(consumerNode!.task_id!)).toHaveLength(0);
     } finally {
       await opened.close();
     }

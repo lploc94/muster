@@ -105,12 +105,17 @@ export function deriveRuntimeActivity(
     return liveTurn.status === 'waiting_user' ? 'waiting_user' : 'running';
   }
 
-  // 3. Unmet prerequisites
+  // 3. Workflow pending shell
+  if (task.workflowShell) {
+    return 'waiting_workflow';
+  }
+
+  // 4. Unmet prerequisites
   if (hasUnmetPrerequisite(task, producerLifecycles)) {
     return 'waiting_prerequisites';
   }
 
-  // 4. Schedulable queued turn
+  // 5. Schedulable queued turn
   if (hasQueuedTurn(turns)) {
     return 'queued';
   }

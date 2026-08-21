@@ -249,7 +249,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
         'SELECT task_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?',
         ['ws', data.runId, 'consumer'],
       );
-      expect(consumerNodeAfterFirst).toMatchObject({ task_id: null, status: 'pending' });
+      expect(consumerNodeAfterFirst?.task_id).toBeTruthy();
+      expect(consumerNodeAfterFirst).toMatchObject({ status: 'pending' });
+      const consumerShellId = String(consumerNodeAfterFirst!.task_id);
+      await expect(ctx.repository.getTask(consumerShellId)).resolves.toMatchObject({
+        lifecycle: 'open',
+        releaseState: 'released',
+        workflowShell: { runId: data.runId, nodeId: 'consumer', gateId: consumerGate!.gateId },
+      });
+      expect(await ctx.repository.listTurns(consumerShellId)).toHaveLength(0);
       expect((await ctx.repository.getTask(p1.taskId))?.lifecycle).toBe('open');
 
       const second = await settleProducer(p2, 'p2-result', '2026-07-19T12:02:00.000Z');
@@ -440,6 +448,7 @@ describe('M018 S02 fan-in NEXT activation', () => {
           WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
         [data.runId],
       );
+      expect(finalResults.some((result) => result.affectedTaskIds?.includes(consumer!.task_id))).toBe(true);
       const turns = await first.listTurns(consumer!.task_id);
       expect(turns).toHaveLength(1);
       const messageId = turns[0]!.inputs.find((input) => input.kind === 'message')?.messageId;
@@ -458,6 +467,294 @@ describe('M018 S02 fan-in NEXT activation', () => {
           [data.runId, gateId],
         ),
       ).toHaveLength(1);
+      await expect(firstClient.get(
+        `SELECT workflow_turns_reserved FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({ workflow_turns_reserved: 4 });
+    } finally {
+      await Promise.all([
+        firstClient.close().catch(() => undefined),
+        secondClient.close().catch(() => undefined),
+      ]);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  it('concurrent stale final fill at the turn limit fails closed', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s02-concurrent-budget-'));
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const firstClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    const secondClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await firstClient.open(dbPath);
+      await secondClient.open(dbPath);
+      const first = new SqliteTaskRepository(firstClient, 'ws');
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const createdAt = '2026-07-22T05:30:00.000Z';
+      await first.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-concurrent-budget',
+        version: 1,
+        name: 'concurrent budget',
+        topology: FAN_IN_TOPOLOGY,
+        policy: { ...DEFAULT_WORKFLOW_POLICY, maxWorkflowTurnsPerRun: 2 },
+        createdAt,
+      });
+      const started = await first.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-concurrent-budget',
+        version: 1,
+        startIdempotencyKey: 'concurrent-budget-start',
+        createdAt,
+        goal: 'concurrent budget',
+        backend: 'grok',
+      });
+      const data = started.operation!.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+      };
+      const entries = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+      const commandFor = async (
+        repository: SqliteTaskRepository,
+        client: DbClient,
+        nodeId: 'p1' | 'p2',
+        finishedAt: string,
+      ) => {
+        const entry = entries.get(nodeId)!;
+        await client.run(
+          `UPDATE turns SET status = 'running', started_at = ?
+            WHERE workspace_id = 'ws' AND id = ?`,
+          [createdAt, entry.activationTurnId],
+        );
+        const task = await repository.getTask(entry.taskId);
+        const turn = await repository.getTurn(entry.activationTurnId);
+        const disposition = {
+          kind: 'workflow_next' as const,
+          change: 'updated' as const,
+          result: `${nodeId} result`,
+        };
+        await stageDispositionForSettlement(repository, turn!, disposition);
+        return {
+          kind: 'settleTurnAndApplyEffects' as const,
+          workspaceId: 'ws',
+          expectedTaskRevision: task!.revision,
+          task: { ...task!, updatedAt: finishedAt },
+          turn: { ...turn!, status: 'succeeded' as const, finishedAt, disposition },
+          expectedStatuses: ['running' as const],
+          relatedTurns: [],
+          messages: [],
+        };
+      };
+      const p1 = await commandFor(first, firstClient, 'p1', '2026-07-22T05:31:00.000Z');
+      const p2 = await commandFor(second, secondClient, 'p2', '2026-07-22T05:31:00.000Z');
+      let transactionArrivals = 0;
+      let releaseTransactions!: () => void;
+      const transactionBarrier = new Promise<void>((resolve) => {
+        releaseTransactions = resolve;
+      });
+      const stalePlannerRepository = (client: DbClient) => new SqliteTaskRepository({
+        all: (sql, params) => client.all(sql, params),
+        get: (sql, params) => client.get(sql, params),
+        run: (sql, params) => client.run(sql, params),
+        pragma: (pragma) => client.pragma(pragma),
+        transaction: async (statements, options) => {
+          transactionArrivals += 1;
+          if (transactionArrivals === 2) releaseTransactions();
+          await transactionBarrier;
+          return client.transaction(statements, options);
+        },
+      }, 'ws');
+      const staleFirst = stalePlannerRepository(firstClient);
+      const staleSecond = stalePlannerRepository(secondClient);
+      const results = await Promise.all([staleFirst.execute(p1), staleSecond.execute(p2)]);
+      const consumer = await firstClient.get<{ task_id: string; status: string }>(
+        `SELECT task_id, status FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ? AND node_id = 'consumer'`,
+        [data.runId],
+      );
+      expect(results.some((result) => result.affectedTaskIds?.includes(consumer!.task_id))).toBe(true);
+      await expect(firstClient.get(
+        `SELECT status, terminal_reason_code, workflow_turns_reserved
+           FROM workflow_runs WHERE workspace_id = 'ws' AND run_id = ?`,
+        [data.runId],
+      )).resolves.toEqual({
+        status: 'failed',
+        terminal_reason_code: 'turn_budget_exhausted',
+        workflow_turns_reserved: 2,
+      });
+      expect((await first.getTask(consumer!.task_id))?.lifecycle).toBe('failed');
+      expect(await first.listTurns(consumer!.task_id)).toHaveLength(0);
+      await expect(firstClient.all(
+        `SELECT status FROM workflow_dependency_gates
+          WHERE workspace_id = 'ws' AND run_id = ? AND status IN ('open', 'satisfied')`,
+        [data.runId],
+      )).resolves.toEqual([]);
+    } finally {
+      await Promise.all([
+        firstClient.close().catch(() => undefined),
+        secondClient.close().catch(() => undefined),
+      ]);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 45_000);
+
+  it('different final gates share one remaining run turn slot', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s02-two-gate-budget-'));
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const firstClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    const secondClient = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await firstClient.open(dbPath);
+      await secondClient.open(dbPath);
+      const first = new SqliteTaskRepository(firstClient, 'ws');
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const createdAt = '2026-07-22T05:40:00.000Z';
+      await first.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-two-gate-budget',
+        version: 1,
+        name: 'two gate budget',
+        topology: {
+          kind: 'graph_v1',
+          nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'c1' }, { nodeId: 'c2' }],
+          edges: [
+            { fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' },
+            { fromNodeId: 'p2', toNodeId: 'c2', inputRef: 'from_p2' },
+          ],
+        },
+        policy: { ...DEFAULT_WORKFLOW_POLICY, maxWorkflowTurnsPerRun: 3 },
+        createdAt,
+      });
+      const started = await first.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-two-gate-budget',
+        version: 1,
+        startIdempotencyKey: 'two-gate-budget-start',
+        createdAt,
+        goal: 'two gate budget',
+        backend: 'grok',
+      });
+      const data = started.operation!.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+      };
+      const entries = new Map(data.entries.map((entry) => [entry.nodeId, entry]));
+      const commandFor = async (
+        repository: SqliteTaskRepository,
+        client: DbClient,
+        nodeId: 'p1' | 'p2',
+      ) => {
+        const entry = entries.get(nodeId)!;
+        await client.run(
+          `UPDATE turns SET status='running', started_at=? WHERE workspace_id='ws' AND id=?`,
+          [createdAt, entry.activationTurnId],
+        );
+        const task = await repository.getTask(entry.taskId);
+        const turn = await repository.getTurn(entry.activationTurnId);
+        const disposition = {
+          kind: 'workflow_next' as const,
+          change: 'updated' as const,
+          result: `${nodeId} result`,
+        };
+        await stageDispositionForSettlement(repository, turn!, disposition);
+        return {
+          kind: 'settleTurnAndApplyEffects' as const,
+          workspaceId: 'ws',
+          expectedTaskRevision: task!.revision,
+          task: { ...task!, updatedAt: '2026-07-22T05:41:00.000Z' },
+          turn: {
+            ...turn!, status: 'succeeded' as const,
+            finishedAt: '2026-07-22T05:41:00.000Z', disposition,
+          },
+          expectedStatuses: ['running' as const],
+          relatedTurns: [],
+          messages: [],
+        };
+      };
+      const p1 = await commandFor(first, firstClient, 'p1');
+      const p2 = await commandFor(second, secondClient, 'p2');
+      let transactionArrivals = 0;
+      let promotedBetweenPlanAndCommit = false;
+      let releaseTransactions!: () => void;
+      const transactionBarrier = new Promise<void>((resolve) => {
+        releaseTransactions = resolve;
+      });
+      const stalePlannerRepository = (client: DbClient) => new SqliteTaskRepository({
+        all: (sql, params) => client.all(sql, params),
+        get: (sql, params) => client.get(sql, params),
+        run: (sql, params) => client.run(sql, params),
+        pragma: (pragma) => client.pragma(pragma),
+        transaction: async (statements, options) => {
+          transactionArrivals += 1;
+          if (transactionArrivals === 2) releaseTransactions();
+          await transactionBarrier;
+          if (transactionArrivals >= 3 && !promotedBetweenPlanAndCommit) {
+            promotedBetweenPlanAndCommit = true;
+            await client.run(
+              `UPDATE turns SET status='running', started_at=?
+                WHERE workspace_id='ws' AND status='queued' AND task_id IN (
+                  SELECT task_id FROM workflow_nodes
+                   WHERE workspace_id='ws' AND run_id=? AND node_id IN ('c1','c2')
+                )`,
+              ['2026-07-22T05:41:30.000Z', data.runId],
+            );
+          }
+          return client.transaction(statements, options);
+        },
+      }, 'ws');
+      const results = await Promise.all([
+        stalePlannerRepository(firstClient).execute(p1),
+        stalePlannerRepository(secondClient).execute(p2),
+      ]);
+      expect(results.every((result) => result.changed)).toBe(true);
+      await expect(firstClient.get(
+        `SELECT status, terminal_reason_code, workflow_turns_reserved
+           FROM workflow_runs WHERE workspace_id='ws' AND run_id=?`,
+        [data.runId],
+      )).resolves.toEqual({
+        status: 'failed',
+        terminal_reason_code: 'turn_budget_exhausted',
+        workflow_turns_reserved: 3,
+      });
+      await expect(firstClient.get(
+        `SELECT COUNT(*) AS count FROM turns
+          WHERE workspace_id='ws' AND task_id IN (
+            SELECT task_id FROM workflow_nodes
+             WHERE workspace_id='ws' AND run_id=? AND node_id IN ('c1','c2')
+          )`,
+        [data.runId],
+      )).resolves.toEqual({ count: 1 });
+      expect(promotedBetweenPlanAndCommit).toBe(true);
+      await expect(firstClient.get(
+        `SELECT COUNT(*) AS count FROM turn_cancel_requests
+          WHERE workspace_id='ws' AND kind='interrupt' AND task_id IN (
+            SELECT task_id FROM workflow_nodes
+             WHERE workspace_id='ws' AND run_id=? AND node_id IN ('c1','c2')
+          )`,
+        [data.runId],
+      )).resolves.toEqual({ count: 1 });
+      await expect(firstClient.get(
+        `SELECT COUNT(*) AS count FROM workflow_activations
+          WHERE workspace_id='ws' AND run_id=? AND node_id IN ('c1','c2')`,
+        [data.runId],
+      )).resolves.toEqual({ count: 1 });
     } finally {
       await Promise.all([
         firstClient.close().catch(() => undefined),
@@ -552,11 +849,14 @@ describe('M018 S02 fan-in NEXT activation', () => {
         if (overflow) {
           expect(run).toEqual({ status: 'failed', terminal_reason_code: 'aggregate_too_large' });
           expect(gate).toEqual({ status: 'failed' });
-          expect(consumer).toEqual({ task_id: null });
+          expect(consumer?.task_id).toEqual(expect.any(String));
           expect(activations).toHaveLength(0);
           expect(await ctx.client.all(
             `SELECT id FROM messages WHERE workspace_id = 'ws' AND content LIKE '[workflow-aggregate]%'`,
           )).toHaveLength(0);
+          const shellTask = await ctx.repository.getTask(consumer!.task_id!);
+          expect(shellTask?.workflowShell).toMatchObject({ runId: data.runId, nodeId: 'consumer' });
+          expect(await ctx.repository.listTurns(consumer!.task_id!)).toHaveLength(0);
         } else {
           expect(run).toEqual({ status: 'running', terminal_reason_code: null });
           expect(gate).toEqual({ status: 'satisfied' });
@@ -567,6 +867,8 @@ describe('M018 S02 fan-in NEXT activation', () => {
             expect.objectContaining({ content: expectedAggregate }),
           ]));
           expect(Buffer.byteLength(expectedAggregate, 'utf8')).toBe(policy.maxAggregateBytes);
+          const consumerTask = await ctx.repository.getTask(consumer!.task_id!);
+          expect(consumerTask?.workflowShell).toBeUndefined();
         }
       } finally {
         await ctx.close();
@@ -776,9 +1078,13 @@ describe('M018 S02 fan-in NEXT activation', () => {
         expect.arrayContaining([
           expect.objectContaining({ node_id: 'p1', status: 'active' }),
           expect.objectContaining({ node_id: 'p2', status: 'active' }),
-          expect.objectContaining({ node_id: 'consumer', status: 'pending', task_id: null }),
+          expect.objectContaining({ node_id: 'consumer', status: 'pending', task_id: expect.any(String) }),
         ]),
       );
+      const consumerNode = nodes.find((n: any) => n.node_id === 'consumer');
+      const consumerTask = await repository.getTask(consumerNode!.task_id);
+      expect(consumerTask?.workflowShell).toMatchObject({ runId: payload.runId, nodeId: 'consumer' });
+      expect(await repository.listTurns(consumerNode!.task_id)).toHaveLength(0);
 
       const consumerGate = payload.nodeGates?.find((g) => g.nodeId === 'consumer');
       expect(consumerGate).toBeTruthy();

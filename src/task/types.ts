@@ -380,6 +380,18 @@ export interface MusterTask {
   handoff?: TaskContinuationHandoffState;
   /** Durable provider/model fallback attempts for the current failed-turn chain. */
   runtimeRecovery?: TaskRuntimeRecoveryState;
+  /**
+   * Workflow-managed shell marker for pending consumers.
+   * Present only on inert task shells until their dependency gate is satisfied;
+   * cleared atomically when the gate activation materializes the first turn.
+   * workflow_nodes status remains authoritative; this marker is the durable
+   * in-task signal for scheduler/readiness/composer guards and UI waiting chrome.
+   */
+  workflowShell?: {
+    runId: string;
+    nodeId: string;
+    gateId: string;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -735,6 +747,7 @@ export interface EngineProjection {
  */
 export type TaskRuntimeActivity =
   | 'waiting_prerequisites'
+  | 'waiting_workflow'
   | 'queued'
   | 'running'
   | 'waiting_user'

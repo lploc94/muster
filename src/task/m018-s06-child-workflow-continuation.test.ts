@@ -467,6 +467,239 @@ async function startThreeLevelChain(opened: Opened, label: string): Promise<{
 }
 
 describe('M018 S06 child-workflow continuation (named flow)', () => {
+  it('admits only one concurrent child invocation for one remaining caller-run slot', async () => {
+    const opened = await openRepo('concurrent-child-limit');
+    const secondClient = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+    try {
+      await secondClient.open(opened.dbPath);
+      const second = new SqliteTaskRepository(secondClient, 'ws');
+      const createdAt = '2026-07-22T13:00:00.000Z';
+      await defineVersion(
+        opened.repository,
+        createdAt,
+        'wf-concurrent-child-root',
+        'concurrent child root',
+      );
+      const concurrentParentTopology: GraphTopologyV1 = {
+        ...MULTI_TERMINAL_CHILD,
+        nodes: MULTI_TERMINAL_CHILD.nodes.map((node) => (
+          node.nodeId.endsWith('_terminal')
+            ? { ...node, role: 'coordinator' as const, capabilities: ['create_child' as const] }
+            : node
+        )),
+      };
+      await defineGraphVersion(
+        opened.repository,
+        createdAt,
+        'wf-concurrent-child-parent',
+        'concurrent child parent',
+        concurrentParentTopology,
+      );
+      await defineVersion(
+        opened.repository,
+        createdAt,
+        'wf-concurrent-child-target',
+        'concurrent child target',
+        'next_result',
+      );
+      const root = await startOneNode(
+        opened.repository,
+        createdAt,
+        'wf-concurrent-child-root',
+        'concurrent-child-root-start',
+        'concurrent child root',
+      );
+      await settleSucceeded(
+        opened.repository,
+        opened.client,
+        root.entryTaskId,
+        root.activationTurnId,
+        {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-concurrent-child-parent',
+            childDefinitionVersion: 1,
+            entryBindings: [
+              {
+                childEntryNodeId: 'left_source',
+                inputRef: 'engine_start',
+                artifactId: root.startArtifactId,
+                artifactRevision: 1,
+              },
+              {
+                childEntryNodeId: 'right_source',
+                inputRef: 'engine_start',
+                artifactId: root.startArtifactId,
+                artifactRevision: 1,
+              },
+            ],
+            childIdempotencyKey: 'concurrent-child-parent',
+          },
+        },
+        '2026-07-22T13:00:10.000Z',
+      );
+      const parentRun = (await childRunsForParent(opened.client, root.runId))[0]!;
+      const sourceRows = await opened.client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ?
+            AND node_id IN ('left_source','right_source')`,
+        [parentRun.run_id],
+      );
+      const sourceEntries = new Map<string, { taskId: string; activationTurnId: string }>();
+      for (const source of sourceRows) {
+        const turn = (await opened.repository.listTurns(source.task_id))[0]!;
+        sourceEntries.set(source.node_id, { taskId: source.task_id, activationTurnId: turn.id });
+      }
+      for (const nodeId of ['left_source', 'right_source'] as const) {
+        const entry = sourceEntries.get(nodeId)!;
+        await settleSucceeded(
+          opened.repository,
+          opened.client,
+          entry.taskId,
+          entry.activationTurnId,
+          { kind: 'workflow_next', change: 'updated', result: `${nodeId} result` },
+          '2026-07-22T13:00:30.000Z',
+        );
+      }
+      const callerRows = await opened.client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = ?
+            AND node_id IN ('left_terminal','right_terminal')`,
+        [parentRun.run_id],
+      );
+      const entries = new Map<string, {
+        nodeId: string;
+        taskId: string;
+        activationTurnId: string;
+        artifactId: string;
+      }>();
+      for (const caller of callerRows) {
+        const turn = (await opened.repository.listTurns(caller.task_id))[0]!;
+        const activation = await opened.client.get<{ activation_id: string }>(
+          `SELECT activation_id FROM workflow_activations
+            WHERE workspace_id = 'ws' AND run_id = ? AND execution_turn_id = ?`,
+          [parentRun.run_id, turn.id],
+        );
+        const artifactId = `concurrent-child-${caller.node_id}-artifact`;
+        await opened.client.transaction([
+          {
+            sql: `INSERT INTO workflow_artifacts (
+                    workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                    revision, kind, payload_json, created_at
+                  ) VALUES (?,?,?,?,?,1,'next_result','{"value":"child input"}',?)`,
+            params: [
+              'ws', parentRun.run_id, artifactId, caller.node_id,
+              'child-input', '2026-07-22T13:00:45.000Z',
+            ],
+          },
+          {
+            sql: `INSERT INTO workflow_artifact_sources (
+                    workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                    producer_run_id, producer_node_id, producer_task_id,
+                    producing_turn_id, producing_activation_id
+                  ) VALUES (?,?,?,1,'workflow_node',?,?,?,?,?)`,
+            params: [
+              'ws', parentRun.run_id, artifactId, parentRun.run_id, caller.node_id,
+              caller.task_id, turn.id, activation!.activation_id,
+            ],
+          },
+        ]);
+        entries.set(caller.node_id, {
+          nodeId: caller.node_id,
+          taskId: caller.task_id,
+          activationTurnId: turn.id,
+          artifactId,
+        });
+      }
+      await opened.client.run(
+        `UPDATE workflow_runs SET max_children = 4, children_reserved = 3
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [parentRun.run_id],
+      );
+      const buildCommand = async (
+        repository: SqliteTaskRepository,
+        client: DbClient,
+        nodeId: 'left_terminal' | 'right_terminal',
+      ) => {
+        const entry = entries.get(nodeId)!;
+        await promoteRunning(client, entry.activationTurnId, '2026-07-22T13:01:00.000Z');
+        const task = await repository.getTask(entry.taskId);
+        const turn = await repository.getTurn(entry.activationTurnId);
+        const disposition: TurnDisposition = {
+          kind: 'workflow_next',
+          change: 'updated',
+          route: {
+            kind: 'child_workflow',
+            childDefinitionId: 'wf-concurrent-child-target',
+            childDefinitionVersion: 1,
+            entryBindings: [{
+              childEntryNodeId: 'entry',
+              inputRef: 'engine_start',
+              artifactId: entry.artifactId,
+              artifactRevision: 1,
+            }],
+            childIdempotencyKey: `concurrent-child-${nodeId}`,
+          },
+        };
+        const staged = await stageDispositionForSettlement(repository, turn!, disposition);
+        expect(staged.changed, JSON.stringify(staged)).toBe(true);
+        return {
+          kind: 'settleTurnAndApplyEffects' as const,
+          workspaceId: 'ws',
+          expectedTaskRevision: task!.revision,
+          task: { ...task!, updatedAt: '2026-07-22T13:02:00.000Z' },
+          turn: {
+            ...turn!,
+            status: 'succeeded' as const,
+            finishedAt: '2026-07-22T13:02:00.000Z',
+            disposition,
+          },
+          expectedStatuses: ['running' as const],
+          relatedTurns: [],
+          messages: [],
+        };
+      };
+      const left = await buildCommand(opened.repository, opened.client, 'left_terminal');
+      const right = await buildCommand(second, secondClient, 'right_terminal');
+      let arrivals = 0;
+      let release!: () => void;
+      const barrier = new Promise<void>((resolve) => { release = resolve; });
+      const stalePlannerRepository = (client: DbClient) => new SqliteTaskRepository({
+        all: (sql, params) => client.all(sql, params),
+        get: (sql, params) => client.get(sql, params),
+        run: (sql, params) => client.run(sql, params),
+        pragma: (pragma) => client.pragma(pragma),
+        transaction: async (statements, options) => {
+          arrivals += 1;
+          if (arrivals === 2) release();
+          await barrier;
+          return client.transaction(statements, options);
+        },
+      }, 'ws');
+
+      const results = await Promise.all([
+        stalePlannerRepository(opened.client).execute(left),
+        stalePlannerRepository(secondClient).execute(right),
+      ]);
+      expect(results.every((result) => result.changed), JSON.stringify(results)).toBe(true);
+      await expect(opened.client.get(
+        `SELECT children_reserved, max_children FROM workflow_runs
+          WHERE workspace_id = 'ws' AND run_id = ?`,
+        [parentRun.run_id],
+      )).resolves.toEqual({ children_reserved: 4, max_children: 4 });
+      await expect(opened.client.get(
+        `SELECT COUNT(*) AS count FROM workflow_runs
+          WHERE workspace_id = 'ws' AND parent_run_id = ?`,
+        [parentRun.run_id],
+      )).resolves.toEqual({ count: 1 });
+    } finally {
+      await secondClient.close().catch(() => undefined);
+      await opened.close();
+    }
+  }, 45_000);
+
   it('an ordinary root coordinator invokes a child and resumes through its return gate', async () => {
     const opened = await openRepo('root-caller');
     try {

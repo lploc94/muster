@@ -28,6 +28,7 @@ import {
 
 const EXPECTED_RUNTIME = [
   'waiting_prerequisites',
+  'waiting_workflow',
   'queued',
   'running',
   'waiting_user',
@@ -153,8 +154,9 @@ describe('task status dual-axis presentation', () => {
     expect(runtimeBlocksComposer('awaiting_outcome')).toBe(false);
   });
 
-  it('blocks free-form composer only for waiting_user (Phase B)', () => {
+  it('blocks free-form composer only for waiting_user and waiting_workflow (Phase B)', () => {
     expect(runtimeBlocksComposer('waiting_user')).toBe(true);
+    expect(runtimeBlocksComposer('waiting_workflow')).toBe(true);
     expect(runtimeBlocksComposer('needs_recovery')).toBe(false);
     expect(runtimeBlocksComposer('waiting_prerequisites')).toBe(false);
     expect(runtimeBlocksComposer('waiting_children')).toBe(false);

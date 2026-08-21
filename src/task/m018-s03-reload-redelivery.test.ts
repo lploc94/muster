@@ -245,7 +245,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       expect(preFault.routed).toEqual([]);
       expect(
         preFault.nodes.find((n) => n.node_id === 'consumer'),
-      ).toMatchObject({ task_id: null, status: 'pending' });
+      ).toMatchObject({ task_id: expect.any(String), status: 'pending' });
     } finally {
       // Keep the DB file; only close the client.
       await seed.client.close().catch(() => undefined);
@@ -306,7 +306,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       expect(afterReopen.gate).toMatchObject({ status: 'open' });
       expect(
         afterReopen.nodes.find((n) => n.node_id === 'consumer'),
-      ).toMatchObject({ task_id: null, status: 'pending' });
+      ).toMatchObject({ task_id: expect.any(String), status: 'pending' });
 
       // Ensure turn is running for resettle (fault rolled back settle).
       await markRunning(recovered.client, p1.activationTurnId, '2026-07-20T01:02:00.000Z');
@@ -347,7 +347,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       // Partial fill never activates consumer.
       expect(
         afterResettle.nodes.find((n) => n.node_id === 'consumer'),
-      ).toMatchObject({ task_id: null, status: 'pending' });
+      ).toMatchObject({ task_id: expect.any(String), status: 'pending' });
       expect(afterResettle.revision).toBeGreaterThan(preFault.revision);
 
       // body_json hygiene: identities only — no result body / SQL / paths.
@@ -399,7 +399,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       expect(afterPartial.routed).toHaveLength(1);
       expect(
         afterPartial.nodes.find((n) => n.node_id === 'consumer'),
-      ).toMatchObject({ task_id: null, status: 'pending' });
+      ).toMatchObject({ task_id: expect.any(String), status: 'pending' });
     } finally {
       await opened.client.close().catch(() => undefined);
     }
@@ -456,7 +456,7 @@ describe('M018 S03 reload and redelivery safety', () => {
       ]);
       expect(
         afterReload.nodes.find((n) => n.node_id === 'consumer'),
-      ).toMatchObject({ task_id: null, status: 'pending' });
+      ).toMatchObject({ task_id: expect.any(String), status: 'pending' });
 
       // Final contribution after reload closes gate and queues one consumer.
       await markRunning(reloaded.client, p2.activationTurnId, '2026-07-20T02:02:00.000Z');

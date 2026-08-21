@@ -614,9 +614,17 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(nextR1.ok).toBe(true);
       expect(nextR1.changed).toBe(true);
 
-      // Planner must not activate until both research producers contribute.
+      // Planner must not activate until both research producers contribute; shell remains pending with no turn.
       let plannerRow = await nodeTask(opened.client, childRunId!, 'planner');
-      expect(plannerRow?.task_id ?? null).toBeNull();
+      expect(plannerRow?.task_id).toEqual(expect.any(String));
+      const plannerPending = await opened.client.get<{ status: string }>(
+        `SELECT status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+        ['ws', childRunId!, 'planner'],
+      );
+      expect(plannerPending?.status).toBe('pending');
+      const plannerShellTask = await opened.repository.getTask(plannerRow!.task_id!);
+      expect(plannerShellTask?.workflowShell).toBeTruthy();
+      expect(await opened.repository.listTurns(plannerRow!.task_id!)).toHaveLength(0);
 
       const nextR2 = await settleSucceeded(
         opened.repository,
