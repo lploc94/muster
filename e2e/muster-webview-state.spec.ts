@@ -4358,7 +4358,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expectPostedMessage(page, {
       type: 'continueTask',
       taskId: 'task-recovery',
-      instruction: 'Continue after documenting the failure.',
+      instruction:
+        'Please check the workspace state and continue the previous work where it left off. Additional context: Continue after documenting the failure.',
     });
 
     await postSnapshot(page, {

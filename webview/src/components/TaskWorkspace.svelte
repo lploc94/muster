@@ -499,10 +499,13 @@
     });
   }
 
+  const CONTINUE_DEFAULT_INSTRUCTION =
+    'Please check the workspace state and continue the previous work where it left off.';
+
   function submitContinue(): void {
     if (!focused) return;
-    const instruction = continueMessage.trim();
-    if (!instruction) return;
+    const extra = continueMessage.trim();
+    const instruction = extra ? `${CONTINUE_DEFAULT_INSTRUCTION} Additional context: ${extra}` : CONTINUE_DEFAULT_INSTRUCTION;
     post({ type: 'continueTask', taskId: focused.id, instruction });
     continueMessage = '';
   }
@@ -938,9 +941,7 @@
               continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
-            Check and continue
-          </vscode-button>
+          <vscode-button onclick={submitContinue}> Check and continue </vscode-button>
         </div>
       </div>
     {:else if showFailedTurnCard}
@@ -978,9 +979,7 @@
               continueMessage = (e.currentTarget as HTMLTextAreaElement).value;
             }}
           ></vscode-textarea>
-          <vscode-button disabled={!continueMessage.trim()} onclick={submitContinue}>
-            Continue
-          </vscode-button>
+          <vscode-button onclick={submitContinue}> Continue </vscode-button>
         </div>
       </div>
     {:else if showResume}
