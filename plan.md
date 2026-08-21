@@ -216,11 +216,11 @@ When a workflow run is created—including a child workflow run—every new/unbo
 - Commit: `feat(workflow): complete operational graph visualization`
 
 ## Completion Criteria
-- [ ] Every phase is complete and committed exactly once.
-- [ ] Every acceptance criterion is checked.
-- [ ] All global gates pass on final HEAD.
-- [ ] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
-- [ ] Worktree is clean apart from pre-existing unrelated changes.
+- [x] Every phase is complete and committed exactly once.
+- [x] Every acceptance criterion is checked.
+- [x] All global gates pass on final HEAD.
+- [x] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
+- [x] Worktree is clean apart from pre-existing unrelated changes.
 
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
@@ -228,3 +228,4 @@ When a workflow run is created—including a child workflow run—every new/unbo
 | 1 | completed | this phase commit (`feat(workflow): materialize inert task shells at start`) | compile; svelte-check; focused 10 files/91 tests; phase gate 6 files/84 tests; broader 14 files/138 tests; focused Playwright | codex-impl-review round 9 APPROVE |
 | 2 | completed | this phase commit (`feat(workflow): expose complete gate and execution state`) | compile; svelte-check; focused 5 files/34 tests; supplemental 3 files/115 tests | codex-impl-review round 6 APPROVE; 19 issues fixed |
 | 3 | completed | this phase commit (`feat(workflow): complete operational graph visualization`) | compile; svelte-check; focused 5 files/45 tests; full 221 files/2720 tests; focused Playwright 4/4 | codex-impl-review round 3 APPROVE; 3 issues fixed |
+| Final review fixes | completed | `15ccace`, `ae6a17a`, `76eaa3c` | compile; svelte-check 0/0; full 222 files/2726 tests; source-boundary/evidence; workflow Playwright 3/3; focused overflow/projection 4 files/46 tests | complete-plan codex-impl-review round 4 APPROVE; 9 issues fixed; 0 disputed |
