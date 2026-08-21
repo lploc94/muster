@@ -765,6 +765,7 @@ test.describe('Phase 6 chat virtualization', () => {
     await page.waitForTimeout(80);
     await scrollUpSlightly();
     await expect(scrollToLatest).toBeVisible();
+    await expect.poll(() => scroll.evaluate((el) => el.scrollTop), { timeout: 5_000 }).toBeGreaterThan(0);
     const scrollBefore = await scroll.evaluate((el) => el.scrollTop);
 
     await postHost(page, {
@@ -1086,9 +1087,8 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       .poll(async () => page.locator('[data-testid="task-tree-row"]').count(), {
         timeout: 15_000,
       })
-      .toBeLessThanOrEqual(MAX_TREE_MOUNTED);
+      .toBeGreaterThan(0);
     const initialMounted = await page.locator('[data-testid="task-tree-row"]').count();
-    expect(initialMounted).toBeGreaterThan(0);
     expect(initialMounted).toBeLessThanOrEqual(MAX_TREE_MOUNTED);
     await expect(page.locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')).toBeVisible();
 
@@ -1156,18 +1156,33 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       .toBe(true);
 
     // Lifecycle menu + recycle close: open menu then scroll its row out of range.
-    await treeList.evaluate((el) => {
-      el.scrollTop = 0;
-      el.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
-    await page.waitForTimeout(80);
+    const rootRow = page.locator('[data-testid="task-tree-row"][data-task-id="tree-root"]');
+    const scrollTreeToTop = async () => {
+      await expect
+        .poll(
+          async () => {
+            const count = await rootRow.count();
+            if (count === 0) {
+              await treeList.evaluate((el) => {
+                el.scrollTop = 0;
+                el.dispatchEvent(new Event('scroll', { bubbles: true }));
+              });
+            }
+            return count;
+          },
+          { timeout: 10_000 },
+        )
+        .toBeGreaterThan(0);
+    };
+    await scrollTreeToTop();
     await clearPosted(page);
     const rootStatus = page
       .locator('[data-testid="task-tree-row"][data-task-id="tree-root"]')
       .locator('xpath=..')
       .locator('.task-tree-panel__status-btn');
     await rootStatus.click({ force: true });
-    await expect(page.getByRole('menuitem').filter({ hasText: 'Mark done' }).first()).toBeVisible({
+    const rootStatusDialog = page.getByTestId('task-status-overlay');
+    await expect(rootStatusDialog.getByRole('button', { name: /Mark done/ })).toBeVisible({
       timeout: 3_000,
     });
     // Scroll away so the open menu's row leaves the virtual window → menu must close.
@@ -1176,19 +1191,12 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       el.dispatchEvent(new Event('scroll', { bubbles: true }));
     });
     await page.waitForTimeout(120);
-    await expect(page.getByRole('menuitem')).toHaveCount(0);
+    await expect(rootStatusDialog).toHaveCount(0);
 
     // Re-open menu at top and complete a lifecycle action.
-    await treeList.evaluate((el) => {
-      el.scrollTop = 0;
-      el.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
-    await page.waitForTimeout(80);
+    await scrollTreeToTop();
     await rootStatus.click({ force: true });
-    await page.evaluate(() => {
-      const item = document.querySelector<HTMLElement>('[role="menuitem"]');
-      item?.click();
-    });
+    await rootStatusDialog.getByRole('button', { name: /Mark done/ }).click();
     await expect
       .poll(async () => {
         const msgs = await postedMessages(page);

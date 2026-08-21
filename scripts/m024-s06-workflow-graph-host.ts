@@ -4,10 +4,11 @@
  * genuine webview-initiated `requestWorkflowGraph` / `workflowGraphResult`
  * round trip across the live host/webview transport.
  *
- * It never posts the request itself and never reads SQLite directly: the
- * webview's own focus effect issues the request, and the host's production
- * `post` path carries the reply. That is the seam the vitest route tests cannot
- * cover, because they inject `getFocused` instead of exercising focus wiring.
+ * It never posts the graph request itself and never reads SQLite directly: a
+ * UAT-gated host message opens the real on-demand modal, the webview store issues
+ * the request, and the host's production `post` path carries the reply. That is
+ * the seam the vitest route tests cannot cover, because they inject `getFocused`
+ * instead of exercising focus and modal wiring.
  */
 import * as assert from 'node:assert/strict';
 import * as fs from 'node:fs';

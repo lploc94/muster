@@ -201,6 +201,7 @@
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
   let workflowGraphOpen = $state(false);
+  let workflowGraphProbeTaskId = $state<string | null>(null);
   /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
   let backendsFocusRequest = $state(0);
   let settingsSnapshot = $state<RuntimeStorageSettingsSnapshot | null>(null);
@@ -596,6 +597,16 @@
           requestId: (msg as { requestId: string }).requestId,
           observation: collectToolCardRenderObservations(document),
         });
+        return;
+      }
+
+      if (
+        msg &&
+        typeof msg === 'object' &&
+        (msg as { type?: unknown }).type === 'workflowGraphProbeRequest' &&
+        typeof (msg as { taskId?: unknown }).taskId === 'string'
+      ) {
+        workflowGraphProbeTaskId = (msg as { taskId: string }).taskId;
         return;
       }
 
@@ -1143,6 +1154,12 @@
   // When the modal is open, sync focus+open to the store so it fetches and stays live via notifyPatch.
   $effect(() => {
     const taskId = tasks.focusedTaskId;
+    const probeTaskId = workflowGraphProbeTaskId;
+    if (probeTaskId && probeTaskId === taskId) {
+      workflowGraphProbeTaskId = null;
+      workflowGraphOpen = true;
+      return;
+    }
     const open = workflowGraphOpen;
     if (!taskId) {
       workflowGraphOpen = false;

@@ -11,7 +11,7 @@ A PASS requires an actual packaged VS Code Extension Development Host to receive
 - Native command: `npm run test:m024-s06-workflow-graph-live-uat`
 - Exit code: 0
 - Provenance: VS Code `1.131.0`; packaged `extension-development-host`; `live-extension-host-transport` probe source.
-- Correlated round trip: the live webview focused the seeded workflow task, sent `requestWorkflowGraph`, and the host emitted a matching `workflowGraphResult`.
+- Correlated round trip: the live webview focused the seeded workflow task, opened the real on-demand graph modal through the UAT-gated trigger, sent `requestWorkflowGraph`, and the host emitted a matching `workflowGraphResult`.
 - Bounded graph observation: 5 nodes, 4 edges, 4 reused nodes, 4 reused edges; host reuse counters agree with wire reuse flags; statuses were `active` and `reused`; no diagnostics, child runs, or feedback rounds.
 - Fixture observation: one live consumer node and four reused ancestor-closure nodes. Runtime task IDs, run IDs, request IDs, prompts, artifact bodies, and absolute paths are excluded from committed evidence.
 
@@ -27,7 +27,7 @@ The S05 Vite, mocked webview, and Playwright coverage exercises browser-side ren
 
 ## Failure Modes
 
-- The graph runner fails closed if VSIX packaging, VS Code startup, extension activation, webview hydration, fixture seeding, focus wiring, request correlation, or graph projection fails.
+- The graph runner fails closed if VSIX packaging, VS Code startup, extension activation, webview hydration, fixture seeding, focus/modal wiring, request correlation, or graph projection fails.
 - The fixture initially exposed two real defects: a producer node ID that did not match the reused consumer node, and a `startWorkflowRun` result that omitted a reuse-boundary consumer task from `affectedTaskIds`, leaving it outside the projection. The second defect is now regression-tested in `src/task/m024-s03-mid-tree-reuse-durable.test.ts`.
 - Windows may temporarily retain an Electron handle during temp-directory cleanup. Cleanup is best-effort only after evidence is atomically written, so it cannot convert a proven native PASS into a failure.
 - Negative `invalidRequest`, non-focused, focus-generation-race, and `notInWorkflow` route behavior remain owned by deterministic route tests; the native probe proves the production focus and transport seam without synthesizing a request.
