@@ -33,5 +33,11 @@ describe("workflow graph webview wiring", () => {
     expect(appSource).toContain("msg.taskId !== tasks.focusedTaskId");
     expect(workspaceSource).toContain("WorkflowGraphPanel");
     expect(workspaceSource).toContain("graph={workflowGraph}");
+    // Status overlay shows per-node detail for the clicked node (lifecycle/runtime/workflow labels)
+    expect(workspaceSource).toContain("task-status-overlay");
+    expect(workspaceSource).toContain('data-testid="node-status-detail"');
+    expect(workspaceSource).toContain('data-testid="node-status-badge"');
+    expect(workspaceSource).toContain("workflowGraphStatusLabel");
+    expect(workspaceSource).toContain("formatUpdatedAt");
   });
 });

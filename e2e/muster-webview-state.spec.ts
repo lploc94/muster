@@ -569,7 +569,7 @@ test.describe('Muster webview host state smoke', () => {
 
     // Compact chrome: title + status button (no legacy expand-details disclosure).
     await expect(page.locator('.task-chrome').getByText('Wire browser regression harness')).toBeVisible();
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Idle/i })).toBeVisible();
     // Between turns / idle open: no turn-activity strip (ready).
     await expect(page.locator('[data-turn-activity]')).toHaveCount(0);
     await expect(page.getByText('Harness ready.')).toBeVisible();
@@ -4306,14 +4306,14 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
 
     await expect(page.locator('.task-chrome').getByText('Run the model evaluation')).toBeVisible();
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Working/i })).toBeVisible();
     await expect(page.locator('[data-turn-activity="executing"]').getByText(/Working/i)).toBeVisible();
     await page.getByRole('button', { name: 'History (previous coordinator tasks)' }).click();
     await expect(page.getByRole('button', { name: /Run the model evaluation.*Task Open.*Turn working.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Recover failed analysis.*Task Open.*Backend claude/i })).toBeVisible();
     await expect(page.getByRole('button', { name: /Cancelled rollout.*Task Cancelled.*Backend claude/i })).toBeVisible();
     await page.getByRole('button', { name: 'Close history' }).click();
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Working/i })).toBeVisible();
     await expect(page.locator('[data-turn-activity="executing"]')).toBeVisible();
     await expect(page.getByRole('button', { name: 'Stop this turn' })).toBeVisible();
     await page.getByRole('button', { name: 'Stop this turn' }).click();
@@ -4338,7 +4338,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 4,
     });
 
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Could not finish/i })).toBeVisible();
     await expect(page.locator('.turn-activity-bar[data-turn-activity="failed_turn"]')).toBeVisible();
     await expect(page.locator('.task-action-panel--danger').getByText(/^Could not finish$/)).toBeVisible();
     // Host currentTurnActivity carries turnId even without activeTurnId projection.
@@ -4409,7 +4409,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 46,
     });
 
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Queued/i })).toBeVisible();
     await expect(page.getByText(/A queued task turn is ready to start/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Resume queued task' })).toBeVisible();
     // Live/queued composers stay editable with queue-oriented guidance (not a hard disable).
@@ -4511,7 +4511,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 1,
     });
 
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Open/i })).toBeVisible();
+    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Waiting for you/i })).toBeVisible();
     // Structured ask: turn waiting for user.
     await expect(page.locator('[data-turn-activity="waiting_you"]').getByText(/Waiting for you/i)).toBeVisible();
     await expect(page.getByText('Agent question')).toBeVisible();
@@ -7680,8 +7680,8 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('task-chrome').getByText('Open', { exact: true })).toHaveCount(0);
 
     const docsNode = page.locator('.task-tree-panel__item').filter({ hasText: 'Docs worker' });
-    await docsNode.getByRole('button', { name: /Task status: Open/i }).click();
-    await page.getByRole('menu', { name: 'Set status for Docs worker' }).getByText('Mark done', { exact: true }).click();
+    await docsNode.locator('.task-tree-panel__status-btn').click();
+    await page.getByRole('dialog', { name: 'Status details for Docs worker' }).getByText('Mark done', { exact: true }).click();
     await expectPostedMessage(page, {
       type: 'setTaskLifecycle',
       taskId: 'worker-b',
@@ -11040,6 +11040,18 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(panel.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
     await expect(panel.getByRole('status')).toContainText('Workflow graph may be incomplete');
     await expect(panel).toContainText('Workflow nodes were truncated');
+
+    // Status overlay shows per-node detail for the clicked node (lifecycle/runtime/workflow labels)
+    await expect(page.getByTestId('node-status-detail')).toHaveCount(0);
+    await page.getByRole('button', { name: /Task status:/ }).click();
+    const detail = page.getByTestId('node-status-detail');
+    await expect(detail).toBeVisible();
+    await expect(detail).toContainText('Run reuse workflow');
+    await expect(detail).toContainText('Lifecycle');
+    await expect(detail).toContainText('Runtime');
+    await expect(page.getByTestId('task-status-overlay')).toBeVisible();
+    await expect(page.getByTestId('task-status-overlay').getByText('Mark done')).toBeVisible();
+    await expect(page.getByTestId('task-status-overlay').getByText('Mark failed')).toBeVisible();
   });
 
 });

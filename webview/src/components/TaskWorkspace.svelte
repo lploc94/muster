@@ -11,13 +11,14 @@
   import ChatThread from './ChatThread.svelte';
   import Composer from './Composer.svelte';
   import AskCard from './AskCard.svelte';
-  import WorkflowGraphPanel from './WorkflowGraphPanel.svelte';
   import { tasks } from '../lib/tasks.svelte';
   import { threadStore } from '../lib/thread.svelte';
   import { effectiveRuntimeActivity, post } from '../lib/protocol';
   import { getTaskPresentation } from '../lib/task-status';
+  import { workflowGraphStatusLabel } from '../lib/workflow-graph-view';
   import type { PendingAsk, TaskLifecycleState, TaskSummary } from '../lib/protocol';
   import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
+  import WorkflowGraphPanel from './WorkflowGraphPanel.svelte';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
   import { selectTask as navSelectTask } from '../lib/task-nav';
   import {
@@ -55,6 +56,10 @@
   let continueMessage = $state('');
   /** The task whose inline lifecycle menu is open. */
   let statusMenuTaskId = $state<string | null>(null);
+  let statusMenuAnchorEl = $state<HTMLElement | null>(null);
+  let statusMenuOverlayEl = $state<HTMLElement | null>(null);
+  let statusMenuPos = $state<{ top: number; left: number; width: number } | null>(null);
+  const statusMenuTask = $derived(statusMenuTaskId ? tasks.tasks.get(statusMenuTaskId) : null);
   let taskChromeRegion = $state<HTMLElement | undefined>(undefined);
   /** Collapsed = selected task is the header; expanded = owning-root tree. */
   let treeExpanded = $state(false);
@@ -110,7 +115,11 @@
     // Close status menu if its row left the mounted window (prevents recycled identity leak).
     if (statusMenuTaskId) {
       const mounted = new Set(items.map((r) => String(r.key)));
-      if (!mounted.has(statusMenuTaskId)) statusMenuTaskId = null;
+      if (!mounted.has(statusMenuTaskId)) {
+        statusMenuTaskId = null;
+        statusMenuAnchorEl = null;
+        statusMenuPos = null;
+      }
     }
   }
 
@@ -285,18 +294,108 @@
 
   function setLifecycle(taskId: string, lifecycle: TaskLifecycleState) {
     statusMenuTaskId = null;
+    statusMenuAnchorEl = null;
+    statusMenuPos = null;
     post({ type: 'setTaskLifecycle', taskId, lifecycle });
+  }
+
+  function openStatusMenu(taskId: string, anchor: HTMLElement): void {
+    if (statusMenuTaskId === taskId) {
+      statusMenuTaskId = null;
+      statusMenuAnchorEl = null;
+      statusMenuPos = null;
+    } else {
+      statusMenuTaskId = taskId;
+      statusMenuAnchorEl = anchor;
+    }
   }
 
   $effect(() => {
     if (!statusMenuTaskId) return;
-    function onPointerDown(e: PointerEvent) {
+    function onPointerDown(e: PointerEvent): void {
       const target = e.target;
-      if (target instanceof Node && taskChromeRegion?.contains(target)) return;
+      if (target instanceof Node) {
+        if (statusMenuOverlayEl?.contains(target)) return;
+        if (statusMenuAnchorEl?.contains(target)) return;
+        const isStatusBtn = (target as Element).closest?.('.task-tree-panel__status-btn');
+        if (isStatusBtn) return;
+        if (taskChromeRegion?.contains(target) && statusMenuOverlayEl && !statusMenuOverlayEl.contains(target)) {
+          // Click inside chrome but outside overlay -> close if not on button
+          // Allow clicks on tree rows to propagate (they will select task)
+        }
+      }
       statusMenuTaskId = null;
+      statusMenuAnchorEl = null;
+      statusMenuPos = null;
     }
     window.addEventListener('pointerdown', onPointerDown, true);
     return () => window.removeEventListener('pointerdown', onPointerDown, true);
+  });
+
+  $effect(() => {
+    if (!statusMenuTaskId || !statusMenuAnchorEl) {
+      statusMenuPos = null;
+      return;
+    }
+    function updatePos(): void {
+      if (!statusMenuAnchorEl || !taskChromeRegion) return;
+      const anchorRect = statusMenuAnchorEl.getBoundingClientRect();
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      const maxWidth = 360;
+      const menuWidth = Math.min(maxWidth, viewportWidth - 16);
+      const estimatedHeight = statusMenuOverlayEl
+        ? statusMenuOverlayEl.offsetHeight + 12
+        : 420;
+      let left = anchorRect.left;
+      if (left + menuWidth > viewportWidth - 8) left = Math.max(8, viewportWidth - menuWidth - 8);
+      let top = anchorRect.bottom + 6;
+      if (top + estimatedHeight > viewportHeight - 8) {
+        const aboveTop = anchorRect.top - estimatedHeight - 6;
+        if (aboveTop >= 8) top = aboveTop;
+        else top = Math.max(8, viewportHeight - estimatedHeight - 8);
+      }
+      statusMenuPos = { top, left, width: menuWidth };
+    }
+    updatePos();
+    window.addEventListener('resize', updatePos);
+    window.addEventListener('scroll', updatePos, true);
+    return () => {
+      window.removeEventListener('resize', updatePos);
+      window.removeEventListener('scroll', updatePos, true);
+    };
+  });
+
+  $effect(() => {
+    if (!statusMenuTaskId) return;
+    function onKeyDown(e: KeyboardEvent): void {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        e.stopPropagation();
+        // Prevent the expanded-tree handler on the same window target from also firing
+        e.stopImmediatePropagation();
+        statusMenuTaskId = null;
+        statusMenuAnchorEl = null;
+        statusMenuPos = null;
+      }
+    }
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  });
+
+  let previousFocusEl = $state<HTMLElement | null>(null);
+  $effect(() => {
+    if (statusMenuTaskId && statusMenuOverlayEl) {
+      previousFocusEl = document.activeElement as HTMLElement | null;
+      queueMicrotask(() => {
+        const firstAction = statusMenuOverlayEl?.querySelector<HTMLElement>('.task-status-menu__item');
+        (firstAction ?? statusMenuOverlayEl)?.focus();
+      });
+    } else if (!statusMenuTaskId && previousFocusEl) {
+      const toRestore = previousFocusEl;
+      previousFocusEl = null;
+      queueMicrotask(() => toRestore?.focus());
+    }
   });
 
   // Reset twistie overrides when the focused task identity changes.
@@ -304,6 +403,8 @@
     void focused?.id;
     collapsedOverride = null;
     statusMenuTaskId = null;
+    statusMenuAnchorEl = null;
+    statusMenuPos = null;
   });
 
   $effect(() => {
@@ -315,9 +416,13 @@
     if (!treeExpanded) return;
     function onKeyDown(event: KeyboardEvent) {
       if (event.key !== 'Escape') return;
+      // If the per-node dialog is open, it consumes the first Escape (see dialog handler above)
+      if (statusMenuTaskId) return;
       event.preventDefault();
       treeExpanded = false;
       statusMenuTaskId = null;
+      statusMenuAnchorEl = null;
+      statusMenuPos = null;
     }
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
@@ -342,12 +447,24 @@
   function toggleTreeChrome(): void {
     treeExpanded = !treeExpanded;
     statusMenuTaskId = null;
+    statusMenuAnchorEl = null;
+    statusMenuPos = null;
   }
 
   function shortGoal(goal: string): string {
     const trimmed = goal.trim();
     if (trimmed.length <= 48) return trimmed || '(no goal)';
     return `${trimmed.slice(0, 45)}…`;
+  }
+
+  function formatUpdatedAt(iso: string): string {
+    try {
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(d);
+    } catch {
+      return iso;
+    }
   }
 
   function lifecycleClass(task: TaskSummary): string {
@@ -662,11 +779,12 @@
                       class:task-tree-panel__status-btn--running={isRunning}
                       data-task-lifecycle={row.task.lifecycle}
                       data-task-running={isRunning ? 'true' : 'false'}
-                      aria-haspopup="menu"
+                      aria-haspopup="dialog"
                       aria-expanded={menuOpen ? 'true' : 'false'}
+                      aria-controls={menuOpen ? 'task-status-dialog' : undefined}
                       aria-label={`Task status: ${statusMeta.label}. Change status for ${row.task.goal}.`}
                       use:tip={statusButtonTip(row.task)}
-                      onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
+                      onclick={(e) => openStatusMenu(row.task.id, e.currentTarget as HTMLElement)}
                     >
                       {#if isRunning}
                         <svg
@@ -702,27 +820,6 @@
                       use:tip={row.task.childOrchestration.label}
                     >
                       {row.task.childOrchestration.label}
-                    </div>
-                  {/if}
-                  {#if menuOpen}
-                    <div
-                      class="task-tree-panel__status-menu"
-                      role="menu"
-                      aria-label={`Set status for ${row.task.goal}`}
-                      style={`margin-left: ${30 + Math.min(row.depth, 4) * 12}px`}
-                    >
-                      {#each lifecycleActions(row.task.lifecycle) as action (action.lifecycle)}
-                        <button
-                          type="button"
-                          class="task-status-menu__item"
-                          role="menuitem"
-                          title={action.description}
-                          onclick={() => setLifecycle(row.task.id, action.lifecycle)}
-                        >
-                          <span class="task-status-menu__item-label">{action.label}</span>
-                          <span class="task-status-menu__item-desc">{action.description}</span>
-                        </button>
-                      {/each}
                     </div>
                   {/if}
                 </div>
@@ -777,11 +874,12 @@
                   class:task-tree-panel__status-btn--running={isRunning}
                   data-task-lifecycle={row.task.lifecycle}
                   data-task-running={isRunning ? 'true' : 'false'}
-                  aria-haspopup="menu"
+                  aria-haspopup="dialog"
                   aria-expanded={menuOpen ? 'true' : 'false'}
+                  aria-controls={menuOpen ? 'task-status-dialog' : undefined}
                   aria-label={`Task status: ${statusMeta.label}. Change status for ${row.task.goal}.`}
                   use:tip={statusButtonTip(row.task)}
-                  onclick={() => (statusMenuTaskId = menuOpen ? null : row.task.id)}
+                  onclick={(e) => openStatusMenu(row.task.id, e.currentTarget as HTMLElement)}
                 >
                   {#if isRunning}
                     <svg
@@ -815,38 +913,111 @@
                   {row.task.childOrchestration.label}
                 </div>
               {/if}
-              {#if menuOpen}
-                <div
-                  class="task-tree-panel__status-menu"
-                  role="menu"
-                  aria-label={`Set status for ${row.task.goal}`}
-                  style="margin-left: 30px"
-                >
-                  {#each lifecycleActions(row.task.lifecycle) as action (action.lifecycle)}
-                    <button
-                      type="button"
-                      class="task-status-menu__item"
-                      role="menuitem"
-                      title={action.description}
-                      onclick={() => setLifecycle(row.task.id, action.lifecycle)}
-                    >
-                      <span class="task-status-menu__item-label">{action.label}</span>
-                      <span class="task-status-menu__item-desc">{action.description}</span>
-                    </button>
-                  {/each}
-                </div>
-              {/if}
             </div>
           {/each}
         {/if}
       </div>
-    </div>
 
-    <ChatThread />
+      {#if statusMenuTaskId && statusMenuTask && statusMenuPos}
+        {@const overlayPresentation = getTaskPresentation(statusMenuTask)}
+        {@const overlayMeta = treeStatusMeta(statusMenuTask)}
+        <div
+          bind:this={statusMenuOverlayEl}
+          id="task-status-dialog"
+          class="task-status-overlay"
+          role="dialog"
+          aria-modal="false"
+          aria-label={`Status details for ${statusMenuTask.goal}`}
+          data-task-id={statusMenuTask.id}
+          data-testid="task-status-overlay"
+          tabindex="-1"
+          style={`top:${statusMenuPos.top}px; left:${statusMenuPos.left}px; width:${statusMenuPos.width}px`}
+        >
+          <div class="task-status-overlay__detail" data-testid="node-status-detail">
+            <div class="task-status-overlay__detail-head">
+              <span class={`codicon ${overlayMeta.icon} ${overlayMeta.spin ? 'task-status-overlay__spin' : ''}`} aria-hidden="true"></span>
+              <div class="task-status-overlay__goal-wrap">
+                <div class="task-status-overlay__goal">{statusMenuTask.goal}</div>
+                <div class="task-status-overlay__sub">{statusMenuTask.id} · {statusMenuTask.role} · {statusMenuTask.backend}{statusMenuTask.model ? ` :: ${statusMenuTask.model}` : ''}</div>
+              </div>
+              <span class={`task-status-badge ${lifecycleClass(statusMenuTask)}`} data-testid="node-status-badge">{overlayMeta.label}</span>
+            </div>
+            <div class="task-status-overlay__fields" data-testid="node-status-fields">
+              <div class="task-status-overlay__field">
+                <span class="task-status-overlay__field-label">Lifecycle</span>
+                <span class="task-status-overlay__field-value">{overlayPresentation.lifecycle.label} — {overlayPresentation.lifecycle.workspaceDetail}</span>
+              </div>
+              {#if overlayPresentation.runtime}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Runtime</span>
+                  <span class="task-status-overlay__field-value">{overlayPresentation.runtime.label} — {overlayPresentation.runtime.workspaceDetail}</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.workflowNodeStatus}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Workflow node</span>
+                  <span class="task-status-overlay__field-value" title={statusMenuTask.workflowNodeStatus}>{workflowGraphStatusLabel(statusMenuTask.workflowNodeStatus)} ({statusMenuTask.workflowNodeStatus})</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.ownerWorkflowStatus}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Owner workflow</span>
+                  <span class="task-status-overlay__field-value" title={statusMenuTask.ownerWorkflowStatus}>{workflowGraphStatusLabel(statusMenuTask.ownerWorkflowStatus)} ({statusMenuTask.ownerWorkflowStatus})</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.currentTurnActivity}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Turn</span>
+                  <span class="task-status-overlay__field-value">{statusMenuTask.currentTurnActivity.state} · {statusMenuTask.currentTurnActivity.turnId}</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.childOrchestration?.label}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Children</span>
+                  <span class="task-status-overlay__field-value">{statusMenuTask.childOrchestration.label}</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.hasOutcomeProposal}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Outcome</span>
+                  <span class="task-status-overlay__field-value">Agent proposed done — awaiting decision</span>
+                </div>
+              {/if}
+              {#if statusMenuTask.continuationOf}
+                <div class="task-status-overlay__field">
+                  <span class="task-status-overlay__field-label">Continuation</span>
+                  <span class="task-status-overlay__field-value">Continuation of {statusMenuTask.continuationOf}</span>
+                </div>
+              {/if}
+              <div class="task-status-overlay__field">
+                <span class="task-status-overlay__field-label">Updated</span>
+                <span class="task-status-overlay__field-value" title={statusMenuTask.updatedAt}>{formatUpdatedAt(statusMenuTask.updatedAt)}</span>
+              </div>
+            </div>
+            <div class="task-status-overlay__tip">{statusButtonTip(statusMenuTask)}</div>
+          </div>
+          <div class="task-status-overlay__actions" role="group" aria-label="Lifecycle actions">
+            {#each lifecycleActions(statusMenuTask.lifecycle) as action (action.lifecycle)}
+              <button
+                type="button"
+                class="task-status-menu__item"
+                title={action.description}
+                onclick={() => setLifecycle(statusMenuTask.id, action.lifecycle)}
+              >
+                <span class="task-status-menu__item-label">{action.label}</span>
+                <span class="task-status-menu__item-desc">{action.description}</span>
+              </button>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
 
     {#if workflowGraph}
       <WorkflowGraphPanel graph={workflowGraph} />
     {/if}
+
+    <ChatThread />
 
     {#if queuedTurnControls.length > 0}
       <div

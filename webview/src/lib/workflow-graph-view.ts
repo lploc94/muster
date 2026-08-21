@@ -78,6 +78,7 @@ const STATUS_LABELS: Readonly<Record<string, string>> = {
   failed: "Failed",
   cancelled: "Cancelled",
   blocked: "Blocked",
+  skipped: "Skipped",
   open: "Open",
   closed: "Closed",
   consumed: "Consumed",
