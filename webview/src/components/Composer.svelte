@@ -460,7 +460,7 @@
   // Phase B: only structured waiting_you / pendingAsk blocks free-form by default.
   const statusBlocksSend = $derived(
     task
-      ? runtimeBlocksComposer(runtime) || turnActivity === 'waiting_you'
+      ? task.workflowNodeStatus === 'pending' || runtimeBlocksComposer(runtime) || turnActivity === 'waiting_you'
       : taskStatus === 'waiting_user',
   );
   const blocked = $derived(mode === 'task' && (!!pendingAsk || readOnly || statusBlocksSend));
@@ -1197,7 +1197,7 @@
   /** True when lifecycle is sealed; composer stays enabled and send reopens. */
   const isTerminalReopenable = $derived(
     task
-      ? isHardTerminal(lifecycle) || lifecycle === 'failed'
+      ? task.workflowNodeStatus !== 'pending' && (isHardTerminal(lifecycle) || lifecycle === 'failed')
       : isHardTerminal(taskStatus) || taskStatus === 'failed',
   );
 
@@ -1208,6 +1208,7 @@
       return 'Answer above to continue.';
     }
     if (task) {
+      if (task.workflowNodeStatus === 'pending') return 'Waiting for workflow inputs. This task activates automatically when its dependency gate is satisfied.';
       if (runtimeBlocksComposer(runtime)) return presentation.composerGuidance;
       if (readOnly) return 'This task is read-only right now.';
       return '';

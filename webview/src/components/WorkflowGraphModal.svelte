@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
   import WorkflowGraphCanvas from './WorkflowGraphCanvas.svelte';
   import { buildWorkflowGraphPanelView } from '../lib/workflow-graph-view';
@@ -8,12 +8,14 @@
     computeWorkflowGraphFit,
     computeWorkflowGraphLayout,
     decreaseWorkflowGraphScale,
+    workflowGraphTopologyKey,
   } from '../lib/workflow-graph-layout';
   import type { WorkflowGraphRequest } from '../lib/workflow-graph-store.svelte';
   interface Props { graph: WorkflowGraphWireGraph | null; request?: WorkflowGraphRequest | null; error?: string | null; onClose: () => void; onRetry?: () => void; }
   let { graph, request = null, error = null, onClose, onRetry }: Props = $props();
   const view = $derived(graph ? buildWorkflowGraphPanelView(graph) : null);
   const layout = $derived(graph ? computeWorkflowGraphLayout(graph) : null);
+  const topologyKey = $derived(graph ? workflowGraphTopologyKey(graph) : '');
   let scale = $state(1);
   let tx = $state(0);
   let ty = $state(0);
@@ -72,8 +74,8 @@
     };
   });
   $effect(() => {
-    if (!layout || !canvasContainer) return;
-    const frame = requestAnimationFrame(() => fitView());
+    if (!topologyKey || !canvasContainer) return;
+    const frame = requestAnimationFrame(() => untrack(fitView));
     return () => cancelAnimationFrame(frame);
   });
 </script>

@@ -1175,6 +1175,25 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
           WHERE workspace_id = 'ws' AND child_run_id = ?`,
         [childRun!.run_id],
       )).resolves.toEqual({ status: 'failed', reason_code: 'aggregate_too_large' });
+      const childTasks = await opened.client.all<{ task_id: string; lifecycle: string }>(
+        `SELECT task.id AS task_id, task.lifecycle
+           FROM tasks task
+           JOIN workflow_nodes node
+             ON node.workspace_id = task.workspace_id AND node.task_id = task.id
+          WHERE node.workspace_id = 'ws' AND node.run_id = ?`,
+        [childRun!.run_id],
+      );
+      expect(childTasks.length).toBeGreaterThan(0);
+      expect(childTasks.every((task) => task.lifecycle === 'failed')).toBe(true);
+      const revision = await opened.repository.getWorkspaceRevision();
+      const taskEffects = await opened.client.all<{ entity_id: string }>(
+        `SELECT entity_id FROM change_log
+          WHERE workspace_id = 'ws' AND revision = ? AND entity_kind = 'task'`,
+        [revision],
+      );
+      expect(taskEffects.map((row) => row.entity_id)).toEqual(
+        expect.arrayContaining(childTasks.map((task) => task.task_id)),
+      );
       await expect(queuedTurnsForTask(opened.client, caller.entryTaskId)).resolves.toHaveLength(0);
     } finally {
       await opened.close();

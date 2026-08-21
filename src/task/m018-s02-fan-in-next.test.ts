@@ -856,7 +856,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
           )).toHaveLength(0);
           const shellTask = await ctx.repository.getTask(consumer!.task_id!);
           expect(shellTask?.workflowShell).toMatchObject({ runId: data.runId, nodeId: 'consumer' });
+          expect(shellTask?.lifecycle).toBe('failed');
           expect(await ctx.repository.listTurns(consumer!.task_id!)).toHaveLength(0);
+          const revision = await ctx.repository.getWorkspaceRevision();
+          const taskEffects = await ctx.client.all<{ entity_id: string }>(
+            `SELECT entity_id FROM change_log
+              WHERE workspace_id = 'ws' AND revision = ? AND entity_kind = 'task'`,
+            [revision],
+          );
+          expect(taskEffects.map((row) => row.entity_id)).toContain(consumer!.task_id!);
         } else {
           expect(run).toEqual({ status: 'running', terminal_reason_code: null });
           expect(gate).toEqual({ status: 'satisfied' });

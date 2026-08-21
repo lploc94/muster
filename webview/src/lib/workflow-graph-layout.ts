@@ -59,6 +59,19 @@ export function decreaseWorkflowGraphScale(currentScale: number, delta: number):
   );
 }
 
+export function workflowGraphTopologyKey(graph: WorkflowGraphWireGraph): string {
+  return JSON.stringify({
+    runId: graph.runId,
+    nodes: graph.nodes.map((node) => node.nodeId),
+    edges: graph.edges.map((edge) => [edge.fromNodeId, edge.toNodeId, edge.inputRef]),
+    gates: graph.gates.map((gate) => [
+      gate.gateId,
+      gate.consumerNodeId,
+      gate.inputs.map((input) => [input.inputRef, input.producerNodeId]),
+    ]),
+  });
+}
+
 export function computeWorkflowGraphLayout(graph: WorkflowGraphWireGraph): WorkflowGraphLayout {
   const nodes = graph.nodes;
   const edges = graph.edges;

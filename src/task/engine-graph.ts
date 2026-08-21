@@ -1915,6 +1915,9 @@ export async function executeToolCommand(
         if (!child || child.parentId !== ctx.callerTaskId) {
           return { ok: false, reason: 'not an owned direct child' };
         }
+        if (child.workflowShell) {
+          return { ok: false, reason: 'workflow shell pending' };
+        }
         const live = turnsForTask(draft, child.id).find(
           (t) => t.status === 'running' || t.status === 'waiting_user',
         );

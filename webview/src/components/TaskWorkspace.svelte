@@ -241,7 +241,9 @@
       parts.push('Agent proposed done — task stays open; chat to continue.');
     }
     if (task.continuationOf) parts.push('Continuation of prior task');
-    parts.push('Click to change status.');
+    parts.push(task.workflowNodeStatus === 'pending'
+      ? 'Workflow controls this task until its dependency gate is satisfied.'
+      : 'Click to change status.');
     return parts.join(' ');
   }
   /** Preview source: thread user bubbles keyed by message id (host transcript projection). */
@@ -257,7 +259,9 @@
     description: string;
   };
 
-  function lifecycleActions(current: TaskLifecycleState | string): LifecycleAction[] {
+  function lifecycleActions(task: TaskSummary): LifecycleAction[] {
+    if (task.workflowNodeStatus === 'pending') return [];
+    const current = task.lifecycle;
     const actions: LifecycleAction[] = [];
     if (current === 'open') {
       actions.push(
@@ -579,6 +583,7 @@
   /** Sealed task: composer stays enabled; hint that send (or Reopen) restores open. */
   const showTerminalReopenHint = $derived(
     !!focused &&
+      focused.workflowNodeStatus !== 'pending' &&
       (focused.lifecycle === 'failed' ||
         focused.lifecycle === 'succeeded' ||
         focused.lifecycle === 'cancelled' ||
@@ -993,7 +998,7 @@
             <div class="task-status-overlay__tip">{statusButtonTip(statusMenuTask)}</div>
           </div>
           <div class="task-status-overlay__actions" role="group" aria-label="Lifecycle actions">
-            {#each lifecycleActions(statusMenuTask.lifecycle) as action (action.lifecycle)}
+            {#each lifecycleActions(statusMenuTask) as action (action.lifecycle)}
               <button
                 type="button"
                 class="task-status-menu__item"

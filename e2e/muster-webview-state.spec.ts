@@ -75,6 +75,8 @@ interface TaskSummary {
   runtimeActivity?: TaskRuntimeActivity | null;
   viewStatus: TaskViewStatus;
   currentTurnActivity: TurnActivity;
+  workflowNodeStatus?: string | null;
+  ownerWorkflowStatus?: string | null;
   updatedAt: string;
   backend: string;
   /** Optional model id selected for this task. */
@@ -7637,6 +7639,7 @@ test.describe('Task-tree chrome navigation', () => {
       viewStatus: 'waiting_workflow',
       runtimeActivity: 'waiting_workflow',
       currentTurnActivity: null,
+      workflowNodeStatus: 'pending',
     });
     const terminalShell = task({
       id: 'workflow-terminal-shell',
@@ -7646,6 +7649,7 @@ test.describe('Task-tree chrome navigation', () => {
       viewStatus: 'waiting_workflow',
       runtimeActivity: 'waiting_workflow',
       currentTurnActivity: null,
+      workflowNodeStatus: 'pending',
     });
 
     await postSnapshot(page, {
@@ -7661,19 +7665,43 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('task-tree-row')).toHaveCount(4);
     await expect(page.getByTestId('task-tree-row').filter({ hasText: consumerShell.goal })).toBeVisible();
     await expect(page.getByTestId('task-tree-row').filter({ hasText: terminalShell.goal })).toBeVisible();
-    await expect(page.locator('.task-chrome').getByRole('button', { name: /Task status: Waiting for workflow/i })).toHaveCount(2);
+    await expect(page.locator('.task-tree-panel__item').filter({ hasText: consumerShell.goal }).getByRole('button', { name: /Task status: Waiting for inputs/i })).toBeVisible();
+    await expect(page.locator('.task-tree-panel__item').filter({ hasText: terminalShell.goal }).getByRole('button', { name: /Task status: Waiting for inputs/i })).toBeVisible();
     await page.getByTestId('task-tree-summary').click();
-    await expect(page.getByText(/will run automatically when its workflow inputs are ready/i)).toBeVisible();
+    await expect(page.getByText(/waiting for workflow inputs.*activates automatically/i)).toBeVisible();
     await expect(page.getByRole('button', { name: 'Send' })).toHaveCount(0);
     await expect(page.getByRole('button', { name: 'Stop this turn' })).toHaveCount(0);
     await expect(page.locator('textarea.composer-input__textarea, textarea').last()).toBeDisabled();
     expect((await postedMessages(page)).filter((message) => (message as { type?: string }).type === 'send')).toHaveLength(0);
+    await page.locator('.task-tree-panel__status-btn').first().click();
+    await expect(page.getByRole('group', { name: 'Lifecycle actions' }).getByRole('button')).toHaveCount(0);
+    await page.keyboard.press('Escape');
+
+    const closedConsumerShell = task({
+      ...consumerShell,
+      lifecycle: 'failed',
+      viewStatus: 'failed',
+      runtimeActivity: null,
+      currentTurnActivity: null,
+      workflowNodeStatus: 'pending',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [coordinator],
+      focusedTaskId: closedConsumerShell.id,
+      subtree: [coordinator, producer, closedConsumerShell, terminalShell],
+      transcript: [],
+      storeRevision: 901,
+    });
+    await expect(page.locator('textarea.composer-input__textarea, textarea').last()).toBeDisabled();
+    await expect(page.getByRole('button', { name: /reopen/i })).toHaveCount(0);
 
     const activatedConsumer = task({
       ...consumerShell,
       viewStatus: 'queued',
       runtimeActivity: 'queued',
       currentTurnActivity: { state: 'queued', turnId: 'workflow-consumer-turn' },
+      workflowNodeStatus: 'active',
     });
     await postRawHostMessage(page, {
       type: 'workspacePatchBatch',
@@ -7683,7 +7711,7 @@ test.describe('Task-tree chrome navigation', () => {
     await page.getByTestId('task-tree-summary').click();
     await expect(page.getByTestId('task-tree-row')).toHaveCount(4);
     await expect(page.locator('[data-testid="task-tree-row"][data-task-id="workflow-consumer-shell"]')).toContainText('Review release evidence');
-    await expect(page.getByText(/will run automatically when its workflow inputs are ready/i)).toHaveCount(0);
+    await expect(page.getByText(/waiting for workflow inputs.*activates automatically/i)).toHaveCount(0);
     const activatedComposer = page.locator('textarea.composer-input__textarea, textarea').last();
     await expect(activatedComposer).toBeEnabled();
     await activatedComposer.fill('Follow up after workflow activation');
@@ -11184,6 +11212,41 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(modal.locator('[data-gate-id="gate-m024-s05"] [data-input-ref="pending_three"]')).toContainText('Pending');
     await modal.getByRole('button', { name: 'Reset view' }).click();
     await expect(modal.locator('.workflow-modal__scale')).toHaveText('100%');
+    await modal.getByRole('button', { name: 'Zoom in' }).click();
+    await expect(modal.locator('.workflow-modal__scale')).toHaveText('115%');
+    await postRawHostMessage(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [{
+        type: 'taskUpserted',
+        task: task({ id: taskId, goal: 'Run reuse workflow', viewStatus: 'running' }),
+      }],
+    });
+    await expect.poll(async () => (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    ).length).toBe(2);
+    const refreshRequest = (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
+    )[1] as { requestId: string; taskId: string };
+    await postRawHostMessage(page, {
+      type: 'workflowGraphResult',
+      requestId: refreshRequest.requestId,
+      taskId: refreshRequest.taskId,
+      ok: true,
+      graph: {
+        ...graphPayload,
+        nodes: graphPayload.nodes.map((node) => node.nodeId === 'node-3'
+          ? { ...node, executionActivity: 'completed', displayState: 'completed', progressBucket: 'completed', workflowNodeStatus: 'succeeded' }
+          : node),
+        progress: {
+          ...graphPayload.progress,
+          completed: 3,
+          executing: 1,
+          activeNodeIds: ['node-4'],
+        },
+      },
+    });
+    await expect(modal.locator('.workflow-modal__scale')).toHaveText('115%');
     await modal.getByRole('button', { name: 'Fit view' }).click();
     await expect(modal.locator('.workflow-modal__scale')).not.toHaveText('100%');
     const wrapBox = await page.getByTestId('workflow-graph-canvas-wrap').boundingBox();
@@ -11205,10 +11268,10 @@ test.describe('M019 S05 Assembled First Run', () => {
     await page.getByTestId('view-workflow-graph').click();
     await expect.poll(async () => (await postedMessages(page)).filter(
       (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
-    ).length).toBe(2);
+    ).length).toBe(3);
     const reopenedRequest = (await postedMessages(page)).filter(
       (message) => (message as { type?: string }).type === 'requestWorkflowGraph',
-    )[1] as { requestId: string; taskId: string };
+    )[2] as { requestId: string; taskId: string };
     await postRawHostMessage(page, {
       type: 'workflowGraphResult',
       requestId: reopenedRequest.requestId,
@@ -11267,6 +11330,14 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(page.getByTestId('workflow-graph-error')).toContainText(
       'This task is not part of a workflow run.',
     );
+    await postRawHostMessage(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [{
+        type: 'taskUpserted',
+        task: task({ id: taskId, goal: 'Inspect workflow error', viewStatus: 'running' }),
+      }],
+    });
     await page.waitForTimeout(400);
     expect((await postedMessages(page)).filter(
       (message) => (message as { type?: string }).type === 'requestWorkflowGraph',

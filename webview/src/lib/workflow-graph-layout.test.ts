@@ -6,6 +6,7 @@ import {
   computeWorkflowGraphFit,
   computeWorkflowGraphLayout,
   decreaseWorkflowGraphScale,
+  workflowGraphTopologyKey,
 } from './workflow-graph-layout';
 
 function chainGraph(count: number): WorkflowGraphWireGraph {
@@ -89,6 +90,18 @@ describe('workflow graph layout and fit', () => {
 
     const invalid = computeWorkflowGraphFit(maximum, { width: 0, height: Number.NaN });
     expect(invalid).toEqual({ scale: 1, x: 0, y: 0 });
+  });
+
+  it('distinguishes topology changes from status-only graph refreshes', () => {
+    const original = chainGraph(2);
+    const refreshed = structuredClone(original);
+    refreshed.nodes[0]!.displayState = 'completed';
+    refreshed.nodes[0]!.workflowNodeStatus = 'succeeded';
+    const changed = chainGraph(3);
+    changed.runId = original.runId;
+
+    expect(workflowGraphTopologyKey(refreshed)).toBe(workflowGraphTopologyKey(original));
+    expect(workflowGraphTopologyKey(changed)).not.toBe(workflowGraphTopologyKey(original));
   });
 
   it('recomputes a smaller scale when the viewport narrows', () => {

@@ -12,6 +12,18 @@ const workspaceSource = readFileSync(
   resolve(root, "webview/src/components/TaskWorkspace.svelte"),
   "utf8",
 );
+const composerSource = readFileSync(
+  resolve(root, "webview/src/components/Composer.svelte"),
+  "utf8",
+);
+const storeSource = readFileSync(
+  resolve(root, "webview/src/lib/workflow-graph-store.svelte.ts"),
+  "utf8",
+);
+const refreshPolicySource = readFileSync(
+  resolve(root, "webview/src/lib/workflow-graph-refresh-policy.ts"),
+  "utf8",
+);
 
 describe("workflow graph webview wiring", () => {
   it("renders the shared bounded presentation view through a dedicated panel", () => {
@@ -77,5 +89,15 @@ describe("workflow graph webview wiring", () => {
     expect(modalSource).toContain("ResizeObserver");
     expect(modalSource).toContain("view.progress.summaryLabel");
     expect(modalSource).toContain("view.gates");
+    expect(modalSource).toContain("workflowGraphTopologyKey");
+    expect(modalSource).toContain("untrack");
+  });
+
+  it("keeps pending shells inspect-only and graph refreshes ordered", () => {
+    expect(workspaceSource).toContain("task.workflowNodeStatus === 'pending'");
+    expect(composerSource).toContain("task.workflowNodeStatus === 'pending'");
+    expect(storeSource).toContain("WorkflowGraphRefreshPolicy");
+    expect(storeSource).toContain("this.error !== null");
+    expect(refreshPolicySource).toContain("dirtyWhileRequest");
   });
 });
