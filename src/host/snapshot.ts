@@ -416,9 +416,19 @@ export function projectCurrentTurnActivity(file: EngineProjection, taskId: strin
   return { state: 'failed_turn', turnId: latest.id, retryable: true };
 }
 
+const WORKFLOW_TERMINAL_STATUSES = new Set<string>([
+  'succeeded',
+  'reused',
+  'failed',
+  'cancelled',
+  'skipped',
+]);
+const WORKFLOW_RUNNING_STATUSES = new Set<string>(['active', 'running']);
+
 function projectChildOrchestration(
   file: EngineProjection,
   parentId: string,
+  workflowNodeStatuses?: ReadonlyMap<string, string>,
 ): TaskSummary['childOrchestration'] | undefined {
   const children = Object.values(file.tasks).filter((t) => t.parentId === parentId);
   if (children.length === 0) return undefined;
@@ -428,19 +438,22 @@ function projectChildOrchestration(
   let awaitingParentSeal = 0;
   let needsParentInput = 0;
   for (const child of children) {
-    if (
+    const ws = workflowNodeStatuses?.get(child.id);
+    const lifecycleTerminal =
       child.lifecycle === 'succeeded' ||
       child.lifecycle === 'failed' ||
       child.lifecycle === 'cancelled' ||
-      child.lifecycle === 'skipped'
-    ) {
+      child.lifecycle === 'skipped';
+    const workflowTerminal = ws !== undefined && WORKFLOW_TERMINAL_STATUSES.has(ws);
+    if (lifecycleTerminal || workflowTerminal) {
       terminal += 1;
     } else {
       open += 1;
+      const workflowRunning = ws !== undefined && WORKFLOW_RUNNING_STATUSES.has(ws);
       const live = turnsForTask(file, child.id).some(
         (t) => t.status === 'running' || t.status === 'waiting_user',
       );
-      if (live) running += 1;
+      if (workflowRunning || live) running += 1;
     }
     if (child.attention?.code === 'awaiting_parent_seal') awaitingParentSeal += 1;
     if (
@@ -468,7 +481,11 @@ function projectChildOrchestration(
   };
 }
 
-export function projectTaskSummary(file: EngineProjection, taskId: string): TaskSummary | undefined {
+export function projectTaskSummary(
+  file: EngineProjection,
+  taskId: string,
+  workflowNodeStatuses?: ReadonlyMap<string, string>,
+): TaskSummary | undefined {
   const task = file.tasks[taskId];
   if (!task) {
     return undefined;
@@ -476,7 +493,12 @@ export function projectTaskSummary(file: EngineProjection, taskId: string): Task
   const turns = turnsForTask(file, taskId);
   const producerLifecycles = producerLifecyclesForTask(file, task);
   const childOrchestration =
-    task.role === 'coordinator' ? projectChildOrchestration(file, taskId) : undefined;
+    task.role === 'coordinator'
+      ? projectChildOrchestration(file, taskId, workflowNodeStatuses)
+      : undefined;
+  const workflowNodeStatus = workflowNodeStatuses?.get(taskId);
+  // ownerWorkflowStatus is not per-node but per-owner; handled in buildSnapshot enrichment.
+  // projectTaskSummary alone does not know owner map, so owner status is attached at snapshot level.
   // Only the latest settled/live turn may present a run-timeout reason. Historical
   // timeouts must not mislabel a later ordinary failure after retry.
   const latestTurn = [...turns].sort((a, b) => b.sequence - a.sequence)[0];
@@ -506,6 +528,7 @@ export function projectTaskSummary(file: EngineProjection, taskId: string): Task
     continuationOf: task.continuationOf,
     ...(childOrchestration ? { childOrchestration } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
+    ...(workflowNodeStatus !== undefined ? { workflowNodeStatus } : {}),
   };
 }
 
@@ -708,12 +731,18 @@ export function buildSnapshot(
      */
     transcript?: TranscriptItem[];
     transcriptPage?: TranscriptPageState;
+    /** Workflow node status map for per-node chrome and orchestration counts. */
+    workflowNodeStatuses?: ReadonlyMap<string, string>;
+    /** Owner workflow run status map for coordinator roots. */
+    ownerWorkflowStatuses?: ReadonlyMap<string, string>;
   },
 ): TaskSnapshot {
   const file = store.getFile();
+  const workflowNodeStatuses = options?.workflowNodeStatuses;
+  const ownerWorkflowStatuses = options?.ownerWorkflowStatuses;
   const rootTasks = Object.values(file.tasks)
     .filter((task) => task.parentId === null)
-    .map((task) => projectTaskSummary(file, task.id))
+    .map((task) => projectTaskSummary(file, task.id, workflowNodeStatuses))
     .filter((summary): summary is TaskSummary => summary !== undefined)
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt) || a.id.localeCompare(b.id));
 
@@ -725,6 +754,14 @@ export function buildSnapshot(
     options?.transcript !== undefined &&
     options?.transcriptPage !== undefined;
   const effectiveFocusId = hasFocusedPage ? focusedTaskId : undefined;
+
+  // Attach owner status to rootTasks even when no focused page (coordinator root chrome).
+  if (ownerWorkflowStatuses && ownerWorkflowStatuses.size > 0) {
+    for (const summary of rootTasks) {
+      const os = ownerWorkflowStatuses.get(summary.id);
+      if (os) (summary as TaskSummary).ownerWorkflowStatus = os;
+    }
+  }
 
   const snapshot: TaskSnapshot = {
     rootTasks,
@@ -741,12 +778,20 @@ export function buildSnapshot(
   const owningRootId = findOwningRoot(file, effectiveFocusId) ?? effectiveFocusId;
   const subtreeIds = collectSubtreeIds(file, owningRootId);
   snapshot.subtree = subtreeIds
-    .map((taskId) => projectTaskSummary(file, taskId))
+    .map((taskId) => projectTaskSummary(file, taskId, workflowNodeStatuses))
     .filter((summary): summary is TaskSummary => summary !== undefined);
   snapshot.transcript = options.transcript;
   snapshot.transcriptPage = options.transcriptPage;
   snapshot.activeTurnId = activeTurnIdForTask(file, effectiveFocusId);
   snapshot.queuedTurns = projectQueuedTurns(file, effectiveFocusId);
+
+  // Attach owner workflow run status for coordinator roots that stay open after run succeeded.
+  if (ownerWorkflowStatuses && ownerWorkflowStatuses.size > 0) {
+    for (const summary of [...snapshot.rootTasks, ...(snapshot.subtree ?? [])]) {
+      const os = ownerWorkflowStatuses.get(summary.id);
+      if (os) (summary as TaskSummary).ownerWorkflowStatus = os;
+    }
+  }
 
   const pending = activePendingAsks?.get(effectiveFocusId);
   if (pending) {

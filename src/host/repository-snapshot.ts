@@ -175,28 +175,19 @@ async function buildRepositorySnapshotAttempt(
       }
     : undefined;
 
-  // Focused ⇒ both transcript + transcriptPage required; no-focus ⇒ neither.
+  // Per-node workflow chrome and orchestration counts: pass maps into snapshot so
+  // childOrchestration reflects workflow terminal/running states while lifecycle stays open.
   const snapshot = buildSnapshot(
     { getFile: () => observation },
     effectiveFocusId,
     activePendingAsks,
-    focusedTask && transcript !== undefined && transcriptPage !== undefined
-      ? { transcript, transcriptPage }
-      : undefined,
+    {
+      ...(focusedTask && transcript !== undefined && transcriptPage !== undefined
+        ? { transcript, transcriptPage }
+        : {}),
+      ...(workflowNodeStatuses.size > 0 ? { workflowNodeStatuses } : {}),
+      ...(ownerWorkflowStatuses.size > 0 ? { ownerWorkflowStatuses } : {}),
+    },
   );
-  // Per-node workflow chrome: attach node status so tree can show succeeded/active while lifecycle stays open (run-level seal)
-  if ((workflowNodeStatuses as Map<string, string>).size > 0) {
-    for (const summary of [...snapshot.rootTasks, ...(snapshot.subtree ?? [])]) {
-      const ws = (workflowNodeStatuses as Map<string, string>).get(summary.id);
-      if (ws) summary.workflowNodeStatus = ws;
-    }
-  }
-  // Owner root chrome: coordinator that stays open but its workflow run already succeeded (needs review) should not look like idle open
-  if ((ownerWorkflowStatuses as Map<string, string>).size > 0) {
-    for (const summary of [...snapshot.rootTasks, ...(snapshot.subtree ?? [])]) {
-      const os = (ownerWorkflowStatuses as Map<string, string>).get(summary.id);
-      if (os) summary.ownerWorkflowStatus = os;
-    }
-  }
   return { snapshot, observation };
 }
