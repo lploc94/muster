@@ -349,6 +349,11 @@ export async function* runAcpTurn(
   spec: AcpAdapterSpec,
   options: RunOptions,
 ): AsyncIterable<NormalizedEvent> {
+  if (options.input.kind !== 'agent') {
+    yield { type: 'error', message: 'acp backend received a script run input' };
+    return;
+  }
+  const initialPrompt = options.input.prompt;
   const messageId = randomUUID();
   const cwd = options.cwd || process.cwd();
   const mcpServers = options.mcpServers ?? [];
@@ -619,7 +624,7 @@ export async function* runAcpTurn(
         return;
       }
 
-      yield* drainPrompt(activeSessionId, options.prompt);
+      yield* drainPrompt(activeSessionId, initialPrompt);
       return;
     }
 
@@ -628,7 +633,7 @@ export async function* runAcpTurn(
     const maxAttempts = Math.max(1, Math.min(2, mcpSetup.maxAttempts ?? 2));
     let forceFreshSession = false;
     let previousFailure: { code: string; message: string } | undefined;
-    let activePrompt = options.prompt;
+    let activePrompt = initialPrompt;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (isAborted()) {

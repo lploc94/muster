@@ -10,6 +10,7 @@ Read in this order when onboarding:
 
 | Doc | Topic |
 |-----|--------|
+| [ARCHITECTURE-DIAGRAMS.md](ARCHITECTURE-DIAGRAMS.md) | Two Mermaid views of the system: runtime turn flow (layer boundaries, MCP/RFD out-of-band edges) and module inventory (subsystem locator) |
 | [SESSION-MANAGEMENT.md](SESSION-MANAGEMENT.md) | Explicit session IDs, resume flow |
 | [TASK-MANAGEMENT.md](TASK-MANAGEMENT.md) | Task/turn domain model, coordinator protocol, TaskEngine lifecycle, model-switch continuation contract, and task Markdown export contract |
 | [plans/task-orchestration-auto-run.md](plans/task-orchestration-auto-run.md) | **PARTIAL**: brief/result/release auto-run (cleanup gate pending) |

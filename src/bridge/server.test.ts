@@ -330,9 +330,16 @@ describe('MusterBridgeServer auth', () => {
       properties: {
         nodes: {
           items: {
-            properties: {
-              label: { maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH },
-            },
+            oneOf: [
+              { properties: { label: { maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH } } },
+              {
+                required: ['nodeKey', 'script'],
+                properties: {
+                  label: { maxLength: WORKFLOW_NODE_LABEL_MAX_LENGTH },
+                  script: { required: ['interpreter', 'file'] },
+                },
+              },
+            ],
           },
         },
       },

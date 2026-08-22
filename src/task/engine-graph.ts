@@ -3,7 +3,12 @@ import type { AskBridge, Answers, AskRef } from '../bridge/ask-bridge';
 import type { CredentialRegistry } from '../bridge/credentials';
 import { buildTurnMcp, deleteMcpConfigFile } from '../bridge/mcp-config';
 import { isKnownBackendId } from '../backends/index';
-import type { Backend } from '../types';
+import { DEFAULT_ACP_EXECUTOR_ID } from '../backends/executor-registry';
+import {
+  getPredefinedWorkflow,
+  listPredefinedWorkflows,
+} from '../host/predefined-workflows';
+import type { Backend, RunInput, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { mergeBriefFromCreate } from './brief';
 import { capabilitiesFor } from './capabilities';
@@ -300,6 +305,8 @@ export interface GraphEngineDeps {
   onRescanSchedulableTurns?: (affectedTaskIds?: readonly string[]) => void;
   /** W9: workspace trust predicate for create-and-run paths. */
   isWorkspaceTrusted?: () => boolean;
+  /** Live user setting used to authorize local process execution at workflow start. */
+  allowLocalExecution?: () => boolean;
   /** W3: sync host env cache for get_host_context (same as first-turn inject). */
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   workspaceFolder?: string;
@@ -428,6 +435,23 @@ function validateWorkflowDefinitionHostRequirements(
       }
       continue;
     }
+    if (node.execution?.kind === 'script') {
+      if (backend !== 'script') {
+        return workflowHostPolicyError(
+          'script_backend_mismatch',
+          `workflow node ${node.nodeId} has script execution without the script backend`,
+        );
+      }
+      try {
+        const backendInstance = deps.makeBackend(backend);
+        if (backendInstance.capabilities?.supportsMCP !== false) {
+          return workflowHostPolicyError('script_executor_invalid', 'script executor must not expose MCP');
+        }
+      } catch {
+        return workflowHostPolicyError('backend_unsupported', 'script executor is unavailable');
+      }
+      continue;
+    }
     if (!isKnownBackendId(backend)) {
       return workflowHostPolicyError('backend_unsupported', `unsupported backend: ${backend}`);
     }
@@ -485,6 +509,15 @@ async function prepareWorkflowStart(
     return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
   }
   if (
+    definition.topology.nodes.some((node) => node.execution?.kind === 'script') &&
+    deps.allowLocalExecution?.() !== true
+  ) {
+    return workflowHostPolicyError(
+      'host_run_disabled',
+      'local script execution is disabled by muster.verification.hostRun',
+    );
+  }
+  if (
     definition.scope.kind === 'root' &&
     definition.scope.ownerRootTaskId !== ctx.rootId
   ) {
@@ -511,7 +544,9 @@ async function prepareWorkflowStart(
     );
   }
 
-  const defaultBackend = input.backend ?? (input.useCallerBackendDefault ? caller.backend : 'grok');
+  const defaultBackend = input.backend ?? (
+    input.useCallerBackendDefault ? caller.backend : DEFAULT_ACP_EXECUTOR_ID
+  );
   const requirements = validateWorkflowDefinitionHostRequirements(
     deps,
     caller,
@@ -790,10 +825,16 @@ export function issueTurnCredential(
 export function buildRunOptionsForTurn(
   deps: GraphEngineDeps,
   turnId: string,
-  base: { prompt: string; resumeId?: string; signal?: AbortSignal; cwd?: string; model?: string },
+  base: {
+    input: RunInput;
+    resumeId?: string;
+    signal?: AbortSignal;
+    cwd?: string;
+    model?: string;
+  },
   /** Opaque engine-allocated attempt id (TaskEngine allocates per MCP-enabled turn). Defaults to 'a0' for non-engine call sites/tests. */
   attemptId: string = 'a0',
-): { options: import('../types').RunOptions; mcpConfigPath?: string } {
+): { options: RunOptions; mcpConfigPath?: string } {
   const file = deps.store.getFile();
   const turn = file.turns[turnId];
   const task = turn ? file.tasks[turn.taskId] : undefined;
@@ -830,7 +871,7 @@ export function remintTurnMcpForAttempt(
   deps: GraphEngineDeps,
   turnId: string,
   attemptId: string,
-  options: import('../types').RunOptions,
+  options: RunOptions,
   previousMcpConfigPath?: string,
 ): { mcpConfigPath?: string } {
   const file = deps.store.getFile();
@@ -976,7 +1017,9 @@ export async function executeToolCommand(
     command.kind !== 'inspect_workflow_run' &&
     command.kind !== 'start_workflow' &&
     command.kind !== 'get_host_context' &&
-    command.kind !== 'list_task_types'
+    command.kind !== 'list_task_types' &&
+    command.kind !== 'list_predefined_workflows' &&
+    command.kind !== 'get_predefined_workflow'
   ) {
     const key = opLedgerKey(ctx.turnId, command.opId);
     const existing = deps.store.getFile().operations?.[key] ?? await deps.repository.getOperation(key);
@@ -2511,6 +2554,7 @@ export async function executeToolCommand(
             kind: 'workflow_next',
             change: command.change,
             result: command.message,
+            ...(command.execution !== undefined ? { execution: command.execution } : {}),
           },
           command.opId,
           {
@@ -2764,6 +2808,38 @@ export async function executeToolCommand(
         ok: true,
         result: { taskTypes: summarized.taskTypes, diagnostics },
       };
+    }
+
+    case 'list_predefined_workflows': {
+      const file = deps.store.getFile();
+      const task = file.tasks[ctx.callerTaskId];
+      if (!task) return { ok: false, error: 'task not found' };
+      const workspaceFolder =
+        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
+        deps.getHostEnvironment?.()?.cwd ??
+        deps.workspaceFolder ??
+        process.cwd();
+      return {
+        ok: true,
+        result: await listPredefinedWorkflows({ workspaceFolder }),
+      };
+    }
+
+    case 'get_predefined_workflow': {
+      const file = deps.store.getFile();
+      const task = file.tasks[ctx.callerTaskId];
+      if (!task) return { ok: false, error: 'task not found' };
+      const workspaceFolder =
+        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
+        deps.getHostEnvironment?.()?.cwd ??
+        deps.workspaceFolder ??
+        process.cwd();
+      const workflow = await getPredefinedWorkflow(
+        { workspaceFolder },
+        command.workflowRef,
+      );
+      if (!workflow) return { ok: false, error: 'predefined workflow not found or changed' };
+      return { ok: true, result: workflow };
     }
 
     case 'define_workflow': {

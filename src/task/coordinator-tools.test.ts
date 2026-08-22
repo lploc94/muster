@@ -467,6 +467,78 @@ describe('coordinator-tools dispatch', () => {
     });
   });
 
+  it('compiles mixed agent and script nodes without exposing internal routing fields', () => {
+    const defined = dispatch(
+      'define_workflow',
+      {
+        name: 'Deterministic check',
+        nodes: [
+          {
+            nodeKey: 'check',
+            script: {
+              interpreter: 'node',
+              file: 'scripts/check.js',
+              args: ['--json'],
+              onFailure: 'continue',
+            },
+          },
+          { nodeKey: 'review', taskType: 'review', label: 'Review the check result.' },
+        ],
+        edges: [{ from: 'check', to: 'review', as: 'checkResult' }],
+      },
+      ctx(['define_workflow']),
+    );
+    expect(defined).toMatchObject({
+      ok: true,
+      command: {
+        kind: 'define_workflow',
+        topology: {
+          nodes: [
+            {
+              nodeId: 'check',
+              backend: 'script',
+              execution: {
+                kind: 'script', interpreter: 'node', file: 'scripts/check.js',
+                args: ['--json'], onFailure: 'continue',
+              },
+            },
+            { nodeId: 'review', taskType: 'review', label: 'Review the check result.' },
+          ],
+        },
+      },
+    });
+    expect(dispatch(
+      'define_workflow',
+      { name: 'bad', nodes: [{ nodeKey: 'both', taskType: 'review', script: { interpreter: 'node', file: 'x.js' } }] },
+      ctx(['define_workflow']),
+    ).ok).toBe(false);
+    expect(dispatch(
+      'define_workflow',
+      { name: 'bad type', nodes: [{ nodeKey: 'both', taskType: 42, script: { interpreter: 'node', file: 'x.js' } }] },
+      ctx(['define_workflow']),
+    ).ok).toBe(false);
+    for (const file of ['/tmp/x.js', '../x.js', 'x.py']) {
+      expect(dispatch(
+        'define_workflow',
+        { name: 'bad path', nodes: [{ nodeKey: 'script', script: { interpreter: 'node', file } }] },
+        ctx(['define_workflow']),
+      ).ok).toBe(false);
+    }
+  });
+
+  it('parses predefined-workflow discovery tools as read-only opaque references', () => {
+    expect(dispatch(
+      'list_predefined_workflows', {}, ctx(['list_predefined_workflows']),
+    )).toEqual({ ok: true, command: { kind: 'list_predefined_workflows' } });
+    const workflowRef = `pwf_${'a'.repeat(32)}`;
+    expect(dispatch(
+      'get_predefined_workflow', { workflowRef }, ctx(['get_predefined_workflow']),
+    )).toEqual({ ok: true, command: { kind: 'get_predefined_workflow', workflowRef } });
+    expect(dispatch(
+      'get_predefined_workflow', { workflowRef: '../workflow.md' }, ctx(['get_predefined_workflow']),
+    ).ok).toBe(false);
+  });
+
   it('generates stable workflow identity from semantic content', () => {
     const first = dispatch(
       'define_workflow',

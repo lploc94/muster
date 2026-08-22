@@ -77,6 +77,9 @@ const MUTABLE_OR_STATEFUL_IDS: readonly UatCommandId[] = [
   // host focus and reads a live transport result. Both are Development-only.
   UAT_COMMANDS.seedWorkflowGraphFixture,
   UAT_COMMANDS.observeWorkflowGraphRoundTrip,
+  // Script workflow QA creates catalog/script fixtures, toggles a workspace
+  // setting, and mutates workflow state. It must remain Development-only.
+  UAT_COMMANDS.runScriptWorkflowQa,
 ];
 
 describe('UAT surface tiering (release-surface invariant)', () => {

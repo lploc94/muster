@@ -78,6 +78,8 @@ export const UAT_COMMANDS = {
    */
   seedWorkflowGraphFixture: 'muster.uat.seedWorkflowGraphFixture',
   observeWorkflowGraphRoundTrip: 'muster.uat.observeWorkflowGraphRoundTrip',
+  /** Native QA for catalog discovery, host policy, and real script workflow execution. */
+  runScriptWorkflowQa: 'muster.uat.runScriptWorkflowQa',
 } as const;
 
 export type UatCommandId = (typeof UAT_COMMANDS)[keyof typeof UAT_COMMANDS];

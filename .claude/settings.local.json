@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "mcp__auggie__codebase-retrieval",
-      "Bash(claude mcp *)"
-    ]
-  }
-}

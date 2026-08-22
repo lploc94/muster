@@ -73,8 +73,9 @@ async function main(): Promise<void> {
 
       if (bridgeUrl && token) {
         injectedMcp = true;
-        const isChild = options.prompt.includes('child work');
-        const isContinuation = options.prompt.includes('[child_results]');
+        const promptText = options.input.kind === 'agent' ? options.input.prompt : '';
+        const isChild = promptText.includes('child work');
+        const isContinuation = promptText.includes('[child_results]');
         // Smoke fixture talks HTTP to the bridge with the same env the stdio
         // proxy would receive; full proxy-process spawn is covered by the D037
         // provider contract suite (mcp-provider-contract.test.ts).

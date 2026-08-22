@@ -25,7 +25,7 @@ vi.mock('./acp-client', () => ({
 import { KiroBackend, KIRO_AGENT_CONFIG } from './kiro';
 
 function options(over: Partial<RunOptions> = {}): RunOptions {
-  return { prompt: 'hello', ...over };
+  return { input: { kind: 'agent', prompt: 'hello' }, ...over };
 }
 
 /** Narrow helper: assistant/reasoning delta contents in order. */
@@ -86,7 +86,7 @@ describe('KiroBackend.run — session + streaming', () => {
 
   it('connects (with extraEnv) before opening a session, then passes cwd/prompt through', async () => {
     const extraEnv = { FOO: 'bar' };
-    await runTurn(new KiroBackend(), options({ prompt: 'do it', cwd: '/work', extraEnv }), fake, {});
+    await runTurn(new KiroBackend(), options({ input: { kind: 'agent', prompt: 'do it' }, cwd: '/work', extraEnv }), fake, {});
     // The ACP connection must be established (with the run's extraEnv) before a session is opened.
     expect(fake.calls.ensureConnected).toEqual([[extraEnv]]);
     expect(fake.callOrder.indexOf('ensureConnected')).toBeLessThan(fake.callOrder.indexOf('newSession'));

@@ -10,6 +10,9 @@ import {
   WORKFLOW_GRAPH_MAX_NODES,
   WORKFLOW_INPUT_REF_MAX_LENGTH,
   WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  WORKFLOW_SCRIPT_ARG_MAX_LENGTH,
+  WORKFLOW_SCRIPT_MAX_ARGS,
+  isValidWorkflowScriptFile,
   type DefineWorkflowInput,
   type GraphTopologyV1,
   type OneNodeTopologyV1,
@@ -20,6 +23,7 @@ import {
   type WorkflowEntryContractV1,
   type WorkflowNodeSpecV1,
   type WorkflowPolicyV1,
+  type ScriptExecutionSpecV1,
   type WorkflowTopologyV1,
 } from './workflow-types';
 
@@ -73,6 +77,36 @@ export type DefinitionDecodeResult =
 
 function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
+}
+
+function decodeScriptExecution(raw: unknown): ScriptExecutionSpecV1 | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const rec = raw as Record<string, unknown>;
+  if (rec.kind !== 'script') return undefined;
+  if (rec.interpreter !== 'node' && rec.interpreter !== 'python' && rec.interpreter !== 'python3') {
+    return undefined;
+  }
+  if (!isValidWorkflowScriptFile(rec.file, rec.interpreter)) return undefined;
+  if (
+    !Array.isArray(rec.args) ||
+    rec.args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
+    !rec.args.every((arg) =>
+      typeof arg === 'string' &&
+      arg.length <= WORKFLOW_SCRIPT_ARG_MAX_LENGTH &&
+      !arg.includes('\0'))
+  ) return undefined;
+  if (rec.onFailure !== 'fail_run' && rec.onFailure !== 'continue') return undefined;
+  if (Object.keys(rec).some((key) =>
+    key !== 'kind' && key !== 'interpreter' && key !== 'file' && key !== 'args' && key !== 'onFailure')) {
+    return undefined;
+  }
+  return {
+    kind: 'script',
+    interpreter: rec.interpreter,
+    file: rec.file,
+    args: [...rec.args] as string[],
+    onFailure: rec.onFailure,
+  };
 }
 
 const WORKFLOW_ENTRY_AGGREGATE_PREFIX = '[workflow-entry]';
@@ -226,6 +260,17 @@ function decodeNode(raw: unknown): WorkflowNodeSpecV1 | undefined {
     capabilities = [...new Set(rec.capabilities as string[])].sort();
     if (capabilities.length !== rec.capabilities.length) return undefined;
   }
+  let execution: ScriptExecutionSpecV1 | undefined;
+  if (rec.execution !== undefined) {
+    execution = decodeScriptExecution(rec.execution);
+    if (!execution) return undefined;
+    if (
+      rec.backend !== 'script' || rec.model !== undefined || rec.taskType !== undefined ||
+      rec.role === 'coordinator' || (capabilities?.length ?? 0) > 0
+    ) return undefined;
+  } else if (rec.backend === 'script') {
+    return undefined;
+  }
   const node: WorkflowNodeSpecV1 = { nodeId: rec.nodeId };
   if (typeof rec.label === 'string') node.label = rec.label;
   if (rec.role === 'coordinator' || rec.role === 'worker') node.role = rec.role;
@@ -233,11 +278,12 @@ function decodeNode(raw: unknown): WorkflowNodeSpecV1 | undefined {
   if (typeof rec.backend === 'string') node.backend = rec.backend;
   if (typeof rec.model === 'string') node.model = rec.model;
   if (capabilities !== undefined) node.capabilities = capabilities;
+  if (execution !== undefined) node.execution = execution;
   // Reject unknown keys so foreign payloads cannot smuggle repository identities.
   for (const key of Object.keys(rec)) {
     if (
       key !== 'nodeId' && key !== 'label' && key !== 'role' && key !== 'taskType' &&
-      key !== 'backend' && key !== 'model' && key !== 'capabilities'
+      key !== 'backend' && key !== 'model' && key !== 'capabilities' && key !== 'execution'
     ) return undefined;
   }
   return node;
@@ -251,6 +297,15 @@ function encodeNodeJson(node: WorkflowNodeSpecV1): Record<string, unknown> {
   if (node.backend !== undefined) nodeJson.backend = node.backend;
   if (node.model !== undefined) nodeJson.model = node.model;
   if (node.capabilities !== undefined) nodeJson.capabilities = [...node.capabilities];
+  if (node.execution !== undefined) {
+    nodeJson.execution = {
+      kind: 'script',
+      interpreter: node.execution.interpreter,
+      file: node.execution.file,
+      args: [...node.execution.args],
+      onFailure: node.execution.onFailure,
+    };
+  }
   return nodeJson;
 }
 
