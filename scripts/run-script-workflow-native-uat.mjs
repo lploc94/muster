@@ -21,8 +21,12 @@ const hostResultOut = path.join(tempDir, 'host-result.json');
 
 function boundedReason(error) {
   return (error instanceof Error ? error.message : String(error))
+    // UNC first: `\\host\share\...` would otherwise survive the drive-letter pass.
+    .replace(/\\\\[^\s)]+/g, '<redacted-path>')
     .replace(/[A-Za-z]:[\\/][^\s)]+/g, '<redacted-path>')
-    .replace(/(?:\/Users\/|\/home\/|\/tmp\/)[^\s)]+/g, '<redacted-path>')
+    // Any absolute POSIX path, not just /Users, /home and /tmp: macOS uses
+    // /private/var for temp dirs and containers use /workspaces and /opt.
+    .replace(/\/[A-Za-z0-9._-]+(?:\/[^\s)]*)+/g, '<redacted-path>')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 500);

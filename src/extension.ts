@@ -5277,7 +5277,11 @@ function registerLiveUatCommands(
       const { repository, workspaceId } = requireRepo();
       if (!taskEngine) throw new Error('UAT task engine unavailable');
       const configuration = vscode.workspace.getConfiguration('muster');
-      const originalHostRun = configuration.get<boolean>('verification.hostRun', false);
+      // Capture the *workspace-scoped* override, not the effective value. Writing the
+      // effective boolean back at Workspace scope would pin a new override whenever the
+      // setting came from user/default scope, silently shadowing later user changes.
+      const originalWorkspaceHostRun =
+        configuration.inspect<boolean>('verification.hostRun')?.workspaceValue;
       try {
         return await runScriptWorkflowUatFixture({
           engine: taskEngine,
@@ -5294,9 +5298,10 @@ function registerLiveUatCommands(
           },
         });
       } finally {
+        // `undefined` removes the override, restoring the original scope precedence.
         await configuration.update(
           'verification.hostRun',
-          originalHostRun,
+          originalWorkspaceHostRun,
           vscode.ConfigurationTarget.Workspace,
         );
       }

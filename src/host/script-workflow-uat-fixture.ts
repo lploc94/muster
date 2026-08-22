@@ -193,7 +193,10 @@ export async function runScriptWorkflowUatFixture(
     writeFile(workspaceSaved, markdown('workspace native QA', 'Workspace native QA body'), 'utf8'),
     writeFile(invalidSaved, 'invalid workflow without frontmatter', 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-produce.js'), [
-      "process.stdout.write('native-alpha\\n|a;$(literal)');",
+      // The metacharacter arrives as argv, so the assertion below proves the executor
+      // passes args literally with no shell expansion. Hard-coding it in the output
+      // would have passed without argv ever being exercised.
+      "process.stdout.write('native-alpha\\n|' + process.argv[2]);",
       "process.stderr.write('native diagnostic');",
       'process.exitCode = 3;',
     ].join('\n'), 'utf8'),
@@ -256,6 +259,10 @@ export async function runScriptWorkflowUatFixture(
           script: {
             interpreter: 'node',
             file: 'native-produce.js',
+            // Shell metacharacters as a real argv entry: the producer echoes
+            // `process.argv[2]`, so the downstream assertion fails if the executor
+            // ever expands or re-quotes an argument.
+            args: ['a;$(literal)'],
             onFailure: 'continue',
           },
         },
@@ -281,6 +288,20 @@ export async function runScriptWorkflowUatFixture(
       dataflowStart,
     );
     assertQa(!denied.ok && /host_run_disabled/.test(denied.error), 'disabled hostRun did not deny start');
+    // The error string alone would also appear if the run had been created and then
+    // rejected downstream. Denial must leave no run, no node and no materialized task.
+    const deniedRuns = await deps.client.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workflow_runs
+        WHERE workspace_id = ? AND definition_id = ?`,
+      [deps.workspaceId, dataflowDefinition.definitionId],
+    );
+    assertQa(deniedRuns?.count === 0, 'denied start persisted a workflow run');
+    const deniedTasks = await deps.client.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM tasks
+        WHERE workspace_id = ? AND parent_id = ? AND id != ?`,
+      [deps.workspaceId, rootId, rootId],
+    );
+    assertQa(deniedTasks?.count === 0, 'denied start materialized a node task');
 
     await deps.setHostRun(true);
     const dataflowResult = await invoke(
