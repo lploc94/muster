@@ -423,8 +423,10 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
     }
     const interpreter = script.interpreter;
     const file = script.file;
-    const args = script.args ?? [];
-    const onFailure = script.onFailure ?? 'fail_run';
+    // Default only when the property is absent: the MCP schema permits an array and an
+    // enum string, so an explicit `null` is a contract violation, not an omission.
+    const args = 'args' in script ? script.args : [];
+    const onFailure = 'onFailure' in script ? script.onFailure : 'fail_run';
     if (
       (interpreter !== 'node' && interpreter !== 'python' && interpreter !== 'python3') ||
       !isValidWorkflowScriptFile(file, interpreter) ||
