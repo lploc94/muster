@@ -91,3 +91,9 @@ playwright-report/
 
 # ── GSD baseline (auto-generated) ──
 .vscode/
+
+# Per-user Claude settings (machine-local paths and permissions)
+.claude/settings.local.json
+
+# Per-user agent routing rules (personal skill installs)
+CLAUDE.md

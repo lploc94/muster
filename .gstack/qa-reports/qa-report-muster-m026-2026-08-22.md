@@ -80,8 +80,12 @@ if (
 ```
 
 Verification: regression assertion added at the existing terminal-failure site in
-`src/task/m018-s07-workflow-status-projection.test.ts`. Test failed before the fix
-(`expected undefined to be 'failed'` once the fixture owner root was bound), passes after.
+`src/task/m018-s07-workflow-status-projection.test.ts`. Re-checked by reverting only the
+`repository.ts` diagnostic and re-running the test: it fails with
+`AssertionError: expected [] to deep equally contain { code: 'terminal_run_has_live_node' }`
+and passes with the diagnostic restored. (An earlier revision of this report quoted
+`expected undefined to be 'failed'`, which came from the fixture's owner-root binding, not
+from the diagnostic under test.)
 
 Commit `c01032d`.
 
