@@ -14,6 +14,46 @@ export const WORKFLOW_GRAPH_MAX_NODES = 64;
 export const WORKFLOW_GRAPH_MAX_EDGES = 128;
 export const WORKFLOW_ENTRY_CONTRACTS_MAX = 128;
 export const WORKFLOW_CHILD_BINDINGS_MAX = 64;
+export const WORKFLOW_SCRIPT_FILE_MAX_LENGTH = 1_024;
+export const WORKFLOW_SCRIPT_MAX_ARGS = 64;
+export const WORKFLOW_SCRIPT_ARG_MAX_LENGTH = 4_096;
+
+export type ScriptInterpreter = 'node' | 'python' | 'python3';
+export type ScriptOnFailure = 'fail_run' | 'continue';
+
+/** Conservative, platform-independent validation before the runtime realpath check. */
+export function isValidWorkflowScriptFile(
+  file: unknown,
+  interpreter: ScriptInterpreter,
+): file is string {
+  if (
+    typeof file !== 'string' ||
+    file.length === 0 ||
+    file.length > WORKFLOW_SCRIPT_FILE_MAX_LENGTH ||
+    /[\0\r\n]/.test(file)
+  ) return false;
+  const portable = file.replace(/\\/g, '/');
+  if (
+    portable.startsWith('/') ||
+    /^[A-Za-z]:/.test(portable) ||
+    portable.split('/').some((segment) => segment === '..')
+  ) return false;
+  const lower = portable.toLowerCase();
+  return interpreter === 'node'
+    ? lower.endsWith('.js') || lower.endsWith('.cjs') || lower.endsWith('.mjs')
+    : lower.endsWith('.py');
+}
+
+/** Frozen local-process execution contract for one deterministic workflow node. */
+export interface ScriptExecutionSpecV1 {
+  kind: 'script';
+  interpreter: ScriptInterpreter;
+  /** Workspace-relative path. Runtime containment is checked again immediately before spawn. */
+  file: string;
+  /** Exact argv values after the script path; never parsed as a shell string. */
+  args: readonly string[];
+  onFailure: ScriptOnFailure;
+}
 
 /** A single ordinary workflow node (entry + only node for one_node_v1). */
 export interface WorkflowNodeSpecV1 {
@@ -31,6 +71,8 @@ export interface WorkflowNodeSpecV1 {
   model?: string;
   /** Host-issued task capabilities required by this node. */
   capabilities?: readonly string[];
+  /** Absent means the historical ACP-agent execution path. */
+  execution?: ScriptExecutionSpecV1;
 }
 
 /**

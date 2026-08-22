@@ -1062,6 +1062,7 @@ export class TaskEngine {
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
       isWorkspaceTrusted: () => this.isWorkspaceTrusted(),
+      allowLocalExecution: () => this.resolveAllowHostVerification(),
       getHostEnvironment: this.getHostEnvironment
         ? () => this.getHostEnvironment!()
         : undefined,
@@ -2027,6 +2028,7 @@ export class TaskEngine {
   }
 
   private configuredRuntimeFallbacks(task: MusterTask): RuntimeFallbackBinding[] {
+    if (task.execution?.kind === 'script') return [];
     let configured: readonly RuntimeFallbackBinding[] = [];
     try {
       configured = this.getRuntimeFallbacks?.(task) ?? [];
@@ -4527,6 +4529,7 @@ export class TaskEngine {
     } | undefined;
     let currentReasoning: (PersistedReasoning & { sourceMessageId: string }) | undefined;
     const streamedTools = new Map<string, PersistedToolCall>();
+    let scriptProcessResult: Extract<NormalizedEvent, { type: 'processCompleted' }> | undefined;
     let mcpConfigPath: string | undefined;
 
     try {
@@ -4540,6 +4543,7 @@ export class TaskEngine {
           observedSessionId,
           rawOutput,
           backend,
+          { suppressAutoRetry: taskForDispatch.execution?.kind === 'script', suppressRuntimeFallback: taskForDispatch.execution?.kind === 'script' },
         );
         if (terminalSettled) {
           this.emitFailureSettlement(
@@ -4554,6 +4558,25 @@ export class TaskEngine {
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
       const prompt = projectPrompt(currentTurn, messages, current, this.getResourceLimits().maxResultBytes);
+      const scriptExecution = taskForDispatch.execution?.kind === 'script'
+        ? taskForDispatch.execution
+        : undefined;
+      const scriptContext = scriptExecution
+        ? await this.repository.getWorkflowExecutionContext(turnId)
+        : undefined;
+      if (scriptExecution && !scriptContext) {
+        const message = 'script workflow inputs are unavailable';
+        terminalSettled = await this.settleFailed(
+          turnId,
+          message,
+          observedSessionId,
+          rawOutput,
+          backend,
+          { suppressAutoRetry: true, suppressRuntimeFallback: true },
+        );
+        if (terminalSettled) this.emitFailureSettlement(startedTurn.taskId, turnId, message);
+        return;
+      }
       this.logLifecycle('turn.started', {
         taskId: taskForDispatch.id,
         turnId,
@@ -4570,18 +4593,45 @@ export class TaskEngine {
       // MCP-enabled turns: optional readiness supervisor + multi-attempt mcpSetup
       // (M017-S06 / D037). prepareAttempt allocates attemptId + remints credentials;
       // awaitReady polls tools/list evidence before onBeforePrompt / prompt.
-      const mcpEnabled = this.bridgePort > 0 && !!this.credentialRegistry;
+      const mcpEnabled = !scriptExecution && this.bridgePort > 0 && !!this.credentialRegistry;
       let attemptId: string | undefined;
-      const baseRun = {
-        input: { kind: 'agent' as const, prompt },
-        resumeId: taskForDispatch.committedSessionId,
-        signal: abort.signal,
-        // Run the agent in the task's workspace directory so ACP adapters
-        // pass it as session/new|load { cwd } instead of falling back to
-        // process.cwd() (wrong dir in a packaged extension).
-        cwd: taskForDispatch.cwd,
-        model: taskForDispatch.model,
-      };
+      const executionCwd = taskForDispatch.cwd ?? this.workspaceFolder;
+      const remainingMs = currentTurn ? remainingRunTimeMs(currentTurn) : undefined;
+      const baseRun: RunOptions = scriptExecution && scriptContext
+        ? {
+            input: {
+              kind: 'script',
+              interpreter: scriptExecution.interpreter,
+              file: scriptExecution.file,
+              args: scriptExecution.args,
+              stdin: JSON.stringify(Object.fromEntries(scriptContext.inputs.map((input) => [
+                input.inputRef,
+                {
+                  value: input.value,
+                  kind: input.artifactKind,
+                  ...(input.exitCode !== undefined ? { exitCode: input.exitCode } : {}),
+                },
+              ]))),
+            },
+            signal: abort.signal,
+            cwd: executionCwd,
+            localExecution: {
+              authorize: () => this.resolveAllowHostVerification() && this.isWorkspaceTrusted(),
+              timeoutMs: remainingMs ?? taskForDispatch.executionPolicy.runTimeoutOverrideMs ?? DEFAULT_RUN_LIMIT_MS,
+              maxStdoutBytes: scriptContext.maxArtifactBytes,
+              maxStderrBytes: this.getResourceLimits().maxErrorBytes,
+            },
+          }
+        : {
+            input: { kind: 'agent', prompt },
+            resumeId: taskForDispatch.committedSessionId,
+            signal: abort.signal,
+            // Run the agent in the task's workspace directory so ACP adapters
+            // pass it as session/new|load { cwd } instead of falling back to
+            // process.cwd() (wrong dir in a packaged extension).
+            cwd: executionCwd,
+            model: taskForDispatch.model,
+          };
       // Provisional attempt mint so mcpServers array exists for in-place remint.
       if (mcpEnabled) {
         attemptId = randomBytes(8).toString('hex');
@@ -5204,6 +5254,25 @@ export class TaskEngine {
             }
             break;
           }
+          case 'processCompleted': {
+            scriptProcessResult = event;
+            const diagnostic = await this.replaceLiveTurn(turnId, (current) => ({
+              ...current,
+              executionResult: {
+                kind: 'script',
+                exitCode: event.exitCode,
+                stderr: event.stderr,
+              },
+            }));
+            if (!diagnostic.ok) {
+              await markStreamPersistenceFailure(
+                diagnostic.reason ?? 'failed to persist script process result',
+              );
+              break;
+            }
+            this.safeEmit({ type: 'event', taskId: turn.taskId, turnId, event });
+            break;
+          }
           case 'raw':
             rawOutput += `${event.line}\n`;
             break;
@@ -5212,6 +5281,57 @@ export class TaskEngine {
             if (!preDone.ok) {
               await markStreamPersistenceFailure(preDone.message);
               break;
+            }
+            if (scriptExecution) {
+              if (!scriptProcessResult) {
+                const message = 'script executor ended without a process result';
+                terminalSettled = await this.settleFailed(
+                  turnId, message, observedSessionId, rawOutput, backend,
+                  { suppressAutoRetry: true, suppressRuntimeFallback: true },
+                );
+                if (terminalSettled) this.emitFailureSettlement(turn.taskId, turnId, message);
+                break;
+              }
+              const state = this.store.getFile();
+              const liveTurn = state.turns[turnId];
+              let rootId = liveTurn?.taskId ?? turn.taskId;
+              const seen = new Set<string>();
+              while (state.tasks[rootId]?.parentId && !seen.has(rootId)) {
+                seen.add(rootId);
+                rootId = state.tasks[rootId]!.parentId!;
+              }
+              const continueRun = scriptProcessResult.exitCode === 0 || scriptExecution.onFailure === 'continue';
+              const staged = await executeToolCommand(
+                this.graphDeps(),
+                {
+                  callerTaskId: liveTurn?.taskId ?? turn.taskId,
+                  turnId,
+                  rootId,
+                  allowedActions: new Set([continueRun ? 'workflow_next' : 'workflow_fail']),
+                },
+                continueRun
+                  ? {
+                      kind: 'workflow_next',
+                      opId: 'engine-script-workflow-next',
+                      change: 'updated',
+                      message: scriptProcessResult.stdout,
+                      execution: { kind: 'script', exitCode: scriptProcessResult.exitCode },
+                    }
+                  : {
+                      kind: 'workflow_fail',
+                      opId: 'engine-script-workflow-fail',
+                      reason: `script exited with code ${scriptProcessResult.exitCode}`,
+                    },
+              );
+              if (!staged.ok) {
+                const message = `script workflow settlement failed: ${staged.error}`;
+                terminalSettled = await this.settleFailed(
+                  turnId, message, observedSessionId, rawOutput, backend,
+                  { suppressAutoRetry: true, suppressRuntimeFallback: true },
+                );
+                if (terminalSettled) this.emitFailureSettlement(turn.taskId, turnId, message);
+                break;
+              }
             }
             const successOutcome = await this.settleSuccess(
               turnId,
@@ -5239,6 +5359,7 @@ export class TaskEngine {
                       terminalReceived: true,
                       failureClass: 'terminal_received',
                       suppressAutoRetry: true,
+                      suppressRuntimeFallback: scriptExecution !== undefined,
                     },
               );
               if (terminalSettled) {
@@ -5347,6 +5468,7 @@ export class TaskEngine {
                   failureClass,
                   suppressAutoRetry: mcpSetupExhausted,
                   mcpSetupExhausted,
+                  suppressRuntimeFallback: scriptExecution !== undefined,
                 },
               );
               if (terminalSettled) {

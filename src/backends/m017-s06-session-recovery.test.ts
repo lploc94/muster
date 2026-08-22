@@ -264,7 +264,7 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
     const pumpA = (async () => {
       const events: NormalizedEvent[] = [];
       for await (const ev of backendA.run({
-        prompt: 'A setup fail',
+        input: { kind: 'agent', prompt: 'A setup fail' },
         mcpSetup: {
           maxAttempts: 2,
           prepareAttempt: () => undefined,
@@ -287,7 +287,7 @@ describe('Pre-dispatch ACP session recovery (M017-S06 / D037)', () => {
     // B: no mcpSetup — streams normally on same process.
     const pumpB = (async () => {
       const events: NormalizedEvent[] = [];
-      for await (const ev of backendB.run({ prompt: 'B streams' })) {
+      for await (const ev of backendB.run({ input: { kind: 'agent', prompt: 'B streams' } })) {
         events.push(ev);
       }
       return events;

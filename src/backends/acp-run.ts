@@ -5,7 +5,6 @@ import {
   McpSetupPrepareResult,
   McpSetupRecoveryMode,
   NormalizedEvent,
-  RunInput,
   RunOptions,
   ToolFileChange,
 } from '../types';
@@ -24,17 +23,6 @@ function redactSetupMessage(message: string): string {
     .replace(/Bearer\s+\S+/gi, 'Bearer [REDACTED]')
     .replace(/MUSTER_BRIDGE_TOKEN[=:]\S*/gi, 'MUSTER_BRIDGE_TOKEN=[REDACTED]')
     .replace(/Authorization:\s*\S+/gi, 'Authorization: [REDACTED]');
-}
-
-/**
- * M026: extract the agent prompt from a run input. An ACP adapter that receives
- * a script input is a routing bug — fail loudly rather than prompting with ''.
- */
-function promptTextOf(input: RunInput): string {
-  if (input.kind !== 'agent') {
-    throw new Error('acp backend received a script run input');
-  }
-  return input.prompt;
 }
 
 /**
@@ -361,6 +349,11 @@ export async function* runAcpTurn(
   spec: AcpAdapterSpec,
   options: RunOptions,
 ): AsyncIterable<NormalizedEvent> {
+  if (options.input.kind !== 'agent') {
+    yield { type: 'error', message: 'acp backend received a script run input' };
+    return;
+  }
+  const initialPrompt = options.input.prompt;
   const messageId = randomUUID();
   const cwd = options.cwd || process.cwd();
   const mcpServers = options.mcpServers ?? [];
@@ -631,7 +624,7 @@ export async function* runAcpTurn(
         return;
       }
 
-      yield* drainPrompt(activeSessionId, promptTextOf(options.input));
+      yield* drainPrompt(activeSessionId, initialPrompt);
       return;
     }
 
@@ -640,7 +633,7 @@ export async function* runAcpTurn(
     const maxAttempts = Math.max(1, Math.min(2, mcpSetup.maxAttempts ?? 2));
     let forceFreshSession = false;
     let previousFailure: { code: string; message: string } | undefined;
-    let activePrompt = promptTextOf(options.input);
+    let activePrompt = initialPrompt;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       if (isAborted()) {

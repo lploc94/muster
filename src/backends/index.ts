@@ -1,11 +1,11 @@
 import type { Backend } from '../types';
-import { ACP_EXECUTOR_FAMILY, resolveExecutor } from './executor-registry';
+import { ACP_EXECUTOR_IDS, resolveExecutor } from './executor-registry';
 
 /**
  * Agent-only backend IDs. Derived from the ACP family so registering another
  * executor family cannot silently widen this closed surface.
  */
-export const BACKEND_IDS = ACP_EXECUTOR_FAMILY.executorIds;
+export const BACKEND_IDS = ACP_EXECUTOR_IDS;
 export type BackendId = (typeof BACKEND_IDS)[number];
 
 export function isKnownBackendId(name: string): name is BackendId {

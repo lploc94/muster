@@ -13,7 +13,7 @@
  */
 
 import { spawnSync } from 'child_process';
-import { basename } from 'path';
+import { validateAllowlistedExecutable } from '../shared/executable-policy';
 import type { TaskVerdict, VerdictEvidence, VerdictStatus } from './types';
 import {
   computeSourceRevision,
@@ -44,7 +44,8 @@ const SHELL_METACHARACTERS = /[;|&$`<>(){}\n\r]/;
 const CONTROL_CHARACTERS = /[\x00-\x1f\x7f]/;
 
 /**
- * Allowlist of known verification runners, matched against `basename(argv[0])`.
+ * Allowlist of known verification runners, matched against a normalized bare
+ * executable name.
  * A command whose executable is NOT one of these is NEVER executed (recorded as fail
  * evidence). This is the second layer of defense on top of the host-authorization
  * flag: even a workspace-trusted, host-authorized run may only invoke vetted runners.
@@ -74,24 +75,6 @@ export const VERIFICATION_EXECUTABLE_ALLOWLIST: ReadonlySet<string> = new Set([
   'deno',
   'bun',
 ]);
-
-/** Normalize argv[0] to a bare, lowercased executable name for allowlist matching. */
-function executableName(arg0: string): string {
-  return basename(arg0).toLowerCase().replace(/\.(exe|cmd|bat)$/, '');
-}
-
-/**
- * Shape of an acceptable BARE executable name (argv[0]). A POSITIVE allowlist-shape
- * check: argv[0] must be exactly one bare token — a leading alphanumeric followed by
- * alphanumerics, `.`, `_`, or `-`. This inherently REJECTS any path separator (`/` or
- * `\`), a leading `.` (`./npm`, `.hidden`), whitespace, AND a drive/colon token such as
- * `C:npm` — a Windows drive-relative form that has no separator, does not start with
- * `.`, and is NOT `path.isAbsolute()`, so it slipped past the old separator blocklist and
- * would resolve to an attacker-planted binary on drive C:. Only a bare name is ever
- * matched against the allowlist and spawned (spawnSync resolves it via PATH); anything
- * that fails this shape is recorded as fail evidence and never executed.
- */
-const BARE_EXECUTABLE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface SanitizedCommand {
   ok: boolean;
@@ -128,20 +111,8 @@ export function sanitizeVerificationCommand(cmd: string): SanitizedCommand {
   // a Windows drive-relative token like `C:npm` (no separator, not path.isAbsolute())
   // that the old blocklist let through. Only a bare name reaches the allowlist below,
   // closing the basename-spoof hole (`./npm` / `/tmp/npm` / `C:npm`).
-  if (!BARE_EXECUTABLE_NAME.test(argv[0])) {
-    return {
-      ok: false,
-      argv: [],
-      reason: `executable must be a bare name (no path component): ${argv[0]}`,
-    };
-  }
-  if (!VERIFICATION_EXECUTABLE_ALLOWLIST.has(executableName(argv[0]))) {
-    return {
-      ok: false,
-      argv: [],
-      reason: `executable not allowlisted: ${executableName(argv[0])}`,
-    };
-  }
+  const executable = validateAllowlistedExecutable(argv[0], VERIFICATION_EXECUTABLE_ALLOWLIST);
+  if (!executable.ok) return { ok: false, argv: [], reason: executable.reason };
   return { ok: true, argv };
 }
 

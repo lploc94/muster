@@ -165,6 +165,7 @@ import {
   type WorkflowGraphProbeCoordinator,
 } from './host/workflow-graph-probe';
 import { seedWorkflowGraphFixture } from './host/workflow-graph-uat-fixture';
+import { runScriptWorkflowUatFixture } from './host/script-workflow-uat-fixture';
 import { buildWorkflowGraphView } from './host/workflow-graph';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
@@ -5272,6 +5273,34 @@ function registerLiveUatCommands(
         return uatChatProvider.observeWorkflowGraphRoundTripForUat(taskId);
       },
     ),
+    vscode.commands.registerCommand(UAT_COMMANDS.runScriptWorkflowQa, async () => {
+      const { repository, workspaceId } = requireRepo();
+      if (!taskEngine) throw new Error('UAT task engine unavailable');
+      const configuration = vscode.workspace.getConfiguration('muster');
+      const originalHostRun = configuration.get<boolean>('verification.hostRun', false);
+      try {
+        return await runScriptWorkflowUatFixture({
+          engine: taskEngine,
+          repository,
+          client: requireClient(),
+          workspaceId,
+          workspaceFolder: resolveTaskCwd(),
+          setHostRun: async (enabled) => {
+            await configuration.update(
+              'verification.hostRun',
+              enabled,
+              vscode.ConfigurationTarget.Workspace,
+            );
+          },
+        });
+      } finally {
+        await configuration.update(
+          'verification.hostRun',
+          originalHostRun,
+          vscode.ConfigurationTarget.Workspace,
+        );
+      }
+    }),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
       if (!uatChatProvider) throw new Error('UAT chat provider unavailable');
