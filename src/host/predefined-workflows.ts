@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { open, opendir } from 'node:fs/promises';
 
 export const PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE = 128;
 export const PREDEFINED_WORKFLOW_MAX_FILE_BYTES = 256 * 1024;
@@ -41,6 +41,19 @@ interface CatalogEntry extends PredefinedWorkflowDocument {
 function boundedFileLabel(file: string): string {
   return basename(file).replace(/[\x00-\x1f\x7f]/g, '').slice(0, 160) || '(unnamed)';
 }
+
+/**
+ * Filesystem errors embed the absolute path in their message. The catalog contract
+ * keeps list/get responses free of host paths, so I/O failures collapse to a fixed
+ * label and only parser reasons (which never see a path) pass through verbatim.
+ */
+function boundedDiagnosticMessage(error: unknown): string {
+  if (error instanceof CatalogFileError) return error.message.slice(0, 240);
+  return 'unable to read workflow file';
+}
+
+/** Marker for catalog rejections whose message is authored here, not by Node. */
+class CatalogFileError extends Error {}
 
 function stripSymmetricQuotes(value: string): string {
   if (value.length >= 2 && (
@@ -99,32 +112,66 @@ async function scanScope(
   folder: string,
   scope: PredefinedWorkflowScope,
 ): Promise<{ entries: CatalogEntry[]; diagnostics: PredefinedWorkflowDiagnostic[] }> {
-  let dirents;
+  const diagnostics: PredefinedWorkflowDiagnostic[] = [];
+  const entries: CatalogEntry[] = [];
+  // Stream the directory instead of materializing every dirent: a very large
+  // `.muster/workflow` would otherwise allocate the whole listing in the extension
+  // host before the per-scope bound is ever applied.
+  const files: string[] = [];
+  let truncated = false;
   try {
-    dirents = await readdir(folder, { withFileTypes: true });
+    const dir = await opendir(folder);
+    try {
+      for await (const entry of dir) {
+        if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue;
+        if (files.length >= PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE) {
+          truncated = true;
+          break;
+        }
+        files.push(entry.name);
+      }
+    } finally {
+      // Breaking out of `for await` closes the handle; closing twice is not an error
+      // worth surfacing.
+      await dir.close().catch(() => undefined);
+    }
   } catch {
     return { entries: [], diagnostics: [] };
   }
-  const diagnostics: PredefinedWorkflowDiagnostic[] = [];
-  const entries: CatalogEntry[] = [];
-  const files = dirents
-    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
-    .map((entry) => entry.name)
-    .sort((left, right) => left.localeCompare(right))
-    .slice(0, PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE);
+  if (truncated) {
+    diagnostics.push({
+      file: '(scope)',
+      code: 'scope_truncated',
+      message: `more than ${PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE} workflow files in ${scope} scope; later files ignored`,
+    });
+  }
+  // Byte-wise order so the same catalog resolves duplicates identically on every
+  // host: `localeCompare` varies with the active locale.
+  files.sort((left, right) => (left < right ? -1 : left > right ? 1 : 0));
   for (const file of files) {
     const fullPath = join(folder, file);
     try {
-      const info = await stat(fullPath);
-      if (!info.isFile() || info.size > PREDEFINED_WORKFLOW_MAX_FILE_BYTES) {
-        throw new Error('file exceeds the catalog size limit');
-      }
-      const content = await readFile(fullPath);
-      if (content.length > PREDEFINED_WORKFLOW_MAX_FILE_BYTES) {
-        throw new Error('file exceeds the catalog size limit');
+      const handle = await open(fullPath, 'r');
+      let content: Buffer;
+      try {
+        const info = await handle.stat();
+        if (!info.isFile()) throw new CatalogFileError('not a regular file');
+        if (info.size > PREDEFINED_WORKFLOW_MAX_FILE_BYTES) {
+          throw new CatalogFileError('file exceeds the catalog size limit');
+        }
+        // Read one byte past the bound from the same handle that was stat'd, so a
+        // file growing between stat and read is rejected rather than allocated whole.
+        const buffer = Buffer.allocUnsafe(PREDEFINED_WORKFLOW_MAX_FILE_BYTES + 1);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        if (bytesRead > PREDEFINED_WORKFLOW_MAX_FILE_BYTES) {
+          throw new CatalogFileError('file exceeds the catalog size limit');
+        }
+        content = Buffer.from(buffer.subarray(0, bytesRead));
+      } finally {
+        await handle.close().catch(() => undefined);
       }
       const parsed = parsePredefinedWorkflowMarkdown(content.toString('utf8'));
-      if (!parsed.ok) throw new Error(parsed.reason);
+      if (!parsed.ok) throw new CatalogFileError(parsed.reason);
       entries.push({
         workflowRef: workflowRef(scope, file, content),
         name: parsed.name,
@@ -140,7 +187,7 @@ async function scanScope(
         diagnostics.push({
           file: boundedFileLabel(file),
           code: 'invalid_workflow_file',
-          message: (error instanceof Error ? error.message : 'unable to read workflow file').slice(0, 240),
+          message: boundedDiagnosticMessage(error),
         });
       }
     }
