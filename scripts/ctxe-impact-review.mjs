@@ -234,35 +234,102 @@ function changedFiles(base, head) {
   return out.split('\n').map((l) => l.trim()).filter((l) => l && SOURCE_RE.test(l));
 }
 
+/** Declaration shapes whose dependents are meaningful across module boundaries. */
+const EXPORT_DECLARATION_PATTERNS = [
+  /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,
+  /^export\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/,
+  /^export\s+(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)/,
+  /^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/,
+  /^export\s+default\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,
+];
+
+function matchExportedName(line) {
+  for (const re of EXPORT_DECLARATION_PATTERNS) {
+    const m = line.match(re);
+    if (m?.[1] && m[1].length > 2 && !RESERVED.has(m[1])) return m[1];
+  }
+  return null;
+}
+
+/** Head-side line ranges touched per file, read from `-U0` hunk headers. */
+function changedLineRanges(base, head, files) {
+  const diff = git(['diff', '-U0', `${base}..${head}`, '--', ...files]);
+  const perFile = new Map();
+  let current = null;
+  for (const raw of diff.split('\n')) {
+    const fileHeader = raw.match(/^\+\+\+ (?:b\/)?(.+)$/);
+    if (fileHeader) {
+      current = fileHeader[1] === '/dev/null' ? null : fileHeader[1];
+      if (current && !perFile.has(current)) perFile.set(current, []);
+      continue;
+    }
+    const hunk = raw.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/);
+    if (!hunk || !current) continue;
+    const start = Number(hunk[1]);
+    const count = hunk[2] === undefined ? 1 : Number(hunk[2]);
+    // count === 0 is a pure deletion: the removed body belongs to whatever
+    // definition surrounds the gap, so probe both sides of it.
+    perFile.get(current).push(
+      count === 0 ? [Math.max(1, start), Math.max(1, start) + 1] : [start, start + count - 1],
+    );
+  }
+  return perFile;
+}
+
 /**
- * Extract candidate symbol names from added/removed lines of the diff.
+ * Top-level exported declarations with the line span each one owns. A declaration
+ * runs until the next top-level export, which is coarse but never misses a body.
+ */
+function exportedDeclarations(content) {
+  const lines = content.split('\n');
+  const decls = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    // Column 0 only: nested `export` inside a namespace is not a module boundary.
+    if (!lines[i].startsWith('export')) continue;
+    const symbol = matchExportedName(lines[i]);
+    if (symbol) decls.push({ symbol, start: i + 1, end: lines.length });
+  }
+  for (let i = 0; i + 1 < decls.length; i += 1) decls[i].end = decls[i + 1].start - 1;
+  return decls;
+}
+
+/**
+ * Symbols whose dependents need review.
  *
- * Only `export`-ed declarations are considered. An earlier version also matched
- * bare `const`/`let` and method-shaped lines, which produced local names like
- * `pending`, `current`, `index` and `base`. Those resolve against unrelated
- * definitions all over the repo and saturated every impact query, so the whole
- * report became noise. Exported names are the only ones whose dependents are
- * meaningful across module boundaries.
+ * Two sources, because a declaration line and a changed body are different events:
+ *   1. Added/removed `export` lines — new, renamed and deleted exports.
+ *   2. Every changed hunk mapped back to its enclosing exported declaration. Editing
+ *      the body of an existing export leaves its declaration line untouched, so
+ *      pattern-matching diff lines alone reported "no symbols" and passed silently.
+ *
+ * Only exported names are considered. Bare `const`/`let` and method-shaped lines
+ * produced locals like `pending`, `current` and `index`, which resolve against
+ * unrelated definitions repo-wide and saturated every impact query.
  */
 function changedSymbols(base, head, files) {
   if (files.length === 0) return [];
-  const diff = git(['diff', '-U0', `${base}..${head}`, '--', ...files]);
   const symbols = new Set();
-  const patterns = [
-    /^export\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,
-    /^export\s+(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)/,
-    /^export\s+(?:interface|type|enum)\s+([A-Za-z_$][\w$]*)/,
-    /^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/,
-    /^export\s+default\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/,
-  ];
+
+  const diff = git(['diff', '-U0', `${base}..${head}`, '--', ...files]);
   for (const raw of diff.split('\n')) {
     if (!/^[+-]/.test(raw) || /^(\+\+\+|---)/.test(raw)) continue;
-    const line = raw.slice(1).trim();
-    for (const re of patterns) {
-      const m = line.match(re);
-      if (m?.[1] && m[1].length > 2 && !RESERVED.has(m[1])) {
-        symbols.add(m[1]);
-        break;
+    const symbol = matchExportedName(raw.slice(1).trim());
+    if (symbol) symbols.add(symbol);
+  }
+
+  for (const [file, ranges] of changedLineRanges(base, head, files)) {
+    if (ranges.length === 0) continue;
+    let content;
+    try {
+      content = git(['show', `${head}:${file}`]);
+    } catch {
+      // Deleted at head; its removed declaration lines are already covered above.
+      continue;
+    }
+    const decls = exportedDeclarations(content);
+    for (const [from, to] of ranges) {
+      for (const decl of decls) {
+        if (decl.start <= to && decl.end >= from) symbols.add(decl.symbol);
       }
     }
   }
@@ -348,18 +415,18 @@ async function main() {
     const allDependentIds = new Set();
     const notResolvedAsDefinition = [];
 
-    // ctxe returns a chunk per site that mentions the name, including `import`
-    // lines and same-named interface fields in unrelated scripts. Those are not
-    // definitions: their dependents describe the mentioning file's own coupling
-    // and produced badly misleading hop-1 results. Only declaration-shaped
-    // chunks in non-script files are treated as authoritative.
+    // ctxe returns a chunk per site that mentions the name, including `import` lines
+    // and same-named interface fields in unrelated files. Those define nothing, so
+    // their dependents describe the mentioning file's own coupling and produced badly
+    // misleading hop-1 results. Only declaration-shaped chunks count.
     for (const def of defs.definitions ?? []) {
-      const candidates = (def.chunks ?? []).filter(
-        (c) =>
-          DEFINITION_SYMBOL_TYPES.has(c.symbol_type) &&
-          !NON_PRODUCTION_RE.test(normalizePath(c.file_path) ?? ''),
+      const declarations = (def.chunks ?? []).filter(
+        (c) => DEFINITION_SYMBOL_TYPES.has(c.symbol_type),
       );
-      const chosen = candidates.length > 0 ? candidates : (def.chunks ?? []).filter((c) => DEFINITION_SYMBOL_TYPES.has(c.symbol_type));
+      // The name came from this diff, so only declarations inside the changed files are
+      // under review. A same-named export elsewhere in the repo has its own dependents,
+      // and reporting them attributes impact this change never caused.
+      const chosen = declarations.filter((c) => changedSet.has(normalizePath(c.file_path) ?? ''));
       if (chosen.length === 0) {
         notResolvedAsDefinition.push(def.symbol);
         continue;
@@ -435,8 +502,13 @@ async function main() {
     );
 
     const flagged = symbolReports.filter((s) => s.untouchedProductionDependents.length > 0);
+    // A symbol the index cannot resolve to a changed definition was never analysed.
+    // Renames and deletions land here routinely, so treating them as clean would
+    // report a pass for dependents nothing ever looked at.
+    const unanalysed = [...new Set([...(defs.not_found ?? []), ...notResolvedAsDefinition])].sort();
     const report = {
-      ok: flagged.length === 0,
+      ok: flagged.length === 0 && unanalysed.length === 0,
+      complete: unanalysed.length === 0,
       kind: 'ctxe-impact-review',
       schemaVersion: 1,
       generatedAt: new Date().toISOString(),
@@ -448,16 +520,18 @@ async function main() {
         candidateSymbols: symbols.length,
         resolvedSymbols: symbolReports.length,
         unresolvedSymbols: (defs.not_found ?? []).length,
+        unanalysedSymbols: unanalysed.length,
         flaggedSymbols: flagged.length,
         saturatedSymbols: symbolReports.filter((s) => s.impactSaturated).length,
       },
       unresolvedSymbols: defs.not_found ?? [],
       mentionOnlySymbols: notResolvedAsDefinition,
+      unanalysedSymbols: unanalysed,
       symbols: symbolReports,
     };
 
-    finish(opts, report);
-    return flagged.length === 0 ? 0 : 1;
+    await finish(opts, report);
+    return report.ok ? 0 : 1;
   } finally {
     await mcp.stop();
   }
@@ -471,18 +545,31 @@ function normalizePath(p) {
 function emptyReport(opts, baseSha, headSha, reason) {
   return {
     ok: true,
+    complete: true,
     kind: 'ctxe-impact-review',
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
     workspace: WORKSPACE,
     diff: { base: opts.base, baseSha, head: opts.head, headSha, maxHops: opts.maxHops },
-    counts: { changedFiles: 0, candidateSymbols: 0, resolvedSymbols: 0, flaggedSymbols: 0 },
+    counts: {
+      changedFiles: 0,
+      candidateSymbols: 0,
+      resolvedSymbols: 0,
+      unanalysedSymbols: 0,
+      flaggedSymbols: 0,
+    },
     skippedReason: reason,
+    unanalysedSymbols: [],
     symbols: [],
   };
 }
 
-function finish(opts, report) {
+/** stdout is a pipe under redirection, so the write must be flushed before exit. */
+async function writeFlushed(stream, text) {
+  if (!stream.write(text)) await once(stream, 'drain');
+}
+
+async function finish(opts, report) {
   if (opts.json) {
     const target = resolve(opts.json);
     mkdirSync(dirname(target), { recursive: true });
@@ -490,7 +577,7 @@ function finish(opts, report) {
     log(opts, `report written: ${target}`);
   }
   if (opts.quiet) return;
-  process.stdout.write(renderText(report));
+  await writeFlushed(process.stdout, renderText(report));
 }
 
 function renderText(report) {
@@ -509,11 +596,24 @@ function renderText(report) {
       `${c.changedFiles} files, ${c.resolvedSymbols}/${c.candidateSymbols} symbols resolved`,
   );
   out.push('');
+  const unanalysed = report.unanalysedSymbols ?? [];
+  if (unanalysed.length > 0) {
+    out.push(`${unanalysed.length} symbol(s) could not be resolved to a changed definition:`);
+    out.push(`      ${unanalysed.slice(0, 12).join(', ')}`);
+    if (unanalysed.length > 12) out.push(`      … ${unanalysed.length - 12} more`);
+    out.push('');
+    out.push('Their dependents were never analysed, so this review is incomplete.');
+    out.push('Renames and deletions land here: re-run after the index catches up,');
+    out.push('or check those dependents by hand.');
+    out.push('');
+  }
   const flagged = report.symbols.filter((s) => s.untouchedProductionDependents.length > 0);
   if (flagged.length === 0) {
-    out.push('No untouched production dependents. Every dependent of every changed');
-    out.push('symbol was either modified in this change set, or is test/script code.');
-    out.push('');
+    if (unanalysed.length === 0) {
+      out.push('No untouched production dependents. Every dependent of every changed');
+      out.push('symbol was either modified in this change set, or is test/script code.');
+      out.push('');
+    }
     return out.join('\n');
   }
   out.push(`${flagged.length} symbol(s) with untouched production dependents:`);
