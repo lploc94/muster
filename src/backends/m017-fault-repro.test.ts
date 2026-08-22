@@ -56,7 +56,7 @@ const TEST_TASK_TYPES = parseTaskTypeRegistry({
 });
 
 function options(over: Partial<RunOptions> = {}): RunOptions {
-  return { prompt: 'hello', ...over };
+  return { input: { kind: 'agent', prompt: 'hello' }, ...over };
 }
 
 async function collectRun(
@@ -197,25 +197,22 @@ describe('M017 R1 GREEN — prompt blocked until MCP ready (S06)', () => {
     const backend = new ClaudeBackend();
     const events = await collectRun(
       backend,
-      options({
-        prompt: 'do work without tools',
-        mcpSetup: {
-          maxAttempts: 2,
-          prepareAttempt: () => undefined,
-          awaitReady: async ({ sessionId }) => {
-            if (fake.isSessionMcpReady(sessionId)) {
-              return { ok: true };
-            }
-            return {
-              ok: false,
-              code: 'missing_evidence',
-              message: fake.mcpFailureReason(sessionId) ?? 'mcp not ready',
-              retriable: true,
-              sticky: true,
-            };
-          },
+      options({ input: { kind: 'agent', prompt: 'do work without tools' }, mcpSetup: {
+        maxAttempts: 2,
+        prepareAttempt: () => undefined,
+        awaitReady: async ({ sessionId }) => {
+          if (fake.isSessionMcpReady(sessionId)) {
+            return { ok: true };
+          }
+          return {
+            ok: false,
+            code: 'missing_evidence',
+            message: fake.mcpFailureReason(sessionId) ?? 'mcp not ready',
+            retriable: true,
+            sticky: true,
+          };
         },
-      }),
+      }, }),
     );
 
     // Observable: MCP not ready, disposition tools missing, prompt never fired.
@@ -550,7 +547,7 @@ describe('M017 G1 session-isolation (GREEN)', () => {
 
     // Start A first so it claims sess-a from the queue.
     const pumpA = (async () => {
-      for await (const ev of backendA.run(options({ prompt: 'session A' }))) eventsA.push(ev);
+      for await (const ev of backendA.run(options({ input: { kind: 'agent', prompt: 'session A' } }))) eventsA.push(ev);
     })();
 
     await fake.waitForPrompt('sess-a');
@@ -560,7 +557,7 @@ describe('M017 G1 session-isolation (GREEN)', () => {
 
     // B starts on the same shared fake process / client.
     const pumpB = (async () => {
-      for await (const ev of backendB.run(options({ prompt: 'session B' }))) eventsB.push(ev);
+      for await (const ev of backendB.run(options({ input: { kind: 'agent', prompt: 'session B' } }))) eventsB.push(ev);
     })();
 
     await fake.waitForPrompt('sess-b');

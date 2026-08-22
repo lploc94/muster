@@ -18,7 +18,7 @@ async function main() {
   }
 
   const options = {
-    prompt,
+    input: { kind: 'agent' as const, prompt },
     resumeId,
     signal: controller.signal,
   };

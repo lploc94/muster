@@ -43,7 +43,7 @@ afterEach(async () => {
 });
 
 function options(over: Partial<RunOptions> = {}): RunOptions {
-  return { prompt: 'edit the file', ...over };
+  return { input: { kind: 'agent', prompt: 'edit the file' }, ...over };
 }
 
 function task(id: string): MusterTask {

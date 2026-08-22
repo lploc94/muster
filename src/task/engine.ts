@@ -4573,7 +4573,7 @@ export class TaskEngine {
       const mcpEnabled = this.bridgePort > 0 && !!this.credentialRegistry;
       let attemptId: string | undefined;
       const baseRun = {
-        prompt,
+        input: { kind: 'agent' as const, prompt },
         resumeId: taskForDispatch.committedSessionId,
         signal: abort.signal,
         // Run the agent in the task's workspace directory so ACP adapters

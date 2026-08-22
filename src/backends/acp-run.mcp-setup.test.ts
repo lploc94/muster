@@ -24,7 +24,7 @@ vi.mock('./acp-client', () => ({
 import { ClaudeBackend } from './claude';
 
 function options(over: Partial<RunOptions> = {}): RunOptions {
-  return { prompt: 'hello', ...over };
+  return { input: { kind: 'agent', prompt: 'hello' }, ...over };
 }
 
 async function collectRun(
@@ -95,7 +95,7 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
 
   it('without mcpSetup keeps legacy path (no awaitReady, prompt still fires)', async () => {
     const backend = new ClaudeBackend();
-    const pump = collectRun(backend, options({ prompt: 'legacy' }));
+    const pump = collectRun(backend, options({ input: { kind: 'agent', prompt: 'legacy' } }));
     await fake.waitForPrompt('sess-1');
     expect(fake.calls.prompt.length).toBe(1);
     fake.resolve('sess-1', { stopReason: 'end_turn' });
@@ -109,11 +109,8 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
     const backend = new ClaudeBackend();
     const pump = collectRun(
       backend,
-      options({
-        prompt: 'work',
-        mcpSetup: ctrl,
-        onBeforePrompt: beforePrompt,
-      }),
+      options({ input: { kind: 'agent', prompt: 'work' }, mcpSetup: ctrl,
+      onBeforePrompt: beforePrompt, }),
     );
 
     await fake.waitForPrompt('sess-1');
@@ -149,11 +146,8 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
     const backend = new ClaudeBackend();
     const events = await collectRun(
       backend,
-      options({
-        prompt: 'never dispatch',
-        mcpSetup: ctrl,
-        onBeforePrompt: beforePrompt,
-      }),
+      options({ input: { kind: 'agent', prompt: 'never dispatch' }, mcpSetup: ctrl,
+      onBeforePrompt: beforePrompt, }),
     );
 
     expect(beforePrompt).not.toHaveBeenCalled();
@@ -191,11 +185,8 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
     const backend = new ClaudeBackend();
     const pump = collectRun(
       backend,
-      options({
-        prompt: 'recover me',
-        mcpSetup: ctrl,
-        onBeforePrompt: beforePrompt,
-      }),
+      options({ input: { kind: 'agent', prompt: 'recover me' }, mcpSetup: ctrl,
+      onBeforePrompt: beforePrompt, }),
     );
 
     await fake.waitForPrompt('sess-2');
@@ -282,11 +273,8 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
 
     const pump = collectRun(
       new ClaudeBackend(),
-      options({
-        prompt: 'original',
-        resumeId: 'sess-load',
-        mcpSetup: ctrl,
-      }),
+      options({ input: { kind: 'agent', prompt: 'original' }, resumeId: 'sess-load',
+      mcpSetup: ctrl, }),
     );
 
     await fake.waitForPrompt('sess-fresh');
@@ -374,13 +362,13 @@ describe('runAcpTurn mcpSetup controller (M017-S06 / T01)', () => {
     const backendB = new ClaudeBackend();
 
     // Start A recovery path (will create sess-A1 fail, then sess-A2).
-    const pumpA = collectRun(backendA, options({ prompt: 'A', mcpSetup: ctrlA }));
+    const pumpA = collectRun(backendA, options({ input: { kind: 'agent', prompt: 'A' }, mcpSetup: ctrlA }));
 
     // Wait until A has closed first session and is setting up second — or until A prompts.
     await fake.waitForPrompt('sess-A2');
 
     // Concurrent B on same process without mcpSetup (or with ready controller).
-    const pumpB = collectRun(backendB, options({ prompt: 'B' }));
+    const pumpB = collectRun(backendB, options({ input: { kind: 'agent', prompt: 'B' } }));
     await fake.waitForPrompt('sess-B');
 
     // B streams while A is mid-flight

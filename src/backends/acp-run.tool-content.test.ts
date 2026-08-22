@@ -18,7 +18,7 @@ vi.mock('./acp-client', () => ({
 import { ClaudeBackend } from './claude';
 
 function options(over: Partial<RunOptions> = {}): RunOptions {
-  return { prompt: 'hello', ...over };
+  return { input: { kind: 'agent', prompt: 'hello' }, ...over };
 }
 
 function toolCompleted(events: NormalizedEvent[]) {

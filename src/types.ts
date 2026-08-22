@@ -182,8 +182,17 @@ export interface McpSetupController {
   ) => string | Promise<string>;
 }
 
+/**
+ * M026: a turn's payload. ACP adapters receive agent prompt text; script
+ * runners receive an interpreter + file + argv. The discriminant keeps a
+ * mis-routed turn a loud failure instead of an empty prompt.
+ */
+export type RunInput =
+  | { kind: 'agent'; prompt: string }
+  | { kind: 'script'; interpreter: string; file: string; args: readonly string[] };
+
 export interface RunOptions {
-  prompt: string;
+  input: RunInput;
   resumeId?: string;
   mcpConfigPath?: string;
   /** Per-session MCP injection for ACP backends (empty by default). */

@@ -3,7 +3,7 @@ import type { AskBridge, Answers, AskRef } from '../bridge/ask-bridge';
 import type { CredentialRegistry } from '../bridge/credentials';
 import { buildTurnMcp, deleteMcpConfigFile } from '../bridge/mcp-config';
 import { isKnownBackendId } from '../backends/index';
-import type { Backend } from '../types';
+import type { Backend, RunInput, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
 import { mergeBriefFromCreate } from './brief';
 import { capabilitiesFor } from './capabilities';
@@ -790,10 +790,16 @@ export function issueTurnCredential(
 export function buildRunOptionsForTurn(
   deps: GraphEngineDeps,
   turnId: string,
-  base: { prompt: string; resumeId?: string; signal?: AbortSignal; cwd?: string; model?: string },
+  base: {
+    input: RunInput;
+    resumeId?: string;
+    signal?: AbortSignal;
+    cwd?: string;
+    model?: string;
+  },
   /** Opaque engine-allocated attempt id (TaskEngine allocates per MCP-enabled turn). Defaults to 'a0' for non-engine call sites/tests. */
   attemptId: string = 'a0',
-): { options: import('../types').RunOptions; mcpConfigPath?: string } {
+): { options: RunOptions; mcpConfigPath?: string } {
   const file = deps.store.getFile();
   const turn = file.turns[turnId];
   const task = turn ? file.tasks[turn.taskId] : undefined;
@@ -830,7 +836,7 @@ export function remintTurnMcpForAttempt(
   deps: GraphEngineDeps,
   turnId: string,
   attemptId: string,
-  options: import('../types').RunOptions,
+  options: RunOptions,
   previousMcpConfigPath?: string,
 ): { mcpConfigPath?: string } {
   const file = deps.store.getFile();
