@@ -804,6 +804,17 @@ describe('M018 S07 bounded workflow status projection', () => {
         total: 3, completed: 1, queued: 0, executing: 0, waiting: 0,
         blocked: 0, notStarted: 1, failed: 1, cancelled: 0, skipped: 0,
       });
+      await ctx.client.run(
+        `UPDATE workflow_runs
+            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        [p1.taskId, p1.taskId, p1.activationTurnId, 'ws', data.runId],
+      );
+      const terminalInspection = await ctx.repository.inspectWorkflowRun(data.runId, p1.taskId);
+      expect(terminalInspection?.runStatus).toBe('failed');
+      expect(terminalInspection?.diagnostics).toContainEqual({
+        code: 'terminal_run_has_live_node',
+      });
     } finally {
       await ctx.close();
     }

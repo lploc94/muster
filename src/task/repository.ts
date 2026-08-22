@@ -3418,6 +3418,12 @@ export class SqliteTaskRepository implements TaskRepository {
     if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
     if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
     if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    if (
+      terminal
+      && nodeRows.some((node) => node.status === 'pending' || node.status === 'active')
+    ) {
+      diagnostics.push({ code: 'terminal_run_has_live_node' });
+    }
     const terminalReason = run.terminal_reason_code;
     if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
       diagnostics.push({ code: 'invalid_terminal_reason' });
