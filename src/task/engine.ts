@@ -4620,6 +4620,9 @@ export class TaskEngine {
               timeoutMs: remainingMs ?? taskForDispatch.executionPolicy.runTimeoutOverrideMs ?? DEFAULT_RUN_LIMIT_MS,
               maxStdoutBytes: scriptContext.maxArtifactBytes,
               maxStderrBytes: this.getResourceLimits().maxErrorBytes,
+              // The stdin envelope is built from artifacts already bounded individually,
+              // so the aggregate ceiling is the right cap for the serialized payload.
+              maxStdinBytes: this.getResourceLimits().maxResultBytes,
             },
           }
         : {

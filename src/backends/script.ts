@@ -1,6 +1,6 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { realpath, stat } from 'node:fs/promises';
-import { extname, isAbsolute, relative, resolve } from 'node:path';
+import { delimiter, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import {
   SCRIPT_EXECUTABLE_ALLOWLIST,
@@ -11,10 +11,19 @@ import {
 const DEFAULT_STDERR_BYTES = 64 * 1024;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_STDOUT_BYTES = 256 * 1024;
+const DEFAULT_STDIN_BYTES = 1024 * 1024;
+/** Grace between the polite tree signal and the forced one. */
+const KILL_GRACE_MS = 2_000;
+/** Hard ceiling on the whole termination sequence, so cancel can never hang. */
+const TERMINATION_DEADLINE_MS = KILL_GRACE_MS * 2;
 
 function isWithin(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+  if (rel === '') return true;
+  if (isAbsolute(rel)) return false;
+  // Segment-aware: `..foo.js` is a legal contained name, only a real `..`
+  // path segment escapes the root.
+  return !rel.split(/[\\/]/).includes('..');
 }
 
 function expectedExtensions(interpreter: string): ReadonlySet<string> {
@@ -34,6 +43,69 @@ function safeChildEnvironment(): NodeJS.ProcessEnv {
   }
   env.PYTHONIOENCODING = 'utf-8';
   return env;
+}
+
+/**
+ * Resolve an allowlisted bare interpreter name to an absolute program path.
+ *
+ * `spawn` would otherwise re-resolve the bare name at launch time, so the binary that
+ * actually runs is whatever `PATH` points at at that instant — not what the allowlist
+ * check saw. Resolving here collapses that window and rejects `.cmd`/`.bat` shims, which
+ * cannot execute without a shell.
+ *
+ * Note: `process.execPath` is deliberately not used for `node`. In the VS Code extension
+ * host it is the Electron binary (`Code.exe`), which does not run a `.js` argument as a
+ * script and hangs instead.
+ */
+async function resolveInterpreter(executable: string): Promise<string> {
+  const searchPath = process.env.PATH ?? process.env.Path ?? '';
+  // Real executable images only, in PATHEXT precedence order.
+  const extensions = process.platform === 'win32' ? ['.EXE', '.COM', ''] : [''];
+  for (const dir of searchPath.split(delimiter)) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      const candidate = join(dir, `${executable}${ext}`);
+      try {
+        if ((await stat(candidate)).isFile()) return candidate;
+      } catch {
+        // Keep scanning the remaining PATH entries.
+      }
+    }
+  }
+  throw new Error(`interpreter not found on PATH: ${executable}`);
+}
+
+/**
+ * Terminate the interpreter *and* anything it spawned. `child.kill()` alone signals only
+ * the direct child, so a script that ignores SIGTERM keeps running and its descendants
+ * outlive it.
+ */
+function killProcessTree(child: ChildProcess, force: boolean): void {
+  const pid = child.pid;
+  if (pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === 'win32') {
+    // Windows kill() has no group semantics; taskkill /T walks the tree.
+    try {
+      const killer = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore',
+      });
+      killer.on('error', () => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      });
+      killer.unref();
+    } catch {
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    }
+    return;
+  }
+  // Spawned detached, so the interpreter leads its own process group and the
+  // negative pid reaches every descendant.
+  try {
+    process.kill(-pid, force ? 'SIGKILL' : 'SIGTERM');
+  } catch {
+    try { child.kill(force ? 'SIGKILL' : 'SIGTERM'); } catch { /* already gone */ }
+  }
 }
 
 async function resolveScriptPath(cwd: string, file: string, interpreter: string): Promise<string> {
@@ -136,16 +208,48 @@ export class ScriptBackend implements Backend {
       yield { type: 'error', message: 'local script execution is not authorized', meta: { code: 'host_run_denied' } };
       return;
     }
+    // Abort can land while `onBeforePrompt` is awaited. Adding a listener to an
+    // already-aborted signal never replays the event, so without this recheck a
+    // cancelled run would still spawn and complete all of its side effects.
+    if (options.signal?.aborted) {
+      yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
+      return;
+    }
+
+    const stdin = options.input.stdin ?? '';
+    const maxStdinBytes = Math.max(1, policy.maxStdinBytes ?? DEFAULT_STDIN_BYTES);
+    if (Buffer.byteLength(stdin, 'utf8') > maxStdinBytes) {
+      yield {
+        type: 'error',
+        message: 'script stdin exceeds the workflow input limit',
+        meta: { code: 'stdin_limit' },
+      };
+      return;
+    }
+
+    let program: string;
+    try {
+      program = await resolveInterpreter(executable.executable);
+    } catch (error) {
+      yield {
+        type: 'error',
+        message: error instanceof Error ? error.message : 'interpreter not found',
+        meta: { code: 'interpreter_denied' },
+      };
+      return;
+    }
 
     const maxStdoutBytes = Math.max(1, policy.maxStdoutBytes || DEFAULT_STDOUT_BYTES);
     const maxStderrBytes = Math.max(1, policy.maxStderrBytes ?? DEFAULT_STDERR_BYTES);
     const timeoutMs = Math.max(1, policy.timeoutMs || DEFAULT_TIMEOUT_MS);
-    const child = spawn(executable.executable, [script, ...options.input.args], {
+    const child = spawn(program, [script, ...options.input.args], {
       cwd,
       shell: false,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: safeChildEnvironment(),
+      // Own process group on POSIX so termination reaches descendants too.
+      detached: process.platform !== 'win32',
     });
 
     let stdoutBytes = 0;
@@ -155,12 +259,34 @@ export class ScriptBackend implements Backend {
     let timedOut = false;
     let cancelled = false;
 
+    // Escalating, deadline-bounded termination. A script may trap SIGTERM and never
+    // exit, so the forced signal follows a grace period and the awaited settle carries
+    // its own ceiling: cancel, timeout and overflow can never hang on a stubborn child.
+    let forceTimer: NodeJS.Timeout | undefined;
+    let deadlineTimer: NodeJS.Timeout | undefined;
+    let armDeadline = (): void => undefined;
+    const abandoned = new Promise<{ kind: 'abandoned' }>((done) => {
+      armDeadline = () => {
+        if (deadlineTimer !== undefined) return;
+        deadlineTimer = setTimeout(() => done({ kind: 'abandoned' }), TERMINATION_DEADLINE_MS);
+        deadlineTimer.unref?.();
+      };
+    });
+    const terminate = () => {
+      killProcessTree(child, false);
+      if (forceTimer === undefined) {
+        forceTimer = setTimeout(() => killProcessTree(child, true), KILL_GRACE_MS);
+        forceTimer.unref?.();
+      }
+      armDeadline();
+    };
+
     child.stdout.on('data', (value: Buffer | string) => {
       const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
       stdoutBytes += chunk.length;
       if (stdoutBytes > maxStdoutBytes) {
         outputExceeded = true;
-        child.kill();
+        terminate();
         return;
       }
       stdoutChunks.push(chunk);
@@ -172,12 +298,12 @@ export class ScriptBackend implements Backend {
 
     const abort = () => {
       cancelled = true;
-      child.kill();
+      terminate();
     };
     options.signal?.addEventListener('abort', abort, { once: true });
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill();
+      terminate();
     }, timeoutMs);
     const terminalPromise = new Promise<
       | { kind: 'close'; code: number | null }
@@ -189,10 +315,12 @@ export class ScriptBackend implements Backend {
     // A script may close stdin before consuming the bounded workflow payload.
     // Ignore that pipe error and let the process terminal event decide outcome.
     child.stdin.on('error', () => undefined);
-    child.stdin.end(options.input.stdin ?? '', 'utf8');
+    child.stdin.end(stdin, 'utf8');
 
-    const terminal = await terminalPromise;
+    const terminal = await Promise.race([terminalPromise, abandoned]);
     clearTimeout(timer);
+    clearTimeout(forceTimer);
+    clearTimeout(deadlineTimer);
     options.signal?.removeEventListener('abort', abort);
 
     if (cancelled || options.signal?.aborted) {
@@ -205,6 +333,14 @@ export class ScriptBackend implements Backend {
     }
     if (outputExceeded) {
       yield { type: 'error', message: 'script stdout exceeds workflow artifact limit', meta: { code: 'stdout_limit' } };
+      return;
+    }
+    if (terminal.kind === 'abandoned') {
+      yield {
+        type: 'error',
+        message: 'script process did not exit after termination',
+        meta: { code: 'termination_timeout' },
+      };
       return;
     }
     if (terminal.kind === 'error' || terminal.code === null) {

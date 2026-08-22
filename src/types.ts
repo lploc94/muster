@@ -235,6 +235,8 @@ export interface RunOptions {
     timeoutMs: number;
     maxStdoutBytes: number;
     maxStderrBytes?: number;
+    /** Cap on the serialized workflow payload written to the script's stdin. */
+    maxStdinBytes?: number;
   };
   /**
    * M017-S06: optional bounded pre-dispatch MCP setup/recovery controller.
