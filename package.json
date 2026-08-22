@@ -328,6 +328,7 @@
     "watch": "tsc -watch -p .",
     "build:webview": "vite build --config webview/vite.config.ts",
     "watch:webview": "vite build --config webview/vite.config.ts --watch",
+    "review:impact": "node scripts/ctxe-impact-review.mjs",
     "vscode:prepublish": "npm run compile",
     "vscode:uninstall": "node ./dist/src/uninstall.js",
     "mvp:claude": "tsx scripts/test-claude.ts",
