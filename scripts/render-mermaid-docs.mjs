@@ -160,10 +160,30 @@ async function launchBrowser() {
   );
 }
 
+/**
+ * Containment for `--out`. The directory is deleted recursively before rendering, so it
+ * must stay inside the gitignored `artifacts/` tree: `--out .` would otherwise resolve to
+ * the repository root and `rm -r` would wipe the working tree.
+ */
+function resolveOutDir(out) {
+  if (typeof out !== 'string' || out.trim() === '') {
+    throw new Error('--out must be a non-empty path inside artifacts/');
+  }
+  const artifactRoot = path.join(repoRoot, 'artifacts');
+  const outDir = path.resolve(repoRoot, out);
+  const rel = path.relative(artifactRoot, outDir);
+  if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) {
+    throw new Error(
+      `--out must resolve to a subdirectory of artifacts/ (got ${path.relative(repoRoot, outDir) || '.'})`,
+    );
+  }
+  return outDir;
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const markdownPath = path.resolve(repoRoot, args.markdown);
-  const outDir = path.resolve(repoRoot, args.out);
+  const outDir = resolveOutDir(args.out);
 
   if (!existsSync(markdownPath)) throw new Error(`Markdown file not found: ${markdownPath}`);
   if (!existsSync(mermaidDist)) throw new Error('mermaid not installed — run `npm install` first.');
@@ -178,7 +198,16 @@ async function main() {
   await mkdir(outDir, { recursive: true });
 
   const server = await startRenderServer();
-  const { browser, label } = await launchBrowser();
+  let browser;
+  let label;
+  try {
+    ({ browser, label } = await launchBrowser());
+  } catch (error) {
+    // The loopback server keeps the event loop alive, so close it before surfacing the
+    // install guidance instead of hanging with no browser.
+    await server.close();
+    throw error;
+  }
   console.log(`Rendering ${blocks.length} diagram(s) with ${label}\n`);
   const failures = [];
   try {
