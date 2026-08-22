@@ -39,6 +39,11 @@ Python/**
 NUL
 nul
 nul.*
+tmp/**
+artifacts/**
+.gstack/**
+.ctxe/**
+.muster/**
 
 # Tests & spikes
 **/*.map
