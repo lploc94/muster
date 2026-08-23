@@ -666,7 +666,7 @@
         return;
       }
       if (msg?.type === 'imagesPicked' && Array.isArray(msg.paths)) {
-        addImageAttachments(msg.paths.filter((p): p is string => typeof p === 'string'));
+        addImageAttachments((msg.paths as unknown[]).filter((p): p is string => typeof p === 'string'));
         return;
       }
       if (msg?.type === 'pastedImageImported' && typeof msg.path === 'string') {

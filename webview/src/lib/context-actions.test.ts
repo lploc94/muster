@@ -39,6 +39,10 @@ describe('Add Context action model', () => {
     expect(getAddContextActionHostMessage('browse-workspace-files')).toEqual(
       { type: 'browseWorkspaceFiles' } satisfies OutMessage,
     );
+    // Regression: the image action must resolve to a real outbound protocol
+    // variant. `satisfies OutMessage` fails typecheck if `pickImage` is missing
+    // from the OutMessage union (svelte-check caught this; vitest alone cannot).
+    expect(getAddContextActionHostMessage('add-image')).toEqual({ type: 'pickImage' } satisfies OutMessage);
 
     // The skill picker is enabled but handled in-webview (client action, no host message).
     const skill = getAddContextAction('add-skill');

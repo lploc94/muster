@@ -748,6 +748,13 @@ export type OutMessage =
    * webview), host writes a temp copy and replies with `filePicked` absolute path.
    */
   | { type: 'importDroppedFile'; name: string; data: ArrayBuffer }
+  /** Add Context -> Image: open the host native image open dialog (multi-select). */
+  | { type: 'pickImage' }
+  /**
+   * Clipboard-pasted image bytes with no filesystem path. Host stages a temp copy
+   * and replies with `pastedImageImported`, or `pastedImageRejected` on failure.
+   */
+  | { type: 'importPastedImage'; name: string; data: ArrayBuffer }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
   | { type: 'deleteTask'; taskId: string }
