@@ -11030,6 +11030,57 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(durableBlob).not.toContain('../../etc');
   });
 
+  /**
+   * Wire-contract fixtures. parseGraph cross-validates node tuples, gate inputs,
+   * edge contributions, progress buckets and reuse counts, so these must stay
+   * mutually consistent or the whole result is rejected and the canvas never mounts.
+   */
+  function reusedNode(nodeId: string) {
+    return {
+      nodeId,
+      workflowNodeStatus: 'reused',
+      executionActivity: 'none',
+      displayState: 'reused',
+      progressBucket: 'completed',
+      reused: true,
+    };
+  }
+
+  function reusedEdge(fromNodeId: string, toNodeId: string) {
+    return {
+      fromNodeId,
+      toNodeId,
+      inputRef: 'result',
+      contributionState: 'supplied_reused',
+      reused: true,
+    };
+  }
+
+  // Every edge needs a gate on its target carrying a matching input.
+  function reusedGate(consumerNodeId: string, producerNodeId: string) {
+    return {
+      gateId: `gate-${consumerNodeId}`,
+      consumerNodeId,
+      status: 'consumed',
+      satisfied: 1,
+      required: 1,
+      inputs: [{ inputRef: 'result', producerNodeId, state: 'supplied_reused' }],
+    };
+  }
+
+  // Unsatisfied gate is what makes node-5 blocked; engine_start inputs need no edge.
+  const blockedGate = {
+    gateId: 'gate-m024-s05',
+    consumerNodeId: 'node-5',
+    status: 'open',
+    satisfied: 1,
+    required: 2,
+    inputs: [
+      { inputRef: 'seed', producerNodeId: 'engine_start', state: 'supplied_live' },
+      { inputRef: 'review', producerNodeId: 'engine_start', state: 'pending' },
+    ],
+  };
+
   test('M024 S05 workflow graph: focused host result renders reuse, active gate, feedback, child run, and degraded state', async ({
     page,
   }) => {
@@ -11070,20 +11121,48 @@ test.describe('M019 S05 Assembled First Run', () => {
       ok: true,
       graph: {
         runId: 'run-m024-s05',
+        runStatus: 'running',
         nodes: [
-          { nodeId: 'node-1', status: 'succeeded', reused: true },
-          { nodeId: 'node-2', status: 'succeeded', reused: true },
-          { nodeId: 'node-3', status: 'succeeded', reused: true },
-          { nodeId: 'node-4', status: 'succeeded', reused: true },
-          { nodeId: 'node-5', status: 'active', reused: false },
+          reusedNode('node-1'),
+          reusedNode('node-2'),
+          reusedNode('node-3'),
+          reusedNode('node-4'),
+          {
+            nodeId: 'node-5',
+            workflowNodeStatus: 'pending',
+            executionActivity: 'none',
+            displayState: 'blocked',
+            progressBucket: 'blocked',
+            reason: 'waiting_for_inputs',
+            reused: false,
+          },
         ],
         edges: [
-          { fromNodeId: 'node-1', toNodeId: 'node-2', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-2', toNodeId: 'node-3', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-3', toNodeId: 'node-4', inputRef: 'result', reused: true },
-          { fromNodeId: 'node-4', toNodeId: 'node-5', inputRef: 'result', reused: false },
+          reusedEdge('node-1', 'node-2'),
+          reusedEdge('node-2', 'node-3'),
+          reusedEdge('node-3', 'node-4'),
         ],
-        activeGate: { gateId: 'gate-m024-s05', status: 'blocked', satisfied: 1, required: 2 },
+        gates: [
+          reusedGate('node-2', 'node-1'),
+          reusedGate('node-3', 'node-2'),
+          reusedGate('node-4', 'node-3'),
+          blockedGate,
+        ],
+        activeGate: blockedGate,
+        progress: {
+          total: 5,
+          completed: 4,
+          queued: 0,
+          executing: 0,
+          waiting: 0,
+          blocked: 1,
+          notStarted: 0,
+          failed: 0,
+          cancelled: 0,
+          skipped: 0,
+          frontierNodeIds: ['node-5'],
+          activeNodeIds: [],
+        },
         feedbackRounds: [
           { roundId: 'feedback-m024-s05', requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
         ],
@@ -11101,8 +11180,9 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(canvas.locator('[data-node-id]')).toHaveCount(5);
     await expect(canvas.locator('[data-edge-from="node-1"][data-edge-to="node-2"]')).toHaveCount(1);
     await expect(modal).toContainText('4 reused nodes · 3 reused edges');
-    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('active');
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Blocked');
+    // node-5 sits behind an unsatisfied gate, so the wire contract marks it blocked, not executing.
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('Blocked');
+    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('Open');
     await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('1 of 2 required inputs supplied');
     await expect(modal).toContainText('Feedback rounds');
     await expect(modal).toContainText('1 of 2 responses received');

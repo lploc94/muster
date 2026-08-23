@@ -1167,7 +1167,8 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       .locator('xpath=..')
       .locator('.task-tree-panel__status-btn');
     await rootStatus.click({ force: true });
-    await expect(page.getByRole('menuitem').filter({ hasText: 'Mark done' }).first()).toBeVisible({
+    const statusOverlay = page.getByTestId('task-status-overlay');
+    await expect(statusOverlay.getByRole('button').filter({ hasText: 'Mark done' }).first()).toBeVisible({
       timeout: 3_000,
     });
     // Scroll away so the open menu's row leaves the virtual window → menu must close.
@@ -1176,7 +1177,7 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
       el.dispatchEvent(new Event('scroll', { bubbles: true }));
     });
     await page.waitForTimeout(120);
-    await expect(page.getByRole('menuitem')).toHaveCount(0);
+    await expect(statusOverlay).toHaveCount(0);
 
     // Re-open menu at top and complete a lifecycle action.
     await treeList.evaluate((el) => {
@@ -1186,7 +1187,7 @@ test.describe('Phase 6 expanded task-tree virtualization', () => {
     await page.waitForTimeout(80);
     await rootStatus.click({ force: true });
     await page.evaluate(() => {
-      const item = document.querySelector<HTMLElement>('[role="menuitem"]');
+      const item = document.querySelector<HTMLElement>('.task-status-menu__item');
       item?.click();
     });
     await expect
