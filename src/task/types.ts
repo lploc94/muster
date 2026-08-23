@@ -631,6 +631,8 @@ export interface TaskMessage {
    * the exact live interleaving of assistant text and tool cards.
    */
   order?: number;
+  /** Absolute paths of images attached to this message (user role only). */
+  attachments?: readonly string[];
 }
 
 /** Persisted tool call for transcript reconstruction (schema ≥ 3). */

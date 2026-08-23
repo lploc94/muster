@@ -4,11 +4,13 @@ import {
   type BackendReadinessSnapshot,
 } from '../shared/backend-readiness';
 import {
+  SEND_OUTBOX_ATTACHMENTS_MAX,
   SEND_OUTBOX_MENTION_BINDINGS_MAX,
   SEND_OUTBOX_PATH_MAX,
   SEND_OUTBOX_SKILLS_MAX,
   SEND_OUTBOX_TEXT_MAX,
 } from '../task/repository';
+import { imageMimeForPath } from '../shared/image-attachments';
 
 const SEND_KEYS = new Set([
   'type',
@@ -21,6 +23,7 @@ const SEND_KEYS = new Set([
   'skills',
   'clientRequestId',
   'mentionBindings',
+  'attachments',
 ]);
 const BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
 const STABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
@@ -40,6 +43,7 @@ export interface HostSendRequest {
   skills?: string[];
   clientRequestId: string;
   mentionBindings?: Array<[string, string]>;
+  attachments?: string[];
 }
 
 export type HostSendRequestParseResult =
@@ -107,6 +111,28 @@ function parseSkills(value: unknown): string[] | undefined | false {
   return result.length > 0 ? result : undefined;
 }
 
+function parseAttachments(value: unknown): string[] | undefined | false {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > SEND_OUTBOX_ATTACHMENTS_MAX) return false;
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of value) {
+    if (
+      typeof entry !== 'string' ||
+      entry.length === 0 ||
+      entry.length > SEND_OUTBOX_PATH_MAX ||
+      /[\0\r\n]/.test(entry) ||
+      seen.has(entry) ||
+      !imageMimeForPath(entry)
+    ) {
+      return false;
+    }
+    seen.add(entry);
+    result.push(entry);
+  }
+  return result.length > 0 ? result : undefined;
+}
+
 /** Strict current-protocol parser before any durable outbox write. */
 export function parseHostSendRequest(value: unknown): HostSendRequestParseResult {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return { ok: false };
@@ -134,7 +160,8 @@ export function parseHostSendRequest(value: unknown): HostSendRequestParseResult
   }
   const skills = parseSkills(raw.skills);
   const mentionBindings = parseMentionBindings(raw.mentionBindings);
-  if (skills === false || mentionBindings === false) return invalid();
+  const attachments = parseAttachments(raw.attachments);
+  if (skills === false || mentionBindings === false || attachments === false) return invalid();
   return {
     ok: true,
     value: {
@@ -148,6 +175,7 @@ export function parseHostSendRequest(value: unknown): HostSendRequestParseResult
       ...(raw.continuationOf !== undefined ? { continuationOf: raw.continuationOf as string } : {}),
       ...(skills ? { skills } : {}),
       ...(mentionBindings ? { mentionBindings } : {}),
+      ...(attachments ? { attachments } : {}),
     },
   };
 }

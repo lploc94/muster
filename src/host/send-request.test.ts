@@ -78,6 +78,52 @@ describe('parseHostSendRequest', () => {
       taskId: 'task-1',
     });
   });
+
+  it('accepts a valid attachments array of image paths', () => {
+    expect(
+      parseHostSendRequest({ ...valid, attachments: ['/workspace/shot.png', '/workspace/other.jpg'] }),
+    ).toEqual({
+      ok: true,
+      value: {
+        ...valid,
+        skills: ['review'],
+        mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+        attachments: ['/workspace/shot.png', '/workspace/other.jpg'],
+      },
+    });
+  });
+
+  it('omits attachments from the parsed value when absent', () => {
+    const result = parseHostSendRequest(valid);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value).not.toHaveProperty('attachments');
+    }
+  });
+
+  it('rejects attachments that are non-image, unsupported-extension, duplicate, or over the cap', () => {
+    expect(parseHostSendRequest({ ...valid, attachments: ['/workspace/doc.txt'] }).ok).toBe(false);
+    expect(parseHostSendRequest({ ...valid, attachments: ['/workspace/noext'] }).ok).toBe(false);
+    expect(
+      parseHostSendRequest({ ...valid, attachments: ['/workspace/a.png', '/workspace/a.png'] }).ok,
+    ).toBe(false);
+    expect(
+      parseHostSendRequest({
+        ...valid,
+        attachments: ['/a.png', '/b.png', '/c.png', '/d.png', '/e.png'],
+      }).ok,
+    ).toBe(false);
+    expect(parseHostSendRequest({ ...valid, attachments: [] })).toEqual({
+      ok: true,
+      value: {
+        ...valid,
+        skills: ['review'],
+        mentionBindings: [['@plan', '/workspace/docs/plan.md']],
+      },
+    });
+    expect(parseHostSendRequest({ ...valid, attachments: 'not-an-array' }).ok).toBe(false);
+    expect(parseHostSendRequest({ ...valid, attachments: [''] }).ok).toBe(false);
+  });
 });
 
 describe('evaluateNewTaskBackendEligibility', () => {

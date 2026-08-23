@@ -8,6 +8,8 @@ export interface UserItem {
   turnId?: string;
   /** Optional mid-turn order (interleaved with assistant/tool segments). */
   order?: number;
+  /** Basenames of images attached to this message. */
+  attachments?: string[];
 }
 export interface AssistantItem {
   kind: 'assistant';

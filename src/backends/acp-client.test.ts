@@ -32,6 +32,7 @@ import {
   type AcpAgentConfig,
   type KillableProcess,
   type PermissionController,
+  type PromptImage,
   type PromptResult,
 } from './acp-client';
 import type { PermissionMode } from './permission-policy';
@@ -958,6 +959,175 @@ describe('AcpClient retired stdout fencing (R038 / M021-S02)', () => {
     await expect(pending).resolves.toEqual({ stopReason: 'end_turn' });
 
     client.dispose();
+  });
+});
+
+describe('AcpClient.prompt() ACP wire content (image attachments)', () => {
+  const config: AcpAgentConfig = {
+    key: 'image-wire-backend',
+    label: 'ImageWire',
+    command: 'fake-acp',
+    args: ['stdio'],
+  };
+
+  afterEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  function captureWrittenRequests(child: FakeStdioChild): Array<{ id: number; method: string; params: unknown }> {
+    const captured: Array<{ id: number; method: string; params: unknown }> = [];
+    const originalWrite = child.stdin.write.bind(child.stdin);
+    child.stdin.write = (data: string): boolean => {
+      for (const line of data.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const msg = JSON.parse(line) as { id?: number; method?: string; params?: unknown };
+          if (msg.id != null && msg.method) {
+            captured.push({ id: msg.id, method: msg.method, params: msg.params });
+          }
+        } catch {
+          // ignore malformed lines
+        }
+      }
+      return originalWrite(data);
+    };
+    return captured;
+  }
+
+  it('places image content blocks before the text block, base64 with mimeType and no data: prefix', async () => {
+    const child = new FakeStdioChild(2001);
+    mockSpawn.mockReturnValueOnce(child);
+    const captured = captureWrittenRequests(child);
+
+    const client = new AcpClient(config);
+    await client.ensureConnected();
+
+    const images: PromptImage[] = [
+      { data: 'YWJj', mimeType: 'image/png' },
+      { data: 'ZGVm', mimeType: 'image/jpeg' },
+    ];
+    const promptCall = client.prompt('sess-1', 'describe these', undefined, undefined, images);
+
+    // Let the fake child's queued initialize/authenticate microtasks and the
+    // session/prompt write itself flush before inspecting captured requests.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    const promptRequest = captured.find((r) => r.method === 'session/prompt');
+    expect(promptRequest).toBeDefined();
+    const params = promptRequest!.params as { sessionId: string; prompt: unknown[] };
+    expect(params.sessionId).toBe('sess-1');
+    expect(params.prompt).toEqual([
+      { type: 'image', data: 'YWJj', mimeType: 'image/png' },
+      { type: 'image', data: 'ZGVm', mimeType: 'image/jpeg' },
+      { type: 'text', text: 'describe these' },
+    ]);
+
+    // Settle the pending prompt so the test doesn't leak a hanging promise.
+    child.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({ jsonrpc: '2.0', id: promptRequest!.id, result: { stopReason: 'end_turn' } }) + '\n',
+      ),
+    );
+    await expect(promptCall).resolves.toEqual({ stopReason: 'end_turn' });
+  });
+
+  it('sends text-only prompt array when no images are provided (existing behavior)', async () => {
+    const child = new FakeStdioChild(2002);
+    mockSpawn.mockReturnValueOnce(child);
+    const captured = captureWrittenRequests(child);
+
+    const client = new AcpClient(config);
+    await client.ensureConnected();
+
+    const promptCall = client.prompt('sess-2', 'hello');
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    const promptRequest = captured.find((r) => r.method === 'session/prompt');
+    expect(promptRequest).toBeDefined();
+    const params = promptRequest!.params as { prompt: unknown[] };
+    expect(params.prompt).toEqual([{ type: 'text', text: 'hello' }]);
+
+    child.stdout.emit(
+      'data',
+      Buffer.from(
+        JSON.stringify({ jsonrpc: '2.0', id: promptRequest!.id, result: { stopReason: 'end_turn' } }) + '\n',
+      ),
+    );
+    await expect(promptCall).resolves.toEqual({ stopReason: 'end_turn' });
+  });
+
+  it('exposes supportsImagePrompt() from the handshake agentCapabilities.promptCapabilities.image', async () => {
+    const child = new FakeStdioChild(2003);
+    child.stdin.write = ((data: string): boolean => {
+      for (const line of data.split('\n')) {
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line) as { id?: number; method?: string };
+        if (msg.id == null) continue;
+        if (msg.method === 'initialize') {
+          queueMicrotask(() => {
+            child.stdout.emit(
+              'data',
+              Buffer.from(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    protocolVersion: 1,
+                    agentCapabilities: { promptCapabilities: { image: true } },
+                  },
+                }) + '\n',
+              ),
+            );
+          });
+        }
+      }
+      return true;
+    }) as typeof child.stdin.write;
+    mockSpawn.mockReturnValueOnce(child);
+
+    const client = new AcpClient(config);
+    expect(client.supportsImagePrompt()).toBe(false);
+    await client.ensureConnected();
+    expect(client.supportsImagePrompt()).toBe(true);
+  });
+
+  it('resets supportsImagePrompt() to false when the process exits (no stale advertisement)', async () => {
+    const child = new FakeStdioChild(2004);
+    child.stdin.write = ((data: string): boolean => {
+      for (const line of data.split('\n')) {
+        if (!line.trim()) continue;
+        const msg = JSON.parse(line) as { id?: number; method?: string };
+        if (msg.id == null) continue;
+        if (msg.method === 'initialize') {
+          queueMicrotask(() => {
+            child.stdout.emit(
+              'data',
+              Buffer.from(
+                JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: msg.id,
+                  result: {
+                    protocolVersion: 1,
+                    agentCapabilities: { promptCapabilities: { image: true } },
+                  },
+                }) + '\n',
+              ),
+            );
+          });
+        }
+      }
+      return true;
+    }) as typeof child.stdin.write;
+    mockSpawn.mockReturnValueOnce(child);
+
+    const client = new AcpClient(config);
+    await client.ensureConnected();
+    expect(client.supportsImagePrompt()).toBe(true);
+
+    child.exitCode = 1;
+    child.emit('exit', 1);
+    expect(client.supportsImagePrompt()).toBe(false);
   });
 });
 

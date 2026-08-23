@@ -134,6 +134,8 @@ export interface TranscriptItem {
   turnId?: string;
   order?: number;
   state?: string;
+  /** Basenames of images attached to this message (user items only). */
+  attachments?: string[];
 }
 
 export interface PendingAsk {
@@ -508,6 +510,12 @@ export type ExtMessage =
     }
   /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
   | { type: 'filePicked'; path: string; displayName?: string }
+  /** Add Context -> Image: user selected one or more images via the native open dialog. */
+  | { type: 'imagesPicked'; paths: string[] }
+  /** Clipboard-pasted image staged to a temp path; host echoes back the resolved path. */
+  | { type: 'pastedImageImported'; path: string }
+  /** Clipboard-pasted image could not be staged (missing name/data, size/type reject). */
+  | { type: 'pastedImageRejected'; reason: string }
   | { type: 'backendsAvailable'; backends: string[] }
   /**
    * Host-owned passive BackendReadinessSnapshot (M019). Webview must parse via
@@ -648,6 +656,8 @@ export type OutMessage =
       skills?: string[];
       /** Display mention → resolved path pairs needed to restore rejected drafts. */
       mentionBindings?: Array<[string, string]>;
+      /** Absolute paths of attached images (composer chips). */
+      attachments?: string[];
       /** Durable idempotent send key (stable across resend). */
       clientRequestId: string;
     }
@@ -1846,6 +1856,15 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'filePicked':
       return isString(data.path) && (data.displayName === undefined || isString(data.displayName));
+
+    case 'imagesPicked':
+      return Array.isArray(data.paths) && data.paths.every(isString);
+
+    case 'pastedImageImported':
+      return isString(data.path);
+
+    case 'pastedImageRejected':
+      return isString(data.reason);
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);

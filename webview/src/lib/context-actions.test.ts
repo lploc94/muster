@@ -6,6 +6,7 @@ import type { OutMessage } from './protocol';
 const EXPECTED_ACTION_IDS = [
   'add-file',
   'browse-workspace-files',
+  'add-image',
   'add-skill',
   'add-wiki-page',
   'add-agent',
@@ -26,10 +27,10 @@ describe('Add Context action model', () => {
 
   it('marks implemented actions as enabled host-postable messages without changing protocol payloads', () => {
     const enabled = ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled');
-
     expect(enabled.map((action) => action.id)).toEqual([
       'add-file',
       'browse-workspace-files',
+      'add-image',
       'add-skill',
     ]);
 

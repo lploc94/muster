@@ -1105,6 +1105,7 @@ export const SEND_OUTBOX_TEXT_MAX = TASK_MESSAGE_MAX_CHARS;
 export const SEND_OUTBOX_SKILLS_MAX = 8;
 export const SEND_OUTBOX_MENTION_BINDINGS_MAX = 64;
 export const SEND_OUTBOX_PATH_MAX = 4096;
+export const SEND_OUTBOX_ATTACHMENTS_MAX = 4;
 
 export interface SendOutboxPayloadV1 {
   version: typeof SEND_OUTBOX_PAYLOAD_VERSION;
@@ -1112,6 +1113,7 @@ export interface SendOutboxPayloadV1 {
   llmText?: string;
   mentionBindings?: Array<[string, string]>;
   skills?: string[];
+  attachments?: string[];
   backend?: string;
   model?: string;
   continuationOf?: string;
@@ -12275,7 +12277,7 @@ interface PresentationRow {
 function validateSendOutboxEntry(entry: SendOutboxEntry): void {
   const stableId = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
   const payloadKeys = new Set([
-    'version', 'text', 'llmText', 'mentionBindings', 'skills', 'backend', 'model', 'continuationOf',
+    'version', 'text', 'llmText', 'mentionBindings', 'skills', 'attachments', 'backend', 'model', 'continuationOf',
   ]);
   if (
     !entry.clientRequestId ||
@@ -12359,6 +12361,24 @@ function validateSendOutboxEntry(entry: SendOutboxEntry): void {
       )
     ) {
       throw new Error('send outbox skills invalid');
+    }
+  }
+  if (payload.attachments !== undefined) {
+    const attachments = new Set<string>();
+    if (
+      !Array.isArray(payload.attachments) ||
+      payload.attachments.length === 0 ||
+      payload.attachments.length > SEND_OUTBOX_ATTACHMENTS_MAX ||
+      payload.attachments.some((attachment) =>
+        typeof attachment !== 'string' ||
+        attachment.length === 0 ||
+        attachment.length > SEND_OUTBOX_PATH_MAX ||
+        /[\0\r\n]/.test(attachment) ||
+        attachments.has(attachment) ||
+        !attachments.add(attachment)
+      )
+    ) {
+      throw new Error('send outbox attachments invalid');
     }
   }
   if (

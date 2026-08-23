@@ -138,6 +138,8 @@ export type TranscriptItem =
       turnId?: string;
       order?: number;
       state?: TaskMessageState;
+      /** Basenames of images attached to this message (user kind only). */
+      attachments?: string[];
     }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
   | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string };

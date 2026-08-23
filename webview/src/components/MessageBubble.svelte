@@ -10,8 +10,17 @@
     streaming?: boolean;
     showFooter?: boolean;
     contextUsage?: { used?: number; size?: number; compacted: boolean } | null;
+    /** Basenames of images attached to this message (user role only). */
+    attachments?: string[];
   }
-  let { role, text, streaming = false, showFooter = true, contextUsage = null }: Props = $props();
+  let {
+    role,
+    text,
+    streaming = false,
+    showFooter = true,
+    contextUsage = null,
+    attachments = [],
+  }: Props = $props();
 
   function formatCompact(n: number): string {
     if (n >= 1_000_000) {
@@ -154,6 +163,21 @@
 
 {#if role === 'user'}
   <div class="flex flex-col items-end">
+    {#if attachments.length > 0}
+      <div class="flex flex-wrap gap-1 mb-1 justify-end" role="list" aria-label="Attached images">
+        {#each attachments as name (name)}
+          <span
+            class="attachment-pill inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs opacity-80"
+            role="listitem"
+            data-testid="attachment-pill"
+            style="background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);"
+          >
+            <span class="codicon codicon-file-media" aria-hidden="true"></span>
+            {name}
+          </span>
+        {/each}
+      </div>
+    {/if}
     <div
       class="user-message-bubble max-w-[85%] break-words rounded-lg px-3 py-2 text-sm"
       style="background: var(--vscode-badge-background); color: var(--vscode-badge-foreground);"

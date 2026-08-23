@@ -1285,6 +1285,54 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Add Context -> Image: multi-select native open dialog restricted to
+   * supported raster formats. Posts full paths for the webview to attach.
+   */
+  private async handlePickImage(): Promise<void> {
+    const defaultUri = workspaceRoot ? vscode.Uri.file(workspaceRoot) : undefined;
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: true,
+      defaultUri,
+      filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp'] },
+    });
+    if (!picked || picked.length === 0) return;
+    this.post({ type: 'imagesPicked', paths: picked.map((uri) => uri.fsPath) });
+  }
+
+  /**
+   * Clipboard-pasted image bytes from the composer. Reuses the dropped-file
+   * staging path (owner-only temp dir, size cap, wx write) but posts a
+   * distinct message pair so paste can never be mistaken for the existing
+   * drop-to-text-mention flow.
+   */
+  private handleImportPastedImage(name: unknown, data: unknown): void {
+    if (typeof name !== 'string' || !name.trim()) {
+      this.post({ type: 'pastedImageRejected', reason: 'Pasted image is missing a name.' });
+      return;
+    }
+    let bytes: Uint8Array | undefined;
+    if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else if (Array.isArray(data) && data.every((n) => typeof n === 'number')) {
+      bytes = Uint8Array.from(data);
+    }
+    if (!bytes) {
+      this.post({ type: 'pastedImageRejected', reason: 'Pasted image data is missing.' });
+      return;
+    }
+    const result = importDroppedFileBytes(name, bytes);
+    if (result.ok) {
+      this.post({ type: 'pastedImageImported', path: result.path });
+    } else {
+      this.post({ type: 'pastedImageRejected', reason: result.message });
+    }
+  }
+
+  /**
    * Deliver passive BackendReadinessSnapshot (M019) and derived backendsAvailable.
    * Failures post a settled diagnostic snapshot rather than staying silent.
    */
@@ -2668,6 +2716,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       id: message.id,
       kind: message.role as 'user' | 'assistant',
       content: message.content,
+      ...(message.attachments && message.attachments.length
+        ? { attachments: message.attachments.map((p) => path.basename(p)) }
+        : {}),
     };
   }
 
@@ -2770,6 +2821,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : {}),
         ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
         ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+        ...(Array.isArray(data.attachments) && data.attachments.length
+          ? { attachments: data.attachments }
+          : {}),
         ...(typeof data.backend === 'string'
           ? { backend: data.backend }
           : newTaskBackend
@@ -2863,6 +2917,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         model: resolvedModel,
         continuationOf: data.continuationOf,
         ...(Array.isArray(data.skills) && data.skills.length ? { skills: data.skills } : {}),
+        ...(Array.isArray(data.attachments) && data.attachments.length
+          ? { attachments: data.attachments }
+          : {}),
         cwd: resolveTaskCwd(),
         clientRequestId,
       });
@@ -2922,6 +2979,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     const result = await taskEngine.sendAsync(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
       clientRequestId,
+      ...(Array.isArray(data.attachments) && data.attachments.length
+        ? { attachments: data.attachments }
+        : {}),
     });
     if (!result.ok) {
       const code = /conflict/i.test(result.reason)
@@ -2989,6 +3049,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           llmText: entry.payload.llmText,
           mentionBindings: entry.payload.mentionBindings,
           skills: entry.payload.skills,
+          attachments: entry.payload.attachments,
           backend: entry.payload.backend,
           model: entry.payload.model,
           continuationOf: entry.payload.continuationOf,
@@ -3685,6 +3746,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           this.postSettingsSnapshot();
           this.postTaskTypesSettingsSnapshot();
           this.postPermissionSettingsSnapshot();
+          break;
+        case 'pickImage':
+          await this.handlePickImage();
+          break;
+        case 'importPastedImage':
+          this.handleImportPastedImage(data.name, data.data);
           break;
         case 'updateSetting':
           await this.handleUpdateSetting(data);
