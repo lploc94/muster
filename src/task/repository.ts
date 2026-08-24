@@ -135,7 +135,7 @@ export interface RepositoryPage<T> {
 }
 
 export type RepositoryTranscriptItem =
-  | { id: string; kind: 'user' | 'assistant'; content: string; turnId?: string; order?: number; state?: TaskMessage['state']; createdAt?: string }
+  | { id: string; kind: 'user' | 'assistant'; content: string; turnId?: string; order?: number; state?: TaskMessage['state']; createdAt?: string; attachments?: readonly string[] }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: Record<string, unknown>; createdAt?: string }
   | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string; createdAt?: string };
 
@@ -14611,6 +14611,13 @@ function transcriptRowKey(row: TranscriptPageRow & { entity_id: string }): Trans
 function decodeTranscriptRow(row: TranscriptPageRow & { entity_id: string }): RepositoryTranscriptItem {
   const createdAt = row.created_at ?? undefined;
   if (row.kind === 'user' || row.kind === 'assistant') {
+    // Attachments live in the message payload sidecar, not a promoted column.
+    // Only user messages carry them; absolute paths stay repository-side and are
+    // reduced to basenames at the host boundary (toHostTranscriptItem).
+    const attachments =
+      row.kind === 'user' && row.payload_json
+        ? (parsePayload(row.payload_json, 'message').attachments as unknown)
+        : undefined;
     return {
       id: row.entity_id,
       kind: row.kind,
@@ -14619,6 +14626,9 @@ function decodeTranscriptRow(row: TranscriptPageRow & { entity_id: string }): Re
       ...(row.ordering !== null ? { order: row.ordering } : {}),
       ...(row.state !== null ? { state: row.state as TaskMessage['state'] } : {}),
       ...(createdAt !== undefined ? { createdAt } : {}),
+      ...(Array.isArray(attachments) && attachments.length > 0
+        ? { attachments: attachments.filter((entry): entry is string => typeof entry === 'string') }
+        : {}),
     };
   }
   if (row.kind === 'reasoning') {

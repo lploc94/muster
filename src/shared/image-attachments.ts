@@ -30,6 +30,19 @@ export function imageMimeForPath(filePath: string): string | undefined {
   return IMAGE_MIME_BY_EXTENSION[ext];
 }
 
+/**
+ * Last path segment of an attachment path, separator-agnostic.
+ *
+ * Deliberately not path.basename: attachment paths are absolute host paths
+ * that may use either separator, and every transcript projector must yield the
+ * same basename regardless of the platform running it (path.basename on POSIX
+ * does not split a Windows path). Absolute paths must never reach the webview.
+ */
+export function attachmentBasename(attachmentPath: string): string {
+  const segments = attachmentPath.split(/[\\/]/);
+  return segments[segments.length - 1] || attachmentPath;
+}
+
 
 export type ReadImageAttachmentResult =
   | { ok: true; data: string; mimeType: string }

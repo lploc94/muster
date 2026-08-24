@@ -326,6 +326,42 @@ describe('buildRepositorySnapshot', () => {
     })).toMatchObject({ content: { toolKind: 'mcp' } });
   });
 
+  it('reduces user attachment paths to basenames and never leaks absolute host paths', () => {
+    const projected = toHostTranscriptItem({
+      id: 'user-with-images',
+      kind: 'user',
+      content: 'look at these',
+      turnId: 'turn-1',
+      order: 0,
+      attachments: [
+        'C:\\Users\\dev\\AppData\\Local\\Temp\\muster-drop-x\\shot.png',
+        '/var/folders/tmp/muster-drop-y/diagram.jpeg',
+      ],
+    });
+    expect(projected).toMatchObject({ attachments: ['shot.png', 'diagram.jpeg'] });
+    // Both separator styles must be reduced regardless of the host platform.
+    const serialized = JSON.stringify(projected);
+    expect(serialized).not.toContain('muster-drop-x');
+    expect(serialized).not.toContain('var/folders');
+  });
+
+  it('omits attachments for user rows without them and for assistant rows that carry them', () => {
+    expect(
+      toHostTranscriptItem({ id: 'plain-user', kind: 'user', content: 'hi', turnId: 't', order: 0 }),
+    ).not.toHaveProperty('attachments');
+    // Attachments are a user-only concept; an assistant row must never project them.
+    expect(
+      toHostTranscriptItem({
+        id: 'assistant-row',
+        kind: 'assistant',
+        content: 'ok',
+        turnId: 't',
+        order: 1,
+        attachments: ['/tmp/muster-drop-z/leak.png'],
+      }),
+    ).not.toHaveProperty('attachments');
+  });
+
   it('retries the bounded read when a workspace revision changes mid-snapshot', async () => {
     await withRepo('repository-snapshot-stable-retry', async (repo) => {
       const first = task('first');

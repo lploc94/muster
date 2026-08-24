@@ -1125,10 +1125,11 @@
     if (paths.length === 0) return;
     const existing = new Set(attachments.map((a) => a.path));
     const additions: Array<{ path: string; name: string }> = [];
+    let capped = false;
     for (const path of paths) {
       if (existing.has(path)) continue;
       if (attachments.length + additions.length >= MAX_ATTACHMENTS) {
-        dropFeedback = `Up to ${MAX_ATTACHMENTS} images per message.`;
+        capped = true;
         break;
       }
       const name = path.replace(/\\/g, '/').split('/').pop() || path;
@@ -1137,8 +1138,10 @@
     }
     if (additions.length > 0) {
       attachments = [...attachments, ...additions];
-      dropFeedback = null;
     }
+    // Decide feedback AFTER the partial add: a multi-select that overflows the
+    // cap must stay visible, not be cleared by the images that did attach.
+    dropFeedback = capped ? `Up to ${MAX_ATTACHMENTS} images per message.` : null;
   }
 
   function removeAttachment(path: string): void {

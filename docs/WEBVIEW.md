@@ -653,6 +653,69 @@ Unit and focused Playwright coverage (including the greppable integrated accepta
 
 ---
 
+## 12.2 Image attachments
+
+An enabled composer accepts **raster image attachments** that are sent to the agent as real
+ACP `image` content blocks. Unlike a file-drop mention (§12), this is **not** a textual `@path`:
+the bytes themselves are base64-encoded into the prompt, so the model sees the picture.
+
+Two entry points, both ending in a removable chip above the textarea:
+
+- **Add Context -> Image** posts `pickImage`; the host opens a native multi-select open dialog
+  filtered to `png`, `jpg`, `jpeg`, `gif`, `webp` and replies `imagesPicked { paths }`.
+- **Clipboard paste** into the textarea posts `importPastedImage { name, data }` for each
+  `image/*` clipboard item. The host stages an owner-only temp copy (same writer as §12) and
+  replies `pastedImageImported { path }`, or `pastedImageRejected { reason }` on failure.
+  `preventDefault()` fires only when an image item was present, so ordinary text paste is untouched.
+
+Dragging an image file keeps §12 behavior and inserts an `@path` mention, not an attachment.
+
+### Protocol and limits
+
+1. Chips live in `data-testid="attachment-chips"` (per chip `attachment-chip`, carrying `data-path`).
+   Removal is local to the composer and never edits the draft text.
+2. On **send**, the webview adds `attachments?: string[]` (absolute host paths) to the `send`
+   message. The host re-validates independently in `src/host/send-request.ts`; a malformed or
+   over-cap array rejects the whole send with `sendRejected { code: 'validation' }`.
+3. At turn start the run pipeline reads each path and prepends one `{ type: 'image', data, mimeType }`
+   block per readable image **before** the text block. `mimeType` is derived per file from its
+   extension, not from the picker.
+
+- At most **4** images per message (`SEND_OUTBOX_ATTACHMENTS_MAX`, mirrored by the composer cap).
+  A multi-select that overflows attaches the prefix and shows `Up to 4 images per message.`
+- At most **5 MiB** per image (`IMAGE_ATTACHMENT_MAX_BYTES`), well under the 25 MiB dropped-file
+  ceiling because base64 inflates by 4/3 inside a single JSON-RPC message.
+- Raster formats only. **SVG is excluded** deliberately: it is markup, not raster.
+- Duplicate paths are collapsed; attachment order is preserved.
+
+### Failure and degradation
+
+- A backend whose `promptCapabilities.image` is not advertised **fails the turn** with
+  `<label> does not support image attachments`, and `session/prompt` is never sent. Images are
+  never silently dropped.
+- An image that is missing, unreadable, over the cap, or of an unsupported type at send time
+  **degrades the turn instead of failing it**: the remaining blocks are still sent and the prompt
+  text gains `[Muster: attachment <name> could not be read and was omitted.]`. That notice carries
+  the **basename only** - host absolute paths never appear in agent-visible or user-visible text.
+
+### Persistence and export
+
+Only **basenames** are projected into the transcript (`attachments?: string[]` on user items),
+so absolute paths never reach the webview. Names survive a window reload and appear in Markdown
+export under an `**Attachments:**` list.
+
+### Proof boundary
+
+Unit tests cover host validation, mime derivation, size/type rejection, transcript projection, and
+export rendering. Focused Playwright covers chips, paste, cap feedback, and reload against mocked
+host messages; those results are **supportive only**. `npm run test:image-attachment-extension-host`
+packages a VSIX and runs a real Extension Host against a spawned ACP agent, asserting the wire
+blocks, byte-exact base64, the unsupported-backend rejection, and the degradation notice. The
+**native image open dialog is not automatable** and remains verified by code review plus manual
+observation.
+
+---
+
 ## 13. Read-only presentation review and revision
 
 A coordinator-triggered dedicated tab presents a bounded review artifact beside the Muster chat. It is **read-only**: it is not an editor, file manager, or alternate conversation surface. Markdown paragraphs, tables, fenced code, and safe links render in the tab; links use the host's safe external-opening policy.

@@ -403,6 +403,23 @@ async function postedMessages(page: Page) {
   return page.evaluate(() => window.__musterPostedMessages ?? []);
 }
 
+/**
+ * Narrow a recorded outbound message to the importPastedImage envelope.
+ * postedMessages() returns structured-cloned wire traffic, so the fields are
+ * checked here rather than asserted at the read site.
+ */
+function isPastedImagePost(message: unknown): message is { type: 'importPastedImage'; name: string; data: unknown } {
+  return (
+    typeof message === 'object' &&
+    message !== null &&
+    'type' in message &&
+    message.type === 'importPastedImage' &&
+    'name' in message &&
+    typeof message.name === 'string' &&
+    'data' in message
+  );
+}
+
 async function expectPostedMessage(page: Page, expected: unknown) {
   // Partial match: Phase C send messages include ephemeral clientRequestId.
   await expect
@@ -4215,6 +4232,137 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(menu).toBeHidden();
     expect(await postedMessages(page)).not.toContainEqual({ type: 'pickFile' });
     expect(await postedMessages(page)).not.toContainEqual({ type: 'browseWorkspaceFiles' });
+  });
+
+  test('Add Context Image posts pickImage and picked paths become removable chips carried on send', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('Look at these');
+
+    // No chip strip until the host answers with real paths.
+    await expect(page.getByTestId('attachment-chips')).toHaveCount(0);
+
+    const addContextButton = page.getByRole('button', { name: 'Add Context' });
+    await addContextButton.click();
+    const menu = page.getByRole('menu', { name: 'Add Context' });
+    const imageItem = menu.getByRole('menuitem', { name: 'Image' });
+    await expect(imageItem).toBeEnabled();
+    await imageItem.click();
+    await expectPostedMessage(page, { type: 'pickImage' });
+    await expect(menu).toHaveCount(0);
+
+    await postRawHostMessage(page, {
+      type: 'imagesPicked',
+      paths: ['/tmp/shots/alpha.png', '/tmp/shots/beta.jpeg'],
+    });
+
+    const chips = page.getByTestId('attachment-chip');
+    await expect(chips).toHaveCount(2);
+    // Chips show basenames only; the absolute path stays in data-path for send.
+    await expect(chips.nth(0)).toContainText('alpha.png');
+    await expect(chips.nth(1)).toContainText('beta.jpeg');
+    await expect(chips.nth(0)).toHaveAttribute('data-path', '/tmp/shots/alpha.png');
+
+    // Removing one chip must not disturb the draft or the surviving chip.
+    await chips.nth(0).getByRole('button', { name: 'Remove alpha.png' }).click();
+    await expect(page.getByTestId('attachment-chip')).toHaveCount(1);
+    await expect(page.getByTestId('attachment-chip')).toContainText('beta.jpeg');
+    await expect(composer).toHaveValue('Look at these');
+
+    await page.getByRole('button', { name: 'Send' }).click();
+    await expectPostedMessage(page, {
+      type: 'send',
+      text: 'Look at these',
+      attachments: ['/tmp/shots/beta.jpeg'],
+    });
+
+    // Chips clear with the draft so the next prompt does not resend the image.
+    await expect(page.getByTestId('attachment-chips')).toHaveCount(0);
+  });
+
+  test('duplicate picks are ignored and the fifth image surfaces the cap instead of attaching', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    await postRawHostMessage(page, { type: 'imagesPicked', paths: ['/tmp/a.png'] });
+    await expect(page.getByTestId('attachment-chip')).toHaveCount(1);
+
+    // Same path again: dedupe by path, no second chip.
+    await postRawHostMessage(page, { type: 'imagesPicked', paths: ['/tmp/a.png'] });
+    await expect(page.getByTestId('attachment-chip')).toHaveCount(1);
+
+    await postRawHostMessage(page, {
+      type: 'imagesPicked',
+      paths: ['/tmp/b.png', '/tmp/c.png', '/tmp/d.png', '/tmp/e.png'],
+    });
+    // Cap is 4: the overflow is refused loudly rather than silently dropped.
+    await expect(page.getByTestId('attachment-chip')).toHaveCount(4);
+    await expect(page.getByRole('alert')).toHaveText('Up to 4 images per message.');
+  });
+
+  test('pasting an image posts importPastedImage bytes and leaves the draft text untouched', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.fill('before paste');
+
+    // Synthetic clipboard paste: a real image item plus real bytes.
+    await composer.evaluate((el: HTMLTextAreaElement) => {
+      const bytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+      const file = new File([bytes], 'clip.png', { type: 'image/png' });
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+
+    // Narrow the recorded host message rather than asserting a shape onto it:
+    // postedMessages() is structured-cloned wire traffic, so the fields must be
+    // checked before they are read.
+    const pastedImagePosts = async () => (await postedMessages(page)).filter(isPastedImagePost);
+    await expect.poll(async () => (await pastedImagePosts()).length).toBeGreaterThan(0);
+    const posted = (await pastedImagePosts())[0]!;
+    // Host-facing name carries the mime-derived extension; bytes travel as a buffer.
+    expect(posted.name).toMatch(/^pasted-image-\d+\.png$/);
+    expect(posted.data).toBeTruthy();
+
+    // Paste of an image must never mutate the textarea.
+    await expect(composer).toHaveValue('before paste');
+
+    // Host echo turns the staged temp path into a chip.
+    await postRawHostMessage(page, { type: 'pastedImageImported', path: '/tmp/muster-drop-x/clip.png' });
+    await expect(page.getByTestId('attachment-chip')).toHaveText(/clip\.png/);
+
+    // A staging failure surfaces the host reason and adds no chip.
+    await postRawHostMessage(page, { type: 'pastedImageRejected', reason: 'Image is too large.' });
+    await expect(page.getByRole('alert')).toHaveText('Image is too large.');
+    await expect(page.getByTestId('attachment-chip')).toHaveCount(1);
+  });
+
+  test('pasting plain text still lands in the draft and posts no image message', async ({ page }) => {
+    await openWebview(page);
+    await postSnapshot(page, { type: 'snapshot', rootTasks: [], storeRevision: 2 });
+    await page.getByRole('button', { name: 'New task' }).first().click();
+
+    const composer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await composer.click();
+    await composer.evaluate((el: HTMLTextAreaElement) => {
+      const dt = new DataTransfer();
+      dt.setData('text/plain', 'pasted words');
+      el.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+    });
+
+    // preventDefault must NOT fire for text-only paste: the browser default applies.
+    expect(await postedMessages(page)).not.toContainEqual(
+      expect.objectContaining({ type: 'importPastedImage' }),
+    );
+    await expect(page.getByTestId('attachment-chips')).toHaveCount(0);
   });
 
   test('Add Context menu hardens dismissal states without losing draft text', async ({ page }) => {

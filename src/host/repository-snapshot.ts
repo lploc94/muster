@@ -2,6 +2,7 @@ import type { PendingAskOverlay, TaskSnapshot, TranscriptItem, TranscriptPageSta
 import { buildSnapshot, projectPersistedToolCall } from './snapshot';
 import type { RepositoryTranscriptItem, TaskRepository } from '../task/repository';
 import type { EngineProjection, PersistedToolCall } from '../task/types';
+import { attachmentBasename } from '../shared/image-attachments';
 
 /** Bounded page size for the focused-task bootstrap transcript (W4). */
 export const BOOTSTRAP_TRANSCRIPT_LIMIT = 100;
@@ -64,6 +65,10 @@ export function toHostTranscriptItem(item: RepositoryTranscriptItem): Transcript
     ...(item.turnId !== undefined ? { turnId: item.turnId } : {}),
     ...(item.order !== undefined ? { order: item.order } : {}),
     ...(item.state !== undefined ? { state: item.state } : {}),
+    // Absolute host paths must never reach the webview: project basenames only.
+    ...(item.kind === 'user' && item.attachments && item.attachments.length > 0
+      ? { attachments: item.attachments.map(attachmentBasename) }
+      : {}),
   };
 }
 
