@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  attachmentBasename,
   IMAGE_ATTACHMENT_MAX_BYTES,
   IMAGE_MIME_BY_EXTENSION,
   imageMimeForPath,
@@ -29,6 +30,30 @@ describe('imageMimeForPath', () => {
     for (const [ext, mime] of Object.entries(IMAGE_MIME_BY_EXTENSION)) {
       expect(imageMimeForPath(`file.${ext}`)).toBe(mime);
     }
+  });
+});
+
+describe('attachmentBasename', () => {
+  it('reduces both separator styles regardless of host platform', () => {
+    expect(attachmentBasename('/tmp/muster-drop-x/shot.png')).toBe('shot.png');
+    expect(attachmentBasename('C:\\Users\\dev\\AppData\\Local\\Temp\\shot.png')).toBe('shot.png');
+    expect(attachmentBasename('shot.png')).toBe('shot.png');
+  });
+
+  it('never falls back to the absolute path when a separator trails', () => {
+    // A trailing separator makes the final split segment empty. Returning the
+    // whole input there would leak the absolute host path (and the OS username)
+    // into the transcript, the Markdown export, and the omission notice.
+    // statSync/readFileSync both accept such a path, and imageMimeForPath still
+    // resolves .png, so nothing upstream rejects it first.
+    expect(attachmentBasename('/tmp/muster-drop-x/shot.png/')).toBe('shot.png');
+    expect(attachmentBasename('C:\\Users\\dev\\shot.png\\')).toBe('shot.png');
+    expect(attachmentBasename('/tmp/x/shot.png///')).toBe('shot.png');
+  });
+
+  it('returns the input only when it holds no non-empty segment', () => {
+    expect(attachmentBasename('/')).toBe('/');
+    expect(attachmentBasename('')).toBe('');
   });
 });
 

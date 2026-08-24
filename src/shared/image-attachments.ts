@@ -31,16 +31,25 @@ export function imageMimeForPath(filePath: string): string | undefined {
 }
 
 /**
- * Last path segment of an attachment path, separator-agnostic.
+ * Last non-empty path segment of an attachment path, separator-agnostic.
  *
  * Deliberately not path.basename: attachment paths are absolute host paths
  * that may use either separator, and every transcript projector must yield the
  * same basename regardless of the platform running it (path.basename on POSIX
  * does not split a Windows path). Absolute paths must never reach the webview.
+ *
+ * Empty segments are discarded rather than taken as-is: a trailing separator
+ * ("/tmp/drop/shot.png/") splits to a final "" and a naive last-segment read
+ * would fall back to the whole input, leaking the absolute host path into the
+ * transcript, the Markdown export, and the agent-visible omission notice.
+ * statSync/readFileSync both accept such a path, so it never fails earlier.
  */
 export function attachmentBasename(attachmentPath: string): string {
   const segments = attachmentPath.split(/[\\/]/);
-  return segments[segments.length - 1] || attachmentPath;
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    if (segments[i]) return segments[i];
+  }
+  return attachmentPath;
 }
 
 

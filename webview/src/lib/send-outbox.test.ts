@@ -33,6 +33,60 @@ describe('send outbox (memory only)', () => {
     expect(outboxRejected(undefined)).toHaveLength(1);
   });
 
+  it('retains attachment paths when a send is rejected so a retry re-sends the images', () => {
+    outboxAdd(undefined, {
+      clientRequestId: 'request-images',
+      taskId: 'task-1',
+      text: 'look at these',
+      attachments: [
+        'C:\\Users\\dev\\AppData\\Local\\Temp\\muster-drop-x\\shot.png',
+        '/var/folders/tmp/muster-drop-y/diagram.jpeg',
+      ],
+      createdAt: 2,
+      status: 'pending',
+    });
+
+    // Losing these on retry would silently send a text-only prompt: the images
+    // were part of the original send and the user gets no notice they vanished.
+    expect(outboxMarkRejected(undefined, 'request-images')).toMatchObject({
+      status: 'rejected',
+      attachments: [
+        'C:\\Users\\dev\\AppData\\Local\\Temp\\muster-drop-x\\shot.png',
+        '/var/folders/tmp/muster-drop-y/diagram.jpeg',
+      ],
+    });
+  });
+
+  it('bounds and de-duplicates attachments restored from the host snapshot', () => {
+    outboxReplaceAll([
+      {
+        clientRequestId: 'request-dirty-images',
+        text: 'Retry',
+        attachments: [
+          '/tmp/a.png',
+          '/tmp/a.png',
+          42 as unknown as string,
+          '',
+          '/tmp/b.png',
+          '/tmp/c.png',
+          '/tmp/d.png',
+          '/tmp/e.png',
+        ],
+        createdAt: 4,
+        status: 'rejected',
+      },
+    ]);
+
+    // Mirrors the host cap in src/host/send-request.ts: a snapshot row that
+    // disagrees would otherwise be replayed into a send the host rejects whole.
+    expect(outboxList()).toEqual([
+      expect.objectContaining({
+        clientRequestId: 'request-dirty-images',
+        attachments: ['/tmp/a.png', '/tmp/b.png', '/tmp/c.png', '/tmp/d.png'],
+      }),
+    ]);
+  });
+
   it('retains skill chips when a send is rejected and drops malformed skill entries', () => {
     outboxAdd(undefined, {
       clientRequestId: 'request-skills',

@@ -562,6 +562,7 @@ export type ExtMessage =
         llmText?: string;
         mentionBindings?: Array<[string, string]>;
         skills?: string[];
+        attachments?: string[];
         backend?: string;
         model?: string;
         continuationOf?: string;
@@ -873,7 +874,7 @@ function isInteger(v: unknown): v is number {
 
 const SEND_OUTBOX_ENTRY_KEYS = [
   'clientRequestId', 'status', 'taskId', 'text', 'llmText', 'mentionBindings',
-  'skills', 'backend', 'model', 'continuationOf', 'createdAt',
+  'skills', 'attachments', 'backend', 'model', 'continuationOf', 'createdAt',
 ] as const;
 const SEND_OUTBOX_TEXT_MAX_LENGTH = 262_144;
 
@@ -915,6 +916,23 @@ function isSendOutboxSnapshotEntry(value: unknown): boolean {
         /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(skill) &&
         !seenSkills.has(skill) &&
         Boolean(seenSkills.add(skill))
+      )
+    ) {
+      return false;
+    }
+  }
+  if (value.attachments !== undefined) {
+    const seenAttachments = new Set<string>();
+    if (
+      !Array.isArray(value.attachments) ||
+      value.attachments.length > 4 ||
+      !value.attachments.every((attachment) =>
+        typeof attachment === 'string' &&
+        attachment.length > 0 &&
+        attachment.length <= 4096 &&
+        !/[\0\r\n]/.test(attachment) &&
+        !seenAttachments.has(attachment) &&
+        Boolean(seenAttachments.add(attachment))
       )
     ) {
       return false;

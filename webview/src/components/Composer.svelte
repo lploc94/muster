@@ -543,6 +543,12 @@
       selectedSkills = [];
       selectedSkillsBackend = null;
     }
+    // Restore image chips carried by a rejected send so a retry re-sends the same
+    // images. Unlike skills these are backend-agnostic: the host re-validates
+    // every path on send, so a stale path fails the send rather than the chip.
+    attachments = (prefill.attachments ?? [])
+      .slice(0, MAX_ATTACHMENTS)
+      .map((p) => ({ path: p, name: p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || p }));
     dropFeedback = null;
     const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
