@@ -7,7 +7,7 @@
  * existing layering.
  */
 
-import { readFileSync, statSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import * as path from 'node:path';
 
 /** Per-attachment byte ceiling. Well under the 25 MiB dropped-file cap:
@@ -59,9 +59,9 @@ export type ReadImageAttachmentResult =
 
 /**
  * Reads and base64-encodes an image file for an ACP prompt content block.
- * Never throws: unsupported extension, unreadable file, or an over-limit
- * size all produce `{ ok: false }` rather than propagating an exception,
- * since a missing/oversized attachment should degrade the turn, not fail it.
+ * Never throws: unsupported extension, unreadable file, a non-regular file, or
+ * an over-limit size all produce `{ ok: false }` rather than propagating an
+ * exception, since a bad attachment should degrade the turn, not fail it.
  */
 export function readImageAttachment(
   filePath: string,
@@ -74,20 +74,47 @@ export function readImageAttachment(
 
   const maxBytes = options?.maxBytes ?? IMAGE_ATTACHMENT_MAX_BYTES;
 
-  let size: number;
+  // O_NONBLOCK keeps a FIFO/device open from hanging before fstat can classify
+  // it; it is absent on Windows, where such paths are not openable this way.
+  // Deliberately NOT O_NOFOLLOW (unlike hashUntrackedEntry in
+  // src/task/source-revision.ts): a user may legitimately pick a symlinked
+  // image, and every path reaching here was minted by the host, so refusing
+  // symlinks would only break that case.
+  const nonBlock = constants.O_NONBLOCK ?? 0;
+  let fd: number;
   try {
-    size = statSync(filePath).size;
+    fd = openSync(filePath, constants.O_RDONLY | nonBlock);
   } catch {
     return { ok: false, reason: 'file not found' };
   }
-  if (size > maxBytes) {
-    return { ok: false, reason: 'file too large' };
-  }
 
   try {
-    const data = readFileSync(filePath).toString('base64');
-    return { ok: true, data, mimeType };
+    // Stat the DESCRIPTOR, not the path: the fd is pinned to the inode we
+    // opened, so nothing swapped in at filePath between the check and the read
+    // can redirect it. The size that clears the cap is the size we encode.
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) {
+      // Directory, FIFO, socket, or device wearing an image extension. Reading
+      // a FIFO or character device would block the turn indefinitely.
+      return { ok: false, reason: 'not a regular file' };
+    }
+    if (stat.size > maxBytes) {
+      return { ok: false, reason: 'file too large' };
+    }
+    const buffer = Buffer.allocUnsafe(stat.size);
+    let filled = 0;
+    while (filled < stat.size) {
+      const chunk = readSync(fd, buffer, filled, stat.size - filled, filled);
+      if (chunk <= 0) break;
+      filled += chunk;
+    }
+    if (filled !== stat.size) {
+      return { ok: false, reason: 'read failed' };
+    }
+    return { ok: true, data: buffer.toString('base64'), mimeType };
   } catch {
     return { ok: false, reason: 'read failed' };
+  } finally {
+    closeSync(fd);
   }
 }

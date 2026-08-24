@@ -605,6 +605,8 @@ function getPermissionMode(): PermissionMode {
 const WEBVIEW_BACKENDS = new Set(['claude', 'grok', 'kiro', 'codex', 'opencode']);
 const MAX_FREE_TEXT_CHARS = 10_000;
 const MAX_LINK_CHARS = 4096;
+/** Ceiling on remembered host-minted image paths (see authorizeImagePath). */
+const MAX_AUTHORIZED_IMAGE_PATHS = 64;
 
 const presentationHost: PresentationHost = {
   joinPath: (...parts) => vscode.Uri.joinPath(parts[0] as vscode.Uri, ...(parts.slice(1) as string[])),
@@ -768,6 +770,17 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private renderProbeCoordinator: WebviewRenderProbeCoordinator | undefined;
   /** UAT-only workflow graph round-trip observer for the current resolved webview. */
   private workflowGraphProbeCoordinator: WorkflowGraphProbeCoordinator | undefined;
+  /**
+   * Image paths this host itself minted — native picker results and staged
+   * clipboard copies. `send` accepts an attachment only if it appears here, so a
+   * compromised or buggy webview cannot name an arbitrary readable file (an
+   * exfil target renamed to *.png) and have the host base64 it into a prompt.
+   * Extension filtering alone cannot carry that weight, and workspace-root
+   * confinement would wrongly reject an image the user legitimately picked from
+   * outside the workspace. Bounded so a long session cannot grow it without
+   * limit; eviction only forces a re-pick.
+   */
+  private authorizedImagePaths = new Set<string>();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -1285,6 +1298,23 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   }
 
   /**
+   * Record a path this host minted so a later `send` may attach it. Bounded
+   * FIFO: a long session cannot grow the set without limit, and evicting the
+   * oldest entry only costs the user a re-pick.
+   */
+  private authorizeImagePath(filePath: string): void {
+    // Re-inserting refreshes recency: delete first so the Set's insertion order
+    // stays a true LRU-by-mint ordering.
+    this.authorizedImagePaths.delete(filePath);
+    this.authorizedImagePaths.add(filePath);
+    while (this.authorizedImagePaths.size > MAX_AUTHORIZED_IMAGE_PATHS) {
+      const oldest = this.authorizedImagePaths.values().next();
+      if (oldest.done) break;
+      this.authorizedImagePaths.delete(oldest.value);
+    }
+  }
+
+  /**
    * Add Context -> Image: multi-select native open dialog restricted to
    * supported raster formats. Posts full paths for the webview to attach.
    */
@@ -1298,7 +1328,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp'] },
     });
     if (!picked || picked.length === 0) return;
-    this.post({ type: 'imagesPicked', paths: picked.map((uri) => uri.fsPath) });
+    const paths = picked.map((uri) => uri.fsPath);
+    for (const p of paths) this.authorizeImagePath(p);
+    this.post({ type: 'imagesPicked', paths });
   }
 
   /**
@@ -1326,6 +1358,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     }
     const result = importDroppedFileBytes(name, bytes);
     if (result.ok) {
+      this.authorizeImagePath(result.path);
       this.post({ type: 'pastedImageImported', path: result.path });
     } else {
       this.post({ type: 'pastedImageRejected', reason: result.message });
@@ -2771,6 +2804,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       });
       return;
     }
+    // Attachments are absolute host paths supplied by the webview. Extension
+    // filtering (send-request.ts) proves only the suffix, so require every path
+    // to be one this host minted via the native picker or paste staging. Without
+    // this, a compromised webview could name any readable file — an exfil target
+    // renamed to *.png — and the host would base64 it into the prompt.
+    if (data.attachments?.some((candidate) => !this.authorizedImagePaths.has(candidate))) {
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'attachment was not selected in this window',
+        code: 'validation',
+      });
+      return;
+    }
 
     // M019 S01/S03: pure new-task inventory gate BEFORE durable outbox mutation.
     // Existing-task follow-ups and task-bound handoffs are not blocked here.
@@ -3039,6 +3087,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     if (!taskRepository) return;
     try {
       const entries = await taskRepository.listSendOutbox();
+      // Reload starts with an empty authorization set, so a restored pending or
+      // rejected send would be rejected by the send gate on replay. These rows
+      // are host-written and were authorized when first sent, so re-trusting
+      // them keeps resend working without widening the gate to webview input.
+      for (const entry of entries) {
+        for (const attachment of entry.payload.attachments ?? []) {
+          this.authorizeImagePath(attachment);
+        }
+      }
       this.post({
         type: 'sendOutboxSnapshot',
         entries: entries.map((entry) => ({
