@@ -78,6 +78,64 @@ describe('workflow domain (one-node define)', () => {
     expect(again.ok && again.fingerprint).toBe(validated.fingerprint);
   });
 
+  it('round-trips and fingerprints a strict script execution descriptor', () => {
+    const topology = {
+      kind: 'one_node_v1' as const,
+      nodes: [{
+        nodeId: 'script',
+        backend: 'script',
+        execution: {
+          kind: 'script' as const,
+          interpreter: 'node' as const,
+          file: 'scripts/check.js',
+          args: ['--json'],
+          onFailure: 'continue' as const,
+        },
+      }] as const,
+      entryNodeId: 'script',
+    };
+    const decoded = decodeOneNodeTopology(topology);
+    expect(decoded).toEqual({ ok: true, topology });
+    const agentDef = makeOneNodeDefinition();
+    const def = { ...agentDef, topology };
+    expect(fingerprintDefinition(def)).not.toBe(fingerprintDefinition(agentDef));
+    expect(decodeStoredTopologyJson(JSON.stringify(topology))).toEqual({ ok: true, topology });
+  });
+
+  it('rejects incomplete or agent-shaped script nodes', () => {
+    const base = {
+      kind: 'one_node_v1',
+      entryNodeId: 'script',
+    };
+    expect(decodeOneNodeTopology({
+      ...base,
+      nodes: [{ nodeId: 'script', backend: 'script' }],
+    }).ok).toBe(false);
+    expect(decodeOneNodeTopology({
+      ...base,
+      nodes: [{
+        nodeId: 'script', backend: 'script', model: 'agent-model',
+        execution: { kind: 'script', interpreter: 'node', file: 'x.js', args: [], onFailure: 'fail_run' },
+      }],
+    }).ok).toBe(false);
+    expect(decodeOneNodeTopology({
+      ...base,
+      nodes: [{
+        nodeId: 'script', backend: 'script',
+        execution: { kind: 'script', interpreter: 'bash', file: 'x.sh', args: [], onFailure: 'fail_run' },
+      }],
+    }).ok).toBe(false);
+    for (const file of ['/tmp/x.js', '../x.js', 'x.py']) {
+      expect(decodeOneNodeTopology({
+        ...base,
+        nodes: [{
+          nodeId: 'script', backend: 'script',
+          execution: { kind: 'script', interpreter: 'node', file, args: [], onFailure: 'fail_run' },
+        }],
+      }).ok).toBe(false);
+    }
+  });
+
   it('rejects multi-node, mismatched entry, foreign keys, and corrupt JSON', () => {
     expect(decodeOneNodeTopology({ kind: 'one_node_v1', nodes: [], entryNodeId: 'a' }).ok).toBe(false);
     expect(decodeOneNodeTopology({

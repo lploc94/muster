@@ -1,30 +1,18 @@
-import { Backend } from '../types';
-import { ClaudeBackend } from './claude';
-import { GrokBackend } from './grok';
-import { KiroBackend } from './kiro';
-import { CodexBackend } from './codex';
-import { OpenCodeBackend } from './opencode';
+import type { Backend } from '../types';
+import { ACP_EXECUTOR_IDS, resolveExecutor } from './executor-registry';
 
-export const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'] as const;
+/**
+ * Agent-only backend IDs. Derived from the ACP family so registering another
+ * executor family cannot silently widen this closed surface.
+ */
+export const BACKEND_IDS = ACP_EXECUTOR_IDS;
 export type BackendId = (typeof BACKEND_IDS)[number];
 
 export function isKnownBackendId(name: string): name is BackendId {
   return (BACKEND_IDS as readonly string[]).includes(name);
 }
 
+/** Public backend construction seam retained for all existing callers. */
 export function makeBackend(name: string): Backend {
-  switch (name) {
-    case 'grok':
-      return new GrokBackend();
-    case 'kiro':
-      return new KiroBackend();
-    case 'codex':
-      return new CodexBackend();
-    case 'opencode':
-      return new OpenCodeBackend();
-    case 'claude':
-      return new ClaudeBackend();
-    default:
-      throw new Error(`unsupported backend: ${name}`);
-  }
+  return resolveExecutor(name);
 }

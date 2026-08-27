@@ -1,4 +1,5 @@
 import type { ToolFileChange } from '../types';
+import type { ScriptExecutionSpecV1 } from './workflow-types';
 
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
@@ -287,6 +288,8 @@ export interface MusterTask {
    * Absent on legacy tasks; never re-resolved on release.
    */
   taskType?: string;
+  /** Frozen workflow-node execution mode. Absent for ordinary ACP agent tasks. */
+  execution?: ScriptExecutionSpecV1;
   /**
    * Backend conversation session for this task. Set after a successful turn
    * (session/new or session/load). Next turns pass it as resumeId — process may
@@ -463,6 +466,8 @@ export type TurnDisposition =
       kind: 'workflow_next';
       change: 'updated' | 'unchanged';
       result?: string;
+      /** Process metadata is durable but stderr stays on the turn diagnostic, never the artifact. */
+      execution?: { kind: 'script'; exitCode: number };
       route?: {
         kind: 'child_workflow';
         childDefinitionId: string;
@@ -596,6 +601,12 @@ export interface TaskTurn {
   resolvedInputs?: ResolvedInputPin[];
   /** Optional frozen first-prompt text compiled from brief + resolvedInputs. */
   compiledPrompt?: string;
+  /** Bounded local-process diagnostic; never used as a downstream artifact body. */
+  executionResult?: {
+    kind: 'script';
+    exitCode: number;
+    stderr: string;
+  };
 }
 
 // Messages (§9) + store envelope (§12.1)

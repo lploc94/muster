@@ -69,6 +69,13 @@ export type NormalizedEvent =
       meta?: Record<string, unknown>;
     }
   | { type: 'usage'; usage: Record<string, unknown>; meta?: Record<string, unknown> }
+  | {
+      type: 'processCompleted';
+      stdout: string;
+      stderr: string;
+      exitCode: number;
+      meta?: Record<string, unknown>;
+    }
   | { type: 'turnCompleted'; meta?: Record<string, unknown> }
   | { type: 'error'; message: string; isCancellation?: boolean; raw?: unknown; meta?: Record<string, unknown> }
   | { type: 'raw'; line: string };
@@ -182,8 +189,24 @@ export interface McpSetupController {
   ) => string | Promise<string>;
 }
 
+/**
+ * A turn's executor-specific payload. ACP adapters receive agent prompt text;
+ * script runners receive an interpreter + file + argv. The discriminant keeps
+ * a mis-routed turn a loud failure instead of an empty prompt.
+ */
+export type RunInput =
+  | { kind: 'agent'; prompt: string }
+  | {
+      kind: 'script';
+      interpreter: string;
+      file: string;
+      args: readonly string[];
+      /** UTF-8 payload written exactly once to child stdin, then stdin is closed. */
+      stdin?: string;
+    };
+
 export interface RunOptions {
-  prompt: string;
+  input: RunInput;
   resumeId?: string;
   mcpConfigPath?: string;
   /** Per-session MCP injection for ACP backends (empty by default). */
@@ -206,6 +229,15 @@ export interface RunOptions {
    * `prompt_outstanding` here so pre-dispatch failures remain safe_to_retry.
    */
   onBeforePrompt?: () => void | Promise<void>;
+  /** Host-owned authorization and bounds for local script execution. */
+  localExecution?: {
+    authorize: () => boolean;
+    timeoutMs: number;
+    maxStdoutBytes: number;
+    maxStderrBytes?: number;
+    /** Cap on the serialized workflow payload written to the script's stdin. */
+    maxStdinBytes?: number;
+  };
   /**
    * M017-S06: optional bounded pre-dispatch MCP setup/recovery controller.
    * When set, session/prompt runs only after awaitReady succeeds for the live

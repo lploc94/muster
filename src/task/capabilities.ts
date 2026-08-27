@@ -7,6 +7,8 @@ export type CoordinatorAction =
   | 'delegate_tasks'
   | 'release_tasks'
   | 'list_task_types'
+  | 'list_predefined_workflows'
+  | 'get_predefined_workflow'
   | 'interrupt_task'
   | 'cancel_task'
   | 'cancel_tasks'
@@ -37,6 +39,8 @@ export type ToolAction = CoordinatorAction | AnyTaskAction;
 
 export const PUBLIC_MCP_TOOL_ACTIONS = [
   'list_task_types',
+  'list_predefined_workflows',
+  'get_predefined_workflow',
   'inspect_workflow_run',
   'get_host_context',
   'upsert_presentation',
@@ -60,6 +64,8 @@ const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
   // create_child is retained as the internal authority for workflow definition/start.
   create_child: [
     'list_task_types',
+    'list_predefined_workflows',
+    'get_predefined_workflow',
     'define_workflow',
     'start_workflow',
   ],

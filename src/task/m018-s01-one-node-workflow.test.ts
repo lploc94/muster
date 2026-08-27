@@ -105,6 +105,57 @@ describe('M018 S01 one-node workflow activation', () => {
     ).toBe(false);
   });
 
+  it('persists a script execution descriptor on the materialized task without schema changes', async () => {
+    const ctx = await openRepo('script-payload');
+    try {
+      const createdAt = '2026-08-22T00:00:00.000Z';
+      const execution = {
+        kind: 'script' as const,
+        interpreter: 'node' as const,
+        file: 'scripts/check.js',
+        args: ['--format', 'json'],
+        onFailure: 'continue' as const,
+      };
+      const defined = await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-script-payload',
+        version: 1,
+        name: 'script payload',
+        topology: {
+          kind: 'one_node_v1',
+          nodes: [{ nodeId: 'script', backend: 'script', execution }],
+          entryNodeId: 'script',
+        },
+        createdAt,
+      });
+      expect(defined.ok).toBe(true);
+
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-script-payload',
+        version: 1,
+        startIdempotencyKey: 'script-payload-1',
+        createdAt,
+        goal: 'run script',
+        backend: 'grok',
+      });
+      const payload = started.operation?.result?.data as { entryTaskId: string };
+      await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({
+        backend: 'script',
+        execution,
+      });
+      const row = await ctx.client.get<{ payload_json: string }>(
+        'SELECT payload_json FROM tasks WHERE workspace_id = ? AND id = ?',
+        ['ws', payload.entryTaskId],
+      );
+      expect(JSON.parse(row!.payload_json).execution).toEqual(execution);
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('one-node top-level updated success and replay', async () => {
     const ctx = await openRepo('start');
     try {
@@ -623,7 +674,8 @@ describe('M018 S01 one-node workflow activation', () => {
           },
         }),
         runTurn: async function* (backend, options) {
-          calls.push({ backend: backend.name, resumeId: options.resumeId, prompt: options.prompt });
+          if (options.input.kind !== 'agent') throw new Error('expected agent input');
+          calls.push({ backend: backend.name, resumeId: options.resumeId, prompt: options.input.prompt });
           await options.onBeforePrompt?.();
           if (backend.name !== 'opencode') {
             yield { type: 'sessionStarted', sessionId: `${backend.name}-failed-session` };

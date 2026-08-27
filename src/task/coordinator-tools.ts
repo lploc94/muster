@@ -28,10 +28,14 @@ import {
   WORKFLOW_GRAPH_MAX_NODES,
   WORKFLOW_NODE_LABEL_MAX_LENGTH,
   WORKFLOW_RUN_GOAL_MAX_LENGTH,
+  WORKFLOW_SCRIPT_ARG_MAX_LENGTH,
+  WORKFLOW_SCRIPT_MAX_ARGS,
+  isValidWorkflowScriptFile,
   type StartWorkflowEntryInput,
   type StartWorkflowNodeReuse,
   type WorkflowEntryContractV1,
   type WorkflowPolicyV1,
+  type WorkflowNodeSpecV1,
 } from './workflow-types';
 
 export interface CreateChildSpec {
@@ -165,6 +169,8 @@ export type ToolCommand =
   | { kind: 'inspect_workflow_run'; runId: string }
   | { kind: 'get_host_context' }
   | { kind: 'list_task_types' }
+  | { kind: 'list_predefined_workflows' }
+  | { kind: 'get_predefined_workflow'; workflowRef: string }
   | { kind: 'complete_task'; opId: string; result: string; verdict?: VerdictInput }
   | { kind: 'fail_task'; opId: string; error: string }
   /** M018 S02: stage workflow NEXT with the final assistant message. */
@@ -173,6 +179,8 @@ export type ToolCommand =
       opId: string;
       change: 'updated' | 'unchanged';
       message: string;
+      /** Engine-only process metadata; public MCP parsing never accepts this field. */
+      execution?: { kind: 'script'; exitCode: number };
     }
   /** M018 S04: stage workflow PREV with the final assistant message. */
   | {
@@ -299,6 +307,8 @@ function toolActionForName(name: string): ToolAction | undefined {
     'inspect_workflow_run',
     'get_host_context',
     'list_task_types',
+    'list_predefined_workflows',
+    'get_predefined_workflow',
     'complete_task',
     'fail_task',
     'workflow_next',
@@ -372,16 +382,22 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
     return undefined;
   }
 
-  const nodes: Array<{ nodeId: string; taskType: string; label?: string }> = [];
+  const nodes: WorkflowNodeSpecV1[] = [];
   const nodeIds = new Set<string>();
   for (const raw of args.nodes) {
     if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['nodeKey', 'taskType', 'label'].includes(key))) {
+    if (Object.keys(raw).some((key) => !['nodeKey', 'taskType', 'script', 'label'].includes(key))) {
       return undefined;
     }
     const nodeId = requireString(raw, 'nodeKey');
-    const taskType = requireString(raw, 'taskType');
-    if (!nodeId || !isStablePresentationId(nodeId) || !taskType || nodeIds.has(nodeId)) {
+    const hasTaskType = Object.prototype.hasOwnProperty.call(raw, 'taskType');
+    const hasScript = Object.prototype.hasOwnProperty.call(raw, 'script');
+    const taskType = hasTaskType ? requireString(raw, 'taskType') : undefined;
+    const script = raw.script;
+    if (
+      !nodeId || !isStablePresentationId(nodeId) || nodeIds.has(nodeId) ||
+      hasTaskType === hasScript
+    ) {
       return undefined;
     }
     if (
@@ -395,10 +411,34 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
       return undefined;
     }
     nodeIds.add(nodeId);
+    const label = typeof raw.label === 'string' ? { label: raw.label } : {};
+    if (hasTaskType) {
+      if (!taskType) return undefined;
+      nodes.push({ nodeId, taskType, ...label });
+      continue;
+    }
+    if (!isRecord(script)) return undefined;
+    if (Object.keys(script).some((key) => !['interpreter', 'file', 'args', 'onFailure'].includes(key))) {
+      return undefined;
+    }
+    const interpreter = script.interpreter;
+    const file = script.file;
+    // Default only when the property is absent: the MCP schema permits an array and an
+    // enum string, so an explicit `null` is a contract violation, not an omission.
+    const args = 'args' in script ? script.args : [];
+    const onFailure = 'onFailure' in script ? script.onFailure : 'fail_run';
+    if (
+      (interpreter !== 'node' && interpreter !== 'python' && interpreter !== 'python3') ||
+      !isValidWorkflowScriptFile(file, interpreter) ||
+      !Array.isArray(args) || args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
+      !args.every((arg) => typeof arg === 'string' && arg.length <= WORKFLOW_SCRIPT_ARG_MAX_LENGTH && !arg.includes('\0')) ||
+      (onFailure !== 'fail_run' && onFailure !== 'continue')
+    ) return undefined;
     nodes.push({
       nodeId,
-      taskType,
-      ...(typeof raw.label === 'string' ? { label: raw.label } : {}),
+      backend: 'script',
+      execution: { kind: 'script', interpreter, file, args: [...args] as string[], onFailure },
+      ...label,
     });
   }
 
@@ -1509,6 +1549,24 @@ export function dispatch(
       return { ok: false, toolError: 'list_task_types takes no arguments' };
     }
     return { ok: true, command: { kind: 'list_task_types' } };
+  }
+
+  if (tool === 'list_predefined_workflows') {
+    if (Object.keys(args).length > 0) {
+      return { ok: false, toolError: 'list_predefined_workflows takes no arguments' };
+    }
+    return { ok: true, command: { kind: 'list_predefined_workflows' } };
+  }
+
+  if (tool === 'get_predefined_workflow') {
+    if (Object.keys(args).some((key) => key !== 'workflowRef')) {
+      return { ok: false, toolError: 'get_predefined_workflow accepts only workflowRef' };
+    }
+    const workflowRef = requireString(args, 'workflowRef');
+    if (!workflowRef || !/^pwf_[a-f0-9]{32}$/.test(workflowRef)) {
+      return { ok: false, toolError: 'a valid predefined workflowRef is required' };
+    }
+    return { ok: true, command: { kind: 'get_predefined_workflow', workflowRef } };
   }
 
   return { ok: false, toolError: `unsupported tool: ${tool}` };

@@ -1070,6 +1070,16 @@ export interface TaskRepository {
     artifactId: string;
     artifactRevision: number;
   }[] | undefined>;
+  /** Trusted engine-only script input values and the run's frozen artifact bound. */
+  getWorkflowExecutionContext(turnId: string): Promise<{
+    maxArtifactBytes: number;
+    inputs: readonly {
+      inputRef: string;
+      value: string;
+      artifactKind: string;
+      exitCode?: number;
+    }[];
+  } | undefined>;
   /** Frozen effective policy for an already-claimed scoped start replay. */
   getWorkflowStartPolicy(input: {
     ownerRootTaskId: string;
@@ -2457,6 +2467,119 @@ export class SqliteTaskRepository implements TaskRepository {
     });
   }
 
+  async getWorkflowExecutionContext(turnId: string): Promise<{
+    maxArtifactBytes: number;
+    inputs: readonly {
+      inputRef: string;
+      value: string;
+      artifactKind: string;
+      exitCode?: number;
+    }[];
+  } | undefined> {
+    if (!turnId) return undefined;
+    const rows = await this.db.all<{
+      input_ref: string;
+      required_kind: string;
+      artifact_kind: string;
+      artifact_payload_json: string;
+      policy_json: string;
+    }>(
+      `SELECT binding.input_ref, binding.required_kind,
+              artifact.kind AS artifact_kind,
+              artifact.payload_json AS artifact_payload_json,
+              run.policy_json
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+         JOIN workflow_dependency_gates gate
+           ON gate.workspace_id = activation.workspace_id
+          AND gate.run_id = activation.run_id
+          AND gate.gate_id = COALESCE(activation.source_gate_id, activation.return_gate_id)
+         JOIN workflow_gate_bindings binding
+           ON binding.workspace_id = gate.workspace_id
+          AND binding.run_id = gate.run_id
+          AND binding.gate_id = gate.gate_id
+         JOIN workflow_gate_fills fill
+           ON fill.workspace_id = binding.workspace_id
+          AND fill.run_id = binding.run_id
+          AND fill.gate_id = binding.gate_id
+          AND fill.input_ref = binding.input_ref
+         JOIN workflow_artifacts artifact
+           ON artifact.workspace_id = fill.workspace_id
+          AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+          AND artifact.artifact_id = fill.artifact_id
+          AND artifact.revision = fill.artifact_revision
+        WHERE activation.workspace_id = ?
+          AND activation.execution_turn_id = ?
+        ORDER BY binding.input_ref`,
+      [this.workspaceId, turnId],
+    );
+    if (rows.length === 0) {
+      const run = await this.db.get<{ policy_json: string }>(
+        `SELECT run.policy_json
+           FROM workflow_activations activation
+           JOIN workflow_runs run
+             ON run.workspace_id = activation.workspace_id
+            AND run.run_id = activation.run_id
+          WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
+          LIMIT 1`,
+        [this.workspaceId, turnId],
+      );
+      if (!run) return undefined;
+      try {
+        const policy = JSON.parse(run.policy_json) as Record<string, unknown>;
+        return Number.isInteger(policy.maxArtifactBytes) && Number(policy.maxArtifactBytes) > 0
+          ? { maxArtifactBytes: Number(policy.maxArtifactBytes), inputs: [] }
+          : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+
+    let maxArtifactBytes: number;
+    try {
+      const policy = JSON.parse(rows[0]!.policy_json) as Record<string, unknown>;
+      if (!Number.isInteger(policy.maxArtifactBytes) || Number(policy.maxArtifactBytes) < 1) return undefined;
+      maxArtifactBytes = Number(policy.maxArtifactBytes);
+    } catch {
+      return undefined;
+    }
+    const inputs: Array<{
+      inputRef: string;
+      value: string;
+      artifactKind: string;
+      exitCode?: number;
+    }> = [];
+    for (const row of rows) {
+      if (row.required_kind === 'engine_start' || row.input_ref === 'engine_start') continue;
+      let payload: Record<string, unknown>;
+      try {
+        payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
+      } catch {
+        return undefined;
+      }
+      const value = typeof payload.result === 'string'
+        ? payload.result
+        : typeof payload.value === 'string'
+          ? payload.value
+          : undefined;
+      if (value === undefined) return undefined;
+      const execution = payload.execution && typeof payload.execution === 'object'
+        ? payload.execution as Record<string, unknown>
+        : undefined;
+      inputs.push({
+        inputRef: row.input_ref,
+        value,
+        artifactKind: row.artifact_kind,
+        ...(execution?.kind === 'script' && Number.isInteger(execution.exitCode)
+          ? { exitCode: Number(execution.exitCode) }
+          : {}),
+      });
+    }
+    return { maxArtifactBytes, inputs };
+  }
+
   async getWorkflowStartPolicy(input: {
     ownerRootTaskId: string;
     callerTaskId: string;
@@ -3305,6 +3428,12 @@ export class SqliteTaskRepository implements TaskRepository {
     if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
     if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
     if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
+    if (
+      terminal
+      && nodeRows.some((node) => node.status === 'pending' || node.status === 'active')
+    ) {
+      diagnostics.push({ code: 'terminal_run_has_live_node' });
+    }
     const terminalReason = run.terminal_reason_code;
     if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
       diagnostics.push({ code: 'invalid_terminal_reason' });
@@ -6644,6 +6773,7 @@ export class SqliteTaskRepository implements TaskRepository {
         backend: node.backend ?? validated.backend,
         ...(node.model !== undefined ? { model: node.model } : {}),
         ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
+        ...(node.execution !== undefined ? { execution: node.execution } : {}),
         capabilities: [...(node.capabilities ?? [])] as MusterTask['capabilities'],
         executionPolicy: {
           maxTurns: validated.policy.maxTurnsPerTask,
@@ -6683,6 +6813,7 @@ export class SqliteTaskRepository implements TaskRepository {
         backend: node.backend ?? validated.backend,
         ...(node.model !== undefined ? { model: node.model } : {}),
         ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
+        ...(node.execution !== undefined ? { execution: node.execution } : {}),
         capabilities: [...(node.capabilities ?? [])] as MusterTask['capabilities'],
         executionPolicy: {
           maxTurns: validated.policy.maxTurnsPerTask,
@@ -6945,6 +7076,7 @@ export class SqliteTaskRepository implements TaskRepository {
           prerequisites: [], backend: node.backend ?? validated.backend,
           ...(node.model !== undefined ? { model: node.model } : {}),
           ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
+          ...(node.execution !== undefined ? { execution: node.execution } : {}),
           capabilities: [...(node.capabilities ?? [])] as MusterTask['capabilities'],
           executionPolicy: { maxTurns: validated.policy.maxTurnsPerTask, maxAutomaticRetries: 1, runTimeoutOverrideMs: validated.policy.runTimeoutMs },
           revision: 0, createdAt: validated.createdAt, updatedAt: validated.createdAt, releasedAt: validated.createdAt,
@@ -7851,7 +7983,11 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTurnId: command.turn.id,
       });
     }
-    const resultBody = workflowResultFromSettlement(command, disposition.result);
+    const resultBody = workflowResultFromSettlement(
+      command,
+      disposition.result,
+      disposition.execution?.kind === 'script',
+    );
     const initialEdge = topology.kind === 'graph_v1'
       ? outgoingEdge(topology, producerNode.node_id)
       : undefined;
@@ -7929,7 +8065,7 @@ export class SqliteTaskRepository implements TaskRepository {
             'next_result',
             revision,
             'next_result',
-            encodePayload({ kind: 'next_result', schema: 1, change: (disposition as any).change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(resultBody !== undefined ? { result: resultBody } : {}) }),
+            encodePayload({ kind: 'next_result', schema: 1, change: (disposition as any).change, producerNodeId: producerNode.node_id, sourceTurnId: command.turn.id, ...(disposition.execution !== undefined ? { execution: disposition.execution } : {}), ...(resultBody !== undefined ? { result: resultBody } : {}) }),
             finishedAt,
           ],
         },
@@ -8283,6 +8419,7 @@ export class SqliteTaskRepository implements TaskRepository {
       change: (disposition as any).change,
       producerNodeId: producerNode.node_id,
       sourceTurnId: command.turn.id,
+      ...(disposition.execution !== undefined ? { execution: disposition.execution } : {}),
       ...(resultBody !== undefined ? { result: resultBody } : {}),
     });
     statements.push({
@@ -10449,6 +10586,7 @@ export class SqliteTaskRepository implements TaskRepository {
         backend: node?.backend ?? validated.backend,
         ...(node?.model ? { model: node.model } : {}),
         ...(node?.taskType ? { taskType: node.taskType } : {}),
+        ...(node?.execution ? { execution: node.execution } : {}),
         capabilities: (node?.capabilities ?? []) as MusterTask['capabilities'],
         executionPolicy: {
           maxTurns: childEffectivePolicy.maxTurnsPerTask,
@@ -10551,6 +10689,7 @@ export class SqliteTaskRepository implements TaskRepository {
         backend: node?.backend ?? validated.backend,
         ...(node?.model ? { model: node.model } : {}),
         ...(node?.taskType ? { taskType: node.taskType } : {}),
+        ...(node?.execution ? { execution: node.execution } : {}),
         capabilities: (node?.capabilities ?? []) as MusterTask['capabilities'],
         executionPolicy: {
           maxTurns: childEffectivePolicy.maxTurnsPerTask,
@@ -10784,7 +10923,11 @@ export class SqliteTaskRepository implements TaskRepository {
     )) {
       return empty;
     }
-    const resultBody = workflowResultFromSettlement(command, (disposition as any).result);
+    const resultBody = workflowResultFromSettlement(
+      command,
+      (disposition as any).result,
+      (disposition as any).execution?.kind === 'script',
+    );
     const terminalCompletion = await this.workflowTerminalCompletion(
       childNode.runId,
       terminalIds,
@@ -13568,7 +13711,11 @@ function reasoningStatement(workspaceId: string, reasoning: PersistedReasoning):
 function workflowResultFromSettlement(
   command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
   explicitResult: string | undefined,
+  preserveExact: boolean = false,
 ): string | undefined {
+  if (preserveExact && explicitResult !== undefined) {
+    return truncateUtf8Bytes(explicitResult, TASK_RESULT_MAX_BYTES).text;
+  }
   const explicit = explicitResult?.trim();
   if (explicit) return truncateUtf8Bytes(explicit, TASK_RESULT_MAX_BYTES).text;
 

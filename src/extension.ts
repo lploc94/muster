@@ -165,6 +165,7 @@ import {
   type WorkflowGraphProbeCoordinator,
 } from './host/workflow-graph-probe';
 import { seedWorkflowGraphFixture } from './host/workflow-graph-uat-fixture';
+import { runScriptWorkflowUatFixture } from './host/script-workflow-uat-fixture';
 import { buildWorkflowGraphView } from './host/workflow-graph';
 import { importDroppedFileBytes } from './host/import-dropped-file';
 import { PresentationManager } from './host/presentation-manager';
@@ -5279,6 +5280,39 @@ function registerLiveUatCommands(
         return uatChatProvider.observeWorkflowGraphRoundTripForUat(taskId);
       },
     ),
+    vscode.commands.registerCommand(UAT_COMMANDS.runScriptWorkflowQa, async () => {
+      const { repository, workspaceId } = requireRepo();
+      if (!taskEngine) throw new Error('UAT task engine unavailable');
+      const configuration = vscode.workspace.getConfiguration('muster');
+      // Capture the *workspace-scoped* override, not the effective value. Writing the
+      // effective boolean back at Workspace scope would pin a new override whenever the
+      // setting came from user/default scope, silently shadowing later user changes.
+      const originalWorkspaceHostRun =
+        configuration.inspect<boolean>('verification.hostRun')?.workspaceValue;
+      try {
+        return await runScriptWorkflowUatFixture({
+          engine: taskEngine,
+          repository,
+          client: requireClient(),
+          workspaceId,
+          workspaceFolder: resolveTaskCwd(),
+          setHostRun: async (enabled) => {
+            await configuration.update(
+              'verification.hostRun',
+              enabled,
+              vscode.ConfigurationTarget.Workspace,
+            );
+          },
+        });
+      } finally {
+        // `undefined` removes the override, restoring the original scope precedence.
+        await configuration.update(
+          'verification.hostRun',
+          originalWorkspaceHostRun,
+          vscode.ConfigurationTarget.Workspace,
+        );
+      }
+    }),
     // M019/S05 native first-run observations — production-path delegates only.
     vscode.commands.registerCommand(UAT_COMMANDS.refreshReadiness, async (args) => {
       if (!uatChatProvider) throw new Error('UAT chat provider unavailable');

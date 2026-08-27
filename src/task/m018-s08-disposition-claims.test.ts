@@ -531,6 +531,64 @@ describe('M018 universal durable disposition claims', () => {
       async *run() {},
     };
 
+    await repository.execute({
+      kind: 'defineWorkflowVersion',
+      workspaceId: 'ws',
+      definitionId: 'wf-host-policy-script',
+      version: 1,
+      name: 'host policy script',
+      topology: {
+        kind: 'one_node_v1',
+        entryNodeId: 'script',
+        nodes: [{
+          nodeId: 'script',
+          backend: 'script',
+          execution: {
+            kind: 'script',
+            interpreter: 'node',
+            file: 'scripts/check.js',
+            args: [],
+            onFailure: 'fail_run',
+          },
+        }],
+      },
+      entryContracts: [],
+      policy: DEFAULT_WORKFLOW_POLICY,
+      ownerRootTaskId: root.id,
+      createdAt: '2026-07-22T02:00:00.000Z',
+    });
+    const hostRunDisabled = await executeToolCommand(
+      graphDeps(repository, root, turn, {
+        getHostEnvironment: () => hostSnapshot,
+        allowLocalExecution: () => false,
+        makeBackend: () => ({
+          name: 'script',
+          capabilities: {
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+            supportsMCP: false,
+          },
+          async *run() {},
+        }),
+      }),
+      {
+        callerTaskId: root.id,
+        turnId: turn.id,
+        rootId: root.id,
+        allowedActions: new Set(['start_workflow']),
+      },
+      {
+        kind: 'start_workflow',
+        opId: 'start-host-policy-script-disabled',
+        definitionId: 'wf-host-policy-script',
+        version: 1,
+        startIdempotencyKey: 'host-policy-script-disabled',
+        entryInputs: [],
+      },
+    );
+    expect(hostRunDisabled).toMatchObject({ ok: false });
+    expect(hostRunDisabled.ok ? '' : hostRunDisabled.error).toContain('host_run_disabled');
+
     const untrusted = await executeToolCommand(
       graphDeps(repository, root, turn, { isWorkspaceTrusted: () => false }),
       context,
