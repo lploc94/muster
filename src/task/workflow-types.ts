@@ -17,9 +17,33 @@ export const WORKFLOW_CHILD_BINDINGS_MAX = 64;
 export const WORKFLOW_SCRIPT_FILE_MAX_LENGTH = 1_024;
 export const WORKFLOW_SCRIPT_MAX_ARGS = 64;
 export const WORKFLOW_SCRIPT_ARG_MAX_LENGTH = 4_096;
+export const WORKFLOW_PACKAGE_PATH_MAX_LENGTH = 1_024;
+export const WORKFLOW_PACKAGE_HASH_LENGTH = 64;
 
 export type ScriptInterpreter = 'node' | 'python' | 'python3';
 export type ScriptOnFailure = 'fail_run' | 'continue';
+
+export type WorkflowPackageKind = 'file' | 'bundle';
+export type WorkflowCatalogRootKind = 'canonical' | 'legacy' | 'custom';
+
+/** Host-authored provenance for a predefined workflow package. */
+export interface WorkflowPackageSourceV1 {
+  kind: 'predefined';
+  scope: 'workspace' | 'global';
+  packageKind: WorkflowPackageKind;
+  catalogRootKind: WorkflowCatalogRootKind;
+  /** Relative to the selected catalog root; `.` for a flat workflow file. */
+  packagePath: string;
+  /** Relative to packagePath; flat workflows use the Markdown basename. */
+  entryFile: string;
+  workflowRef: string;
+  packageSha256: string;
+}
+
+/** Package provenance plus the exact script bytes approved at definition time. */
+export interface WorkflowScriptSourceV1 extends WorkflowPackageSourceV1 {
+  scriptSha256: string;
+}
 
 /** Conservative, platform-independent validation before the runtime realpath check. */
 export function isValidWorkflowScriptFile(
@@ -30,17 +54,18 @@ export function isValidWorkflowScriptFile(
     typeof file !== 'string' ||
     file.length === 0 ||
     file.length > WORKFLOW_SCRIPT_FILE_MAX_LENGTH ||
-    /[\0\r\n]/.test(file)
+    /[\x00-\x1f\x7f]/.test(file)
   ) return false;
   const portable = file.replace(/\\/g, '/');
   if (
     portable.startsWith('/') ||
     /^[A-Za-z]:/.test(portable) ||
-    portable.split('/').some((segment) => segment === '..')
+    portable.split('/').some((segment) => segment === '' || segment === '..')
   ) return false;
   const lower = portable.toLowerCase();
   return interpreter === 'node'
     ? lower.endsWith('.js') || lower.endsWith('.cjs') || lower.endsWith('.mjs')
+      || lower.endsWith('.ts') || lower.endsWith('.cts') || lower.endsWith('.mts')
     : lower.endsWith('.py');
 }
 
@@ -48,11 +73,13 @@ export function isValidWorkflowScriptFile(
 export interface ScriptExecutionSpecV1 {
   kind: 'script';
   interpreter: ScriptInterpreter;
-  /** Workspace-relative path. Runtime containment is checked again immediately before spawn. */
+  /** Package-relative path, or workspace-relative for an ad-hoc definition. */
   file: string;
   /** Exact argv values after the script path; never parsed as a shell string. */
   args: readonly string[];
   onFailure: ScriptOnFailure;
+  /** Present only when the node was compiled from a predefined package. */
+  source?: WorkflowScriptSourceV1;
 }
 
 /** A single ordinary workflow node (entry + only node for one_node_v1). */

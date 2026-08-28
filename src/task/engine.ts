@@ -3,6 +3,11 @@ import type { Answers, AskRef } from '../bridge/ask-bridge';
 import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import type { McpReadinessSupervisor } from '../bridge/mcp-readiness';
+import {
+  resolvePredefinedWorkflowScript,
+  resolvePredefinedWorkflowSource,
+  type PredefinedWorkflowCatalogOptions,
+} from '../host/predefined-workflows';
 import { runTurn as defaultRunTurn } from '../runner';
 import type { Backend, NormalizedEvent, RunOptions, ToolFileChange } from '../types';
 import type { TurnTrigger } from './types';
@@ -76,6 +81,7 @@ import {
 import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
+import type { WorkflowScriptSourceV1 } from './workflow-types';
 import {
   deriveResourceClaimKeys,
   isWorkflowTransactionalCommand,
@@ -204,6 +210,8 @@ export interface TaskEngineConfig {
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   /** Fallback cwd when task.cwd and snapshot.cwd are absent. */
   workspaceFolder?: string;
+  /** Optional isolated global workflow catalog root used by hosts/tests. */
+  globalWorkflowFolder?: string;
   /**
    * Task-types W2: live cwd-aware registry from host settings.
    * Passed through to GraphEngineDeps for create/list.
@@ -295,6 +303,27 @@ const DEFAULT_LIMITS: DispositionLimits = {
 
 function nowIso(clock?: () => string): string {
   return clock?.() ?? new Date().toISOString();
+}
+
+function predefinedWorkflowCatalogOptions(
+  workspaceFolder: string | undefined,
+  globalWorkflowFolder: string | undefined,
+): PredefinedWorkflowCatalogOptions {
+  return {
+    workspaceFolder: workspaceFolder ?? process.cwd(),
+    ...(globalWorkflowFolder !== undefined ? { globalWorkflowFolder } : {}),
+  };
+}
+
+async function resolveFrozenPredefinedWorkflow(
+  source: WorkflowScriptSourceV1,
+  workspaceFolder: string | undefined,
+  globalWorkflowFolder: string | undefined,
+) {
+  return resolvePredefinedWorkflowSource(
+    predefinedWorkflowCatalogOptions(workspaceFolder, globalWorkflowFolder),
+    source,
+  );
 }
 
 function canonicalizeToolEvidence(
@@ -533,6 +562,7 @@ export class TaskEngine {
   private readonly prepareHostEnvironment?: () => Promise<void>;
   private readonly getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   private readonly workspaceFolder?: string;
+  private readonly globalWorkflowFolder?: string;
   private readonly getTaskTypeRegistry?: (
     cwd?: string,
   ) => import('./task-types').TaskTypeRegistryResult;
@@ -655,6 +685,7 @@ export class TaskEngine {
     this.prepareHostEnvironment = config.prepareHostEnvironment;
     this.getHostEnvironment = config.getHostEnvironment;
     this.workspaceFolder = config.workspaceFolder;
+    this.globalWorkflowFolder = config.globalWorkflowFolder;
     this.getTaskTypeRegistry = config.getTaskTypeRegistry;
     this.getRuntimeFallbacks = config.getRuntimeFallbacks;
     this.getAdvertisedCommands = config.getAdvertisedCommands;
@@ -1067,6 +1098,7 @@ export class TaskEngine {
         ? () => this.getHostEnvironment!()
         : undefined,
       workspaceFolder: this.workspaceFolder,
+      globalWorkflowFolder: this.globalWorkflowFolder,
       getTaskTypeRegistry: this.getTaskTypeRegistry
         ? (cwd) => this.getTaskTypeRegistry!(cwd)
         : undefined,
@@ -4577,6 +4609,31 @@ export class TaskEngine {
         if (terminalSettled) this.emitFailureSettlement(startedTurn.taskId, turnId, message);
         return;
       }
+      const executionCwd = taskForDispatch.cwd ?? this.workspaceFolder;
+      const catalogWorkspaceFolder = this.workspaceFolder ?? executionCwd;
+      const frozenPackage = scriptExecution?.source
+        ? await resolveFrozenPredefinedWorkflow(
+            scriptExecution.source,
+            catalogWorkspaceFolder,
+            this.globalWorkflowFolder,
+          )
+        : undefined;
+      const scriptRoot = scriptExecution?.source
+        ? frozenPackage?.packageRoot
+        : executionCwd;
+      if (scriptExecution && !scriptRoot) {
+        const message = 'predefined workflow script package is unavailable';
+        terminalSettled = await this.settleFailed(
+          turnId,
+          message,
+          observedSessionId,
+          rawOutput,
+          backend,
+          { suppressAutoRetry: true, suppressRuntimeFallback: true },
+        );
+        if (terminalSettled) this.emitFailureSettlement(startedTurn.taskId, turnId, message);
+        return;
+      }
       this.logLifecycle('turn.started', {
         taskId: taskForDispatch.id,
         turnId,
@@ -4595,7 +4652,6 @@ export class TaskEngine {
       // awaitReady polls tools/list evidence before onBeforePrompt / prompt.
       const mcpEnabled = !scriptExecution && this.bridgePort > 0 && !!this.credentialRegistry;
       let attemptId: string | undefined;
-      const executionCwd = taskForDispatch.cwd ?? this.workspaceFolder;
       const remainingMs = currentTurn ? remainingRunTimeMs(currentTurn) : undefined;
       const baseRun: RunOptions = scriptExecution && scriptContext
         ? {
@@ -4620,6 +4676,32 @@ export class TaskEngine {
               timeoutMs: remainingMs ?? taskForDispatch.executionPolicy.runTimeoutOverrideMs ?? DEFAULT_RUN_LIMIT_MS,
               maxStdoutBytes: scriptContext.maxArtifactBytes,
               maxStderrBytes: this.getResourceLimits().maxErrorBytes,
+              scriptRoot,
+              ...(scriptExecution.source?.scriptSha256 !== undefined
+                ? { expectedScriptSha256: scriptExecution.source.scriptSha256 }
+                : {}),
+              ...(scriptExecution.source
+                ? {
+                    verifyPackageIntegrity: async () => {
+                      const current = await resolveFrozenPredefinedWorkflow(
+                        scriptExecution.source!,
+                        catalogWorkspaceFolder,
+                        this.globalWorkflowFolder,
+                      );
+                      if (!current) {
+                        throw new Error('predefined workflow package changed after definition');
+                      }
+                      const currentScript = await resolvePredefinedWorkflowScript(
+                        current,
+                        scriptExecution.file,
+                        scriptExecution.interpreter,
+                      );
+                      if (!currentScript || currentScript.scriptSha256 !== scriptExecution.source!.scriptSha256) {
+                        throw new Error('predefined workflow script changed after definition');
+                      }
+                    },
+                  }
+                : {}),
               // The stdin envelope is built from artifacts already bounded individually,
               // so the aggregate ceiling is the right cap for the serialized payload.
               maxStdinBytes: this.getResourceLimits().maxResultBytes,

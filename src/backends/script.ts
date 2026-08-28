@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants } from 'node:fs';
+import { lstat, open, realpath, stat } from 'node:fs/promises';
 import { delimiter, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { Backend, NormalizedEvent, RunOptions } from '../types';
 import {
@@ -26,10 +28,54 @@ function isWithin(root: string, candidate: string): boolean {
   return !rel.split(/[\\/]/).includes('..');
 }
 
+async function pathHasNoSymlinkComponents(root: string, candidate: string): Promise<boolean> {
+  const rel = relative(root, candidate);
+  if (rel === '') return true;
+  if (isAbsolute(rel) || rel.split(/[\\/]/).includes('..')) return false;
+  let current = root;
+  for (const part of rel.split(/[\\/]/)) {
+    if (!part || part === '.') continue;
+    current = join(current, part);
+    const info = await lstat(current).catch(() => undefined);
+    if (!info || info.isSymbolicLink()) return false;
+  }
+  return true;
+}
+
 function expectedExtensions(interpreter: string): ReadonlySet<string> {
   return normalizeExecutableName(interpreter) === 'node'
-    ? new Set(['.js', '.cjs', '.mjs'])
+    ? new Set(['.js', '.cjs', '.mjs', '.ts', '.cts', '.mts'])
     : new Set(['.py']);
+}
+
+const MAX_SCRIPT_FILE_BYTES = 8 * 1024 * 1024;
+
+async function sha256File(file: string): Promise<string> {
+  const handle = await open(file, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  try {
+    const info = await handle.stat();
+    if (!info.isFile() || info.size > MAX_SCRIPT_FILE_BYTES) {
+      throw new Error('script file exceeds the executable size limit');
+    }
+    const hash = createHash('sha256');
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let position = 0;
+    while (position < info.size) {
+      const result = await handle.read(
+        buffer,
+        0,
+        Math.min(buffer.length, info.size - position),
+        position,
+      );
+      if (result.bytesRead === 0) break;
+      hash.update(buffer.subarray(0, result.bytesRead));
+      position += result.bytesRead;
+    }
+    if (position !== info.size) throw new Error('script file changed while reading');
+    return hash.digest('hex');
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
 }
 
 function safeChildEnvironment(): NodeJS.ProcessEnv {
@@ -108,13 +154,24 @@ function killProcessTree(child: ChildProcess, force: boolean): void {
   }
 }
 
-async function resolveScriptPath(cwd: string, file: string, interpreter: string): Promise<string> {
-  if (!file || isAbsolute(file) || file.includes('\0')) {
-    throw new Error('script file must be a non-empty workspace-relative path');
+async function resolveScriptPath(scriptRoot: string, file: string, interpreter: string): Promise<string> {
+  if (!file || /[\x00-\x1f\x7f]/.test(file)) {
+    throw new Error('script file must be a non-empty package-relative path');
   }
-  const workspace = await realpath(cwd);
-  const unresolved = resolve(workspace, file);
-  if (!isWithin(workspace, unresolved)) throw new Error('script file escapes the workspace');
+  const root = await realpath(scriptRoot);
+  const normalized = file.replace(/\\/g, '/');
+  if (
+    normalized.startsWith('/') ||
+    /^[A-Za-z]:/.test(normalized) ||
+    normalized.split('/').some((part) => part === '' || part === '..')
+  ) {
+    throw new Error('script file must be a non-empty package-relative path');
+  }
+  const unresolved = resolve(root, normalized);
+  if (!isWithin(root, unresolved)) throw new Error('script file escapes the package root');
+  if (!(await pathHasNoSymlinkComponents(root, unresolved))) {
+    throw new Error('script path contains a symbolic link');
+  }
 
   let script: string;
   try {
@@ -122,7 +179,7 @@ async function resolveScriptPath(cwd: string, file: string, interpreter: string)
   } catch {
     throw new Error('script file does not exist');
   }
-  if (!isWithin(workspace, script)) throw new Error('script file resolves outside the workspace');
+  if (!isWithin(root, script)) throw new Error('script file resolves outside the package root');
   const info = await stat(script);
   if (!info.isFile()) throw new Error('script path is not a regular file');
   if (!expectedExtensions(interpreter).has(extname(script).toLowerCase())) {
@@ -172,10 +229,11 @@ export class ScriptBackend implements Backend {
       yield { type: 'error', message: 'script execution requires a workspace cwd', meta: { code: 'invalid_cwd' } };
       return;
     }
+    const scriptRoot = policy.scriptRoot ?? cwd;
 
     let script: string;
     try {
-      script = await resolveScriptPath(cwd, options.input.file, options.input.interpreter);
+      script = await resolveScriptPath(scriptRoot, options.input.file, options.input.interpreter);
     } catch (error) {
       yield {
         type: 'error',
@@ -239,10 +297,71 @@ export class ScriptBackend implements Backend {
       return;
     }
 
+    if (!policy.authorize()) {
+      yield { type: 'error', message: 'local script execution is not authorized', meta: { code: 'host_run_denied' } };
+      return;
+    }
+    if (options.signal?.aborted) {
+      yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
+      return;
+    }
+
+    try {
+      // Re-resolve after interpreter setup so the final path check is adjacent to
+      // the integrity checks and the side-effecting spawn.
+      script = await resolveScriptPath(scriptRoot, options.input.file, options.input.interpreter);
+      if (policy.expectedScriptSha256 !== undefined) {
+        const actual = await sha256File(script);
+        if (actual !== policy.expectedScriptSha256) {
+          yield {
+            type: 'error',
+            message: 'predefined workflow script changed after definition',
+            meta: { code: 'script_integrity_mismatch' },
+          };
+          return;
+        }
+      }
+    } catch (error) {
+      yield {
+        type: 'error',
+        message: error instanceof Error ? error.message : 'script integrity validation failed',
+        meta: { code: 'invalid_script_path' },
+      };
+      return;
+    }
+
+    // This is the final asynchronous package/script verification before the
+    // authorization and cancellation fences immediately preceding spawn.
+    if (policy.verifyPackageIntegrity) {
+      try {
+        await policy.verifyPackageIntegrity();
+      } catch (error) {
+        yield {
+          type: 'error',
+          message: error instanceof Error ? error.message : 'script package integrity validation failed',
+          meta: { code: 'package_integrity_mismatch' },
+        };
+        return;
+      }
+    }
+    if (!policy.authorize()) {
+      yield { type: 'error', message: 'local script execution is not authorized', meta: { code: 'host_run_denied' } };
+      return;
+    }
+    if (options.signal?.aborted) {
+      yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
+      return;
+    }
+
     const maxStdoutBytes = Math.max(1, policy.maxStdoutBytes || DEFAULT_STDOUT_BYTES);
     const maxStderrBytes = Math.max(1, policy.maxStderrBytes ?? DEFAULT_STDERR_BYTES);
     const timeoutMs = Math.max(1, policy.timeoutMs || DEFAULT_TIMEOUT_MS);
-    const child = spawn(program, [script, ...options.input.args], {
+    const isTypeScript = ['.ts', '.cts', '.mts'].includes(extname(script).toLowerCase());
+    const child = spawn(program, [
+      ...(isTypeScript ? ['--experimental-strip-types'] : []),
+      script,
+      ...options.input.args,
+    ], {
       cwd,
       shell: false,
       windowsHide: true,

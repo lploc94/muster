@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import AdmZip from 'adm-zip';
-import { runTests } from '@vscode/test-electron';
+import { downloadAndUnzipVSCode, runTests } from '@vscode/test-electron';
 import { createVSIX } from '@vscode/vsce';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -14,7 +14,7 @@ const downloadTimeout = Number.parseInt(
   process.env.MUSTER_VSCODE_DOWNLOAD_TIMEOUT_MS || '120000',
   10,
 );
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-script-workflow-uat-'));
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'msw-'));
 const evidenceOut = process.env.MUSTER_UAT_EVIDENCE_OUT ||
   path.join(root, 'artifacts', 'script-workflow-native-qa.json');
 const hostResultOut = path.join(tempDir, 'host-result.json');
@@ -36,6 +36,24 @@ function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(`${filePath}.tmp`, `${JSON.stringify(value, null, 2)}\n`);
   fs.renameSync(`${filePath}.tmp`, filePath);
+}
+
+async function resolveVSCodeExecutable(extensionDevelopmentPath) {
+  const downloaded = vscodeExecutablePath ?? await downloadAndUnzipVSCode({
+    version,
+    timeout: Number.isFinite(downloadTimeout) ? downloadTimeout : 120_000,
+    extensionDevelopmentPath,
+  });
+  const candidates = process.platform === 'darwin'
+    ? [
+        downloaded,
+        path.join(path.dirname(downloaded), 'Code'),
+        path.join(path.dirname(downloaded), 'Code - Insiders'),
+      ]
+    : [downloaded];
+  const executable = candidates.find((candidate) => fs.existsSync(candidate));
+  if (!executable) throw new Error('downloaded VS Code executable is unavailable');
+  return executable;
 }
 
 async function main() {
@@ -61,6 +79,7 @@ async function main() {
     const extracted = path.join(tempDir, 'extracted');
     zip.extractAllTo(extracted, true);
     const extensionDevelopmentPath = path.join(extracted, 'extension');
+    const resolvedVSCodeExecutablePath = await resolveVSCodeExecutable(extensionDevelopmentPath);
     const workspacePath = path.join(tempDir, 'workspace');
     const userDataDir = path.join(tempDir, 'user-data');
     const isolatedHome = path.join(tempDir, 'home');
@@ -69,8 +88,7 @@ async function main() {
     fs.mkdirSync(isolatedHome, { recursive: true });
 
     await runTests({
-      ...(vscodeExecutablePath ? { vscodeExecutablePath } : { version }),
-      timeout: Number.isFinite(downloadTimeout) ? downloadTimeout : 120_000,
+      vscodeExecutablePath: resolvedVSCodeExecutablePath,
       extensionDevelopmentPath,
       extensionTestsPath: compiledTest,
       extensionTestsEnv: {

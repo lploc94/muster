@@ -20,7 +20,7 @@ test('native evidence records a real packaged Extension Host PASS', async () => 
   const evidence = await read('docs/uat/script-workflow-native-evidence.md');
   assert.match(evidence, /^# Script Workflow Native Host QA Evidence$/m);
   assert.match(evidence, /^- Verdict: PASS$/m);
-  assert.match(evidence, /VS Code `1\.134\.0`, `extension-development-host`/);
+  assert.match(evidence, /VS Code `1\.135\.0`, `extension-development-host`/);
   assert.match(evidence, /npm run test:script-workflow-native-uat/);
   assert.match(evidence, /host_run_disabled/);
   assert.match(evidence, /zero ACP session claims/);
@@ -43,6 +43,7 @@ test('package scripts and native runner keep the reproducible QA path', async ()
   assert.match(host, /UAT_COMMANDS\.runScriptWorkflowQa/);
   for (const proof of [
     'workspaceShadowsGlobal', 'staleRefRejected', 'disabledStartRejected',
-    'exactStdoutPreserved', 'failRunFailedOnce', 'noAcpSessionClaims',
+    'globalBundleExecuted', 'packageIntegrityRejected', 'exactStdoutPreserved',
+    'failRunFailedOnce', 'noAcpSessionClaims',
   ]) assert.match(fixture, new RegExp(proof));
 });

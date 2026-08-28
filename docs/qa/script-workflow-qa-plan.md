@@ -2,7 +2,7 @@
 
 ## Scope and proof boundary
 
-This plan verifies the independently implemented script executor, script workflow dataflow, semantic workflow compiler, and Markdown saved-workflow catalog. It does not treat a green unit test as proof of live Extension Host behavior. Native PASS requires `npm run test:script-workflow-native-uat`, which packages a fresh VSIX and runs the scenarios inside an actual VS Code Extension Development Host.
+This plan verifies the independently implemented script executor, script workflow dataflow, semantic workflow compiler, and flat/bundle Markdown saved-workflow catalog. It does not treat a green unit test as proof of live Extension Host behavior. Native PASS requires `npm run test:script-workflow-native-uat`, which packages a fresh VSIX and runs the scenarios inside an actual VS Code Extension Development Host.
 
 The five ACP backends remain a regression surface. No test may silently widen `BACKEND_IDS` with `script`, create an ACP session for a script node, inherit arbitrary host secrets, or route script stderr into workflow artifacts.
 
@@ -15,10 +15,13 @@ The five ACP backends remain a regression surface. No test may silently widen `B
 | CAT-03 | List returns metadata/ref only; get returns untrusted body | Catalog and public-path integration tests | `opaqueRefResolved`, `pathsRedacted` |
 | CAT-04 | Invalid and duplicate files are bounded diagnostics | Catalog unit test | `invalidFileDiagnosed` |
 | CAT-05 | Content changes invalidate opaque refs | Catalog unit test | `staleRefRejected` |
+| CAT-06 | Directory bundles select an unambiguous entry and expose package kind | Catalog and global-bundle integration tests | `globalBundleExecuted` |
+| CAT-07 | Nested bundle changes invalidate the package ref without exposing paths | Catalog and runtime integration tests | `packageIntegrityRejected` |
 | CMP-01 | `define_workflow` accepts agent/script mixed graphs | `src/task/coordinator-tools.test.ts` | Two-node native script graph |
 | CMP-02 | Node shape is strict XOR; invalid path/interpreter/extension fails early | Coordinator and workflow-codec tests | Native definition uses only public shape |
 | EXE-01 | Real Node execution uses argv/stdin without a shell | `src/backends/script.test.ts` | Native two-process graph |
 | EXE-02 | Real Python uses the same typed contract when installed | Conditional real-Python backend test | Record local result in the run log |
+| EXE-07 | A global bundle script resolves from its package root while process cwd remains the active workspace | Script backend and public-path integration tests | `globalBundleExecuted` |
 | EXE-03 | stdout is exact, including newline, empty output, and literal metacharacters | Backend and workflow integration tests | `exactStdoutPreserved`, `emptyStdoutSucceeded` |
 | EXE-04 | Nonzero `continue` preserves exit code downstream | Workflow integration test | `continueExitMetadataPreserved` |
 | EXE-05 | Nonzero `fail_run` fails once without retry/fallback | Workflow integration test | `failRunFailedOnce` |
@@ -64,13 +67,14 @@ npm run test:source-boundary
 
 Use a disposable trusted workspace and restore the setting afterward.
 
-1. Create `.muster/workflow/review.md` with valid `name`, `description`, and a short body. Create one invalid Markdown file beside it.
+1. Create `.muster/workflows/review.md` with valid `name`, `description`, and a short body. Create one invalid Markdown file beside it.
 2. Launch `Run Extension` from `.vscode/launch.json`, open Muster, and ask a coordinator to use the saved workflow. Confirm the valid workflow is discoverable and the invalid file does not block the catalog.
-3. Keep `muster.verification.hostRun=false`. Ask the coordinator to start a workflow containing a Node script. Confirm start is rejected with `host_run_disabled` and no child task/process appears.
-4. Set `muster.verification.hostRun=true` without reloading. Start the same workflow again. Confirm the graph contains script nodes and reaches its expected terminal state.
-5. Exercise `continue`, empty stdout, and `fail_run`. Confirm newline/empty results are not replaced with assistant prose, continue exposes the exit code downstream, and fail_run creates no automatic retry.
-6. Modify the saved Markdown file after listing it. Confirm the old opaque ref is rejected and a fresh list produces a new ref.
-7. Attempt `../escape.js`, an absolute path, a wrong extension, and a non-allowlisted interpreter. Confirm none spawn.
-8. Restore `muster.verification.hostRun` to its original value and delete the disposable scripts/catalog files.
+3. Add a global bundle under `~/.muster/workflows/review-bundle/` with `review-bundle.md` and `scripts/node_1.ts`; add a same-named `scripts/node_1.ts` in the workspace with a different marker. Confirm the bundle is listed as `packageKind=bundle` and the global marker runs.
+4. Keep `muster.verification.hostRun=false`. Ask the coordinator to start a workflow containing a Node script. Confirm start is rejected with `host_run_disabled` and no child task/process appears.
+5. Set `muster.verification.hostRun=true` without reloading. Start the same workflow again. Confirm the graph contains script nodes, the bundle script runs from the package root, and `process.cwd()` remains the active workspace.
+6. Exercise `continue`, empty stdout, and `fail_run`. Confirm newline/empty results are not replaced with assistant prose, continue exposes the exit code downstream, and fail_run creates no automatic retry.
+7. Modify the saved Markdown file or any nested bundle file after listing/definition. Confirm the old opaque ref is rejected and a frozen definition cannot execute the changed package.
+8. Attempt `../escape.js`, an absolute path, a wrong extension, a symlink, and a non-allowlisted interpreter. Confirm none spawn.
+9. Restore `muster.verification.hostRun` to its original value and delete the disposable scripts/catalog files.
 
 Do not record bearer tokens, absolute user paths, workflow bodies, task IDs, run IDs, or database paths in committed evidence.

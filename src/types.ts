@@ -237,6 +237,12 @@ export interface RunOptions {
     maxStderrBytes?: number;
     /** Cap on the serialized workflow payload written to the script's stdin. */
     maxStdinBytes?: number;
+    /** Trusted package root; process cwd remains the caller's workspace. */
+    scriptRoot?: string;
+    /** Integrity digest captured when a predefined package was compiled. */
+    expectedScriptSha256?: string;
+    /** Revalidate the complete predefined package and selected script immediately before spawn. */
+    verifyPackageIntegrity?: () => void | Promise<void>;
   };
   /**
    * M017-S06: optional bounded pre-dispatch MCP setup/recovery controller.
