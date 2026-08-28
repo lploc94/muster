@@ -1,4 +1,5 @@
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -73,6 +74,98 @@ describe('ScriptBackend', () => {
     ]);
   });
 
+  it('runs TypeScript from an explicit package root while keeping process cwd separate', async () => {
+    const cwd = workspace();
+    const packageRoot = join(cwd, 'global-package');
+    mkdirSync(join(packageRoot, 'scripts'), { recursive: true });
+    const source = 'const value: string = "package"; process.stdout.write(value + "|" + process.cwd());';
+    const script = join(packageRoot, 'scripts', 'run.ts');
+    writeFileSync(script, source);
+    writeFileSync(join(cwd, 'scripts-shadow.ts'), 'process.stdout.write("workspace-shadow");');
+    const runOptions = options(cwd, 'scripts/run.ts', {
+      localExecution: {
+        ...options(cwd, 'scripts/run.ts').localExecution!,
+        scriptRoot: packageRoot,
+        expectedScriptSha256: createHash('sha256').update(source).digest('hex'),
+      },
+    });
+    await expect(collect(runOptions)).resolves.toEqual([
+      {
+        type: 'processCompleted',
+        stdout: `package|${realpathSync(cwd)}`,
+        stderr: '',
+        exitCode: 0,
+      },
+      { type: 'turnCompleted', meta: { executorKind: 'script', exitCode: 0 } },
+    ]);
+
+    writeFileSync(script, 'const value: string = "changed"; process.stdout.write(value);');
+    await expect(collect(runOptions)).resolves.toEqual([
+      expect.objectContaining({
+        type: 'error',
+        meta: { code: 'script_integrity_mismatch' },
+      }),
+    ]);
+  });
+
+  it('fails closed when the predefined package changes at the dispatch boundary', async () => {
+    const cwd = workspace();
+    writeFileSync(join(cwd, 'package.js'), 'process.stdout.write("must-not-run");');
+    const runOptions = options(cwd, 'package.js', {
+      localExecution: {
+        ...options(cwd, 'package.js').localExecution!,
+        verifyPackageIntegrity: async () => {
+          throw new Error('predefined workflow package changed after definition');
+        },
+      },
+    });
+    await expect(collect(runOptions)).resolves.toEqual([
+      {
+        type: 'error',
+        message: 'predefined workflow package changed after definition',
+        meta: { code: 'package_integrity_mismatch' },
+      },
+    ]);
+  });
+
+  it('rechecks authorization and cancellation after asynchronous package verification', async () => {
+    const cwd = workspace();
+    writeFileSync(join(cwd, 'late.js'), 'process.stdout.write("must-not-run");');
+    let authorized = true;
+    const runOptions = options(cwd, 'late.js', {
+      signal: (() => {
+        const controller = new AbortController();
+        return controller.signal;
+      })(),
+      localExecution: {
+        ...options(cwd, 'late.js').localExecution!,
+        authorize: () => authorized,
+        verifyPackageIntegrity: async () => {
+          authorized = false;
+          await Promise.resolve();
+        },
+      },
+    });
+    await expect(collect(runOptions)).resolves.toEqual([
+      expect.objectContaining({ type: 'error', meta: { code: 'host_run_denied' } }),
+    ]);
+
+    const controller = new AbortController();
+    const cancelled = options(cwd, 'late.js', {
+      signal: controller.signal,
+      localExecution: {
+        ...options(cwd, 'late.js').localExecution!,
+        verifyPackageIntegrity: async () => {
+          controller.abort();
+          await Promise.resolve();
+        },
+      },
+    });
+    await expect(collect(cancelled)).resolves.toEqual([
+      expect.objectContaining({ type: 'error', isCancellation: true }),
+    ]);
+  });
+
   it.skipIf(pythonExecutable === undefined)('runs a real Python file through the same typed contract', async () => {
     const cwd = workspace();
     writeFileSync(join(cwd, 'run.py'), [
@@ -105,6 +198,17 @@ describe('ScriptBackend', () => {
 
     const escaped = options(cwd, '../outside.js');
     expect(await collect(escaped)).toEqual([
+      expect.objectContaining({ type: 'error', meta: { code: 'invalid_script_path' } }),
+    ]);
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects intermediate symlinks in the script path', async () => {
+    const cwd = workspace();
+    mkdirSync(join(cwd, 'scripts'), { recursive: true });
+    writeFileSync(join(cwd, 'scripts', 'run.js'), 'process.stdout.write("must-not-run")');
+    symlinkSync(join(cwd, 'scripts'), join(cwd, 'alias'), 'dir');
+
+    expect(await collect(options(cwd, 'alias/run.js'))).toEqual([
       expect.objectContaining({ type: 'error', meta: { code: 'invalid_script_path' } }),
     ]);
   });

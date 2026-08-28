@@ -52,6 +52,16 @@ describe('live UAT exposure gate', () => {
     expect(appSource).toContain('collectToolCardRenderObservations(document)');
   });
 
+  it('opens the workflow graph through the UAT-gated webview before observing its request', () => {
+    const extensionSource = readFileSync(new URL('../extension.ts', import.meta.url), 'utf8');
+    const appSource = readFileSync(new URL('../../webview/src/App.svelte', import.meta.url), 'utf8');
+    expect(extensionSource).toContain("type: 'workflowGraphProbeRequest'");
+    expect(extensionSource).toContain('UAT workflow graph modal request could not be delivered');
+    expect(appSource).toContain("type === 'workflowGraphProbeRequest'");
+    expect(appSource).toContain('workflowGraphProbeTaskId = (msg as { taskId: string }).taskId');
+    expect(appSource).toContain('workflowGraphOpen = true');
+  });
+
   it('seeds bounded terminal tool-call evidence through named production repository commands', async () => {
     const execute = vi.fn().mockResolvedValue({ ok: true, changed: true });
     const result = await seedStorageWorkload({ execute } as never, 'ws');

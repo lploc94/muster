@@ -7,6 +7,8 @@ import { DEFAULT_ACP_EXECUTOR_ID } from '../backends/executor-registry';
 import {
   getPredefinedWorkflow,
   listPredefinedWorkflows,
+  resolvePredefinedWorkflow,
+  resolvePredefinedWorkflowScript,
 } from '../host/predefined-workflows';
 import type { Backend, RunInput, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
@@ -55,6 +57,7 @@ import { durableDispositionClaim } from './disposition-claim';
 import type {
   WorkflowDefinitionV1,
   WorkflowPolicyV1,
+  WorkflowTopologyV1,
 } from './workflow-types';
 import { validateDefineWorkflow } from './workflow';
 import {
@@ -310,6 +313,8 @@ export interface GraphEngineDeps {
   /** W3: sync host env cache for get_host_context (same as first-turn inject). */
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   workspaceFolder?: string;
+  /** Optional isolated global catalog root used by hosts/tests. */
+  globalWorkflowFolder?: string;
   /**
    * Task-types W2: live cwd-aware registry (VS Code muster.taskTypes).
    * Missing hook → treated as empty at create/list sites.
@@ -393,6 +398,68 @@ function freezeWorkflowDefinitionRouting(
   return validated.ok
     ? { ok: true, definition: validated.definition }
     : workflowHostPolicyError('invalid_workflow_definition', validated.reason);
+}
+
+function workflowCatalogFolder(
+  deps: GraphEngineDeps,
+  caller: MusterTask,
+): string {
+  return deps.workspaceFolder ??
+    deps.getHostEnvironment?.()?.cwd ??
+    (caller.cwd && caller.cwd.length > 0 ? caller.cwd : undefined) ??
+    process.cwd();
+}
+
+async function bindPredefinedWorkflowScripts(
+  deps: GraphEngineDeps,
+  caller: MusterTask,
+  topology: WorkflowTopologyV1,
+  workflowRef: string,
+): Promise<{ ok: true; topology: WorkflowTopologyV1 } | { ok: false; error: string }> {
+  const resolved = await resolvePredefinedWorkflow(
+    {
+      workspaceFolder: workflowCatalogFolder(deps, caller),
+      ...(deps.globalWorkflowFolder !== undefined
+        ? { globalWorkflowFolder: deps.globalWorkflowFolder }
+        : {}),
+    },
+    workflowRef,
+  );
+  if (!resolved) {
+    return workflowHostPolicyError(
+      'predefined_workflow_stale',
+      'predefined workflow is not found or changed; list and retrieve it again',
+    );
+  }
+
+  const nodes = [];
+  for (const node of topology.nodes) {
+    if (node.execution?.kind !== 'script') {
+      nodes.push(node);
+      continue;
+    }
+    const source = await resolvePredefinedWorkflowScript(
+      resolved,
+      node.execution.file,
+      node.execution.interpreter,
+    );
+    if (!source) {
+      return workflowHostPolicyError(
+        'predefined_script_invalid',
+        `predefined workflow script for node ${node.nodeId} is missing or invalid`,
+      );
+    }
+    nodes.push({
+      ...node,
+      execution: { ...node.execution, source },
+    });
+  }
+  return {
+    ok: true,
+    topology: topology.kind === 'one_node_v1'
+      ? { ...topology, nodes: [nodes[0]!] as [typeof nodes[number]] }
+      : { ...topology, nodes },
+  };
 }
 
 function workflowHostPolicyError(code: string, message: string): {
@@ -1958,6 +2025,9 @@ export async function executeToolCommand(
         if (!child || child.parentId !== ctx.callerTaskId) {
           return { ok: false, reason: 'not an owned direct child' };
         }
+        if (child.workflowShell) {
+          return { ok: false, reason: 'workflow shell pending' };
+        }
         const live = turnsForTask(draft, child.id).find(
           (t) => t.status === 'running' || t.status === 'waiting_user',
         );
@@ -2811,14 +2881,15 @@ export async function executeToolCommand(
       const file = deps.store.getFile();
       const task = file.tasks[ctx.callerTaskId];
       if (!task) return { ok: false, error: 'task not found' };
-      const workspaceFolder =
-        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
-        deps.getHostEnvironment?.()?.cwd ??
-        deps.workspaceFolder ??
-        process.cwd();
+      const workspaceFolder = workflowCatalogFolder(deps, task);
       return {
         ok: true,
-        result: await listPredefinedWorkflows({ workspaceFolder }),
+        result: await listPredefinedWorkflows({
+          workspaceFolder,
+          ...(deps.globalWorkflowFolder !== undefined
+            ? { globalWorkflowFolder: deps.globalWorkflowFolder }
+            : {}),
+        }),
       };
     }
 
@@ -2826,13 +2897,14 @@ export async function executeToolCommand(
       const file = deps.store.getFile();
       const task = file.tasks[ctx.callerTaskId];
       if (!task) return { ok: false, error: 'task not found' };
-      const workspaceFolder =
-        (task.cwd && task.cwd.length > 0 ? task.cwd : undefined) ??
-        deps.getHostEnvironment?.()?.cwd ??
-        deps.workspaceFolder ??
-        process.cwd();
+      const workspaceFolder = workflowCatalogFolder(deps, task);
       const workflow = await getPredefinedWorkflow(
-        { workspaceFolder },
+        {
+          workspaceFolder,
+          ...(deps.globalWorkflowFolder !== undefined
+            ? { globalWorkflowFolder: deps.globalWorkflowFolder }
+            : {}),
+        },
         command.workflowRef,
       );
       if (!workflow) return { ok: false, error: 'predefined workflow not found or changed' };
@@ -2861,7 +2933,18 @@ export async function executeToolCommand(
       if (!validated.ok) {
         return workflowHostPolicyError('invalid_workflow_definition', validated.reason);
       }
-      const frozen = freezeWorkflowDefinitionRouting(deps, caller, validated.definition);
+      let definitionToFreeze = validated.definition;
+      if (command.predefinedWorkflowRef !== undefined) {
+        const bound = await bindPredefinedWorkflowScripts(
+          deps,
+          caller,
+          definitionToFreeze.topology,
+          command.predefinedWorkflowRef,
+        );
+        if (!bound.ok) return bound;
+        definitionToFreeze = { ...definitionToFreeze, topology: bound.topology };
+      }
+      const frozen = freezeWorkflowDefinitionRouting(deps, caller, definitionToFreeze);
       if (!frozen.ok) return frozen;
       let definition = frozen.definition;
       if (

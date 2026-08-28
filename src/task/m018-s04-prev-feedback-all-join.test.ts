@@ -1279,7 +1279,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
         { kind: 'workflow_next', change: 'updated', result: 'p1-only-v2' },
         '2026-07-19T11:04:00.000Z',
       );
-      expect(response.ok).toBe(true);
+      expect(response).toMatchObject({ ok: true, changed: true });
 
       const roundFinal = await ctx.client.get(
         `SELECT status FROM workflow_feedback_rounds

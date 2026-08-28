@@ -10,7 +10,10 @@ import {
   WORKFLOW_GRAPH_MAX_NODES,
   WORKFLOW_INPUT_REF_MAX_LENGTH,
   WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  WORKFLOW_PACKAGE_HASH_LENGTH,
+  WORKFLOW_PACKAGE_PATH_MAX_LENGTH,
   WORKFLOW_SCRIPT_ARG_MAX_LENGTH,
+  WORKFLOW_SCRIPT_FILE_MAX_LENGTH,
   WORKFLOW_SCRIPT_MAX_ARGS,
   isValidWorkflowScriptFile,
   type DefineWorkflowInput,
@@ -24,6 +27,7 @@ import {
   type WorkflowNodeSpecV1,
   type WorkflowPolicyV1,
   type ScriptExecutionSpecV1,
+  type WorkflowScriptSourceV1,
   type WorkflowTopologyV1,
 } from './workflow-types';
 
@@ -79,6 +83,56 @@ function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
+function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSourceV1 | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const rec = raw as Record<string, unknown>;
+  const allowed = new Set([
+    'kind', 'scope', 'packageKind', 'catalogRootKind', 'packagePath',
+    'entryFile', 'workflowRef', 'packageSha256', 'scriptSha256',
+  ]);
+  if (Object.keys(rec).some((key) => !allowed.has(key))) return undefined;
+  if (
+    rec.kind !== 'predefined' ||
+    (rec.scope !== 'workspace' && rec.scope !== 'global') ||
+    (rec.packageKind !== 'file' && rec.packageKind !== 'bundle') ||
+    (rec.catalogRootKind !== 'canonical' && rec.catalogRootKind !== 'legacy' && rec.catalogRootKind !== 'custom') ||
+    !isNonEmptyString(rec.packagePath, WORKFLOW_PACKAGE_PATH_MAX_LENGTH) ||
+    !isNonEmptyString(rec.entryFile, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
+    !isNonEmptyString(rec.workflowRef, 64) ||
+    !isNonEmptyString(rec.packageSha256, WORKFLOW_PACKAGE_HASH_LENGTH) ||
+    !isNonEmptyString(rec.scriptSha256, WORKFLOW_PACKAGE_HASH_LENGTH)
+  ) return undefined;
+  const packagePath = rec.packagePath;
+  const entryFile = rec.entryFile;
+  const isSafeRelative = (value: string, allowDot = false): boolean => {
+    if (value === '.' && allowDot) return true;
+    const portable = value.replace(/\\/g, '/');
+    return !portable.startsWith('/') &&
+      !/^[A-Za-z]:/.test(portable) &&
+      !/[\x00-\x1f\x7f]/.test(portable) &&
+      !portable.split('/').some((part) => part === '' || part === '..');
+  };
+  if (
+    !isSafeRelative(packagePath, true) ||
+    !isSafeRelative(entryFile) ||
+    (rec.packageKind === 'file' ? packagePath !== '.' : packagePath === '.') ||
+    !/^pwf_[a-f0-9]{32}$/.test(rec.workflowRef) ||
+    !/^[a-f0-9]{64}$/.test(rec.packageSha256) ||
+    !/^[a-f0-9]{64}$/.test(rec.scriptSha256)
+  ) return undefined;
+  return {
+    kind: 'predefined',
+    scope: rec.scope,
+    packageKind: rec.packageKind,
+    catalogRootKind: rec.catalogRootKind,
+    packagePath,
+    entryFile,
+    workflowRef: rec.workflowRef,
+    packageSha256: rec.packageSha256,
+    scriptSha256: rec.scriptSha256,
+  };
+}
+
 function decodeScriptExecution(raw: unknown): ScriptExecutionSpecV1 | undefined {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
   const rec = raw as Record<string, unknown>;
@@ -96,8 +150,14 @@ function decodeScriptExecution(raw: unknown): ScriptExecutionSpecV1 | undefined 
       !arg.includes('\0'))
   ) return undefined;
   if (rec.onFailure !== 'fail_run' && rec.onFailure !== 'continue') return undefined;
+  let source: WorkflowScriptSourceV1 | undefined;
+  if (rec.source !== undefined) {
+    source = decodeWorkflowScriptSource(rec.source);
+    if (!source) return undefined;
+  }
   if (Object.keys(rec).some((key) =>
-    key !== 'kind' && key !== 'interpreter' && key !== 'file' && key !== 'args' && key !== 'onFailure')) {
+    key !== 'kind' && key !== 'interpreter' && key !== 'file' && key !== 'args' &&
+    key !== 'onFailure' && key !== 'source')) {
     return undefined;
   }
   return {
@@ -106,6 +166,7 @@ function decodeScriptExecution(raw: unknown): ScriptExecutionSpecV1 | undefined 
     file: rec.file,
     args: [...rec.args] as string[],
     onFailure: rec.onFailure,
+    ...(source !== undefined ? { source } : {}),
   };
 }
 
@@ -304,6 +365,7 @@ function encodeNodeJson(node: WorkflowNodeSpecV1): Record<string, unknown> {
       file: node.execution.file,
       args: [...node.execution.args],
       onFailure: node.execution.onFailure,
+      ...(node.execution.source !== undefined ? { source: node.execution.source } : {}),
     };
   }
   return nodeJson;

@@ -48,6 +48,107 @@ async function settleSucceeded(
 }
 
 describe('M024 S04 workflow graph projection', () => {
+  it('retries the complete graph read when the workspace revision changes mid-projection', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s04-revision-'));
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
+    });
+    const peer = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
+    });
+    try {
+      await client.open(dbPath);
+      await peer.open(dbPath);
+      const repository = new SqliteTaskRepository(client, WORKSPACE_ID);
+      const peerRepository = new SqliteTaskRepository(peer, WORKSPACE_ID);
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: WORKSPACE_ID,
+        identityKey: 'm024-s04-revision-read', displayName: 'revision read',
+        createdAt: NOW, lastOpenedAt: NOW,
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: WORKSPACE_ID, task: rootTask() });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: WORKSPACE_ID,
+        turn: {
+          id: 'root-revision-turn', taskId: 'root-1', sequence: 1,
+          status: 'running', trigger: 'user', inputs: [], createdAt: NOW, startedAt: NOW,
+        },
+      });
+      await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-revision-read', version: 1, name: 'revision read',
+        topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'only' }], entryNodeId: 'only' },
+        createdAt: NOW,
+      });
+      const started = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-revision-read', version: 1,
+        startIdempotencyKey: 'revision-read', createdAt: NOW,
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-revision-turn',
+        goal: 'revision read', backend: 'grok',
+      });
+      expect(started).toMatchObject({ ok: true, changed: true });
+
+      const originalAll = client.all.bind(client);
+      let graphNodeReads = 0;
+      let injected = false;
+      (client as unknown as { all: typeof client.all }).all = async (sql, params) => {
+        if (sql.includes('FROM workflow_nodes node') && sql.includes('ORDER BY node.node_id LIMIT 65')) {
+          graphNodeReads += 1;
+          if (!injected) {
+            injected = true;
+            const root = await peerRepository.getTask('root-1');
+            await peerRepository.execute({
+              kind: 'renameTask', workspaceId: WORKSPACE_ID, taskId: 'root-1',
+              goal: 'revision changed during graph read', updatedAt: '2026-08-01T00:00:01.000Z',
+              expectedTaskRevision: root!.revision,
+            });
+          }
+        }
+        return originalAll(sql, params);
+      };
+
+      await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toMatchObject({
+        runId: expect.any(String),
+      });
+      expect(graphNodeReads).toBe(2);
+
+      graphNodeReads = 0;
+      let forcedRaces = 0;
+      (client as unknown as { all: typeof client.all }).all = async (sql, params) => {
+        if (sql.includes('FROM workflow_nodes node') && sql.includes('ORDER BY node.node_id LIMIT 65')) {
+          graphNodeReads += 1;
+          forcedRaces += 1;
+          const root = await peerRepository.getTask('root-1');
+          await peerRepository.execute({
+            kind: 'renameTask', workspaceId: WORKSPACE_ID, taskId: 'root-1',
+            goal: `forced revision race ${forcedRaces}`,
+            updatedAt: `2026-08-01T00:00:0${forcedRaces + 1}.000Z`,
+            expectedTaskRevision: root!.revision,
+          });
+        }
+        return originalAll(sql, params);
+      };
+      const outcome = await routeRequestWorkflowGraph(
+        { type: 'requestWorkflowGraph', requestId: 'unstable-read', taskId: 'root-1' },
+        {
+          getFocused: () => ({ taskId: 'root-1', generation: 1 }),
+          buildWorkflowGraph: () => buildWorkflowGraphView(repository, 'root-1'),
+        },
+      );
+      expect(outcome).toMatchObject({
+        kind: 'message',
+        message: { ok: false, code: 'unavailable' },
+      });
+      expect(graphNodeReads).toBe(3);
+    } finally {
+      await client.close().catch(() => {});
+      await peer.close().catch(() => {});
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('reads the durable S03 five-node reuse closure and its reused edge density from on-disk SQLite', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s04-graph-'));
     const client = new DbClient({

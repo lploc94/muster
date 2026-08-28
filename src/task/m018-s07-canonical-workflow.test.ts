@@ -626,6 +626,48 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(plannerShellTask?.workflowShell).toBeTruthy();
       expect(await opened.repository.listTurns(plannerRow!.task_id!)).toHaveLength(0);
 
+      const pendingToolFile = await buildStoreFromRepo(opened.repository, [
+        caller.entryTaskId,
+        plannerRow!.task_id!,
+      ]);
+      const pendingToolResult = await executeToolCommand(
+        makeMinimalDeps(pendingToolFile, opened.repository),
+        {
+          callerTaskId: caller.entryTaskId,
+          turnId: caller.activationTurnId,
+          rootId: caller.entryTaskId,
+          allowedActions: new Set(['continue_child']),
+        },
+        {
+          kind: 'continue_child',
+          opId: 'reject-pending-planner-shell',
+          childId: plannerRow!.task_id!,
+          instruction: 'must not bypass the workflow gate',
+        },
+      );
+      expect(pendingToolResult).toMatchObject({ ok: false, error: expect.stringMatching(/workflow shell/i) });
+      expect(await opened.repository.listTurns(plannerRow!.task_id!)).toHaveLength(0);
+      expect(await opened.repository.listMessages(plannerRow!.task_id!)).toHaveLength(0);
+
+      await expect(opened.repository.execute({
+        kind: 'continueChildTask',
+        workspaceId: 'ws',
+        expectedTasks: [{ id: plannerShellTask!.id, revision: plannerShellTask!.revision }],
+        tasks: [plannerShellTask!],
+        insertTurnIds: ['forged-shell-turn'],
+        turns: [{
+          id: 'forged-shell-turn', taskId: plannerShellTask!.id, sequence: 1,
+          status: 'queued', trigger: 'engine', inputs: [], createdAt: createdAt,
+        }],
+        insertMessageIds: ['forged-shell-message'],
+        messages: [{
+          id: 'forged-shell-message', taskId: plannerShellTask!.id, role: 'user',
+          state: 'assigned', content: 'forged', createdAt: createdAt,
+        }],
+      })).resolves.toMatchObject({ changed: false, reason: 'workflow shell pending' });
+      expect(await opened.repository.listTurns(plannerRow!.task_id!)).toHaveLength(0);
+      expect(await opened.repository.listMessages(plannerRow!.task_id!)).toHaveLength(0);
+
       const nextR2 = await settleSucceeded(
         opened.repository,
         opened.client,

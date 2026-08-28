@@ -3,6 +3,7 @@ import type { WorkflowGraphWireGraph } from "../../../src/shared/workflow-graph-
 import {
   buildWorkflowGraphPanelView,
   workflowGraphDiagnosticLabel,
+  workflowGraphNodeTone,
   workflowGraphStatusLabel,
 } from "./workflow-graph-view";
 
@@ -93,6 +94,57 @@ function graph(
   };
 }
 
+function operationalGraph(): WorkflowGraphWireGraph {
+  return {
+    runId: "run-operational",
+    runStatus: "running",
+    nodes: [
+      { nodeId: "a", workflowNodeStatus: "succeeded", executionActivity: "completed", displayState: "completed", progressBucket: "completed", reused: false },
+      { nodeId: "b", workflowNodeStatus: "active", executionActivity: "executing", displayState: "executing", progressBucket: "executing", reused: false },
+      { nodeId: "d", workflowNodeStatus: "active", executionActivity: "executing", displayState: "executing", progressBucket: "executing", reused: false },
+      { nodeId: "c", workflowNodeStatus: "pending", executionActivity: "none", displayState: "blocked", progressBucket: "blocked", reason: "waiting_for_inputs", reused: false },
+      { nodeId: "e", workflowNodeStatus: "pending", executionActivity: "none", displayState: "blocked", progressBucket: "blocked", reason: "waiting_for_inputs", reused: false },
+    ],
+    edges: [
+      { fromNodeId: "a", toNodeId: "c", inputRef: "from_a", contributionState: "supplied_live", reused: false },
+      { fromNodeId: "b", toNodeId: "c", inputRef: "from_b", contributionState: "pending", reused: false },
+      { fromNodeId: "c", toNodeId: "e", inputRef: "from_c", contributionState: "blocking", reused: false },
+    ],
+    gates: [
+      { gateId: "gate-a", consumerNodeId: "a", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      { gateId: "gate-b", consumerNodeId: "b", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      { gateId: "gate-d", consumerNodeId: "d", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      {
+        gateId: "gate-c", consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
+        inputs: [
+          { inputRef: "from_a", producerNodeId: "a", state: "supplied_live" },
+          { inputRef: "from_b", producerNodeId: "b", state: "pending" },
+        ],
+      },
+      {
+        gateId: "gate-e", consumerNodeId: "e", status: "open", satisfied: 0, required: 1,
+        inputs: [{ inputRef: "from_c", producerNodeId: "c", state: "blocking" }],
+      },
+    ],
+    activeGate: {
+      gateId: "gate-c", consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
+      inputs: [
+        { inputRef: "from_a", producerNodeId: "a", state: "supplied_live" },
+        { inputRef: "from_b", producerNodeId: "b", state: "pending" },
+      ],
+    },
+    progress: {
+      total: 5, completed: 1, queued: 0, executing: 2, waiting: 0,
+      blocked: 2, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+      frontierNodeIds: ["b", "d", "c", "e"], activeNodeIds: ["b", "d"],
+    },
+    feedbackRounds: [],
+    childRuns: [],
+    reuse: { nodeCount: 0, edgeCount: 0 },
+    diagnostics: [],
+  };
+}
+
 describe("buildWorkflowGraphPanelView", () => {
   it("reduces a five-node reuse closure into stable operator-facing panel data", () => {
     const view = buildWorkflowGraphPanelView(graph());
@@ -143,11 +195,19 @@ describe("buildWorkflowGraphPanelView", () => {
     expect(view.activeNodeId).toBe("five");
     expect(view.activeGate).toEqual({
       id: "gate-five",
+      consumerNodeId: "five",
       status: "open",
       statusLabel: "Open",
       satisfied: 3,
       required: 4,
       progressLabel: "3 of 4 required inputs supplied",
+      blockingLabel: "Waiting on four",
+      inputs: [
+        { inputRef: "one", producerNodeId: "one", state: "supplied_reused", stateLabel: "Supplied reused", missing: false },
+        { inputRef: "two", producerNodeId: "two", state: "supplied_reused", stateLabel: "Supplied reused", missing: false },
+        { inputRef: "three", producerNodeId: "three", state: "supplied_reused", stateLabel: "Supplied reused", missing: false },
+        { inputRef: "four", producerNodeId: "four", state: "pending", stateLabel: "Pending", missing: true },
+      ],
     });
     expect(view.feedbackRounds).toEqual([
       {
@@ -215,6 +275,66 @@ describe("buildWorkflowGraphPanelView", () => {
     });
   });
 
+  it("reduces all consumer gates, contribution states, simultaneous execution, and progress", () => {
+    const view = buildWorkflowGraphPanelView(operationalGraph());
+
+    expect(view.nodes.filter((node) => node.active).map((node) => node.id)).toEqual(["b", "d"]);
+    expect(view.nodes.find((node) => node.id === "c")).toMatchObject({
+      status: "blocked",
+      statusLabel: "Blocked",
+      reasonLabel: "Waiting for workflow inputs",
+    });
+    expect(view.edges).toEqual([
+      expect.objectContaining({ fromNodeId: "a", toNodeId: "c", inputRef: "from_a", state: "supplied_live", stateLabel: "Supplied live" }),
+      expect.objectContaining({ fromNodeId: "b", toNodeId: "c", inputRef: "from_b", state: "pending", stateLabel: "Pending" }),
+      expect.objectContaining({ fromNodeId: "c", toNodeId: "e", inputRef: "from_c", state: "blocking", stateLabel: "Blocking" }),
+    ]);
+    expect(view.gates).toHaveLength(5);
+    expect(view.gates.find((gate) => gate.consumerNodeId === "c")).toEqual({
+      id: "gate-c",
+      consumerNodeId: "c",
+      status: "open",
+      statusLabel: "Open",
+      satisfied: 1,
+      required: 2,
+      progressLabel: "1 of 2 required inputs supplied",
+      blockingLabel: "Waiting on from_b",
+      inputs: [
+        { inputRef: "from_a", producerNodeId: "a", state: "supplied_live", stateLabel: "Supplied live", missing: false },
+        { inputRef: "from_b", producerNodeId: "b", state: "pending", stateLabel: "Pending", missing: true },
+      ],
+    });
+    expect(view.gates.find((gate) => gate.consumerNodeId === "e")?.blockingLabel).toBe("Blocked by from_c");
+    expect(view.progress).toEqual({
+      total: 5,
+      completed: 1,
+      queued: 0,
+      executing: 2,
+      waiting: 0,
+      blocked: 2,
+      notStarted: 0,
+      failed: 0,
+      cancelled: 0,
+      skipped: 0,
+      frontierNodeIds: ["b", "d", "c", "e"],
+      activeNodeIds: ["b", "d"],
+      summaryLabel: "1 of 5 completed · 2 executing · 2 blocked",
+      frontierLabel: "Frontier: b, d, c, e",
+    });
+  });
+
+  it("keeps pending and terminal blocking gate explanations distinct", () => {
+    const mixed = operationalGraph();
+    const gate = mixed.gates.find((candidate) => candidate.consumerNodeId === "c")!;
+    gate.satisfied = 0;
+    gate.inputs = [
+      { inputRef: "failed_input", producerNodeId: "a", state: "blocking" },
+      { inputRef: "future_input", producerNodeId: "b", state: "pending" },
+    ];
+    expect(buildWorkflowGraphPanelView(mixed).gates.find((candidate) => candidate.consumerNodeId === "c")?.blockingLabel)
+      .toBe("Waiting on future_input · Blocked by failed_input");
+  });
+
   it("covers durable node and gate statuses while retaining a safe fallback for future values", () => {
     for (const status of ["pending", "active", "reused", "succeeded", "consumed"]) {
       expect(workflowGraphStatusLabel(status)).not.toBe("Unknown status");
@@ -225,5 +345,23 @@ describe("buildWorkflowGraphPanelView", () => {
     expect(workflowGraphDiagnosticLabel("workflow_graph_edges_truncated")).toBe(
       "Workflow edges were truncated",
     );
+  });
+
+  it("assigns distinct semantic tones to every operational display state", () => {
+    expect([
+      "completed", "reused", "executing", "queued", "waiting", "blocked",
+      "failed", "cancelled", "skipped", "not_started",
+    ].map((status) => [status, workflowGraphNodeTone(status as Parameters<typeof workflowGraphNodeTone>[0])])).toEqual([
+      ["completed", "success"],
+      ["reused", "success"],
+      ["executing", "attention"],
+      ["queued", "info"],
+      ["waiting", "info"],
+      ["blocked", "warning"],
+      ["failed", "danger"],
+      ["cancelled", "muted"],
+      ["skipped", "muted"],
+      ["not_started", "neutral"],
+    ]);
   });
 });

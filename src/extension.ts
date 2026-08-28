@@ -2289,10 +2289,10 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   /**
    * M024/S06: observe one real webview-initiated workflow graph round trip.
    *
-   * Arms the expectation *before* touching focus, because the webview posts its
-   * own `requestWorkflowGraph` as soon as focus changes; arming afterwards would
-   * race the very message we must observe. The null hop forces a genuine focus
-   * transition even when the task is already focused.
+   * Arms the expectation before touching focus, then asks the UAT-gated webview
+   * to open the graph modal after the null hop forces a genuine focus transition.
+   * Opening the modal exercises the production on-demand store, which emits the
+   * observed `requestWorkflowGraph`; the host never synthesizes that request.
    */
   async observeWorkflowGraphRoundTripForUat(taskId: string) {
     const coordinator = this.workflowGraphProbeCoordinator;
@@ -2303,6 +2303,13 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     try {
       await this.transitionFocus(undefined);
       await this.transitionFocus(taskId);
+      const delivered = await this._view?.webview.postMessage({
+        type: 'workflowGraphProbeRequest',
+        taskId,
+      });
+      if (!delivered) {
+        throw new Error('UAT workflow graph modal request could not be delivered');
+      }
     } catch (error) {
       // Keep the pending observation from surfacing as an unhandled rejection;
       // it settles on its own timeout.

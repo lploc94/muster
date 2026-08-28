@@ -243,6 +243,8 @@ export type ToolCommand =
       topology: unknown;
       entryContracts: readonly WorkflowEntryContractV1[];
       policy?: WorkflowPolicyV1;
+      /** Opaque host-resolved source for a predefined workflow package. */
+      predefinedWorkflowRef?: string;
     }
   | {
       kind: 'start_workflow';
@@ -369,11 +371,18 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
   name: string;
   topology: unknown;
   entryContracts: WorkflowEntryContractV1[];
+  predefinedWorkflowRef?: string;
 } | undefined {
-  const allowed = new Set(['name', 'nodes', 'edges', 'inputs']);
+  const allowed = new Set(['name', 'nodes', 'edges', 'inputs', 'predefinedWorkflowRef']);
   if (Object.keys(args).some((key) => !allowed.has(key))) return undefined;
   const name = requireString(args, 'name');
   if (!name) return undefined;
+  let predefinedWorkflowRef: string | undefined;
+  if (Object.prototype.hasOwnProperty.call(args, 'predefinedWorkflowRef')) {
+    const candidate = args.predefinedWorkflowRef;
+    if (typeof candidate !== 'string' || !/^pwf_[a-f0-9]{32}$/.test(candidate)) return undefined;
+    predefinedWorkflowRef = candidate;
+  }
   if (
     !Array.isArray(args.nodes) ||
     args.nodes.length === 0 ||
@@ -496,7 +505,12 @@ function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
   const topology = nodes.length === 1
     ? { kind: 'one_node_v1', entryNodeId: nodes[0]!.nodeId, nodes }
     : { kind: 'graph_v1', nodes, edges };
-  return { name, topology, entryContracts };
+  return {
+    name,
+    topology,
+    entryContracts,
+    ...(predefinedWorkflowRef !== undefined ? { predefinedWorkflowRef } : {}),
+  };
 }
 
 function parseSemanticWorkflowReuse(value: unknown): StartWorkflowNodeReuse[] | undefined {
@@ -1475,6 +1489,9 @@ export function dispatch(
               name: semantic.name,
               topology: semantic.topology,
               entryContracts: semantic.entryContracts,
+              ...(semantic.predefinedWorkflowRef !== undefined
+                ? { predefinedWorkflowRef: semantic.predefinedWorkflowRef }
+                : {}),
             },
           };
         }

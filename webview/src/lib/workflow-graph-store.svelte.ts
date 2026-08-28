@@ -1,5 +1,6 @@
 import type { WorkflowGraphWireGraph } from '../../../src/shared/workflow-graph-wire';
 import { post as defaultPost } from './protocol';
+import { WorkflowGraphRefreshPolicy } from './workflow-graph-refresh-policy';
 
 /**
  * Throttle with leading + trailing (live telemetry pattern).
@@ -63,6 +64,7 @@ export class WorkflowGraphStore {
   private pendingTaskId: string | null = null;
   private isOpen = false;
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
+  private refreshPolicy = new WorkflowGraphRefreshPolicy();
 
   constructor(
     private doPost: typeof defaultPost = defaultPost as unknown as typeof defaultPost,
@@ -80,6 +82,7 @@ export class WorkflowGraphStore {
     this.graph = null;
     this.request = null;
     this.error = null;
+    this.refreshPolicy.reset();
     if (!taskId) return;
     // Legacy auto-fetch path — retained so existing wiring tests that call setFocused directly still trigger a fetch.
     // App.svelte now gates via setOpen(); this path is only for direct callers / tests.
@@ -106,6 +109,7 @@ export class WorkflowGraphStore {
     this.graph = null;
     this.request = null;
     this.error = null;
+    this.refreshPolicy.reset();
     if (!open || !taskId) return;
     this.requestFetch(taskId);
   }
@@ -117,6 +121,7 @@ export class WorkflowGraphStore {
     this.graph = null;
     this.request = null;
     this.error = null;
+    this.refreshPolicy.reset();
     this.isOpen = false;
   }
 
@@ -157,6 +162,7 @@ export class WorkflowGraphStore {
       return;
     }
     if (this.timeoutId) { clearTimeout(this.timeoutId); this.timeoutId = null; }
+    const refreshAfterResult = this.refreshPolicy.onResult(msg.ok && !!msg.graph);
     this.request = null;
     if (msg.ok && msg.graph) {
       this.graph = msg.graph;
@@ -166,6 +172,13 @@ export class WorkflowGraphStore {
       // Preserve host error code for UI (notInWorkflow, unavailable, invalidRequest)
       this.error = (msg as any).code ?? 'unavailable';
     }
+    if (
+      refreshAfterResult
+      && msg.ok
+      && msg.graph
+      && this.isOpen
+      && this.pendingTaskId === focusedTaskId
+    ) this.throttledFetch();
   }
 
   /** Patch-driven invalidation: hybrid event-driven + throttled poll fallback. */
@@ -178,7 +191,7 @@ export class WorkflowGraphStore {
     // — avoids polling plain tasks (common practice: scoped invalidation).
     if (!this.graph && !isCoordinator && !this.request) return;
     // Avoid overlapping with in-flight request for same task
-    if (this.request?.taskId === focusedTaskId) return;
+    if (this.refreshPolicy.onPatch(this.request?.taskId === focusedTaskId, this.error !== null) === 'ignore') return;
     this.pendingTaskId = focusedTaskId;
     this.throttledFetch();
   }
@@ -187,6 +200,7 @@ export class WorkflowGraphStore {
     const requestId = `workflow-graph-${++this.seq}-${Date.now()}`;
     this.request = { requestId, taskId };
     this.error = null;
+    this.refreshPolicy.reset();
     this.debug('workflow_graph.webview_request', { requestId, taskId });
     this.doPost({ type: 'requestWorkflowGraph', requestId, taskId });
     // Guard against silent host (no reply) — don't stay in loading forever
@@ -201,6 +215,7 @@ export class WorkflowGraphStore {
         });
         this.request = null;
         this.error = 'unavailable';
+        this.refreshPolicy.reset();
       }
     }, 8000);
   }
@@ -214,6 +229,9 @@ export class WorkflowGraphStore {
 
   dispose(): void {
     this.throttledFetch.cancel();
+    if (this.timeoutId) clearTimeout(this.timeoutId);
+    this.timeoutId = null;
+    this.refreshPolicy.reset();
   }
 }
 

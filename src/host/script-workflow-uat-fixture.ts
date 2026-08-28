@@ -28,6 +28,8 @@ export interface ScriptWorkflowUatResult {
   };
   runtime: {
     graphSucceeded: true;
+    globalBundleExecuted: true;
+    packageIntegrityRejected: true;
     exactStdoutPreserved: true;
     continueExitMetadataPreserved: true;
     stderrDiagnosticOnly: true;
@@ -63,6 +65,29 @@ async function waitForRun(
       return completion.runStatus;
     }
     if (Date.now() >= deadline) throw new Error('script workflow UAT: workflow run timed out');
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+async function waitForRejectedPackageRun(
+  deps: ScriptWorkflowUatDeps,
+  runId: string,
+  rootId: string,
+): Promise<void> {
+  const deadline = Date.now() + 20_000;
+  for (;;) {
+    const completion = await deps.repository.getWorkflowRunCompletion(runId, rootId);
+    if (completion?.runStatus === 'failed') return;
+    const failedTurn = await deps.client.get<{ count: number }>(
+      `SELECT COUNT(*) AS count
+         FROM workflow_nodes node
+         JOIN turns turn_row
+           ON turn_row.workspace_id = node.workspace_id AND turn_row.task_id = node.task_id
+        WHERE node.workspace_id = ? AND node.run_id = ? AND turn_row.status = 'failed'`,
+      [deps.workspaceId, runId],
+    );
+    if ((failedTurn?.count ?? 0) > 0) return;
+    if (Date.now() >= deadline) throw new Error('script workflow UAT: rejected workflow run timed out');
     await new Promise<void>((resolve) => setTimeout(resolve, 25));
   }
 }
@@ -110,7 +135,7 @@ async function defineAndStart(
   credential: CredentialContext,
   semantic: Record<string, unknown>,
   goal: string,
-): Promise<{ runId: string; entryTaskId: string }> {
+): Promise<{ definitionId: string; runId: string; entryTaskId: string }> {
   const definition = route('define_workflow', semantic, credential);
   assertQa(definition.kind === 'define_workflow', 'define route returned the wrong command');
   await invoke(deps, credential, 'define_workflow', definition);
@@ -125,7 +150,7 @@ async function defineAndStart(
   };
   assertQa(typeof result.runId === 'string', 'start returned no runId');
   assertQa(typeof result.entryTaskId === 'string', 'start returned no entryTaskId');
-  return { runId: result.runId, entryTaskId: result.entryTaskId };
+  return { definitionId: definition.definitionId, runId: result.runId, entryTaskId: result.entryTaskId };
 }
 
 /**
@@ -171,11 +196,16 @@ export async function runScriptWorkflowUatFixture(
   await deps.engine.getProjection()?.refreshTask(rootId);
   const credential = context(rootId, turnId);
 
-  const workspaceCatalog = join(deps.workspaceFolder, '.muster', 'workflow');
-  const globalCatalog = join(homedir(), '.muster', 'workflow');
+   const workspaceCatalog = join(deps.workspaceFolder, '.muster', 'workflows');
+   const globalCatalog = join(homedir(), '.muster', 'workflows');
+   const globalBundle = join(globalCatalog, 'native-qa-bundle');
+   const globalBundleEntry = join(globalBundle, 'native-qa-bundle.md');
+   const globalBundleScript = join(globalBundle, 'scripts', 'native-global.ts');
   await Promise.all([
     mkdir(workspaceCatalog, { recursive: true }),
     mkdir(globalCatalog, { recursive: true }),
+    mkdir(join(globalBundle, 'scripts'), { recursive: true }),
+    mkdir(join(deps.workspaceFolder, 'scripts'), { recursive: true }),
   ]);
   const savedName = `Native QA Saved Workflow ${randomUUID()}`;
   const workspaceSaved = join(workspaceCatalog, 'native-qa-saved.md');
@@ -192,6 +222,19 @@ export async function runScriptWorkflowUatFixture(
     writeFile(globalSaved, markdown('global native QA', 'Global native QA body'), 'utf8'),
     writeFile(workspaceSaved, markdown('workspace native QA', 'Workspace native QA body'), 'utf8'),
     writeFile(invalidSaved, 'invalid workflow without frontmatter', 'utf8'),
+    writeFile(globalBundleEntry, [
+      '---',
+      'name: Native global bundle',
+      'description: Global bundle package-root proof',
+      '---',
+      'Run the global package script.',
+    ].join('\n'), 'utf8'),
+    writeFile(globalBundleScript, [
+      'const result: string = "global-bundle";',
+      'process.stdout.write(result);',
+    ].join('\n'), 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'scripts', 'native-global.ts'),
+      'process.stdout.write("workspace-shadow");', 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-produce.js'), [
       // The metacharacter arrives as argv, so the assertion below proves the executor
       // passes args literally with no shell expansion. Hard-coding it in the output
@@ -223,7 +266,7 @@ export async function runScriptWorkflowUatFixture(
       'list_predefined_workflows',
       { kind: 'list_predefined_workflows' },
     ) as {
-      workflows?: Array<{ workflowRef: string; name: string; description: string; scope: string }>;
+       workflows?: Array<{ workflowRef: string; name: string; description: string; scope: string; packageKind: string }>;
       diagnostics?: Array<{ file: string; code: string }>;
     };
     const selected = listed.workflows?.find((entry) => entry.name === savedName);
@@ -235,6 +278,12 @@ export async function runScriptWorkflowUatFixture(
       'invalid catalog file was not diagnosed',
     );
     assertQa(!JSON.stringify(listed).includes(deps.workspaceFolder), 'catalog list leaked a path');
+    const globalBundleEntryRef = listed.workflows?.find((entry) => entry.name === 'Native global bundle');
+    assertQa(
+      globalBundleEntryRef?.scope === 'global' &&
+      globalBundleEntryRef.packageKind === 'bundle',
+      'global bundle was not discoverable as a bundle',
+    );
     const loaded = await invoke(
       deps,
       credential,
@@ -316,6 +365,51 @@ export async function runScriptWorkflowUatFixture(
       await waitForRun(deps.repository, dataflowResult.runId, rootId) === 'succeeded',
       'continue dataflow did not succeed',
     );
+
+    const globalBundleRun = await defineAndStart(deps, credential, {
+      name: `Native global bundle execution ${rootId}`,
+      predefinedWorkflowRef: globalBundleEntryRef!.workflowRef,
+      nodes: [{
+        nodeKey: 'global',
+        script: { interpreter: 'node', file: 'scripts/native-global.ts' },
+      }],
+    }, 'Native global bundle QA');
+    assertQa(
+      await waitForRun(deps.repository, globalBundleRun.runId, rootId) === 'succeeded',
+      'global bundle workflow did not succeed',
+    );
+    const globalBundleArtifact = await deps.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result' LIMIT 1`,
+      [deps.workspaceId, globalBundleRun.runId],
+    );
+    assertQa(
+      JSON.parse(globalBundleArtifact!.payload_json).result === 'global-bundle',
+      'global bundle resolved the workspace shadow instead of its package script',
+    );
+    await writeFile(globalBundleScript, [
+      'const result: string = "changed-global-bundle";',
+      'process.stdout.write(result);',
+    ].join('\n'), 'utf8');
+    const staleGlobalBundleStart = route('start_workflow', {
+      workflow: `${globalBundleRun.definitionId}@1`,
+      goal: 'Native changed package rejection',
+    }, credential);
+    assertQa(staleGlobalBundleStart.kind === 'start_workflow', 'stale global bundle start route failed');
+    const staleGlobalBundleResult = await invoke(
+      deps,
+      credential,
+      'start_workflow',
+      staleGlobalBundleStart,
+    ) as { runId?: unknown };
+    assertQa(typeof staleGlobalBundleResult.runId === 'string', 'stale global bundle start returned no runId');
+    await waitForRejectedPackageRun(deps, staleGlobalBundleResult.runId, rootId);
+    const staleGlobalBundleArtifact = await deps.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+         WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result' LIMIT 1`,
+      [deps.workspaceId, staleGlobalBundleResult.runId],
+    );
+    assertQa(!staleGlobalBundleArtifact, 'changed global bundle produced a successful artifact');
     const artifacts = await deps.client.all<{
       producer_node_id: string;
       payload_json: string;
@@ -421,6 +515,8 @@ export async function runScriptWorkflowUatFixture(
       },
       runtime: {
         graphSucceeded: true,
+        globalBundleExecuted: true,
+        packageIntegrityRejected: true,
         exactStdoutPreserved: true,
         continueExitMetadataPreserved: true,
         stderrDiagnosticOnly: true,
