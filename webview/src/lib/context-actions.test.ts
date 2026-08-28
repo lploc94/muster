@@ -6,6 +6,7 @@ import type { OutMessage } from './protocol';
 const EXPECTED_ACTION_IDS = [
   'add-file',
   'browse-workspace-files',
+  'add-image',
   'add-skill',
   'add-wiki-page',
   'add-agent',
@@ -26,10 +27,10 @@ describe('Add Context action model', () => {
 
   it('marks implemented actions as enabled host-postable messages without changing protocol payloads', () => {
     const enabled = ADD_CONTEXT_ACTIONS.filter((action) => action.state === 'enabled');
-
     expect(enabled.map((action) => action.id)).toEqual([
       'add-file',
       'browse-workspace-files',
+      'add-image',
       'add-skill',
     ]);
 
@@ -38,6 +39,10 @@ describe('Add Context action model', () => {
     expect(getAddContextActionHostMessage('browse-workspace-files')).toEqual(
       { type: 'browseWorkspaceFiles' } satisfies OutMessage,
     );
+    // Regression: the image action must resolve to a real outbound protocol
+    // variant. `satisfies OutMessage` fails typecheck if `pickImage` is missing
+    // from the OutMessage union (svelte-check caught this; vitest alone cannot).
+    expect(getAddContextActionHostMessage('add-image')).toEqual({ type: 'pickImage' } satisfies OutMessage);
 
     // The skill picker is enabled but handled in-webview (client action, no host message).
     const skill = getAddContextAction('add-skill');

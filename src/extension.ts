@@ -168,6 +168,7 @@ import { seedWorkflowGraphFixture } from './host/workflow-graph-uat-fixture';
 import { runScriptWorkflowUatFixture } from './host/script-workflow-uat-fixture';
 import { buildWorkflowGraphView } from './host/workflow-graph';
 import { importDroppedFileBytes } from './host/import-dropped-file';
+import { ImagePathAuthorizations } from './host/image-authorizations';
 import { PresentationManager } from './host/presentation-manager';
 import {
   createPresentationPanelFactory,
@@ -768,6 +769,8 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private renderProbeCoordinator: WebviewRenderProbeCoordinator | undefined;
   /** UAT-only workflow graph round-trip observer for the current resolved webview. */
   private workflowGraphProbeCoordinator: WorkflowGraphProbeCoordinator | undefined;
+  /** Host-minted image paths accepted by the send boundary. */
+  private readonly imagePathAuthorizations = new ImagePathAuthorizations();
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -1281,6 +1284,57 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       this.postFilePicked(result.path, name.trim());
     } else {
       this.postCommandError(result.message);
+    }
+  }
+
+  /**
+   * Add Context -> Image: multi-select native open dialog restricted to
+   * supported raster formats. Posts full paths for the webview to attach.
+   */
+  private async handlePickImage(): Promise<void> {
+    const defaultUri = workspaceRoot ? vscode.Uri.file(workspaceRoot) : undefined;
+    const picked = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectFolders: false,
+      canSelectMany: true,
+      defaultUri,
+      filters: { Images: ['png', 'jpg', 'jpeg', 'gif', 'webp'] },
+    });
+    if (!picked || picked.length === 0) return;
+    const paths = picked.map((uri) => uri.fsPath);
+    for (const p of paths) this.imagePathAuthorizations.authorize(p);
+    this.post({ type: 'imagesPicked', paths });
+  }
+
+  /**
+   * Clipboard-pasted image bytes from the composer. Reuses the dropped-file
+   * staging path (owner-only temp dir, size cap, wx write) but posts a
+   * distinct message pair so paste can never be mistaken for the existing
+   * drop-to-text-mention flow.
+   */
+  private handleImportPastedImage(name: unknown, data: unknown): void {
+    if (typeof name !== 'string' || !name.trim()) {
+      this.post({ type: 'pastedImageRejected', reason: 'Pasted image is missing a name.' });
+      return;
+    }
+    let bytes: Uint8Array | undefined;
+    if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else if (Array.isArray(data) && data.every((n) => typeof n === 'number')) {
+      bytes = Uint8Array.from(data);
+    }
+    if (!bytes) {
+      this.post({ type: 'pastedImageRejected', reason: 'Pasted image data is missing.' });
+      return;
+    }
+    const result = importDroppedFileBytes(name, bytes);
+    if (result.ok) {
+      this.imagePathAuthorizations.authorize(result.path);
+      this.post({ type: 'pastedImageImported', path: result.path });
+    } else {
+      this.post({ type: 'pastedImageRejected', reason: result.message });
     }
   }
 
@@ -2675,6 +2729,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
       id: message.id,
       kind: message.role as 'user' | 'assistant',
       content: message.content,
+      ...(message.attachments && message.attachments.length
+        ? { attachments: message.attachments.map((p) => path.basename(p)) }
+        : {}),
     };
   }
 
@@ -2723,6 +2780,21 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         clientRequestId,
         taskId: data.taskId,
         reason: 'message cannot be empty',
+        code: 'validation',
+      });
+      return;
+    }
+    // Attachments are absolute host paths supplied by the webview. Extension
+    // filtering (send-request.ts) proves only the suffix, so require every path
+    // to be one this host minted via the native picker or paste staging. Without
+    // this, a compromised webview could name any readable file — an exfil target
+    // renamed to *.png — and the host would base64 it into the prompt.
+    if (!this.imagePathAuthorizations.authorizedAll(data.attachments)) {
+      this.post({
+        type: 'sendRejected',
+        clientRequestId,
+        taskId: data.taskId,
+        reason: 'attachment was not selected in this window',
         code: 'validation',
       });
       return;
@@ -2777,6 +2849,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           : {}),
         ...(Array.isArray(data.mentionBindings) ? { mentionBindings: data.mentionBindings } : {}),
         ...(Array.isArray(data.skills) ? { skills: data.skills } : {}),
+        ...(Array.isArray(data.attachments) && data.attachments.length
+          ? { attachments: data.attachments }
+          : {}),
         ...(typeof data.backend === 'string'
           ? { backend: data.backend }
           : newTaskBackend
@@ -2870,6 +2945,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         model: resolvedModel,
         continuationOf: data.continuationOf,
         ...(Array.isArray(data.skills) && data.skills.length ? { skills: data.skills } : {}),
+        ...(Array.isArray(data.attachments) && data.attachments.length
+          ? { attachments: data.attachments }
+          : {}),
         cwd: resolveTaskCwd(),
         clientRequestId,
       });
@@ -2929,6 +3007,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     const result = await taskEngine.sendAsync(data.taskId, text, {
       agentContent: llmText !== text ? llmText : undefined,
       clientRequestId,
+      ...(Array.isArray(data.attachments) && data.attachments.length
+        ? { attachments: data.attachments }
+        : {}),
     });
     if (!result.ok) {
       const code = /conflict/i.test(result.reason)
@@ -2986,6 +3067,15 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     if (!taskRepository) return;
     try {
       const entries = await taskRepository.listSendOutbox();
+      // Reload starts with an empty authorization set, so a restored pending or
+      // rejected send would be rejected by the send gate on replay. These rows
+      // are host-written and were authorized when first sent, so re-trusting
+      // them keeps resend working without widening the gate to webview input.
+      for (const entry of entries) {
+        for (const attachment of entry.payload.attachments ?? []) {
+          this.imagePathAuthorizations.authorize(attachment);
+        }
+      }
       this.post({
         type: 'sendOutboxSnapshot',
         entries: entries.map((entry) => ({
@@ -2996,6 +3086,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           llmText: entry.payload.llmText,
           mentionBindings: entry.payload.mentionBindings,
           skills: entry.payload.skills,
+          attachments: entry.payload.attachments,
           backend: entry.payload.backend,
           model: entry.payload.model,
           continuationOf: entry.payload.continuationOf,
@@ -3692,6 +3783,12 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           this.postSettingsSnapshot();
           this.postTaskTypesSettingsSnapshot();
           this.postPermissionSettingsSnapshot();
+          break;
+        case 'pickImage':
+          await this.handlePickImage();
+          break;
+        case 'importPastedImage':
+          this.handleImportPastedImage(data.name, data.data);
           break;
         case 'updateSetting':
           await this.handleUpdateSetting(data);

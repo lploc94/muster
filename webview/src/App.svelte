@@ -734,6 +734,7 @@
                 continuationOf: entry.continuationOf,
                 mentionBindings: entry.mentionBindings,
                 skills: entry.skills,
+                attachments: entry.attachments,
                 clientRequestId: entry.clientRequestId,
               });
             }
@@ -1107,6 +1108,7 @@
                 continuationOf: entry.continuationOf,
                 mentionBindings: entry.mentionBindings,
                 skills: entry.skills,
+                attachments: entry.attachments,
                 clientRequestId: entry.clientRequestId,
               });
             }
@@ -1188,6 +1190,7 @@
       entry.mentionBindings,
       entry.skills,
       entry.backend,
+      entry.attachments,
     );
   });
 </script>

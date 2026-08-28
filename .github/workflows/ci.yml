@@ -92,6 +92,20 @@ jobs:
           MUSTER_VSCODE_VERSION: ${{ matrix.vscode-version }}
           MUSTER_EXPECT_INCOMPATIBLE: ${{ matrix.expect-incompatible }}
 
+  image-attachment-extension-host:
+    name: Image attachment Extension Host
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - run: npm ci
+      - run: xvfb-run -a npm run test:image-attachment-extension-host
+
   workflow-graph-native-host:
     name: Workflow graph native host evidence
     runs-on: ubuntu-latest

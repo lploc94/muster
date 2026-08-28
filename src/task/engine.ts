@@ -85,6 +85,7 @@ import type { WorkflowScriptSourceV1 } from './workflow-types';
 import {
   deriveResourceClaimKeys,
   isWorkflowTransactionalCommand,
+  SEND_OUTBOX_ATTACHMENTS_MAX,
   type TaskRepository,
 } from './repository';
 import {
@@ -439,6 +440,27 @@ export function projectPrompt(
     }
   }
   return parts.join('\n\n');
+}
+
+/**
+ * Concatenated attachment paths from a turn's user messages, capped at
+ * SEND_OUTBOX_ATTACHMENTS_MAX. Separate from projectPrompt so that function's
+ * string return type is undisturbed for its other callers.
+ */
+export function projectAttachments(
+  turn: TaskTurn,
+  messages: ReadonlyMap<string, TaskMessage>,
+): readonly string[] {
+  const messageInputs = turn.inputs
+    .filter((input): input is { kind: 'message'; messageId: string } => input.kind === 'message')
+    .map((input) => messages.get(input.messageId))
+    .filter((message): message is TaskMessage => message !== undefined)
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+  const attachments: string[] = [];
+  for (const message of messageInputs) {
+    if (message.attachments) attachments.push(...message.attachments);
+  }
+  return attachments.slice(0, SEND_OUTBOX_ATTACHMENTS_MAX);
 }
 
 function messageMapFromFile(file: EngineProjection): Map<string, TaskMessage> {
@@ -1566,6 +1588,8 @@ export class TaskEngine {
      * for a continuation (`continuationOf` set → no fresh first turn to inject into).
      */
     skills?: string[];
+    /** Absolute paths of images attached to the first message (composer chips). */
+    attachments?: string[];
     /** Phase C idempotent send key. */
     clientRequestId?: string;
   }): Promise<EngineResult<{ taskId: string; messageId: string; turnId: string; clientRequestId?: string }>> {
@@ -1680,6 +1704,7 @@ export class TaskEngine {
       ...(agentContent ? { agentContent } : {}),
       state: 'pending',
       createdAt: now,
+      ...(params.attachments && params.attachments.length ? { attachments: params.attachments } : {}),
     };
     const queued = transitionStartTask(task, [], {
       turnId,
@@ -2180,7 +2205,7 @@ export class TaskEngine {
   async sendAsync(
     taskId: string,
     content: string,
-    options?: { agentContent?: string; clientRequestId?: string },
+    options?: { agentContent?: string; clientRequestId?: string; attachments?: string[] },
   ): Promise<EngineResult<{ messageId: string; turnId?: string; clientRequestId?: string }>> {
     const hold = this.rejectIfMaintenanceHold();
     if (hold) return hold;
@@ -2254,6 +2279,7 @@ export class TaskEngine {
       ...(agentContent ? { agentContent } : {}),
       state: 'pending',
       createdAt: now,
+      ...(options?.attachments && options.attachments.length ? { attachments: options.attachments } : {}),
     };
     const queue = existingTurns.length === 0
       ? transitionStartTask(nextTask, existingTurns, {
@@ -4590,6 +4616,7 @@ export class TaskEngine {
       const currentTurn = current.turns[turnId];
       const messages = messageMapFromFile(current);
       const prompt = projectPrompt(currentTurn, messages, current, this.getResourceLimits().maxResultBytes);
+      const imagePaths = projectAttachments(currentTurn, messages);
       const scriptExecution = taskForDispatch.execution?.kind === 'script'
         ? taskForDispatch.execution
         : undefined;
@@ -4708,7 +4735,11 @@ export class TaskEngine {
             },
           }
         : {
-            input: { kind: 'agent', prompt },
+            input: {
+              kind: 'agent',
+              prompt,
+              ...(imagePaths.length ? { imagePaths } : {}),
+            },
             resumeId: taskForDispatch.committedSessionId,
             signal: abort.signal,
             // Run the agent in the task's workspace directory so ACP adapters
@@ -4717,7 +4748,6 @@ export class TaskEngine {
             cwd: executionCwd,
             model: taskForDispatch.model,
           };
-      // Provisional attempt mint so mcpServers array exists for in-place remint.
       if (mcpEnabled) {
         attemptId = randomBytes(8).toString('hex');
       }

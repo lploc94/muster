@@ -82,6 +82,8 @@ export interface TaskComposerMessageParams {
   backend?: string;
   model?: string | null;
   mentionBindings?: Array<[string, string]>;
+  /** Absolute paths of attached images (composer chips). */
+  attachments?: string[];
 }
 
 /**
@@ -126,6 +128,9 @@ export function buildTaskComposerMessage(
   if (model) base.model = model;
   if (params.mentionBindings && params.mentionBindings.length > 0) {
     base.mentionBindings = params.mentionBindings.map(([label, resolved]) => [label, resolved]);
+  }
+  if (params.attachments && params.attachments.length > 0) {
+    base.attachments = [...params.attachments];
   }
   return base;
 }

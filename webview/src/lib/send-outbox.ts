@@ -11,6 +11,8 @@ export interface OutboxEntry {
   llmText?: string;
   mentionBindings?: Array<[string, string]>;
   skills?: string[];
+  /** Absolute host paths of attached images; restored on resend and reload. */
+  attachments?: string[];
   backend?: string;
   model?: string;
   continuationOf?: string;
@@ -22,6 +24,7 @@ export interface OutboxEntry {
 const memory = new Map<string, OutboxEntry>();
 
 const MAX_PERSISTED_SKILLS = 8;
+const MAX_PERSISTED_ATTACHMENTS = 4;
 
 function normalizeMentionBindings(value: unknown): Array<[string, string]> | undefined {
   if (!Array.isArray(value)) return undefined;
@@ -52,11 +55,31 @@ function normalizeSkills(value: unknown): string[] | undefined {
   return out.length > 0 ? out : undefined;
 }
 
+/**
+ * Attachment paths survive a rejected send and a reload so a resend carries the
+ * same images. Bounded and de-duplicated to mirror the host-side validation in
+ * src/host/send-request.ts, which rejects the whole send when it disagrees.
+ */
+function normalizeAttachments(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== 'string') continue;
+    if (!entry || seen.has(entry)) continue;
+    seen.add(entry);
+    out.push(entry);
+    if (out.length >= MAX_PERSISTED_ATTACHMENTS) break;
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 function normalizeEntry(entry: OutboxEntry): OutboxEntry {
   return {
     ...entry,
     mentionBindings: normalizeMentionBindings(entry.mentionBindings),
     skills: normalizeSkills(entry.skills),
+    attachments: normalizeAttachments(entry.attachments),
     status: entry.status ?? 'pending',
   };
 }

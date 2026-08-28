@@ -30,6 +30,7 @@ function transcriptToThreadItem(item: TranscriptItem): ThreadItem | null {
         text: asText(item.content),
         turnId: item.turnId,
         order: item.order,
+        ...(item.attachments && item.attachments.length ? { attachments: item.attachments } : {}),
       };
     case 'assistant':
       return {

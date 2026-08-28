@@ -956,7 +956,7 @@
               {/if}
 
               {#if item.kind === 'user'}
-                <MessageBubble role="user" text={item.text} />
+                <MessageBubble role="user" text={item.text} attachments={item.attachments} />
               {:else if item.kind === 'assistant'}
                 <MessageBubble
                   role="assistant"

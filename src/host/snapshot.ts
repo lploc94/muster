@@ -1,5 +1,6 @@
 import type { Question } from '../bridge/ask-bridge';
 import { boundToolFileChanges } from '../shared/tool-file-changes';
+import { attachmentBasename } from '../shared/image-attachments';
 import { deriveRuntimeActivity, deriveViewStatus } from '../task/derived-status';
 import { prerequisitesBlockTask } from '../task/scheduler';
 import {
@@ -138,6 +139,8 @@ export type TranscriptItem =
       turnId?: string;
       order?: number;
       state?: TaskMessageState;
+      /** Basenames of images attached to this message (user kind only). */
+      attachments?: string[];
     }
   | { id: string; kind: 'tool'; turnId: string; order: number; content: ToolTranscriptContent }
   | { id: string; kind: 'reasoning'; turnId: string; order: number; content: string };
@@ -587,6 +590,9 @@ export function buildTranscript(file: EngineProjection, taskId: string): Transcr
         turnId,
         order: message.order,
         state: message.state,
+        ...(message.role === 'user' && message.attachments && message.attachments.length > 0
+          ? { attachments: message.attachments.map(attachmentBasename) }
+          : {}),
       },
       key: { turnSequence: seq, kindRank, ordering, createdAt: message.createdAt, entityId: message.id },
     });

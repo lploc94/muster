@@ -23,7 +23,7 @@ Read in this order when onboarding:
 | [plans/delegate-task-ux-improve.md](plans/delegate-task-ux-improve.md) | **PARTIAL**: compound wait, repair, ask_parent; C5 residuals under cleanup |
 | [MCP-INJECTION.md](MCP-INJECTION.md) | `context_engine` + `coordinator` MCP per turn |
 | [MUSTER-BRIDGE.md](MUSTER-BRIDGE.md) | Bridge / elicitation (MCP `ask_user` disabled — see cleanup C3) |
-| [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, Trustworthy first run / backend recovery, and diagnostics |
+| [WEBVIEW.md](WEBVIEW.md) | Chat UI, workspace file-drop mention contract, composer image attachments, read-only presentation review, queued follow-ups and interrupt & send, task Markdown export, lifecycle, Trustworthy first run / backend recovery, and diagnostics |
 | [SETTINGS.md](SETTINGS.md) | Host-backed Settings domain shell: 4-domain IA (Agents, Execution, Connections, Data) with three actionable tabs rendered (Agents / Execution / Data) and Connections reserved; Agents → Backends readiness, Test Connection, Doctor, and recovery |
 | [SETTINGS-DESIGN.md](SETTINGS-DESIGN.md) | Adopted Settings information architecture, naming, responsive layout, and migration guidance |
 | [SQLITE-STORAGE.md](SQLITE-STORAGE.md) | SQLite global storage: location/scope, WAL, backup vs export, manual restore, developer reset, recovery, privacy |

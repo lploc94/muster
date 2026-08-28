@@ -73,6 +73,7 @@
   } from '../lib/composer-submit';
   import { outboxAdd } from '../lib/send-outbox';
   import { vscode } from '../lib/vscode';
+  import { imageExtensionForMime } from '../lib/image-attachments';
 
   interface Props {
     mode: 'draft' | 'task';
@@ -132,6 +133,9 @@
   let isDraggingFile = $state(false);
   let isExplorerDrag = $state(false);
   let dropFeedback = $state<string | null>(null);
+  /** Composer image attachment chips (paste or Add Context -> Image). */
+  let attachments = $state<Array<{ path: string; name: string }>>([]);
+  const MAX_ATTACHMENTS = 4;
   let isAddContextMenuOpen = $state(false);
   let lastPrefillNonce = $state<number | null>(null);
   /** Reactive mirror of the pure autocomplete session (request scope + listbox). */
@@ -539,6 +543,12 @@
       selectedSkills = [];
       selectedSkillsBackend = null;
     }
+    // Restore image chips carried by a rejected send so a retry re-sends the same
+    // images. Unlike skills these are backend-agnostic: the host re-validates
+    // every path on send, so a stale path fails the send rather than the chip.
+    attachments = (prefill.attachments ?? [])
+      .slice(0, MAX_ATTACHMENTS)
+      .map((p) => ({ path: p, name: p.replace(/\\/g, '/').split('/').filter(Boolean).pop() || p }));
     dropFeedback = null;
     const appliedId = prefill.clientRequestId;
     tasks.clearComposerPrefill();
@@ -652,13 +662,27 @@
         }
         return;
       }
-      if (msg?.type !== 'filePicked' || typeof msg.path !== 'string') return;
-      dropFeedback = null;
-      const displayName =
-        typeof msg.displayName === 'string' && msg.displayName.trim()
-          ? msg.displayName.trim()
-          : undefined;
-      insertFileMention(msg.path, displayName);
+      if (msg?.type === 'filePicked' && typeof msg.path === 'string') {
+        dropFeedback = null;
+        const displayName =
+          typeof msg.displayName === 'string' && msg.displayName.trim()
+            ? msg.displayName.trim()
+            : undefined;
+        insertFileMention(msg.path, displayName);
+        return;
+      }
+      if (msg?.type === 'imagesPicked' && Array.isArray(msg.paths)) {
+        addImageAttachments((msg.paths as unknown[]).filter((p): p is string => typeof p === 'string'));
+        return;
+      }
+      if (msg?.type === 'pastedImageImported' && typeof msg.path === 'string') {
+        addImageAttachments([msg.path]);
+        return;
+      }
+      if (msg?.type === 'pastedImageRejected' && typeof msg.reason === 'string') {
+        dropFeedback = msg.reason;
+        return;
+      }
     }
 
     window.addEventListener('message', onMessage);
@@ -787,6 +811,7 @@
         continuationOf?: string;
         skills?: string[];
         mentionBindings?: Array<[string, string]>;
+        attachments?: string[];
         clientRequestId: string;
       } = { type: 'send', text: displayText, backend, clientRequestId };
       if (llmText !== displayText) payload.llmText = llmText;
@@ -798,6 +823,9 @@
       }
       if (mentionBindings.size > 0) {
         payload.mentionBindings = Array.from(mentionBindings.entries());
+      }
+      if (attachments.length > 0) {
+        payload.attachments = attachments.map((a) => a.path);
       }
       outboxAdd(vscode, {
         clientRequestId,
@@ -823,6 +851,7 @@
       draftText = '';
       mentionBindings = new Map();
       selectedSkills = [];
+      attachments = [];
       closeSkillPopup();
       return;
     }
@@ -858,6 +887,7 @@
       llmText,
       mentionBindings:
         mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
+      attachments: attachments.length > 0 ? attachments.map((a) => a.path) : undefined,
       ...(pickerBackend ? { backend: pickerBackend } : {}),
       ...(pickerModel ? { model: pickerModel } : {}),
     });
@@ -879,6 +909,7 @@
     draftText = '';
     mentionBindings = new Map();
     selectedSkills = [];
+    attachments = [];
     closeSkillPopup();
   }
 
@@ -1088,6 +1119,62 @@
     }
     if (extraction.code !== 'disabled') {
       dropFeedback = extraction.message;
+    }
+  }
+
+  /**
+   * Add picked/pasted image paths as composer chips, capped at MAX_ATTACHMENTS.
+   * Silently ignores the overflow beyond the cap rather than erroring — the
+   * picker is multi-select, so a partial add is the expected outcome.
+   */
+  function addImageAttachments(paths: string[]): void {
+    if (paths.length === 0) return;
+    const existing = new Set(attachments.map((a) => a.path));
+    const additions: Array<{ path: string; name: string }> = [];
+    let capped = false;
+    for (const path of paths) {
+      if (existing.has(path)) continue;
+      if (attachments.length + additions.length >= MAX_ATTACHMENTS) {
+        capped = true;
+        break;
+      }
+      const name = path.replace(/\\/g, '/').split('/').pop() || path;
+      additions.push({ path, name });
+      existing.add(path);
+    }
+    if (additions.length > 0) {
+      attachments = [...attachments, ...additions];
+    }
+    // Decide feedback AFTER the partial add: a multi-select that overflows the
+    // cap must stay visible, not be cleared by the images that did attach.
+    dropFeedback = capped ? `Up to ${MAX_ATTACHMENTS} images per message.` : null;
+  }
+
+  function removeAttachment(path: string): void {
+    attachments = attachments.filter((a) => a.path !== path);
+  }
+
+  /** Clipboard-pasted image: stage bytes on the host, never touches the draft text. */
+  async function onComposerPaste(e: ClipboardEvent): Promise<void> {
+    if (!canSend || !e.clipboardData) return;
+    const items = Array.from(e.clipboardData.items);
+    const imageItems = items.filter((item) => item.type.startsWith('image/'));
+    if (imageItems.length === 0) return;
+    e.preventDefault();
+    for (const item of imageItems) {
+      const file = item.getAsFile();
+      if (!file) continue;
+      const ext = imageExtensionForMime(item.type) ?? 'png';
+      try {
+        const buffer = await file.arrayBuffer();
+        post({
+          type: 'importPastedImage',
+          name: `pasted-image-${Date.now()}.${ext}`,
+          data: buffer,
+        });
+      } catch {
+        dropFeedback = 'Unable to read the pasted image.';
+      }
     }
   }
 
@@ -1712,6 +1799,26 @@
     </div>
   {/if}
 
+  {#if attachments.length > 0}
+    <div class="skill-chips" role="list" aria-label="Attached images" data-testid="attachment-chips">
+      {#each attachments as attachment (attachment.path)}
+        <span class="skill-chip" role="listitem" data-testid="attachment-chip" data-path={attachment.path}>
+          <span class="codicon codicon-file-media" aria-hidden="true"></span>
+          <span class="skill-chip__label">{attachment.name}</span>
+          <button
+            type="button"
+            class="skill-chip__remove"
+            aria-label={`Remove ${attachment.name}`}
+            data-testid="attachment-chip-remove"
+            onclick={() => removeAttachment(attachment.path)}
+          >
+            <span class="codicon codicon-close" aria-hidden="true"></span>
+          </button>
+        </span>
+      {/each}
+    </div>
+  {/if}
+
   <!-- Layered input: highlight backdrop + transparent textarea (Cursor-style live chips). -->
   <div class="composer-input" class:composer-input--disabled={!canSend}>
     <div
@@ -1733,6 +1840,7 @@
       onselect={onDraftSelectOrKeyup}
       onclick={onDraftSelectOrKeyup}
       onblur={onComposerTextareaBlur}
+      onpaste={onComposerPaste}
       oncompositionstart={onMentionCompositionStart}
       oncompositionend={onMentionCompositionEnd}
       spellcheck="true"

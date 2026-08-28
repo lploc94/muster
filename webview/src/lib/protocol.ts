@@ -134,6 +134,8 @@ export interface TranscriptItem {
   turnId?: string;
   order?: number;
   state?: string;
+  /** Basenames of images attached to this message (user items only). */
+  attachments?: string[];
 }
 
 export interface PendingAsk {
@@ -508,6 +510,12 @@ export type ExtMessage =
     }
   /** `path` = resolve target for LLM; optional `displayName` = short chip label. */
   | { type: 'filePicked'; path: string; displayName?: string }
+  /** Add Context -> Image: user selected one or more images via the native open dialog. */
+  | { type: 'imagesPicked'; paths: string[] }
+  /** Clipboard-pasted image staged to a temp path; host echoes back the resolved path. */
+  | { type: 'pastedImageImported'; path: string }
+  /** Clipboard-pasted image could not be staged (missing name/data, size/type reject). */
+  | { type: 'pastedImageRejected'; reason: string }
   | { type: 'backendsAvailable'; backends: string[] }
   /**
    * Host-owned passive BackendReadinessSnapshot (M019). Webview must parse via
@@ -554,6 +562,7 @@ export type ExtMessage =
         llmText?: string;
         mentionBindings?: Array<[string, string]>;
         skills?: string[];
+        attachments?: string[];
         backend?: string;
         model?: string;
         continuationOf?: string;
@@ -648,6 +657,8 @@ export type OutMessage =
       skills?: string[];
       /** Display mention → resolved path pairs needed to restore rejected drafts. */
       mentionBindings?: Array<[string, string]>;
+      /** Absolute paths of attached images (composer chips). */
+      attachments?: string[];
       /** Durable idempotent send key (stable across resend). */
       clientRequestId: string;
     }
@@ -738,6 +749,13 @@ export type OutMessage =
    * webview), host writes a temp copy and replies with `filePicked` absolute path.
    */
   | { type: 'importDroppedFile'; name: string; data: ArrayBuffer }
+  /** Add Context -> Image: open the host native image open dialog (multi-select). */
+  | { type: 'pickImage' }
+  /**
+   * Clipboard-pasted image bytes with no filesystem path. Host stages a temp copy
+   * and replies with `pastedImageImported`, or `pastedImageRejected` on failure.
+   */
+  | { type: 'importPastedImage'; name: string; data: ArrayBuffer }
   | { type: 'openLink'; url: string }
   | { type: 'clearHistory' }
   | { type: 'deleteTask'; taskId: string }
@@ -856,7 +874,7 @@ function isInteger(v: unknown): v is number {
 
 const SEND_OUTBOX_ENTRY_KEYS = [
   'clientRequestId', 'status', 'taskId', 'text', 'llmText', 'mentionBindings',
-  'skills', 'backend', 'model', 'continuationOf', 'createdAt',
+  'skills', 'attachments', 'backend', 'model', 'continuationOf', 'createdAt',
 ] as const;
 const SEND_OUTBOX_TEXT_MAX_LENGTH = 262_144;
 
@@ -898,6 +916,23 @@ function isSendOutboxSnapshotEntry(value: unknown): boolean {
         /^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(skill) &&
         !seenSkills.has(skill) &&
         Boolean(seenSkills.add(skill))
+      )
+    ) {
+      return false;
+    }
+  }
+  if (value.attachments !== undefined) {
+    const seenAttachments = new Set<string>();
+    if (
+      !Array.isArray(value.attachments) ||
+      value.attachments.length > 4 ||
+      !value.attachments.every((attachment) =>
+        typeof attachment === 'string' &&
+        attachment.length > 0 &&
+        attachment.length <= 4096 &&
+        !/[\0\r\n]/.test(attachment) &&
+        !seenAttachments.has(attachment) &&
+        Boolean(seenAttachments.add(attachment))
       )
     ) {
       return false;
@@ -1846,6 +1881,15 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'filePicked':
       return isString(data.path) && (data.displayName === undefined || isString(data.displayName));
+
+    case 'imagesPicked':
+      return Array.isArray(data.paths) && data.paths.every(isString);
+
+    case 'pastedImageImported':
+      return isString(data.path);
+
+    case 'pastedImageRejected':
+      return isString(data.reason);
 
     case 'backendsAvailable':
       return Array.isArray(data.backends) && data.backends.every(isString);

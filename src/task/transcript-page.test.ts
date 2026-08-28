@@ -477,6 +477,64 @@ describe('getTranscriptPage — query plan is task-scoped (Finding 4)', () => {
   });
 });
 
+describe('getTranscriptPage — user message attachments', () => {
+  it('carries attachments from the message payload sidecar into the page item', async () => {
+    await withRepo('transcript-attachments', async (repo) => {
+      const task = makeTask('attach-task');
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repo.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: turn('T1', task.id, 1, 'succeeded', 'user', [{ kind: 'message', messageId: 'm-shot' }], '2026-07-16T00:00:01.000Z'),
+      });
+      const message: TaskMessage = {
+        ...msg('m-shot', task.id, 'user', 'look at these', '2026-07-16T00:00:02.000Z'),
+        attachments: ['/tmp/muster-drop-x/screenshot.png', '/tmp/muster-drop-x/diagram.jpeg'],
+      };
+      await repo.execute({ kind: 'appendMessage', workspaceId: 'ws', message });
+
+      const page = await repo.getTranscriptPage(task.id, undefined, 100);
+      const user = page.items.find((item) => item.kind === 'user');
+      expect(user).toBeDefined();
+      // Repository stays absolute: basename reduction is the host boundary's job.
+      expect(user && 'attachments' in user ? user.attachments : undefined).toEqual([
+        '/tmp/muster-drop-x/screenshot.png',
+        '/tmp/muster-drop-x/diagram.jpeg',
+      ]);
+    });
+  });
+
+  it('omits the attachments key for user messages without attachments and for assistant rows', async () => {
+    await withRepo('transcript-no-attachments', async (repo) => {
+      const task = makeTask('plain-task');
+      await repo.execute({ kind: 'createTask', workspaceId: 'ws', task });
+      await repo.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: turn('T1', task.id, 1, 'succeeded', 'user', [{ kind: 'message', messageId: 'm-plain' }], '2026-07-16T00:00:01.000Z'),
+      });
+      await repo.execute({
+        kind: 'appendMessage',
+        workspaceId: 'ws',
+        message: msg('m-plain', task.id, 'user', 'no images', '2026-07-16T00:00:02.000Z'),
+      });
+      await repo.execute({
+        kind: 'appendTranscriptBatch',
+        workspaceId: 'ws',
+        taskId: task.id,
+        messages: [msg('m-reply', task.id, 'assistant', 'ok', '2026-07-16T00:00:03.000Z', 1, 'T1')],
+        reasoning: [],
+        toolCalls: [],
+      });
+
+      const page = await repo.getTranscriptPage(task.id, undefined, 100);
+      for (const item of page.items) {
+        expect(item).not.toHaveProperty('attachments');
+      }
+    });
+  });
+});
+
 // ---------- fixtures ----------
 
 function turn(

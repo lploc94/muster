@@ -195,7 +195,7 @@ export interface McpSetupController {
  * a mis-routed turn a loud failure instead of an empty prompt.
  */
 export type RunInput =
-  | { kind: 'agent'; prompt: string }
+  | { kind: 'agent'; prompt: string; imagePaths?: readonly string[] }
   | {
       kind: 'script';
       interpreter: string;

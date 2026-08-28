@@ -140,6 +140,8 @@ class TasksState {
     clientRequestId?: string;
     mentionBindings?: Array<[string, string]>;
     skills?: string[];
+    /** Absolute host paths of images attached to the rejected send. */
+    attachments?: string[];
     /** Backend the restored skills belong to; chips restore only when it matches. */
     skillsBackend?: string;
   } | null>(null);
@@ -478,6 +480,7 @@ class TasksState {
     mentionBindings?: Array<[string, string]>,
     skills?: string[],
     skillsBackend?: string,
+    attachments?: string[],
   ): void {
     this.prefillNonceSeq += 1;
     this.composerPrefill = {
@@ -487,6 +490,7 @@ class TasksState {
       ...(mentionBindings && mentionBindings.length > 0 ? { mentionBindings } : {}),
       ...(skills && skills.length > 0 ? { skills } : {}),
       ...(skillsBackend ? { skillsBackend } : {}),
+      ...(attachments && attachments.length > 0 ? { attachments } : {}),
     };
   }
 

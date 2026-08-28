@@ -141,7 +141,12 @@ function renderConversation(file: EngineProjection, taskId: string): string {
     }
     const heading = item.kind === 'user' ? '### User' : '### Assistant';
     // Preserve content verbatim (including retention markers). Do not interpret Markdown.
-    blocks.push(`${heading}\n\n${item.content}`);
+    let block = `${heading}\n\n${item.content}`;
+    if (item.kind === 'user' && item.attachments && item.attachments.length > 0) {
+      const list = item.attachments.map((name) => `- ${name}`).join('\n');
+      block += `\n\n**Attachments:**\n${list}`;
+    }
+    blocks.push(block);
   }
 
   if (blocks.length === 0) {

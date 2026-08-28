@@ -30,6 +30,7 @@ Open-source VS Code extension that **coordinates** multiple AI coding CLIs from 
 | ACP RFD elicitation + Grok ask adapter | ✅ — MCP `ask_user` removed; see [MUSTER-BRIDGE.md](docs/MUSTER-BRIDGE.md) |
 | Reload recovery UI (Retry / Continue / Resume) | ✅ |
 | Read-only presentation tabs | ✅ — [review and revision guide](docs/WEBVIEW.md) |
+| Composer image attachments (ACP `image` blocks) | ✅ — [contract](docs/WEBVIEW.md) |
 
 ## Prerequisites
 
@@ -93,7 +94,7 @@ Dev-only file IPC proof — production design uses [Muster Bridge](docs/MUSTER-B
 | [docs/TASK-MANAGEMENT.md](docs/TASK-MANAGEMENT.md) | Task/turn model, TaskEngine, and Markdown export contract |
 | [docs/SETTINGS.md](docs/SETTINGS.md) | Host-backed Settings pattern |
 | [docs/SETTINGS-DESIGN.md](docs/SETTINGS-DESIGN.md) | Adopted four-domain Settings information architecture; three actionable tabs rendered and Connections reserved |
-| [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI, read-only presentation review/revision, and task Markdown export UX |
+| [docs/WEBVIEW.md](docs/WEBVIEW.md) | Chat UI, composer image attachments, read-only presentation review/revision, and task Markdown export UX |
 | [docs/SQLITE-STORAGE.md](docs/SQLITE-STORAGE.md) | SQLite global storage, backup/reset, recovery, and privacy |
 | [docs/UI-VISUAL-REGRESSION.md](docs/UI-VISUAL-REGRESSION.md) | Pinned Linux visual baselines: compare, explicit update, CI artifacts, troubleshooting |
 | [docs/UI-IMPROVEMENT-ROADMAP.md](docs/UI-IMPROVEMENT-ROADMAP.md) | Deferred prioritized UI work (a11y, hit targets, motion, theme/zoom, density) — not implemented in M014 |

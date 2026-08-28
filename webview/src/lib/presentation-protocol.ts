@@ -15,7 +15,6 @@ const OPTIONAL_DOCUMENT_KEYS = new Set([
   'updatedAt',
 ]);
 const DOCUMENT_KEYS = new Set([...REQUIRED_DOCUMENT_KEYS, ...OPTIONAL_DOCUMENT_KEYS]);
-const ENVELOPE_KEYS = new Set(['rootId', 'document']);
 const STABLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const ID_MAX_LENGTH = 128;
 const TITLE_MAX_LENGTH = 200;
@@ -47,11 +46,6 @@ export interface PresentationDocument {
   sourcePath?: string;
   sourceFolderUri?: string;
   updatedAt?: string;
-}
-
-export interface PersistedPresentationState {
-  rootId: string;
-  document: PresentationDocument;
 }
 
 export function parsePresentationRevealRequest(value: unknown): PresentationRevealRequest | undefined {
@@ -151,16 +145,6 @@ export function parsePresentationDocument(value: unknown): PresentationDocument 
   return doc;
 }
 
-export function parsePersistedPresentationState(value: unknown): PersistedPresentationState | undefined {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
-  const raw = value as Record<string, unknown>;
-  if (Object.keys(raw).some((k) => !ENVELOPE_KEYS.has(k))) return undefined;
-  if (!isStableId(raw.rootId)) return undefined;
-  const document = parsePresentationDocument(raw.document);
-  if (!document) return undefined;
-  return { rootId: raw.rootId, document };
-}
-
 export function parsePresentationUpdate(
   value: unknown,
 ): { document: PresentationDocument; rootId: string } | undefined {
@@ -189,13 +173,6 @@ export function applyPresentationUpdate(
     return current;
   }
   return next.document;
-}
-
-export function buildPersistedState(
-  rootId: string,
-  document: PresentationDocument,
-): PersistedPresentationState | undefined {
-  return isStableId(rootId) ? { rootId, document } : undefined;
 }
 
 export function kindLabel(kind: PresentationKind | undefined): string {

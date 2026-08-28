@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import { basename } from 'node:path';
 import {
   BackendCapabilities,
   McpSetupAttemptContext,
@@ -9,6 +10,7 @@ import {
   ToolFileChange,
 } from '../types';
 import { TOOL_FILE_CHANGES_MAX_FILES } from '../shared/tool-file-change-contract';
+import { readImageAttachment } from '../shared/image-attachments';
 import {
   AcpAgentConfig,
   type AcpModelConfig,
@@ -354,6 +356,7 @@ export async function* runAcpTurn(
     return;
   }
   const initialPrompt = options.input.prompt;
+  const imagePaths = options.input.imagePaths ?? [];
   const messageId = randomUUID();
   const cwd = options.cwd || process.cwd();
   const mcpServers = options.mcpServers ?? [];
@@ -522,11 +525,31 @@ export async function* runAcpTurn(
         return;
       }
 
+      if (imagePaths.length > 0 && !client.supportsImagePrompt()) {
+        yield {
+          type: 'error',
+          message: `${spec.label} does not support image attachments`,
+        };
+        return;
+      }
+
+      let finalPromptText = promptText;
+      const images: { data: string; mimeType: string }[] = [];
+      for (const imagePath of imagePaths) {
+        const result = readImageAttachment(imagePath);
+        if (result.ok) {
+          images.push({ data: result.data, mimeType: result.mimeType });
+        } else {
+          finalPromptText += `\n\n[Muster: attachment ${basename(imagePath)} could not be read and was omitted.]`;
+        }
+      }
+
       const promptPromise = client.prompt(
         sessionId,
-        promptText,
+        finalPromptText,
         options.signal,
         options.promptTimeoutMs,
+        images.length > 0 ? images : undefined,
       );
 
       while (true) {

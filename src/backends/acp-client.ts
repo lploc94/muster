@@ -234,6 +234,19 @@ export interface AcpInitializeResult {
   };
 }
 
+/**
+ * Outbound ACP `image` content block payload.
+ *
+ * Mirrors the ACP `ImageContent` shape the bundled adapters validate:
+ * `{ type: 'image', data, mimeType }`.
+ */
+export interface PromptImage {
+  /** Base64-encoded image bytes, no `data:` prefix. */
+  data: string;
+  /** IANA media type, e.g. 'image/png'. */
+  mimeType: string;
+}
+
 
 /** Auth choice returned by a backend's {@link AcpAgentConfig.resolveAuth}. */
 export interface AcpAuthChoice {
@@ -635,6 +648,7 @@ export class AcpClient {
   private extraEnv?: Record<string, string>;
   private authenticated = false;
   loadSessionSupported = false;
+  private imagePromptSupported = false;
   /**
    * Agent-advertised command/skill names (ACP available_commands_update).
    * Tri-state: undefined = the backend has NEVER advertised (UNKNOWN); a Set
@@ -748,18 +762,31 @@ export class AcpClient {
     text: string,
     signal?: AbortSignal,
     timeoutMs?: number,
+    images?: readonly PromptImage[],
   ): Promise<PromptResult> {
     await this.ensureConnected();
     // Keep the request id so bounded cancellation can drop the pending entry
     // (and clear its 30-minute timeout) when force-settling a hung turn.
     const { id, promise } = this.sendRequest('session/prompt', {
       sessionId,
-      prompt: [{ type: 'text', text }],
+      prompt: [
+        ...(images ?? []).map((image) => ({
+          type: 'image',
+          data: image.data,
+          mimeType: image.mimeType,
+        })),
+        { type: 'text', text },
+      ],
     }, timeoutMs);
     return boundedPromptCancel(promise as Promise<PromptResult>, signal, {
       onCancel: () => this.cancel(sessionId),
       onForceSettle: () => this.dropPending(id),
     });
+  }
+
+  /** Whether the connected agent advertised ACP `promptCapabilities.image`. */
+  supportsImagePrompt(): boolean {
+    return this.imagePromptSupported;
   }
 
   /**
@@ -880,6 +907,7 @@ export class AcpClient {
       if (this.proc !== proc) return;
       this.proc = undefined;
       this.authenticated = false;
+      this.imagePromptSupported = false;
       // Stale advertisements must not outlive the process (see teardownProcess).
       this.advertisedCommands = undefined;
       this.connectPromise = undefined;
@@ -899,6 +927,7 @@ export class AcpClient {
       })) as AcpInitializeResult;
 
       this.loadSessionSupported = !!init.agentCapabilities?.loadSession;
+      this.imagePromptSupported = !!init.agentCapabilities?.promptCapabilities?.image;
 
       if (this.config.resolveAuth) {
         const choice = this.config.resolveAuth(init, env);

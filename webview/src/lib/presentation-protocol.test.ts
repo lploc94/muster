@@ -1,7 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   applyPresentationUpdate,
-  parsePersistedPresentationState,
   parsePresentationRevealRequest,
   parsePresentationRevealResult,
   parsePresentationUpdate,
@@ -47,7 +46,7 @@ describe('presentation browser protocol', () => {
     });
   });
 
-  it('accepts optional host and coordinator fields and envelope restore', () => {
+  it('accepts optional host and coordinator fields', () => {
     const document = {
       presentationId: 'release-notes',
       ownerTaskId: 'task-root',
@@ -65,36 +64,12 @@ describe('presentation browser protocol', () => {
       rootId: 'root-1',
     });
     expect(
-      parsePersistedPresentationState({
-        rootId: 'root-1',
-        document,
-      }),
-    ).toEqual({ rootId: 'root-1', document });
-    expect(
       parsePresentationUpdate({
         type: 'presentationUpdate',
         document: { ...document, sourcePath: document.sourcePath },
         rootId: 'bad id',
       }),
     ).toBeUndefined();
-  });
-
-  it('restores only an exact, bounded persisted presentation document', () => {
-    const document = {
-      presentationId: 'release-notes',
-      ownerTaskId: 'task-root',
-      revision: 2,
-      title: 'Persisted release notes',
-      markdown: '# Restored',
-    };
-
-    expect(parsePersistedPresentationState(document)).toBeUndefined();
-    expect(parsePersistedPresentationState({ rootId: 'task-root', document })).toEqual({
-      rootId: 'task-root',
-      document,
-    });
-    expect(parsePersistedPresentationState({ rootId: 'task-root', document, injected: true })).toBeUndefined();
-    expect(parsePersistedPresentationState({ rootId: 'task-root', document: { ...document, markdown: '' } })).toBeUndefined();
   });
 
   it('rejects unknown message or document fields', () => {

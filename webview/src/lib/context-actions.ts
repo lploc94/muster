@@ -4,6 +4,7 @@ export type AddContextActionId =
   | 'add-file'
   | 'browse-workspace-files'
   | 'add-skill'
+  | 'add-image'
   | 'add-wiki-page'
   | 'add-agent'
   | 'add-browser-tab'
@@ -20,7 +21,7 @@ interface AddContextActionBase {
   state: AddContextActionState;
 }
 
-export type AddContextHostMessage = Extract<OutMessage, { type: 'pickFile' | 'browseWorkspaceFiles' }>;
+export type AddContextHostMessage = Extract<OutMessage, { type: 'pickFile' | 'browseWorkspaceFiles' | 'pickImage' }>;
 
 /** Client-side (in-webview) activation id for actions handled without a host round-trip. */
 export type AddContextClientAction = 'openSkillPicker';
@@ -57,6 +58,14 @@ export const ADD_CONTEXT_ACTIONS = [
     icon: 'codicon-folder-opened',
     state: 'enabled',
     hostMessage: { type: 'browseWorkspaceFiles' },
+  },
+  {
+    id: 'add-image',
+    label: 'Image',
+    description: 'Attach an image to this prompt.',
+    icon: 'codicon-file-media',
+    state: 'enabled',
+    hostMessage: { type: 'pickImage' },
   },
   {
     id: 'add-skill',

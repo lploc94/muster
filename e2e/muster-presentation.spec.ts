@@ -46,9 +46,30 @@ function presentation(overrides: Partial<PresentationDocument> = {}): Presentati
     ...overrides,
   };
 }
+/**
+ * Opaque restore handle — the only shape Presentation writes to setState.
+ * Documents are never persisted; SQLite + the host serializer are canonical.
+ */
+function persistedHandle(overrides: { rootId?: string; presentationId?: string } = {}) {
+  return { rootId: 'task-root', presentationId: 'release-notes', ...overrides };
+}
+
+/**
+ * Mirror real startup: seed the opaque handle, then let the host deliver the
+ * document via presentationUpdate. Startup state alone never renders content.
+ */
+async function openWithDocument(
+  page: Page,
+  document: PresentationDocument = presentation(),
+  rootId = 'task-root',
+) {
+  await openPresentation(page, persistedHandle({ rootId, presentationId: document.presentationId }));
+  await postUpdate(page, document, rootId);
+}
+
 
 test('reveals linked chat with identity-free messages and accessible typed status', async ({ page }) => {
-  await openPresentation(page, presentation());
+  await openWithDocument(page);
 
   const action = page.getByRole('button', { name: 'Open linked chat' });
   await action.click();
@@ -86,8 +107,15 @@ test('reveals linked chat with identity-free messages and accessible typed statu
   await expect(chatStatus).toHaveText('Could not open linked chat.');
 });
 
-test('restores a validated persisted presentation on browser startup', async ({ page }) => {
-  await openPresentation(page, presentation({
+test('ignores a persisted handle until the host re-sends the document', async ({ page }) => {
+  // setState carries opaque IDs only, so startup alone can never paint content.
+  await openPresentation(page, persistedHandle());
+
+  await expect(page.getByText('Waiting for presentation content…')).toBeVisible();
+  await expect(page.locator('[data-presentation-id]')).toHaveCount(0);
+
+  // The host owns the document; only its update renders the presentation.
+  await postUpdate(page, presentation({
     revision: 4,
     title: 'Restored title',
     markdown: '# Restored body',
@@ -99,23 +127,28 @@ test('restores a validated persisted presentation on browser startup', async ({ 
   await expect(page.getByRole('heading', { name: 'Restored body', level: 1 })).toBeVisible();
 });
 
-test('persists the last accepted host revision as exact VS Code envelope state', async ({ page }) => {
+test('persists only an opaque restore handle after an accepted host revision', async ({ page }) => {
   await openPresentation(page);
   const accepted = presentation({ revision: 3, title: 'Persisted title', markdown: '# Persisted body' });
 
   await postUpdate(page, accepted, 'task-root');
 
+  // Bounded IDs only — no markdown, title, summary, or source path.
   await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual({
     rootId: 'task-root',
-    document: accepted,
+    presentationId: accepted.presentationId,
   });
 });
 
-test('renders the waiting state for malformed persisted presentation state', async ({ page }) => {
+test('ignores a malformed persisted handle and still accepts a later host update', async ({ page }) => {
   await openPresentation(page, { ...presentation(), markdown: '', injected: true });
 
   await expect(page.getByText('Waiting for presentation content…')).toBeVisible();
   await expect(page.locator('[data-presentation-id]')).toHaveCount(0);
+
+  // A rejected handle must not poison the host update path.
+  await postUpdate(page, presentation());
+  await expect(page.getByRole('heading', { name: 'Browser-ready', level: 1 })).toBeVisible();
 });
 
 test('renders a guarded Markdown presentation from a host update', async ({ page }) => {
@@ -148,7 +181,7 @@ test('renders a guarded Markdown presentation from a host update', async ({ page
 test('keeps presentation chrome compact, aligned, and overflow-safe', async ({ page }) => {
   await page.setViewportSize({ width: 895, height: 520 });
   const longBody = Array.from({ length: 60 }, (_, index) => `Dòng nội dung ${index + 1}.`).join('\n\n');
-  await openPresentation(page, presentation({
+  await openWithDocument(page, presentation({
     title: 'plan',
     kind: 'document',
     sourcePath: 'docs/plans/ho-chi-minh-city-three-day-plan.md',
@@ -204,7 +237,7 @@ test('expands a long table of contents without an internal scrollbar', async ({ 
     { length: 12 },
     (_, index) => `## Section ${index + 1}\n\nSection ${index + 1} content.`,
   ).join('\n\n');
-  await openPresentation(page, presentation({ markdown: `# Long plan\n\n${headings}` }));
+  await openWithDocument(page, presentation({ markdown: `# Long plan\n\n${headings}` }));
 
   const toc = page.getByRole('navigation', { name: 'Contents' });
   await expect(toc).toBeVisible();
@@ -344,7 +377,7 @@ test('preserves the last accepted revision after malformed, stale, or conflictin
   await expect(page.getByText(/Malformed title|Stale title|Other title|Wrong owner/)).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => window.__musterPersistedState)).toEqual({
     rootId: 'task-root',
-    document: accepted,
+    presentationId: accepted.presentationId,
   });
 });
 
@@ -409,7 +442,7 @@ test('presentation reduced-motion heading scroll does not use smooth behavior', 
   await page.setViewportSize({ width: 900, height: 640 });
   await page.emulateMedia({ reducedMotion: 'reduce' });
 
-  await openPresentation(page, presentation({
+  await openWithDocument(page, presentation({
     title: 'Reduced motion plan',
     markdown: multiHeadingMarkdown(),
   }));
@@ -476,7 +509,7 @@ test('M015 S03 flow: presentation reduced motion', async ({ page }) => {
   await page.setViewportSize({ width: 900, height: 640 });
   await page.emulateMedia({ reducedMotion: 'reduce' });
 
-  await openPresentation(page, presentation({
+  await openWithDocument(page, presentation({
     title: 'S03 reduced motion flow',
     markdown: multiHeadingMarkdown(),
   }));
