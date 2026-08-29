@@ -4,10 +4,13 @@
  */
 
 export const WORKFLOW_CATALOG_REQUEST_ID_MAX = 128;
-export const WORKFLOW_CATALOG_REF_MAX = 512;
-export const WORKFLOW_CATALOG_NAME_MAX = 512;
-export const WORKFLOW_CATALOG_DESCRIPTION_MAX = 1_024;
-/** Mirrors PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE. */
+/** Predefined refs use `pwf_` plus 32 lowercase hex chars (36); this allows headroom. */
+export const WORKFLOW_CATALOG_REF_MAX = 64;
+/** Mirrors parsePredefinedWorkflowMarkdown's 200-character name bound. */
+export const WORKFLOW_CATALOG_NAME_MAX = 200;
+/** Mirrors parsePredefinedWorkflowMarkdown's 1,000-character description bound. */
+export const WORKFLOW_CATALOG_DESCRIPTION_MAX = 1_000;
+/** Per-payload wire budget; the host's 128-file limit is per scope across two scopes, and the route clamps and reports truncation. */
 export const WORKFLOW_CATALOG_WORKFLOWS_MAX = 128;
 /** Mirrors PREDEFINED_WORKFLOW_MAX_DIAGNOSTICS. */
 export const WORKFLOW_CATALOG_DIAGNOSTICS_MAX = 32;
@@ -79,7 +82,7 @@ function isBoundedString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
 }
 
-/** Same bounds as isBoundedString but tolerates '' (description is optional upstream). */
+/** Same bounds as isBoundedString but tolerates ''; the host currently always sends a non-empty description, and the wire deliberately tolerates '' so a future optional-description workflow cannot break the panel. */
 function isBoundedOrEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length <= max && !value.includes('\0');
 }
@@ -103,7 +106,10 @@ export function parseRequestWorkflowCatalogMessage(raw: unknown): ParsedRequestW
   if (!isRecord(raw) || raw.type !== 'requestWorkflowCatalog') return { ok: false, silent: true };
   const { requestId, reason } = raw;
   if (!isBoundedString(requestId, WORKFLOW_CATALOG_REQUEST_ID_MAX)) return { ok: false, silent: true };
-  if (!hasExactKeys(raw, ['type', 'requestId', 'reason']) || typeof reason !== 'string' || !REASONS.has(reason)) {
+  if (!hasExactKeys(raw, ['type', 'requestId', 'reason'])) {
+    return { ok: false, silent: false, requestId, code: 'invalidRequest' };
+  }
+  if (typeof reason !== 'string' || !REASONS.has(reason)) {
     return { ok: false, silent: false, requestId, code: 'invalidRequest' };
   }
   return { ok: true, requestId, reason: reason as WorkflowCatalogReason };
@@ -151,6 +157,8 @@ function parseCatalog(raw: unknown): WorkflowCatalogWire | null {
   if (typeof reason !== 'string' || !REASONS.has(reason)) return null;
   const workflows = parseList(raw.workflows, WORKFLOW_CATALOG_WORKFLOWS_MAX, parseEntry);
   if (workflows === null) return null;
+  const workflowRefs = new Set(workflows.map((workflow) => workflow.workflowRef));
+  if (workflowRefs.size !== workflows.length) return null;
   const diagnostics = parseList(raw.diagnostics, WORKFLOW_CATALOG_DIAGNOSTICS_MAX, parseDiagnostic);
   if (diagnostics === null) return null;
   return { reason: reason as WorkflowCatalogReason, workflows, diagnostics };
