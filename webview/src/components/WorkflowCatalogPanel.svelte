@@ -165,7 +165,6 @@
     <section
       class="workflow-catalog__diagnostics"
       data-testid="workflow-catalog-diagnostics"
-      role="status"
       aria-labelledby="workflow-catalog-diagnostics-heading"
     >
       <h3 id="workflow-catalog-diagnostics-heading" class="workflow-catalog__group-heading">
@@ -211,7 +210,6 @@
   bind:this={panelEl}
   tabindex="-1"
   aria-label="Workflows"
-  aria-busy={loading}
 >
   <header class="workflow-catalog__header">
     <h2 class="workflow-catalog__title">Workflows</h2>
@@ -246,9 +244,12 @@
       <span>{loading ? 'Reading workflow catalog…' : 'Waiting for workflow catalog…'}</span>
     </div>
   {:else if viewState === 'error'}
-    <div class="workflow-catalog__error" data-testid="workflow-catalog-error" role="alert">
+    <div class="workflow-catalog__error" data-testid="workflow-catalog-error">
       <span class="codicon codicon-error workflow-catalog__error-icon" aria-hidden="true"></span>
-      <div class="workflow-catalog__error-copy">
+      <div
+        class="workflow-catalog__error-copy"
+        role={catalog === null ? 'alert' : 'status'}
+      >
         <p class="workflow-catalog__error-title">Could not read the workflow catalog</p>
         <p class="workflow-catalog__error-detail">
           {catalog === null
@@ -293,6 +294,11 @@
 
   .workflow-catalog:focus {
     outline: none;
+  }
+
+  .workflow-catalog:focus-visible {
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: -1px;
   }
 
   .workflow-catalog__header,
