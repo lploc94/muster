@@ -4,6 +4,7 @@ import {
   type WorkflowCatalogRouteDeps,
 } from './workflow-catalog-route';
 import {
+  parseWorkflowCatalogResult,
   WORKFLOW_CATALOG_DIAGNOSTICS_MAX,
   WORKFLOW_CATALOG_WORKFLOWS_MAX,
 } from '../shared/workflow-catalog-wire';
@@ -92,10 +93,11 @@ describe('routeRequestWorkflowCatalog', () => {
       readCatalog: async () => ({ workflows, diagnostics: [] }),
     }));
 
-    expect(outcome).toMatchObject({ kind: 'message' });
-    const message = (outcome as { message: { catalog: { workflows: unknown[]; diagnostics: { code: string }[] } } }).message;
-    expect(message.catalog.workflows).toHaveLength(WORKFLOW_CATALOG_WORKFLOWS_MAX);
-    expect(message.catalog.diagnostics.at(-1)?.code).toBe('catalog_truncated');
+    expect(outcome.kind).toBe('message');
+    if (outcome.kind !== 'message' || !outcome.message.ok) throw new Error('expected success message');
+    expect(outcome.message.catalog.workflows).toHaveLength(WORKFLOW_CATALOG_WORKFLOWS_MAX);
+    expect(outcome.message.catalog.workflows[0]?.workflowRef).toBe('ref-0');
+    expect(outcome.message.catalog.diagnostics.at(-1)?.code).toBe('catalog_truncated');
   });
 
   it('keeps the truncation diagnostic within the cap when diagnostics are already full', async () => {
@@ -111,18 +113,43 @@ describe('routeRequestWorkflowCatalog', () => {
       readCatalog: async () => ({ workflows, diagnostics }),
     }));
 
-    const message = (outcome as { message: { catalog: { diagnostics: { code: string }[] } } }).message;
+    expect(outcome.kind).toBe('message');
+    if (outcome.kind !== 'message' || !outcome.message.ok) throw new Error('expected success message');
+    const message = outcome.message;
     expect(message.catalog.diagnostics).toHaveLength(WORKFLOW_CATALOG_DIAGNOSTICS_MAX);
+    expect(message.catalog.diagnostics.slice(0, -1).map((diagnostic) => diagnostic.file))
+      .toEqual(Array.from({ length: WORKFLOW_CATALOG_DIAGNOSTICS_MAX - 1 }, (_, i) => `w${i}.md`));
     expect(message.catalog.diagnostics.at(-1)?.code).toBe('catalog_truncated');
+    expect(parseWorkflowCatalogResult(message)).not.toBeNull();
+  });
+  it('does not report truncation at the exact workflow cap', async () => {
+    const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX }, (_, i) => ({
+      workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',
+      scope: 'workspace' as const, packageKind: 'file' as const,
+    }));
+    const diagnostics = Array.from({ length: WORKFLOW_CATALOG_DIAGNOSTICS_MAX }, (_, i) => ({
+      file: `w${i}.md`, code: 'invalid_workflow_file', message: 'bad',
+    }));
+
+    const outcome = await routeRequestWorkflowCatalog(request, deps({
+      readCatalog: async () => ({ workflows, diagnostics }),
+    }));
+
+    expect(outcome.kind).toBe('message');
+    if (outcome.kind !== 'message' || !outcome.message.ok) throw new Error('expected success message');
+    expect(outcome.message.catalog.workflows).toHaveLength(WORKFLOW_CATALOG_WORKFLOWS_MAX);
+    expect(outcome.message.catalog.workflows[0]?.workflowRef).toBe('ref-0');
+    expect(outcome.message.catalog.diagnostics).toEqual(diagnostics);
+    expect(outcome.message.catalog.diagnostics.some(({ code }) => code === 'catalog_truncated')).toBe(false);
   });
 
   it('emits a payload its own parser accepts', async () => {
-    const { parseWorkflowCatalogResult } = await import('../shared/workflow-catalog-wire');
     const outcome = await routeRequestWorkflowCatalog(request, deps());
 
     expect(outcome.kind).toBe('message');
+    if (outcome.kind !== 'message') throw new Error('expected message');
     expect(parseWorkflowCatalogResult(
-      (outcome as { message: unknown }).message,
+      outcome.message,
     )).not.toBeNull();
   });
 });
