@@ -122,6 +122,7 @@ describe('routeRequestWorkflowCatalog', () => {
     expect(message.catalog.diagnostics.at(-1)?.code).toBe('catalog_truncated');
     expect(parseWorkflowCatalogResult(message)).not.toBeNull();
   });
+
   it('does not report truncation at the exact workflow cap', async () => {
     const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX }, (_, i) => ({
       workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',

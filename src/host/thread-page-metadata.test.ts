@@ -112,6 +112,16 @@ describe('host+webview protocol version contract', () => {
     expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 13;/);
   });
 
+  it('logs catalog read errors without raw filesystem messages', () => {
+    const reader = extensionSource.match(
+      /new WorkflowCatalogCache\([\s\S]*?async \(workspaceFolder: string\) => \{([\s\S]*?)\n\s*\},\s*\);/,
+    )?.[1];
+    expect(reader, 'workflow catalog reader must exist').toBeTruthy();
+    expect(reader).toContain('workflow_catalog.host_read_error');
+    expect(reader).toContain('throw error;');
+    expect(reader).not.toMatch(/error\.message/);
+  });
+
   it('maps missing repository via getTask throw to unavailable', () => {
     expect(extensionSource).toContain("throw new Error('task repository not ready')");
     // Must not use getTask: async () => undefined for the not-ready path.

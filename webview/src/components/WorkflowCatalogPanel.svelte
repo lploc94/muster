@@ -95,7 +95,6 @@
       </h3>
       <ul
         class="workflow-catalog__list"
-        aria-labelledby="workflow-catalog-workspace-heading"
       >
         {#each workspaceEntries as entry (entry.workflowRef)}
           <li class="workflow-catalog__row" data-testid="workflow-catalog-row">
@@ -127,7 +126,6 @@
       </h3>
       <ul
         class="workflow-catalog__list"
-        aria-labelledby="workflow-catalog-global-heading"
       >
         {#each globalEntries as entry (entry.workflowRef)}
           <li class="workflow-catalog__row" data-testid="workflow-catalog-row">
@@ -173,7 +171,6 @@
       </h3>
       <ul
         class="workflow-catalog__list workflow-catalog__diagnostic-list"
-        aria-labelledby="workflow-catalog-diagnostics-heading"
       >
         {#each diagnostics as diagnostic, index (`${diagnostic.file}:${diagnostic.code}:${index}`)}
           {@const scopeNotice = isScopeNotice(diagnostic.file)}
@@ -270,10 +267,6 @@
     {#if catalog !== null}
       {@render catalogSnapshot()}
     {/if}
-  {:else if viewState === 'populated'}
-    {@render catalogSnapshot()}
-  {:else if viewState === 'diagnostics-only'}
-    {@render catalogSnapshot()}
   {:else}
     {@render catalogSnapshot()}
   {/if}

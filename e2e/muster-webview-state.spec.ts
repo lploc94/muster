@@ -11631,6 +11631,7 @@ test.describe('Workflow catalog surface', () => {
     await page.getByTestId('workflow-catalog-close').click();
     await expect(panel).toHaveCount(0);
   });
+
   test('renders guidance for an empty catalog', async ({ page }) => {
     await openWebview(page);
     await page.getByTestId('open-workflows').first().click();

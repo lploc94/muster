@@ -294,4 +294,18 @@ describe('parseWorkflowCatalogResult', () => {
       },
     }))).toBeNull();
   });
+
+  it('rejects an over-bound diagnostic file', () => {
+    expect(parseWorkflowCatalogResult(result({
+      catalog: {
+        reason: 'initial',
+        workflows: [],
+        diagnostics: [{
+          file: 'f'.repeat(WORKFLOW_CATALOG_DIAGNOSTIC_FILE_MAX + 1),
+          code: 'x',
+          message: 'x',
+        }],
+      },
+    }))).toBeNull();
+  });
 });

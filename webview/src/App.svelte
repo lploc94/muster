@@ -603,6 +603,11 @@
         typeof msg === 'object' &&
         (msg as { type?: unknown }).type === 'workflowGraphResult';
 
+      const isWorkflowCatalogResult =
+        msg &&
+        typeof msg === 'object' &&
+        (msg as { type?: unknown }).type === 'workflowCatalogResult';
+
       // This response is intentionally outside the production protocol: the
       // host can issue its paired request only through the UAT-gated command.
       if (
@@ -650,6 +655,15 @@
             taskId: raw.taskId,
             ok: raw.ok,
             code: raw.code,
+            keys: Object.keys(raw),
+          });
+        }
+
+        if (isWorkflowCatalogResult) {
+          const raw = msg as Record<string, unknown>;
+          postDebug('workflow_catalog.webview_parser_drop', {
+            requestId: raw.requestId,
+            ok: raw.ok,
             keys: Object.keys(raw),
           });
         }

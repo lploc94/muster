@@ -115,12 +115,6 @@ export function parseRequestWorkflowCatalogMessage(raw: unknown): ParsedRequestW
   return { ok: true, requestId, reason: reason as WorkflowCatalogReason };
 }
 
-/** Convenience parser for callers that only accept an exact valid request. */
-export function parseRequestWorkflowCatalog(raw: unknown): Omit<RequestWorkflowCatalog, 'type'> | null {
-  const parsed = parseRequestWorkflowCatalogMessage(raw);
-  return parsed.ok ? { requestId: parsed.requestId, reason: parsed.reason } : null;
-}
-
 function parseEntry(raw: unknown): WorkflowCatalogWireEntry | null {
   if (!isRecord(raw)) return null;
   if (!hasExactKeys(raw, ['workflowRef', 'name', 'description', 'scope', 'packageKind'])) return null;

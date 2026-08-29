@@ -58,13 +58,6 @@ export class WorkflowCatalogStore {
     this.policy.settle();
     this.loading = false;
     this.clearTimer();
-  }
-
-  dispose(): void {
-    this.policy.reset();
-    this.loading = false;
-    this.clearTimer();
-    this.catalog = null;
     this.error = null;
   }
 
