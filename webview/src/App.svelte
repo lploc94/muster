@@ -70,6 +70,8 @@
   import type { WorkflowGraphWireGraph } from '../../src/shared/workflow-graph-wire';
   import { WorkflowGraphStore } from './lib/workflow-graph-store.svelte';
   import WorkflowGraphModal from './components/WorkflowGraphModal.svelte';
+  import { workflowCatalogStore } from './lib/workflow-catalog-store.svelte';
+  import WorkflowCatalogPanel from './components/WorkflowCatalogPanel.svelte';
   import { vscode } from './lib/vscode';
   import { collectToolCardRenderObservations } from './lib/render-probe';
 
@@ -111,6 +113,9 @@
   let workflowGraph = $derived(workflowGraphStore.graph);
   let workflowGraphRequest = $derived(workflowGraphStore.request);
   let workflowGraphError = $derived(workflowGraphStore.error);
+  let workflowCatalog = $derived(workflowCatalogStore.catalog);
+  let workflowCatalogLoading = $derived(workflowCatalogStore.loading);
+  let workflowCatalogError = $derived(workflowCatalogStore.error);
   let taskSnapshotHydrated = $state(false);
   const visibleCommandError = $derived(
     tasks.commandError &&
@@ -201,6 +206,7 @@
   let historyOpen = $state(false);
   let settingsOpen = $state(false);
   let workflowGraphOpen = $state(false);
+  let workflowsOpen = $state(false);
   let workflowGraphProbeTaskId = $state<string | null>(null);
   /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
   let backendsFocusRequest = $state(0);
@@ -382,6 +388,7 @@
   function openSettings(opts?: { topicId?: SettingsTopicId; focusBackends?: boolean }) {
     historyOpen = false;
     workflowGraphOpen = false;
+    workflowsOpen = false;
     settingsOpen = true;
     if (opts?.topicId) {
       setSettingsActiveTopicId(opts.topicId);
@@ -448,12 +455,24 @@
     settingsOpen = false;
   }
 
+  function openWorkflows() {
+    historyOpen = false;
+    workflowGraphOpen = false;
+    settingsOpen = false;
+    workflowsOpen = true;
+  }
+
+  function closeWorkflows() {
+    workflowsOpen = false;
+  }
+
   function backToList() {
     tasks.focusedTaskId = null;
     tasks.draftMode = false;
     threadStore.clearFocus();
     historyOpen = false;
     workflowGraphOpen = false;
+    workflowsOpen = false;
     // Tell the host we left the chat so it drops its focus; otherwise a later
     // snapshot (e.g. after Clear history) would re-open the stale chat.
     post({ type: 'blurTask' });
@@ -862,6 +881,10 @@
           break;
         }
 
+        case 'workflowCatalogResult':
+          workflowCatalogStore.handleResult(msg);
+          break;
+
         case 'transcriptPageResult': {
           // Drop early if the message is not for the currently focused task.
           if (msg.taskId !== tasks.focusedTaskId) break;
@@ -1168,6 +1191,18 @@
     }
     untrack(() => workflowGraphStore.setOpen(open && Boolean(taskId), taskId));
   });
+  // Declarative $effect — the catalog requests only when its panel becomes visible
+  // and settles its request lifecycle when the panel hides.
+  $effect(() => {
+    const open = workflowsOpen;
+    untrack(() => {
+      if (open) {
+        workflowCatalogStore.open();
+      } else {
+        workflowCatalogStore.close();
+      }
+    });
+  });
 
   // After focus changes, restore only rejected drafts (never pending ACK entries).
   $effect(() => {
@@ -1302,6 +1337,15 @@
     onStartBackendProbe={onStartBackendProbeFromSettings}
     onCancelBackendProbe={onCancelBackendProbeFromSettings}
   />
+{:else if workflowsOpen}
+  <WorkflowCatalogPanel
+    catalog={workflowCatalog}
+    loading={workflowCatalogLoading}
+    error={workflowCatalogError}
+    onClose={closeWorkflows}
+    onReload={() => workflowCatalogStore.reload()}
+    onRetry={() => workflowCatalogStore.retry()}
+  />
 {:else}
 {#if visibleCommandError}
   <div class="task-command-error" role="alert">
@@ -1356,6 +1400,17 @@
       >
         <span class="codicon codicon-settings-gear"></span>
       </button>
+      <button
+        type="button"
+        class="icon-btn shrink-0 mr-2"
+        onclick={openWorkflows}
+        aria-label="Workflows"
+        aria-pressed={workflowsOpen}
+        data-testid="open-workflows"
+        use:tip={'Workflows'}
+      >
+        <span class="codicon codicon-list-tree"></span>
+      </button>
     </div>
     <div class="shrink-0" style="border-top: 1px solid var(--vscode-panel-border);"></div>
     {#if taskSnapshotHydrated}
@@ -1397,7 +1452,10 @@
         type="button"
         class="icon-btn"
        
-        onclick={() => (historyOpen = !historyOpen)}
+        onclick={() => {
+          workflowsOpen = false;
+          historyOpen = !historyOpen;
+        }}
         aria-label="History (previous coordinator tasks)"
         use:tip={'History (previous coordinator tasks)'}
       >
@@ -1411,6 +1469,7 @@
         onclick={() => {
           if (!tasks.focusedTaskId) return;
           historyOpen = false;
+          workflowsOpen = false;
           workflowGraphOpen = !workflowGraphOpen;
         }}
         aria-label="View workflow graph"
@@ -1419,6 +1478,18 @@
         use:tip={'View workflow graph'}
       >
         <span class="codicon codicon-graph"></span>
+      </button>
+
+      <button
+        type="button"
+        class="icon-btn"
+        onclick={openWorkflows}
+        aria-label="Workflows"
+        aria-pressed={workflowsOpen}
+        data-testid="open-workflows"
+        use:tip={'Workflows'}
+      >
+        <span class="codicon codicon-list-tree"></span>
       </button>
 
       <button
