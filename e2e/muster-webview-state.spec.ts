@@ -339,7 +339,7 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 12;
+const PROTOCOL_VERSION = 13;
 
 /**
  * Normalize a focused snapshot to the protocol v9 current-only contract:

@@ -107,8 +107,8 @@ const protocolSource = fs.readFileSync(
 );
 
 describe('host+webview protocol version contract', () => {
-  it('pins host at 13 and webview at 12 during the split', () => {
-    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 12;/);
+  it('pins host and webview at 13', () => {
+    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 13;/);
     expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 13;/);
   });
 

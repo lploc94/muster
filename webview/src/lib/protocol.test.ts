@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(12);
+    expect(PROTOCOL_VERSION).toBe(13);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1964,7 +1964,7 @@ describe('protocol v9 workspacePatchBatch', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(12);
+    expect(PROTOCOL_VERSION).toBe(13);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {
