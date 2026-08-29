@@ -2465,3 +2465,57 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
     expect(vscode.postMessage).toHaveBeenCalledWith(message);
   });
 });
+
+describe('isExtMessage workflowCatalogResult (workflow catalog)', () => {
+  it('accepts a shared-contract-valid catalog result', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: true,
+        catalog: {
+          reason: 'initial',
+          workflows: [{
+            workflowRef: 'pwf_0123456789abcdef0123456789abcdef',
+            name: 'Release checklist',
+            description: 'Bounded catalog fixture.',
+            scope: 'workspace',
+            packageKind: 'file',
+          }],
+          diagnostics: [],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed and extra-field catalog results fail-closed', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: false,
+        code: 'unavailable',
+        message: 'untrusted host detail',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: true,
+        catalog: { reason: 'initial', workflows: 'not-an-array', diagnostics: [] },
+      }),
+    ).toBe(false);
+  });
+
+  it('posts the correlated request workflow catalog shape', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = {
+      type: 'requestWorkflowCatalog',
+      requestId: 'request-1',
+      reason: 'reload',
+    };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+  });
+});
