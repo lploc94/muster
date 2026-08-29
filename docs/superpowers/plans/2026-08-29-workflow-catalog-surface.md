@@ -1032,7 +1032,7 @@ git commit -m "feat(workflow-catalog): register catalog messages and bump protoc
 - Consumes: `WorkflowCatalogWire` from Task 1; `post` from `./protocol`.
 - Produces:
   - `webview/src/lib/workflow-catalog-request-policy.ts`: `type WorkflowCatalogFetch = { requestId: string; reason: 'initial' | 'reload' } | null` and `class WorkflowCatalogRequestPolicy` with `onOpen()`, `onReload()`, `onResult(requestId, ok)`, `onTimeout(requestId)`, `settle()`, `reset()`
-  - `webview/src/lib/workflow-catalog-store.svelte.ts`: `WORKFLOW_CATALOG_TIMEOUT_MS = 10_000`, `class WorkflowCatalogStore` with reactive `catalog`, `loading`, `error` and methods `open()`, `reload()`, `retry()`, `handleResult(msg)`, `close()`, `dispose()`, plus `export const workflowCatalogStore = new WorkflowCatalogStore()`
+  - `webview/src/lib/workflow-catalog-store.svelte.ts`: `WORKFLOW_CATALOG_TIMEOUT_MS = 8_000` (matches the graph store), `class WorkflowCatalogStore` with reactive `catalog`, `loading`, `error` and methods `open()`, `reload()`, `retry()`, `handleResult(msg)`, `close()`, `dispose()`, plus `export const workflowCatalogStore = new WorkflowCatalogStore()`
 
 **Why the split:** runes are not compiled in this repo's Vitest setup — `vitest.config.ts` sets `environment: 'node'` with no Svelte plugin, so `$state` does not work in tests. That is exactly why `webview/src/lib/workflow-graph-store.test.ts` tests the extracted `WorkflowGraphRefreshPolicy` rather than the runes store. So correlation, single-flight, and timeout ownership live in a plain policy class that is unit-tested, and the `.svelte.ts` store holds only reactive fields and delegates. Do not add a Svelte plugin to the shared Vitest config for this task.
 
