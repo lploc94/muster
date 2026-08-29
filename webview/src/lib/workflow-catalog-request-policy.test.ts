@@ -66,6 +66,8 @@ describe('WorkflowCatalogRequestPolicy', () => {
 
     expect(policy.onTimeout('stale-id')).toBe(false);
     expect(policy.onTimeout(first.requestId)).toBe(true);
+    policy.settle();
+    expect(policy.onTimeout(first.requestId)).toBe(false);
     expect(policy.onReload()).not.toBeNull();
   });
 

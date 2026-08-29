@@ -37,10 +37,7 @@ export class WorkflowCatalogStore {
   }
 
   retry(): void {
-    const fetch = this.policy.onReload();
-    if (fetch === null) return;
-    this.error = null;
-    this.dispatch(fetch);
+    this.reload();
   }
 
   handleResult(msg: WorkflowCatalogResult): void {
@@ -73,6 +70,7 @@ export class WorkflowCatalogStore {
 
   private dispatch(fetch: WorkflowCatalogFetch): void {
     if (fetch === null) return;
+    this.error = null;
     this.loading = true;
     this.clearTimer();
     this.timeoutId = setTimeout(() => {
