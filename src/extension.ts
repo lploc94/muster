@@ -781,8 +781,24 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
    */
   private readonly workflowCatalogCache = new WorkflowCatalogCache(
     async (workspaceFolder: string) => {
-      const { workflows, diagnostics } = await listPredefinedWorkflows({ workspaceFolder });
-      return { workflows, diagnostics };
+      try {
+        const { workflows, diagnostics } = await listPredefinedWorkflows({ workspaceFolder });
+        return { workflows, diagnostics };
+      } catch (error) {
+        const errorRecord =
+          error && typeof error === 'object'
+            ? error as { name?: unknown; code?: unknown }
+            : undefined;
+        debugMuster('workflow_catalog.host_read_error', {
+          name: error instanceof Error
+            ? error.name
+            : typeof errorRecord?.name === 'string'
+              ? errorRecord.name
+              : typeof error,
+          code: typeof errorRecord?.code === 'string' ? errorRecord.code : undefined,
+        });
+        throw error;
+      }
     },
   );
 

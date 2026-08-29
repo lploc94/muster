@@ -107,9 +107,9 @@ const protocolSource = fs.readFileSync(
 );
 
 describe('host+webview protocol version contract', () => {
-  it('keeps exact version 12 in both host and webview constants', () => {
+  it('pins host at 13 and webview at 12 during the split', () => {
     expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 12;/);
-    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 12;/);
+    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 13;/);
   });
 
   it('maps missing repository via getTask throw to unavailable', () => {
