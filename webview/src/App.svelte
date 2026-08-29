@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import SettingsPanel from './components/SettingsPanel.svelte';
   import TaskHistoryList from './components/TaskList.svelte';
   import TaskWorkspace from './components/TaskWorkspace.svelte';
@@ -207,6 +207,7 @@
   let settingsOpen = $state(false);
   let workflowGraphOpen = $state(false);
   let workflowsOpen = $state(false);
+  let workflowsTriggerEl: HTMLButtonElement | undefined = $state();
   let workflowGraphProbeTaskId = $state<string | null>(null);
   /** Incremented on revealBackendDiagnostics so BackendsSettings re-focuses. */
   let backendsFocusRequest = $state(0);
@@ -462,8 +463,10 @@
     workflowsOpen = true;
   }
 
-  function closeWorkflows() {
+  async function closeWorkflows(): Promise<void> {
     workflowsOpen = false;
+    await tick();
+    workflowsTriggerEl?.focus();
   }
 
   function backToList() {
@@ -1418,6 +1421,7 @@
       <button
         type="button"
         class="icon-btn shrink-0 mr-2"
+        bind:this={workflowsTriggerEl}
         onclick={openWorkflows}
         aria-label="Workflows"
         aria-pressed={workflowsOpen}
@@ -1498,6 +1502,7 @@
       <button
         type="button"
         class="icon-btn"
+        bind:this={workflowsTriggerEl}
         onclick={openWorkflows}
         aria-label="Workflows"
         aria-pressed={workflowsOpen}

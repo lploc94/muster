@@ -50,10 +50,8 @@
   }
 
   let panelEl: HTMLElement | undefined = $state();
-  let previousActiveElement: HTMLElement | null = null;
 
   onMount(() => {
-    previousActiveElement = document.activeElement as HTMLElement | null;
     panelEl?.focus();
 
     function onKey(event: KeyboardEvent): void {
@@ -66,7 +64,6 @@
     window.addEventListener('keydown', onKey, true);
     return () => {
       window.removeEventListener('keydown', onKey, true);
-      previousActiveElement?.focus();
     };
   });
 </script>

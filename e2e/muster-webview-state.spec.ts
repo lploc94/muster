@@ -11620,6 +11620,7 @@ test.describe('Workflow catalog surface', () => {
 
     await page.getByTestId('workflow-catalog-close').click();
     await expect(panel).toHaveCount(0);
+    await expect(page.getByTestId('open-workflows').first()).toBeFocused();
 
     await page.getByTestId('open-workflows').first().click();
     await expect(panel).toBeVisible();
@@ -11628,8 +11629,9 @@ test.describe('Workflow catalog surface', () => {
     expect(await catalogRequests(page)).toHaveLength(3);
     await page.waitForTimeout(100);
     expect(await catalogRequests(page)).toHaveLength(3);
-    await page.getByTestId('workflow-catalog-close').click();
+    await page.keyboard.press('Escape');
     await expect(panel).toHaveCount(0);
+    await expect(page.getByTestId('open-workflows').first()).toBeFocused();
   });
 
   test('renders guidance for an empty catalog', async ({ page }) => {
