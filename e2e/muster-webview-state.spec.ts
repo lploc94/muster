@@ -11623,9 +11623,61 @@ test.describe('Workflow catalog surface', () => {
 
     await page.getByTestId('open-workflows').first().click();
     await expect(panel).toBeVisible();
-    await expect(catalogRequests(page)).resolves.toHaveLength(3);
+    await expect(panel).toHaveAttribute('data-state', 'populated');
+    await page.waitForTimeout(100);
+    expect(await catalogRequests(page)).toHaveLength(3);
+    await page.waitForTimeout(100);
+    expect(await catalogRequests(page)).toHaveLength(3);
     await page.getByTestId('workflow-catalog-close').click();
     await expect(panel).toHaveCount(0);
+  });
+  test('renders guidance for an empty catalog', async ({ page }) => {
+    await openWebview(page);
+    await page.getByTestId('open-workflows').first().click();
+    const first = await lastCatalogRequest(page, 1);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: first.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [],
+        diagnostics: [],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-catalog-panel');
+    await expect(panel).toHaveAttribute('data-state', 'empty');
+    await expect(page.getByTestId('workflow-catalog-empty')).toContainText('.muster/workflows/');
+    await expect(page.getByTestId('workflow-catalog-error')).toHaveCount(0);
+  });
+
+  test('renders a diagnostics-only state for an empty catalog with diagnostics', async ({ page }) => {
+    await openWebview(page);
+    await page.getByTestId('open-workflows').first().click();
+    const first = await lastCatalogRequest(page, 1);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: first.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [],
+        diagnostics: [{
+          file: 'broken.md',
+          code: 'invalid_workflow_file',
+          message: 'missing name',
+        }],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-catalog-panel');
+    await expect(panel).toHaveAttribute('data-state', 'diagnostics-only');
+    await expect(page.getByTestId('workflow-catalog-empty')).toContainText('.muster/workflows/');
+    await expect(page.getByTestId('workflow-catalog-diagnostics')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-diagnostic')).toHaveCount(1);
   });
 });
 

@@ -1182,6 +1182,7 @@
     const probeTaskId = workflowGraphProbeTaskId;
     if (probeTaskId && probeTaskId === taskId) {
       workflowGraphProbeTaskId = null;
+      workflowsOpen = false;
       workflowGraphOpen = true;
       return;
     }
