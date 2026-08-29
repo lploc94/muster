@@ -19,13 +19,12 @@ export type WorkflowCatalogReader = (workspaceFolder: string) => Promise<Workflo
  * resolved root can change between requests without any user action here.
  *
  * A failed rescan rejects without replacing the previous snapshot, so a transient
- * read error cannot discard usable data. If scans overlap, only the most recently
- * started scan may replace the cached snapshot.
+ * read error cannot discard usable data. Calling dispose() resets the state rather
+ * than retiring the cache, so a later read intentionally rescans and repopulates it.
  */
 export class WorkflowCatalogCache {
   private key: string | undefined;
   private snapshot: WorkflowCatalogSnapshot | undefined;
-  private generation = 0;
 
   constructor(private readonly load: WorkflowCatalogReader) {}
 
@@ -34,17 +33,13 @@ export class WorkflowCatalogCache {
       return this.snapshot;
     }
 
-    const generation = ++this.generation;
     const next = await this.load(workspaceFolder);
-    if (generation === this.generation) {
-      this.key = workspaceFolder;
-      this.snapshot = next;
-    }
+    this.key = workspaceFolder;
+    this.snapshot = next;
     return next;
   }
 
   dispose(): void {
-    this.generation += 1;
     this.key = undefined;
     this.snapshot = undefined;
   }

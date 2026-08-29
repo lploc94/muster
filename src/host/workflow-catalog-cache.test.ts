@@ -16,8 +16,9 @@ describe('WorkflowCatalogCache', () => {
     const read = vi.fn(async () => snapshot('one'));
     const cache = new WorkflowCatalogCache(read);
 
-    await expect(cache.read('/root/a', 'initial')).resolves.toEqual(snapshot('one'));
-    await expect(cache.read('/root/a', 'initial')).resolves.toEqual(snapshot('one'));
+    const first = await cache.read('/root/a', 'initial');
+    expect(first).toEqual(snapshot('one'));
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(first);
     expect(read).toHaveBeenCalledTimes(1);
   });
 
