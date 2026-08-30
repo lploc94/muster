@@ -1,4 +1,5 @@
 import {
+  isSafeWorkflowCatalogDiagnosticFile,
   parseRequestWorkflowCatalogMessage,
   WORKFLOW_CATALOG_DIAGNOSTICS_MAX,
   WORKFLOW_CATALOG_DIAGNOSTIC_MESSAGE_MAX,
@@ -51,7 +52,8 @@ function toWireCatalog(
   const diagnostics: WorkflowCatalogWireDiagnostic[] = snapshot.diagnostics
     .slice(0, WORKFLOW_CATALOG_DIAGNOSTICS_MAX)
     .map(({ file, code, message }) => ({
-      file, code,
+      file: isSafeWorkflowCatalogDiagnosticFile(file) ? file : '(catalog)',
+      code,
       message: message.slice(0, WORKFLOW_CATALOG_DIAGNOSTIC_MESSAGE_MAX),
     }));
 

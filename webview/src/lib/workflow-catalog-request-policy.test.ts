@@ -14,17 +14,20 @@ describe('WorkflowCatalogRequestPolicy', () => {
     expect(policy.onReload()).toBeNull();
   });
 
-  it('serves a held snapshot on reopen without a request', () => {
+  it('revalidates the active workspace with initial after a settled reopen', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
-    expect(policy.onResult(first.requestId, true)).toBe(true);
-    expect(policy.onOpen()).toBeNull();
+    expect(policy.onResult(first.requestId)).toBe(true);
+
+    const reopened = policy.onOpen()!;
+    expect(reopened.reason).toBe('initial');
+    expect(reopened.requestId).not.toBe(first.requestId);
   });
 
-  it('reloads with reason reload once a snapshot is held', () => {
+  it('reloads with reason reload once the prior request settles', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
-    policy.onResult(first.requestId, true);
+    policy.onResult(first.requestId);
 
     const second = policy.onReload()!;
     expect(second.reason).toBe('reload');
@@ -35,29 +38,29 @@ describe('WorkflowCatalogRequestPolicy', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
 
-    expect(policy.onResult('some-other-id', true)).toBe(false);
-    expect(policy.onResult(first.requestId, true)).toBe(true);
+    expect(policy.onResult('some-other-id')).toBe(false);
+    expect(policy.onResult(first.requestId)).toBe(true);
     // Already settled: a duplicate reply is dropped too.
-    expect(policy.onResult(first.requestId, true)).toBe(false);
+    expect(policy.onResult(first.requestId)).toBe(false);
   });
 
-  it('a failed result settles without holding a snapshot, so retry refetches', () => {
+  it('a failed result settles so retry refetches', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
-    expect(policy.onResult(first.requestId, false)).toBe(true);
+    expect(policy.onResult(first.requestId)).toBe(true);
 
     const retry = policy.onReload()!;
     expect(retry.reason).toBe('reload');
   });
 
-  it('a failed reload keeps the held snapshot so open does not refetch', () => {
+  it('revalidates with initial after a failed reload settles', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
-    policy.onResult(first.requestId, true);
+    policy.onResult(first.requestId);
     const reload = policy.onReload()!;
-    policy.onResult(reload.requestId, false);
+    policy.onResult(reload.requestId);
 
-    expect(policy.onOpen()).toBeNull();
+    expect(policy.onOpen()).toMatchObject({ reason: 'initial' });
   });
 
   it('times out only the in-flight request', () => {
@@ -66,7 +69,6 @@ describe('WorkflowCatalogRequestPolicy', () => {
 
     expect(policy.onTimeout('stale-id')).toBe(false);
     expect(policy.onTimeout(first.requestId)).toBe(true);
-    policy.settle();
     expect(policy.onTimeout(first.requestId)).toBe(false);
     expect(policy.onReload()).not.toBeNull();
   });
@@ -74,31 +76,11 @@ describe('WorkflowCatalogRequestPolicy', () => {
   it('does not let stale results or timeouts settle a newer request', () => {
     const policy = new WorkflowCatalogRequestPolicy();
     const first = policy.onOpen()!;
-    expect(policy.onResult(first.requestId, true)).toBe(true);
+    expect(policy.onResult(first.requestId)).toBe(true);
     const second = policy.onReload()!;
 
-    expect(policy.onResult(first.requestId, false)).toBe(false);
+    expect(policy.onResult(first.requestId)).toBe(false);
     expect(policy.onTimeout(first.requestId)).toBe(false);
-    expect(policy.onResult(second.requestId, true)).toBe(true);
-  });
-
-  it('settle clears the in-flight request while retaining a held snapshot', () => {
-    const policy = new WorkflowCatalogRequestPolicy();
-    const first = policy.onOpen()!;
-    expect(policy.onResult(first.requestId, true)).toBe(true);
-    expect(policy.onReload()).not.toBeNull();
-    policy.settle();
-
-    expect(policy.onOpen()).toBeNull();
-    expect(policy.onReload()).not.toBeNull();
-  });
-
-  it('reset clears both the in-flight request and the held snapshot', () => {
-    const policy = new WorkflowCatalogRequestPolicy();
-    const first = policy.onOpen()!;
-    policy.onResult(first.requestId, true);
-    policy.reset();
-
-    expect(policy.onOpen()).toMatchObject({ reason: 'initial' });
+    expect(policy.onResult(second.requestId)).toBe(true);
   });
 });

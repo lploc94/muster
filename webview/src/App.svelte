@@ -1209,16 +1209,13 @@
     }
     untrack(() => workflowGraphStore.setOpen(open && Boolean(taskId), taskId));
   });
-  // Declarative $effect — the catalog requests only when its panel becomes visible
-  // and settles its request lifecycle when the panel hides.
+  // Revalidate the active workspace whenever the panel becomes visible. Hiding
+  // preserves request correlation so a successful background reload still lands.
   $effect(() => {
     const open = workflowsOpen;
     untrack(() => {
-      if (open) {
-        workflowCatalogStore.open();
-      } else {
-        workflowCatalogStore.close();
-      }
+      if (open) workflowCatalogStore.open();
+      else workflowCatalogStore.close();
     });
   });
 

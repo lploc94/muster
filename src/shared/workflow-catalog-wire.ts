@@ -82,6 +82,14 @@ function isBoundedString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max && !value.includes('\0');
 }
 
+const UNSAFE_DIAGNOSTIC_FILE = /[\\/\x00-\x1f\x7f]/;
+
+/** Diagnostic file labels are basenames or reserved host labels, never paths. */
+export function isSafeWorkflowCatalogDiagnosticFile(value: unknown): value is string {
+  return isBoundedString(value, WORKFLOW_CATALOG_DIAGNOSTIC_FILE_MAX)
+    && !UNSAFE_DIAGNOSTIC_FILE.test(value);
+}
+
 /** Same bounds as isBoundedString but tolerates ''; the host currently always sends a non-empty description, and the wire deliberately tolerates '' so a future optional-description workflow cannot break the panel. */
 function isBoundedOrEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length <= max && !value.includes('\0');
@@ -139,7 +147,7 @@ function parseEntry(raw: unknown): WorkflowCatalogWireEntry | null {
 function parseDiagnostic(raw: unknown): WorkflowCatalogWireDiagnostic | null {
   if (!isRecord(raw) || !hasExactKeys(raw, ['file', 'code', 'message'])) return null;
   const { file, code, message } = raw;
-  if (!isBoundedString(file, WORKFLOW_CATALOG_DIAGNOSTIC_FILE_MAX)) return null;
+  if (!isSafeWorkflowCatalogDiagnosticFile(file)) return null;
   if (!isBoundedString(code, WORKFLOW_CATALOG_DIAGNOSTIC_CODE_MAX)) return null;
   if (!isBoundedOrEmptyString(message, WORKFLOW_CATALOG_DIAGNOSTIC_MESSAGE_MAX)) return null;
   return { file, code, message };

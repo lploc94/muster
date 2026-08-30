@@ -123,6 +123,24 @@ describe('routeRequestWorkflowCatalog', () => {
     expect(parseWorkflowCatalogResult(message)).not.toBeNull();
   });
 
+  it('replaces unsafe diagnostic paths before posting the catalog', async () => {
+    const outcome = await routeRequestWorkflowCatalog(request, deps({
+      readCatalog: async () => ({
+        workflows: [],
+        diagnostics: [
+          { file: '/Users/alice/private.md', code: 'invalid_workflow_file', message: 'bad' },
+          { file: 'C:\\Users\\alice\\private.md', code: 'invalid_workflow_file', message: 'bad' },
+        ],
+      }),
+    }));
+
+    expect(outcome.kind).toBe('message');
+    if (outcome.kind !== 'message' || !outcome.message.ok) throw new Error('expected success message');
+    expect(outcome.message.catalog.diagnostics.map(({ file }) => file))
+      .toEqual(['(catalog)', '(catalog)']);
+    expect(parseWorkflowCatalogResult(outcome.message)).not.toBeNull();
+  });
+
   it('does not report truncation at the exact workflow cap', async () => {
     const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX }, (_, i) => ({
       workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',

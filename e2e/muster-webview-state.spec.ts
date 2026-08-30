@@ -11618,17 +11618,53 @@ test.describe('Workflow catalog surface', () => {
     await expect(panel).toHaveAttribute('data-state', 'populated');
     await expect(page.getByTestId('workflow-catalog-diagnostic')).toHaveCount(0);
 
+    await page.getByTestId('workflow-catalog-reload').click();
+    const fourth = await lastCatalogRequest(page, 4);
+    expect(fourth.reason).toBe('reload');
     await page.getByTestId('workflow-catalog-close').click();
     await expect(panel).toHaveCount(0);
     await expect(page.getByTestId('open-workflows').first()).toBeFocused();
 
     await page.getByTestId('open-workflows').first().click();
     await expect(panel).toBeVisible();
-    await expect(panel).toHaveAttribute('data-state', 'populated');
-    await page.waitForTimeout(100);
-    expect(await catalogRequests(page)).toHaveLength(3);
-    await page.waitForTimeout(100);
-    expect(await catalogRequests(page)).toHaveLength(3);
+    await expect(page.getByTestId('workflow-catalog-refreshing')).toBeVisible();
+    expect(await catalogRequests(page)).toHaveLength(4);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: fourth.requestId,
+      ok: true,
+      catalog: {
+        reason: 'reload',
+        workflows: [
+          workspaceEntry,
+          globalEntry,
+          {
+            workflowRef: 'ref-deploy',
+            name: 'Deploy',
+            description: 'Ship the current build',
+            scope: 'workspace',
+            packageKind: 'file',
+          },
+        ],
+        diagnostics: [],
+      },
+    });
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(3);
+    const fifth = await lastCatalogRequest(page, 5);
+    expect(fifth.reason).toBe('initial');
+    await expect(page.getByTestId('workflow-catalog-refreshing')).toBeVisible();
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: fifth.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [workspaceEntry, globalEntry],
+        diagnostics: [],
+      },
+    });
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(2);
     await page.keyboard.press('Escape');
     await expect(panel).toHaveCount(0);
     await expect(page.getByTestId('open-workflows').first()).toBeFocused();

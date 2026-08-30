@@ -2,7 +2,9 @@ export type WorkflowCatalogFetch = { requestId: string; reason: 'initial' | 'rel
 
 /**
  * Pure request-correlation policy for the catalog store: monotonic request ids,
- * single-flight, and the held-snapshot rule that makes reopening free.
+ * and single-flight request ownership. Every settled reopen sends an `initial`
+ * request so the host can resolve the currently active workspace root; its
+ * workspace-keyed cache keeps same-root reopen requests filesystem-free.
  *
  * Extracted from the runes store because vitest.config.ts runs the node
  * environment with no Svelte plugin, so $state is not compiled in tests.
@@ -10,11 +12,10 @@ export type WorkflowCatalogFetch = { requestId: string; reason: 'initial' | 'rel
 export class WorkflowCatalogRequestPolicy {
   private seq = 0;
   private inFlight: string | null = null;
-  private held = false;
 
-  /** null means no request: a snapshot is already held, or one is in flight. */
+  /** null means the existing request remains authoritative. */
   onOpen(): WorkflowCatalogFetch {
-    if (this.held || this.inFlight !== null) return null;
+    if (this.inFlight !== null) return null;
     return this.begin('initial');
   }
 
@@ -24,11 +25,9 @@ export class WorkflowCatalogRequestPolicy {
   }
 
   /** True when the reply is the in-flight request and the caller should apply it. */
-  onResult(requestId: string, ok: boolean): boolean {
+  onResult(requestId: string): boolean {
     if (this.inFlight === null || requestId !== this.inFlight) return false;
     this.inFlight = null;
-    // A failed reload leaves `held` as it was, so the prior snapshot survives.
-    if (ok) this.held = true;
     return true;
   }
 
@@ -36,15 +35,6 @@ export class WorkflowCatalogRequestPolicy {
     if (this.inFlight !== requestId) return false;
     this.inFlight = null;
     return true;
-  }
-
-  settle(): void {
-    this.inFlight = null;
-  }
-
-  reset(): void {
-    this.inFlight = null;
-    this.held = false;
   }
 
   private begin(reason: 'initial' | 'reload'): WorkflowCatalogFetch {

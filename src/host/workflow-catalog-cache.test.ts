@@ -11,6 +11,14 @@ function snapshot(name: string): WorkflowCatalogSnapshot {
   };
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
 describe('WorkflowCatalogCache', () => {
   it('scans once for initial then serves the cached snapshot', async () => {
     const read = vi.fn(async () => snapshot('one'));
@@ -57,6 +65,61 @@ describe('WorkflowCatalogCache', () => {
 
     fail = false;
     await expect(cache.read('/root/a', 'initial')).resolves.toEqual(snapshot('one'));
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an older scan overwrite a newer completed scan', async () => {
+    const older = deferred<WorkflowCatalogSnapshot>();
+    const newer = deferred<WorkflowCatalogSnapshot>();
+    const read = vi.fn()
+      .mockImplementationOnce(() => older.promise)
+      .mockImplementationOnce(() => newer.promise);
+    const cache = new WorkflowCatalogCache(read);
+
+    const olderRead = cache.read('/root/a', 'initial');
+    const newerRead = cache.read('/root/a', 'initial');
+    const newerSnapshot = snapshot('newer');
+    newer.resolve(newerSnapshot);
+    await expect(newerRead).resolves.toBe(newerSnapshot);
+    older.resolve(snapshot('older'));
+    await expect(olderRead).resolves.toEqual(snapshot('older'));
+
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(newerSnapshot);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an older scan replace a newer cache hit', async () => {
+    const pending = deferred<WorkflowCatalogSnapshot>();
+    const cached = snapshot('cached');
+    const read = vi.fn()
+      .mockResolvedValueOnce(cached)
+      .mockImplementationOnce(() => pending.promise);
+    const cache = new WorkflowCatalogCache(read);
+
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(cached);
+    const otherRead = cache.read('/root/b', 'initial');
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(cached);
+
+    pending.resolve(snapshot('other'));
+    await expect(otherRead).resolves.toEqual(snapshot('other'));
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(cached);
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let an in-flight scan repopulate the cache after dispose', async () => {
+    const pending = deferred<WorkflowCatalogSnapshot>();
+    const fresh = snapshot('fresh');
+    const read = vi.fn()
+      .mockImplementationOnce(() => pending.promise)
+      .mockResolvedValueOnce(fresh);
+    const cache = new WorkflowCatalogCache(read);
+
+    const staleRead = cache.read('/root/a', 'initial');
+    cache.dispose();
+    pending.resolve(snapshot('stale'));
+    await expect(staleRead).resolves.toEqual(snapshot('stale'));
+
+    await expect(cache.read('/root/a', 'initial')).resolves.toBe(fresh);
     expect(read).toHaveBeenCalledTimes(2);
   });
 

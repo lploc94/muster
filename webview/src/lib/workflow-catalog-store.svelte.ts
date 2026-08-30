@@ -16,8 +16,9 @@ export const WORKFLOW_CATALOG_TIMEOUT_MS = 8_000;
  * Svelte 5 class store for the workspace-scoped workflow catalog.
  *
  * Deliberately simpler than WorkflowGraphStore: the catalog has no patch-driven
- * refresh, so there is no throttle. Reads happen on first open and on explicit
- * Reload only. Correlation lives in WorkflowCatalogRequestPolicy.
+ * refresh, so there is no throttle. Opens revalidate the active workspace through
+ * the host cache; explicit Reload forces a rescan. Correlation lives in
+ * WorkflowCatalogRequestPolicy.
  */
 export class WorkflowCatalogStore {
   catalog = $state<WorkflowCatalogWire | null>(null);
@@ -25,11 +26,16 @@ export class WorkflowCatalogStore {
   error = $state<string | null>(null);
   private policy = new WorkflowCatalogRequestPolicy();
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
+  private panelOpen = false;
+  private revalidateAfterFlight = false;
 
   constructor(private doPost: typeof defaultPost = defaultPost) {}
 
   open(): void {
-    this.dispatch(this.policy.onOpen());
+    this.panelOpen = true;
+    const fetch = this.policy.onOpen();
+    this.revalidateAfterFlight = fetch === null;
+    this.dispatch(fetch);
   }
 
   reload(): void {
@@ -41,24 +47,23 @@ export class WorkflowCatalogStore {
   }
 
   handleResult(msg: WorkflowCatalogResult): void {
-    if (!this.policy.onResult(msg.requestId, msg.ok)) return;
+    if (!this.policy.onResult(msg.requestId)) return;
     this.loading = false;
     this.clearTimer();
     if (msg.ok) {
       this.catalog = msg.catalog;
       this.error = null;
+      this.revalidateOpenPanel();
       return;
     }
     // Keep the prior snapshot: an error must not discard usable data.
     this.error = msg.code;
+    this.revalidateOpenPanel();
   }
 
-  /** Panel closed. The snapshot is retained so reopening does not refetch. */
+  /** Panel close preserves request correlation so a background result can settle. */
   close(): void {
-    this.policy.settle();
-    this.loading = false;
-    this.clearTimer();
-    this.error = null;
+    this.panelOpen = false;
   }
 
   private dispatch(fetch: WorkflowCatalogFetch): void {
@@ -71,6 +76,7 @@ export class WorkflowCatalogStore {
       this.loading = false;
       this.error = 'unavailable';
       this.timeoutId = null;
+      this.revalidateOpenPanel();
     }, WORKFLOW_CATALOG_TIMEOUT_MS);
     const message: RequestWorkflowCatalog = {
       type: 'requestWorkflowCatalog',
@@ -78,6 +84,12 @@ export class WorkflowCatalogStore {
       reason: fetch.reason,
     };
     this.doPost(message);
+  }
+
+  private revalidateOpenPanel(): void {
+    if (!this.panelOpen || !this.revalidateAfterFlight) return;
+    this.revalidateAfterFlight = false;
+    this.dispatch(this.policy.onOpen());
   }
 
   private clearTimer(): void {

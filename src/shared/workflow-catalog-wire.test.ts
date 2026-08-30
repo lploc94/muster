@@ -282,6 +282,23 @@ describe('parseWorkflowCatalogResult', () => {
     }))).toBeNull();
   });
 
+  it('rejects diagnostic paths and control-bearing labels', () => {
+    for (const file of [
+      '/Users/alice/.muster/workflows/broken.md',
+      'C:\\Users\\alice\\.muster\\workflows\\broken.md',
+      'nested/broken.md',
+      'nested\\broken.md',
+      'broken\n.md',
+    ]) {
+      expect(parseWorkflowCatalogResult(result({
+        catalog: {
+          reason: 'initial', workflows: [],
+          diagnostics: [{ file, code: 'invalid_workflow_file', message: 'bad' }],
+        },
+      }))).toBeNull();
+    }
+  });
+
   it('rejects an over-bound diagnostic code', () => {
     expect(parseWorkflowCatalogResult(result({
       catalog: {
