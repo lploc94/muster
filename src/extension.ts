@@ -160,6 +160,9 @@ import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { routeLoadTranscriptPage } from './host/transcript-page-route';
 import { routeRequestWorkflowGraph } from './host/workflow-graph-route';
+import { routeRequestWorkflowCatalog } from './host/workflow-catalog-route';
+import { WorkflowCatalogCache } from './host/workflow-catalog-cache';
+import { listPredefinedWorkflows } from './host/predefined-workflows';
 import {
   createWorkflowGraphProbeCoordinator,
   type WorkflowGraphProbeCoordinator,
@@ -589,7 +592,7 @@ function debugElicitation(event: string, details: Record<string, unknown> = {}):
  * version is stamped on the bootstrap `snapshot` message, and a mismatch is
  * surfaced in the webview as a visible "reload the window" banner.
  */
-const PROTOCOL_VERSION = 12;
+const PROTOCOL_VERSION = 13;
 
 /** How long a permission prompt waits for a webview decision before safe-denying. */
 const PERMISSION_PROMPT_TIMEOUT_MS = USER_INTERACTION_TIMEOUT_MS;
@@ -771,6 +774,33 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
   private workflowGraphProbeCoordinator: WorkflowGraphProbeCoordinator | undefined;
   /** Host-minted image paths accepted by the send boundary. */
   private readonly imagePathAuthorizations = new ImagePathAuthorizations();
+  /**
+   * Catalog snapshot cache. Keyed by resolved workspace folder inside the cache,
+   * because resolveTaskCwd() is multi-root aware and can return a different
+   * folder between requests.
+   */
+  private readonly workflowCatalogCache = new WorkflowCatalogCache(
+    async (workspaceFolder: string) => {
+      try {
+        const { workflows, diagnostics } = await listPredefinedWorkflows({ workspaceFolder });
+        return { workflows, diagnostics };
+      } catch (error) {
+        const errorRecord =
+          error && typeof error === 'object'
+            ? error as { name?: unknown; code?: unknown }
+            : undefined;
+        debugMuster('workflow_catalog.host_read_error', {
+          name: error instanceof Error
+            ? error.name
+            : typeof errorRecord?.name === 'string'
+              ? errorRecord.name
+              : typeof error,
+          code: typeof errorRecord?.code === 'string' ? errorRecord.code : undefined,
+        });
+        throw error;
+      }
+    },
+  );
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -2226,6 +2256,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     this.pollingReady = false;
     this.windowStateSub?.dispose();
     this.windowStateSub = undefined;
+    this.workflowCatalogCache.dispose();
     // Tear down any in-flight Test Connection probes when the webview is replaced.
     try {
       backendProbeService?.disposeAll();
@@ -2679,6 +2710,37 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         ok: outcome.message.ok,
       });
     }
+  }
+
+  /**
+   * Serve the bounded predefined workflow catalog. The pure route validates
+   * before any catalog read and emits only its shared, fixed response shape.
+   * Unlike the graph route there is no focus check: the catalog is
+   * workspace-scoped, so it is served from the entry list too.
+   */
+  private async handleRequestWorkflowCatalog(data: unknown): Promise<void> {
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+    debugMuster('workflow_catalog.host_request', {
+      requestId: raw.requestId,
+      reason: raw.reason,
+      keys: Object.keys(raw),
+    });
+    const outcome = await routeRequestWorkflowCatalog(data, {
+      readCatalog: (reason) => this.workflowCatalogCache.read(resolveTaskCwd(), reason),
+    });
+    debugMuster('workflow_catalog.host_outcome', {
+      requestId: raw.requestId,
+      kind: outcome.kind,
+      ...(outcome.kind === 'message'
+        ? {
+            ok: outcome.message.ok,
+            code: outcome.message.ok ? undefined : outcome.message.code,
+            workflowCount: outcome.message.ok ? outcome.message.catalog.workflows.length : undefined,
+            diagnosticCount: outcome.message.ok ? outcome.message.catalog.diagnostics.length : undefined,
+          }
+        : {}),
+    });
+    if (outcome.kind === 'message') this.post(outcome.message);
   }
 
   /**
@@ -3757,6 +3819,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'requestWorkflowGraph':
           await this.handleRequestWorkflowGraph(data);
+          break;
+        case 'requestWorkflowCatalog':
+          await this.handleRequestWorkflowCatalog(data);
           break;
         case 'requestWorkspaceRecovery':
           this.handleRequestWorkspaceRecovery(data);

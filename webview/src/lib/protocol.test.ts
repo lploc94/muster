@@ -172,7 +172,7 @@ describe('protocol v7 focused transcriptPage contract', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(12);
+    expect(PROTOCOL_VERSION).toBe(13);
   });
 
   it('accepts focused snapshot with transcript + transcriptPage', () => {
@@ -1964,7 +1964,7 @@ describe('protocol v9 workspacePatchBatch', () => {
   };
 
   it('uses the current protocol version', () => {
-    expect(PROTOCOL_VERSION).toBe(12);
+    expect(PROTOCOL_VERSION).toBe(13);
   });
 
   it('accepts a multi-kind batch and empty patches', () => {
@@ -2460,6 +2460,60 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
       type: 'requestWorkflowGraph',
       requestId: 'request-1',
       taskId: 'task-1',
+    };
+    post(message);
+    expect(vscode.postMessage).toHaveBeenCalledWith(message);
+  });
+});
+
+describe('isExtMessage workflowCatalogResult (workflow catalog)', () => {
+  it('accepts a shared-contract-valid catalog result', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: true,
+        catalog: {
+          reason: 'initial',
+          workflows: [{
+            workflowRef: 'pwf_0123456789abcdef0123456789abcdef',
+            name: 'Release checklist',
+            description: 'Bounded catalog fixture.',
+            scope: 'workspace',
+            packageKind: 'file',
+          }],
+          diagnostics: [],
+        },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects malformed and extra-field catalog results fail-closed', () => {
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: false,
+        code: 'unavailable',
+        message: 'untrusted host detail',
+      }),
+    ).toBe(false);
+    expect(
+      isExtMessage({
+        type: 'workflowCatalogResult',
+        requestId: 'request-1',
+        ok: true,
+        catalog: { reason: 'initial', workflows: 'not-an-array', diagnostics: [] },
+      }),
+    ).toBe(false);
+  });
+
+  it('posts the correlated request workflow catalog shape', () => {
+    vi.mocked(vscode.postMessage).mockClear();
+    const message: OutMessage = {
+      type: 'requestWorkflowCatalog',
+      requestId: 'request-1',
+      reason: 'reload',
     };
     post(message);
     expect(vscode.postMessage).toHaveBeenCalledWith(message);

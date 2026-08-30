@@ -30,8 +30,13 @@ import {
   type RequestWorkflowGraph,
   type WorkflowGraphResult,
 } from '../../../src/shared/workflow-graph-wire';
+import {
+  parseWorkflowCatalogResult,
+  type RequestWorkflowCatalog,
+  type WorkflowCatalogResult,
+} from '../../../src/shared/workflow-catalog-wire';
 
-export const PROTOCOL_VERSION = 12;
+export const PROTOCOL_VERSION = 13;
 
 export type { BackendReadinessSnapshot, BackendProbeProgress, BackendProbeRequest };
 
@@ -590,6 +595,8 @@ export type ExtMessage =
    * shared fail-closed contract before any webview consumer can inspect it.
    */
   | WorkflowGraphResult
+  /** Correlated bounded predefined workflow catalog snapshot. */
+  | WorkflowCatalogResult
   /**
    * Host response to `requestFileMentionSuggestions`.
    * Success returns relative suggestion items only (never absolute paths, cwd,
@@ -666,6 +673,8 @@ export type OutMessage =
   | { type: 'hydrateSubtree'; taskId: string }
   /** Correlated bounded workflow topology request (M024/S05). */
   | RequestWorkflowGraph
+  /** Correlated bounded workflow catalog request; reason distinguishes first open from Reload. */
+  | RequestWorkflowCatalog
   /**
    * Request one bounded older transcript page for the focused task (introduced in v7).
    * Host replies with `transcriptPageResult` (typed success or fixed error code).
@@ -1797,6 +1806,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
 
     case 'workflowGraphResult':
       return parseWorkflowGraphResult(data) !== null;
+    case 'workflowCatalogResult':
+      return parseWorkflowCatalogResult(data) !== null;
 
     case 'askPending':
       return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);

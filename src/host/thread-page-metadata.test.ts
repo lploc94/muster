@@ -107,9 +107,19 @@ const protocolSource = fs.readFileSync(
 );
 
 describe('host+webview protocol version contract', () => {
-  it('keeps exact version 12 in both host and webview constants', () => {
-    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 12;/);
-    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 12;/);
+  it('pins host and webview at 13', () => {
+    expect(protocolSource).toMatch(/export const PROTOCOL_VERSION = 13;/);
+    expect(extensionSource).toMatch(/const PROTOCOL_VERSION = 13;/);
+  });
+
+  it('logs catalog read errors without raw filesystem messages', () => {
+    const reader = extensionSource.match(
+      /new WorkflowCatalogCache\([\s\S]*?async \(workspaceFolder: string\) => \{([\s\S]*?)\n\s*\},\s*\);/,
+    )?.[1];
+    expect(reader, 'workflow catalog reader must exist').toBeTruthy();
+    expect(reader).toContain('workflow_catalog.host_read_error');
+    expect(reader).toContain('throw error;');
+    expect(reader).not.toMatch(/error\.message/);
   });
 
   it('maps missing repository via getTask throw to unavailable', () => {

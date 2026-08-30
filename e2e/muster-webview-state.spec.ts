@@ -339,7 +339,7 @@ function taskTypesSettingsSnapshot(overrides?: {
 // PROTOCOL_VERSION in webview/src/lib/protocol.ts. Test fixtures below always
 // send it so the version-mismatch banner doesn't mask the harness's own
 // snapshot messages.
-const PROTOCOL_VERSION = 12;
+const PROTOCOL_VERSION = 13;
 
 /**
  * Normalize a focused snapshot to the protocol v9 current-only contract:
@@ -11501,6 +11501,187 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(requests[1]!.requestId).not.toBe(firstRequest.requestId);
   });
 
+});
+test.describe('Workflow catalog surface', () => {
+  const workspaceEntry = {
+    workflowRef: 'ref-build',
+    name: 'Build checks',
+    description: 'Run lint and typecheck',
+    scope: 'workspace',
+    packageKind: 'bundle',
+  } as const;
+  const globalEntry = {
+    workflowRef: 'ref-release',
+    name: 'Release notes',
+    description: 'Draft release notes',
+    scope: 'global',
+    packageKind: 'file',
+  } as const;
+
+  type CatalogRequest = {
+    type: 'requestWorkflowCatalog';
+    requestId: string;
+    reason: string;
+  };
+
+  function isCatalogRequest(message: unknown): message is CatalogRequest {
+    if (typeof message !== 'object' || message === null) return false;
+    if (!('type' in message) || message.type !== 'requestWorkflowCatalog') return false;
+    return (
+      'requestId' in message &&
+      typeof message.requestId === 'string' &&
+      'reason' in message &&
+      typeof message.reason === 'string'
+    );
+  }
+
+  async function catalogRequests(page: Page): Promise<CatalogRequest[]> {
+    return (await postedMessages(page)).filter(isCatalogRequest);
+  }
+
+  async function lastCatalogRequest(page: Page, count: number): Promise<CatalogRequest> {
+    await expect.poll(async () => (await catalogRequests(page)).length).toBe(count);
+    const requests = await catalogRequests(page);
+    return requests.at(-1)!;
+  }
+
+  test('opens, reloads, preserves catalog data on failure, retries, and closes', async ({ page }) => {
+    await openWebview(page);
+
+    await page.getByTestId('open-workflows').first().click();
+    await expect(page.getByTestId('workflow-catalog-loading')).toBeVisible();
+    const first = await lastCatalogRequest(page, 1);
+    expect(first.reason).toBe('initial');
+    expect((await catalogRequests(page))).toHaveLength(1);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: first.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [workspaceEntry, globalEntry],
+        diagnostics: [{
+          file: 'messy.md',
+          code: 'invalid_workflow_file',
+          message: 'missing name',
+        }],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-catalog-panel');
+    await expect(panel).toHaveAttribute('data-state', 'populated');
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(2);
+    await expect(page.getByTestId('workflow-catalog-group-workspace')).toContainText('Build checks');
+    await expect(page.getByTestId('workflow-catalog-group-workspace')).toContainText('bundle');
+    await expect(page.getByTestId('workflow-catalog-group-global')).toContainText('Release notes');
+    await expect(page.getByTestId('workflow-catalog-group-global')).toContainText('User');
+    await expect(page.getByTestId('workflow-catalog-diagnostics')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-diagnostic')).toHaveCount(1);
+    await expect(page.getByTestId('workflow-catalog-diagnostic')).toContainText('invalid_workflow_file');
+
+    await page.getByTestId('workflow-catalog-reload').click();
+    const second = await lastCatalogRequest(page, 2);
+    expect(second.reason).toBe('reload');
+    await expect(page.getByTestId('workflow-catalog-refreshing')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(2);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: second.requestId,
+      ok: false,
+      code: 'unavailable',
+    });
+    await expect(panel).toHaveAttribute('data-state', 'error');
+    await expect(page.getByTestId('workflow-catalog-error')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(2);
+    await expect(page.getByTestId('workflow-catalog-group-workspace')).toContainText('Build checks');
+    await expect(page.getByTestId('workflow-catalog-group-global')).toContainText('Release notes');
+
+    await page.getByTestId('workflow-catalog-retry').click();
+    const third = await lastCatalogRequest(page, 3);
+    expect(third.reason).toBe('reload');
+    await expect(page.getByTestId('workflow-catalog-error')).toHaveCount(0);
+    await expect(page.getByTestId('workflow-catalog-refreshing')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-row')).toHaveCount(2);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: third.requestId,
+      ok: true,
+      catalog: {
+        reason: 'reload',
+        workflows: [workspaceEntry, globalEntry],
+        diagnostics: [],
+      },
+    });
+    await expect(panel).toHaveAttribute('data-state', 'populated');
+    await expect(page.getByTestId('workflow-catalog-diagnostic')).toHaveCount(0);
+
+    await page.getByTestId('workflow-catalog-close').click();
+    await expect(panel).toHaveCount(0);
+    await expect(page.getByTestId('open-workflows').first()).toBeFocused();
+
+    await page.getByTestId('open-workflows').first().click();
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute('data-state', 'populated');
+    await page.waitForTimeout(100);
+    expect(await catalogRequests(page)).toHaveLength(3);
+    await page.waitForTimeout(100);
+    expect(await catalogRequests(page)).toHaveLength(3);
+    await page.keyboard.press('Escape');
+    await expect(panel).toHaveCount(0);
+    await expect(page.getByTestId('open-workflows').first()).toBeFocused();
+  });
+
+  test('renders guidance for an empty catalog', async ({ page }) => {
+    await openWebview(page);
+    await page.getByTestId('open-workflows').first().click();
+    const first = await lastCatalogRequest(page, 1);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: first.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [],
+        diagnostics: [],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-catalog-panel');
+    await expect(panel).toHaveAttribute('data-state', 'empty');
+    await expect(page.getByTestId('workflow-catalog-empty')).toContainText('.muster/workflows/');
+    await expect(page.getByTestId('workflow-catalog-error')).toHaveCount(0);
+  });
+
+  test('renders a diagnostics-only state for an empty catalog with diagnostics', async ({ page }) => {
+    await openWebview(page);
+    await page.getByTestId('open-workflows').first().click();
+    const first = await lastCatalogRequest(page, 1);
+
+    await postRawHostMessage(page, {
+      type: 'workflowCatalogResult',
+      requestId: first.requestId,
+      ok: true,
+      catalog: {
+        reason: 'initial',
+        workflows: [],
+        diagnostics: [{
+          file: 'broken.md',
+          code: 'invalid_workflow_file',
+          message: 'missing name',
+        }],
+      },
+    });
+
+    const panel = page.getByTestId('workflow-catalog-panel');
+    await expect(panel).toHaveAttribute('data-state', 'diagnostics-only');
+    await expect(page.getByTestId('workflow-catalog-empty')).toContainText('.muster/workflows/');
+    await expect(page.getByTestId('workflow-catalog-diagnostics')).toBeVisible();
+    await expect(page.getByTestId('workflow-catalog-diagnostic')).toHaveCount(1);
+  });
 });
 
 declare global {

@@ -222,7 +222,7 @@ describe('predefined workflow catalog', () => {
     const invalidName = join(global, 'invalid-name');
     mkdirSync(invalidName, { recursive: true });
     writeFileSync(join(invalidName, 'invalid-name.md'), markdown('Invalid', 'control', 'Body'));
-    writeFileSync(join(invalidName, 'bad\x01.js'), 'process.stdout.write("bad")');
+    writeFileSync(join(invalidName, 'bad\x7f.js'), 'process.stdout.write("bad")');
 
     const listed = await listPredefinedWorkflows({ workspaceFolder: workspace, globalWorkflowFolder: global });
     expect(listed.workflows).toEqual([]);
