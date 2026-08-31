@@ -261,7 +261,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `feat(workflow-routing): add durable decision repair`
 
 ## Phase 6: Route Execute Outcomes by Numeric Exit
-- Status: pending
+- Status: complete
 - Depends on: Phase 5
 - Goal: Replace script `onFailure` with complete canonical zero/nonzero outcome contracts that stage existing NEXT/PREV/FAIL dispositions without weakening execution safety.
 - Current behavior: `ScriptBackend` safely executes one bounded script and records numeric exit/stdout/stderr; `engine.ts` maps exit 0 or `onFailure: continue` to NEXT and nonzero `fail_run` to FAIL. Nonzero cannot request contextual PREV.
@@ -284,9 +284,9 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
   - Keep operational error/retry/cancellation classification separate from semantic exit routing and preserve exact execution metadata for diagnostics/reload.
   - Delete legacy types/branches and update all test/UAT callers in the same phase so no production fallback survives.
 - Acceptance criteria:
-  - [ ] AC-1: Exit 0 always produces one NEXT result and numeric nonzero follows exactly the manifest's PREV or FAIL route - proven by backend and script workflow tests.
-  - [ ] AC-2: Nonzero PREV always reaches only declared direct producers with actionable bounded feedback, including deterministic synthesis for empty stdout - proven by feedback integration tests.
-  - [ ] AC-3: Operational failures and stderr remain separate from semantic routes, and no `onFailure` compatibility remains - proven by negative executor/package/public-contract tests and source inspection.
+  - [x] AC-1: Exit 0 always produces one NEXT result and numeric nonzero follows exactly the manifest's PREV or FAIL route - proven by backend and script workflow tests.
+  - [x] AC-2: Nonzero PREV always reaches only declared direct producers with actionable bounded feedback, including deterministic synthesis for empty stdout - proven by feedback integration tests.
+  - [x] AC-3: Operational failures and stderr remain separate from semantic routes, and no `onFailure` compatibility remains - proven by negative executor/package/public-contract tests and source inspection.
 - Focused verification:
   - `npx vitest run src/backends/script.test.ts src/task/script-workflow.test.ts src/host/predefined-workflows.test.ts src/task/coordinator-tools.test.ts src/task/m018-s04-prev-feedback-all-join.test.ts`
 - Phase gates:
@@ -347,5 +347,5 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 | 3 | complete | this phase commit (`refactor(workflow-storage): persist canonical definitions`) | Focused: 89/89; affected workflow/retry: 112/112; child-return integration: 1/1; `npx tsc -p . --noEmit`; `git diff --check`; compile; SQLite storage docs; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 5 findings fixed |
 | 4 | complete | this phase commit (`feat(workflow-runtime): compose exact named outputs`) | Focused: 126/126; repository: 41/41; one-node workflow: 10/10; `npx tsc -p . --noEmit`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 2 rounds; 1 finding fixed, 1 withdrawn after transaction-boundary evidence |
 | 5 | complete | this phase commit (`feat(workflow-routing): add durable decision repair`) | Focused: 176/176; prompt/workflow boundaries: 77/77; `npx tsc -p . --noEmit`; `git diff --check`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 7 findings fixed, 1 disputed from the approved closed error-code contract |
-| 6 | pending | N/A | pending | pending |
+| 6 | complete | this phase commit (`feat(workflow-execute): map exit outcomes to dispositions`) | Focused: 130/130; script-workflow QA: 156/156; QA docs: 3/3; `npx tsc -p . --noEmit`; compile; source-boundary + fixtures passed; native VS Code 1.135.0 qualification remains truthfully PENDING at its pre-run workspace-setting blocker | `codex-impl-review` APPROVE in 1 round; no findings |
 | 7 | pending | N/A | pending | pending |

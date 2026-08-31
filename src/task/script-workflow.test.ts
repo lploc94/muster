@@ -1,13 +1,16 @@
-import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { makeBackend } from '../backends';
 import type { CredentialContext } from '../bridge/credentials';
 import { dispatch } from './coordinator-tools';
+import { WORKFLOW_FEEDBACK_MAX_BYTES } from './content-limits';
 import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
+import { mapWorkflowExitResult } from './workflow-exit';
+import type { WorkflowExitOutcome } from './workflow-types';
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -53,11 +56,19 @@ async function waitForRun(client: DbClient, runId: string): Promise<string | und
   return undefined;
 }
 
-function exitOutcome() {
+function exitOutcome(): WorkflowExitOutcome {
   return {
     kind: 'exit',
     next: { when: { exitCode: 0 } },
     fail: { when: { exitCode: 'nonzero' } },
+  };
+}
+
+function prevExitOutcome(targets: readonly string[]): WorkflowExitOutcome {
+  return {
+    kind: 'exit',
+    next: { when: { exitCode: 0 } },
+    prev: { when: { exitCode: 'nonzero' }, targets, feedback: 'stdout' },
   };
 }
 
@@ -169,6 +180,48 @@ afterEach(async () => {
 });
 
 describe('script workflow runtime', () => {
+  it('purely maps only numeric results through the complete frozen exit contract', () => {
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', outcome: exitOutcome(), exitCode: 0, stdout: 'result\n',
+    })).toEqual({
+      ok: true,
+      disposition: {
+        kind: 'workflow_next', change: 'updated', result: 'result\n',
+        execution: { kind: 'script', exitCode: 0 },
+      },
+    });
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', title: 'Quality check', outcome: prevExitOutcome(['source']),
+      exitCode: 7, stdout: 'repair this\n',
+    })).toEqual({
+      ok: true,
+      disposition: { kind: 'workflow_prev', targets: ['source'], note: 'repair this\n' },
+    });
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', title: 'Quality check', outcome: prevExitOutcome(['source']),
+      exitCode: 7, stdout: ' \n',
+    })).toEqual({
+      ok: true,
+      disposition: {
+        kind: 'workflow_prev', targets: ['source'],
+        note: 'Execute check "Quality check" exited with code 7 without stdout. Correct the declared producer inputs and run the check again.',
+      },
+    });
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', outcome: exitOutcome(), exitCode: 7, stdout: 'ignored',
+    })).toEqual({
+      ok: true,
+      disposition: { kind: 'workflow_fail', reason: 'script exited with code 7' },
+    });
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', outcome: prevExitOutcome(['source']), exitCode: 7,
+      stdout: 'x'.repeat(WORKFLOW_FEEDBACK_MAX_BYTES + 1),
+    })).toEqual({ ok: false, reason: 'script stdout exceeds workflow feedback limit' });
+    expect(mapWorkflowExitResult({
+      nodeId: 'check', outcome: exitOutcome(), exitCode: Number.NaN, stdout: '',
+    })).toEqual({ ok: false, reason: 'script executor produced an invalid exit code' });
+  });
+
   it('defines and executes a canonical saved package through the public host path', async () => {
     const ctx = await fixture('public-path');
     const packageRoot = join(ctx.dir, '.muster', 'workflows');
@@ -506,6 +559,256 @@ describe('script workflow runtime', () => {
     const stored = await ctx.repository.getWorkflowDefinition(globalDefinition, 1);
     expect(stored?.topology.nodes[0]?.execution?.source).toMatchObject({ packagePath: 'global-package', entryFile: 'workflow.json' });
   }, 60_000);
+
+  it('maps the same nonzero exit to declared PREV or FAIL and synthesizes diagnostic-safe empty-output feedback', async () => {
+    const ctx = await fixture('declared-nonzero-routes');
+    writeFileSync(join(ctx.dir, 'producer.js'), [
+      "const fs = require('node:fs');",
+      "const file = process.cwd() + '/producer.count';",
+      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(file, String(count));",
+      "process.stdout.write('producer-v' + count);",
+    ].join('\n'));
+    writeFileSync(join(ctx.dir, 'check.js'), [
+      "const fs = require('node:fs');",
+      "const file = process.cwd() + '/check.count';",
+      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(file, String(count));",
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  if (count === 1) {",
+      "    process.stderr.write('private nonzero diagnostic');",
+      "    process.exitCode = 9;",
+      "    return;",
+      "  }",
+      "  if (parsed.candidate.value !== 'producer-v2') throw new Error('feedback revision missing');",
+      "  process.stdout.write('accepted-v2');",
+      "});",
+    ].join('\n'));
+    writeFileSync(join(ctx.dir, 'fail.js'), [
+      "process.stderr.write('private nonzero diagnostic');",
+      'process.exitCode = 9;',
+    ].join('\n'));
+    const createdAt = new Date().toISOString();
+    await ctx.repository.execute({
+      kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-script-prev-empty', version: 1,
+      name: 'script PREV empty stdout',
+      topology: {
+        kind: 'workflow', inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'check' }],
+        nodes: [
+          {
+            nodeId: 'producer', backend: 'script',
+            execution: { kind: 'script', interpreter: 'node', file: 'producer.js', args: [] },
+            outcome: exitOutcome(),
+          },
+          {
+            nodeId: 'check', title: 'Acceptance check', backend: 'script',
+            execution: { kind: 'script', interpreter: 'node', file: 'check.js', args: [] },
+            outcome: prevExitOutcome(['candidate']),
+          },
+        ],
+        edges: [{ fromNodeId: 'producer', toNodeId: 'check', inputRef: 'candidate', expectedArtifactKind: 'next_result' }],
+      },
+      entryContracts: [], createdAt,
+    });
+    await ctx.repository.execute({
+      kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-script-fail-nine', version: 1,
+      name: 'script FAIL nine',
+      topology: {
+        kind: 'workflow', inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'fail' }],
+        nodes: [{
+          nodeId: 'fail', title: 'Failing check', backend: 'script',
+          execution: { kind: 'script', interpreter: 'node', file: 'fail.js', args: [] },
+          outcome: exitOutcome(),
+        }],
+        edges: [],
+      },
+      entryContracts: [], createdAt,
+    });
+    const prevStart = await ctx.repository.execute({
+      kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-script-prev-empty', version: 1,
+      startIdempotencyKey: 'prev-empty-1', createdAt, goal: 'repair then accept', backend: 'grok',
+    });
+    const failStart = await ctx.repository.execute({
+      kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-script-fail-nine', version: 1,
+      startIdempotencyKey: 'fail-nine-1', createdAt: new Date().toISOString(), goal: 'fail', backend: 'grok',
+    });
+    const prev = prevStart.operation!.result.data as { runId: string };
+    const fail = failStart.operation!.result.data as { runId: string; activationTurnId: string };
+    const engine = await TaskEngine.loadAsync({
+      repository: ctx.repository, workspaceId: 'ws', workspaceFolder: ctx.dir, makeBackend,
+      isWorkspaceTrusted: () => true, allowHostVerification: true,
+    });
+    ctx.setEngine(engine);
+
+    expect(await waitForRun(ctx.client, prev.runId)).toBe('succeeded');
+    expect(await waitForRun(ctx.client, fail.runId)).toBe('failed');
+    const checkNode = await ctx.client.get<{ task_id: string }>(
+      `SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'check'`,
+      ['ws', prev.runId],
+    );
+    const checkTurns = await ctx.repository.listTurns(checkNode!.task_id);
+    expect(checkTurns).toHaveLength(2);
+    expect(checkTurns[0]).toMatchObject({
+      status: 'succeeded',
+      disposition: {
+        kind: 'workflow_prev',
+        targets: ['candidate'],
+        note: 'Execute check "Acceptance check" exited with code 9 without stdout. Correct the declared producer inputs and run the check again.',
+      },
+      executionResult: { kind: 'script', exitCode: 9, stderr: 'private nonzero diagnostic' },
+    });
+    expect(checkTurns[1]).toMatchObject({
+      status: 'succeeded',
+      disposition: { kind: 'workflow_next', result: 'accepted-v2', execution: { kind: 'script', exitCode: 0 } },
+    });
+    expect(JSON.stringify(checkTurns[0]!.disposition)).not.toContain('private nonzero diagnostic');
+    await expect(ctx.repository.getTurn(fail.activationTurnId)).resolves.toMatchObject({
+      status: 'succeeded',
+      disposition: { kind: 'workflow_fail', reason: 'script exited with code 9' },
+      executionResult: { kind: 'script', exitCode: 9, stderr: 'private nonzero diagnostic' },
+    });
+    const rounds = await ctx.client.all<{ status: string }>(
+      'SELECT status FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?',
+      ['ws', prev.runId],
+    );
+    expect(rounds).toEqual([{ status: 'consumed' }]);
+    const producerNode = await ctx.client.get<{ task_id: string }>(
+      `SELECT task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? AND node_id = 'producer'`,
+      ['ws', prev.runId],
+    );
+    const producerMessages = await ctx.client.all<{ content: string }>(
+      'SELECT content FROM messages WHERE workspace_id = ? AND task_id = ? ORDER BY created_at, id',
+      ['ws', producerNode!.task_id],
+    );
+    expect(JSON.stringify(producerMessages)).toContain('Acceptance check');
+    expect(JSON.stringify(producerMessages)).not.toContain('private nonzero diagnostic');
+    const artifact = await ctx.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'check' AND kind = 'next_result'`,
+      ['ws', prev.runId],
+    );
+    expect(JSON.parse(artifact!.payload_json)).toMatchObject({ result: 'accepted-v2', execution: { kind: 'script', exitCode: 0 } });
+    expect(readFileSync(join(ctx.dir, 'producer.count'), 'utf8')).toBe('2');
+    expect(readFileSync(join(ctx.dir, 'check.count'), 'utf8')).toBe('2');
+  }, 30_000);
+
+  it('routes nonzero stdout to an exact PREV ALL-join and settles each activation once across reload', async () => {
+    const ctx = await fixture('prev-all-join-reload');
+    for (const producer of ['p1', 'p2', 'p3']) {
+      writeFileSync(join(ctx.dir, `${producer}.js`), [
+        "const fs = require('node:fs');",
+        `const file = process.cwd() + '/${producer}.count';`,
+        "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+        "fs.writeFileSync(file, String(count));",
+        `process.stdout.write('${producer}-v' + count);`,
+      ].join('\n'));
+    }
+    writeFileSync(join(ctx.dir, 'join-check.js'), [
+      "const fs = require('node:fs');",
+      "const file = process.cwd() + '/join-check.count';",
+      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(file, String(count));",
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  if (count === 1) {",
+      "    process.stdout.write('refresh both producers\\n');",
+      "    process.stderr.write('join diagnostic only');",
+      "    process.exitCode = 7;",
+      "    return;",
+      "  }",
+      "  if (parsed.from_p1.value !== 'p1-v2' || parsed.from_p2.value !== 'p2-v2' || parsed.from_p3.value !== 'p3-v1') throw new Error('ALL-join revisions missing');",
+      "  process.stdout.write(parsed.from_p1.value + '|' + parsed.from_p2.value + '|' + parsed.from_p3.value);",
+      "});",
+    ].join('\n'));
+    const createdAt = new Date().toISOString();
+    await ctx.repository.execute({
+      kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-script-prev-all', version: 1,
+      name: 'script PREV all join',
+      topology: {
+        kind: 'workflow', inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'check' }],
+        nodes: [
+          ...['p1', 'p2', 'p3'].map((nodeId) => ({
+            nodeId, backend: 'script',
+            execution: { kind: 'script' as const, interpreter: 'node' as const, file: `${nodeId}.js`, args: [] },
+            outcome: exitOutcome(),
+          })),
+          {
+            nodeId: 'check', title: 'Join check', backend: 'script',
+            execution: { kind: 'script', interpreter: 'node', file: 'join-check.js', args: [] },
+            outcome: prevExitOutcome(['from_p1', 'from_p2']),
+          },
+        ],
+        edges: [
+          { fromNodeId: 'p1', toNodeId: 'check', inputRef: 'from_p1', expectedArtifactKind: 'next_result' },
+          { fromNodeId: 'p2', toNodeId: 'check', inputRef: 'from_p2', expectedArtifactKind: 'next_result' },
+          { fromNodeId: 'p3', toNodeId: 'check', inputRef: 'from_p3', expectedArtifactKind: 'next_result' },
+        ],
+      },
+      entryContracts: [], createdAt,
+    });
+    const started = await ctx.repository.execute({
+      kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-script-prev-all', version: 1,
+      startIdempotencyKey: 'prev-all-1', createdAt, goal: 'refresh both', backend: 'grok',
+    });
+    const run = started.operation!.result.data as { runId: string };
+    const engine = await TaskEngine.loadAsync({
+      repository: ctx.repository, workspaceId: 'ws', workspaceFolder: ctx.dir, makeBackend,
+      isWorkspaceTrusted: () => true, allowHostVerification: true,
+    });
+    ctx.setEngine(engine);
+    expect(await waitForRun(ctx.client, run.runId)).toBe('succeeded');
+    await engine.shutdown();
+    const reloaded = await TaskEngine.loadAsync({
+      repository: ctx.repository, workspaceId: 'ws', workspaceFolder: ctx.dir, makeBackend,
+      isWorkspaceTrusted: () => true, allowHostVerification: true,
+    });
+    ctx.setEngine(reloaded);
+    await reloaded.whenIdle();
+
+    const nodes = await ctx.client.all<{ node_id: string; task_id: string }>(
+      'SELECT node_id, task_id FROM workflow_nodes WHERE workspace_id = ? AND run_id = ? ORDER BY node_id',
+      ['ws', run.runId],
+    );
+    const byNode = new Map(nodes.map((node) => [node.node_id, node.task_id]));
+    expect(await ctx.repository.listTurns(byNode.get('p1')!)).toHaveLength(2);
+    expect(await ctx.repository.listTurns(byNode.get('p2')!)).toHaveLength(2);
+    expect(await ctx.repository.listTurns(byNode.get('p3')!)).toHaveLength(1);
+    const checkTurns = await ctx.repository.listTurns(byNode.get('check')!);
+    expect(checkTurns).toHaveLength(2);
+    expect(checkTurns[0]).toMatchObject({
+      disposition: { kind: 'workflow_prev', targets: ['from_p1', 'from_p2'], note: 'refresh both producers\n' },
+      executionResult: { kind: 'script', exitCode: 7, stderr: 'join diagnostic only' },
+    });
+    expect(checkTurns[1]).toMatchObject({
+      disposition: { kind: 'workflow_next', result: 'p1-v2|p2-v2|p3-v1', execution: { kind: 'script', exitCode: 0 } },
+    });
+    const rounds = await ctx.client.all<{ status: string }>(
+      'SELECT status FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?',
+      ['ws', run.runId],
+    );
+    expect(rounds).toEqual([{ status: 'consumed' }]);
+    const targets = await ctx.client.all<{ target_node_id: string; status: string }>(
+      'SELECT target_node_id, status FROM workflow_feedback_targets WHERE workspace_id = ? AND run_id = ? ORDER BY target_node_id',
+      ['ws', run.runId],
+    );
+    expect(targets).toEqual([
+      { target_node_id: 'p1', status: 'responded' },
+      { target_node_id: 'p2', status: 'responded' },
+    ]);
+    expect(readFileSync(join(ctx.dir, 'p1.count'), 'utf8')).toBe('2');
+    expect(readFileSync(join(ctx.dir, 'p2.count'), 'utf8')).toBe('2');
+    expect(readFileSync(join(ctx.dir, 'p3.count'), 'utf8')).toBe('1');
+    expect(readFileSync(join(ctx.dir, 'join-check.count'), 'utf8')).toBe('2');
+  }, 30_000);
 
   it('keeps empty stdout successful and fails a canonical nonzero script without retrying', async () => {
     const ctx = await fixture('terminal-semantics');

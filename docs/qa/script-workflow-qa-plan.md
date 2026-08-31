@@ -23,8 +23,8 @@ The five ACP backends remain a regression surface. No test may silently widen `B
 | EXE-02 | Real Python uses the same typed contract when installed | Conditional real-Python backend test | Record local result in the run log |
 | EXE-07 | A global bundle script resolves from its package root while process cwd remains the active workspace | Script backend and public-path integration tests | `globalBundleExecuted` |
 | EXE-03 | stdout is exact, including newline, empty output, and literal metacharacters | Backend and workflow integration tests | `exactStdoutPreserved`, `emptyStdoutSucceeded` |
-| EXE-04 | Nonzero `continue` preserves exit code downstream | Workflow integration test | `continueExitMetadataPreserved` |
-| EXE-05 | Nonzero `fail_run` fails once without retry/fallback | Workflow integration test | `failRunFailedOnce` |
+| EXE-04 | Numeric nonzero follows exactly the declared PREV targets, including synthesized actionable feedback for empty stdout | Workflow integration and feedback ALL-join tests | `nonzeroPrevCorrected`, `emptyPrevFeedbackSynthesized` |
+| EXE-05 | Numeric nonzero declared as FAIL closes once without retry/fallback | Workflow integration test | `nonzeroFailFailedOnce` |
 | EXE-06 | stderr is bounded diagnostic only and never an artifact | Backend and workflow tests | `stderrDiagnosticOnly` |
 | SEC-01 | Workspace trust and live `muster.verification.hostRun` authorize execution | Host-policy and public-path tests | disabled reject followed by enabled accept |
 | SEC-02 | Authorization is rechecked after durable dispatch boundary | Backend revocation test | Supported by native live setting path |
@@ -72,7 +72,7 @@ Use a disposable trusted workspace and restore the setting afterward.
 3. Add a global package under `~/.muster/workflows/review-bundle/` with `workflow.json` and `scripts/node_1.ts`; add a same-named `scripts/node_1.ts` in the workspace with a different marker. Confirm the package is listed as `packageKind=bundle` and the global marker runs.
 4. Keep `muster.verification.hostRun=false`. Ask the coordinator to start a workflow containing a Node script. Confirm start is rejected with `host_run_disabled` and no child task/process appears.
 5. Set `muster.verification.hostRun=true` without reloading. Start the same workflow again. Confirm the graph contains script nodes, the bundle script runs from the package root, and `process.cwd()` remains the active workspace.
-6. Exercise declared execute zero/nonzero outcomes, empty stdout, and failure. Confirm newline/empty results are not replaced with assistant prose, declared routing controls the outcome, and operational failures create no unsafe fallback.
+6. Exercise declared execute zero/nonzero outcomes, including nonzero PREV with stdout, synthesized feedback for empty stdout, and nonzero FAIL. Confirm newline/empty NEXT results are not replaced with assistant prose, PREV reaches only declared direct producers, stderr stays diagnostic-only, and operational failures create no semantic fallback.
 7. Modify `workflow.json`, a referenced prompt, or any nested package file after listing/definition. Confirm the old opaque ref is rejected and a frozen definition cannot execute the changed package.
 8. Attempt `../escape.js`, an absolute path, a wrong extension, a symlink, and a non-allowlisted interpreter. Confirm none spawn.
 9. Restore `muster.verification.hostRun` to its original value and delete the disposable scripts/catalog files.

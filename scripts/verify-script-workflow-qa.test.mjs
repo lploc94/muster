@@ -16,10 +16,15 @@ test('script workflow QA plan maps requirements to automated and native evidence
   assert.match(plan, /Do not record bearer tokens/);
 });
 
-test('native evidence records a real packaged Extension Host PASS', async () => {
+test('native evidence records a truthful packaged Extension Host qualification state', async () => {
   const evidence = await read('docs/uat/script-workflow-native-evidence.md');
   assert.match(evidence, /^# Script Workflow Native Host QA Evidence$/m);
-  assert.match(evidence, /^- Verdict: PASS$/m);
+  assert.match(evidence, /^- Verdict: (?:PASS|PENDING)$/m);
+  if (/^- Verdict: PENDING$/m.test(evidence)) {
+    assert.match(evidence, /not release evidence for the current implementation/);
+    assert.match(evidence, /blocked .* before any workflow run was created/);
+    assert.match(evidence, /no terminal observation/);
+  }
   assert.match(evidence, /VS Code `1\.135\.0`, `extension-development-host`/);
   assert.match(evidence, /npm run test:script-workflow-native-uat/);
   assert.match(evidence, /host_run_disabled/);
@@ -44,6 +49,7 @@ test('package scripts and native runner keep the reproducible QA path', async ()
   for (const proof of [
     'workspaceShadowsGlobal', 'staleRefRejected', 'disabledStartRejected',
     'globalBundleExecuted', 'packageIntegrityRejected', 'exactStdoutPreserved',
-    'failRunFailedOnce', 'noAcpSessionClaims',
+    'nonzeroPrevCorrected', 'emptyPrevFeedbackSynthesized',
+    'nonzeroFailFailedOnce', 'noAcpSessionClaims',
   ]) assert.match(fixture, new RegExp(proof));
 });

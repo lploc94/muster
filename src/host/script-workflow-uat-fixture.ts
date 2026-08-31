@@ -31,10 +31,12 @@ export interface ScriptWorkflowUatResult {
     globalBundleExecuted: true;
     packageIntegrityRejected: true;
     exactStdoutPreserved: true;
-    continueExitMetadataPreserved: true;
+    nextExitMetadataPreserved: true;
+    nonzeroPrevCorrected: true;
+    emptyPrevFeedbackSynthesized: true;
     stderrDiagnosticOnly: true;
     emptyStdoutSucceeded: true;
-    failRunFailedOnce: true;
+    nonzeroFailFailedOnce: true;
     noAcpSessionClaims: true;
     graphProjected: true;
   };
@@ -124,6 +126,14 @@ function exitOutcome() {
     kind: 'exit',
     next: { when: { exitCode: 0 } },
     fail: { when: { exitCode: 'nonzero' } },
+  };
+}
+
+function prevExitOutcome(targets: readonly string[]) {
+  return {
+    kind: 'exit',
+    next: { when: { exitCode: 0 } },
+    prev: { when: { exitCode: 'nonzero' }, targets, feedback: 'stdout' },
   };
 }
 
@@ -309,6 +319,32 @@ export async function runScriptWorkflowUatFixture(
     ].join('\n'), 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-empty.js'),
       "process.stderr.write('empty native note')", 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'native-prev-producer.js'), [
+      "const fs = require('node:fs');",
+      "const file = process.cwd() + '/' + process.argv[2];",
+      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(file, String(count));",
+      "process.stdout.write('native-prev-v' + count);",
+    ].join('\n'), 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'native-prev-check.js'), [
+      "const fs = require('node:fs');",
+      "const file = process.cwd() + '/' + process.argv[2];",
+      "const count = fs.existsSync(file) ? Number(fs.readFileSync(file, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(file, String(count));",
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  if (count === 1) {",
+      "    process.stderr.write('native PREV diagnostic only');",
+      "    process.exitCode = 9;",
+      "    return;",
+      "  }",
+      "  if (parsed.candidate.value !== 'native-prev-v2') throw new Error('native feedback revision missing');",
+      "  process.stdout.write('native-prev-accepted');",
+      "});",
+    ].join('\n'), 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-fail.js'),
       "process.stderr.write('failure native note'); process.exitCode = 9;", 'utf8'),
   ]);
@@ -526,6 +562,72 @@ export async function runScriptWorkflowUatFixture(
       'empty stdout was dropped from the artifact',
     );
 
+    const producerCounter = `.native-prev-producer-${rootId}.count`;
+    const checkCounter = `.native-prev-check-${rootId}.count`;
+    const corrected = await defineAndStart(deps, credential, {
+      manifest: canonicalManifest(
+        `Native PREV correction ${rootId}`,
+        [
+          scriptNode('producer', 'native-prev-producer.js', [producerCounter]),
+          {
+            nodeKey: 'check',
+            title: 'Native PREV check',
+            script: { interpreter: 'node', file: 'native-prev-check.js', args: [checkCounter] },
+            outcome: prevExitOutcome(['candidate']),
+          },
+        ],
+        [{ from: 'producer', to: 'check', inputRef: 'candidate' }],
+        [],
+        [{ name: 'result', kind: 'result', from: 'check' }],
+      ),
+    }, 'Native PREV correction QA');
+    assertQa(
+      await waitForRun(deps.repository, corrected.runId, rootId) === 'succeeded',
+      'declared nonzero PREV correction did not succeed',
+    );
+    const correctedNodes = await deps.client.all<{ node_id: string; task_id: string | null }>(
+      `SELECT node_id, task_id FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+      [deps.workspaceId, corrected.runId],
+    );
+    const checkTaskId = correctedNodes.find((entry) => entry.node_id === 'check')?.task_id;
+    assertQa(typeof checkTaskId === 'string', 'PREV check task was not materialized');
+    const checkTurns = await deps.repository.listTurns(checkTaskId);
+    const prevTurn = checkTurns.find((entry) => entry.disposition?.kind === 'workflow_prev');
+    assertQa(checkTurns.length === 2 && prevTurn, 'PREV check did not settle exactly once per activation');
+    assertQa(
+      prevTurn.disposition?.kind === 'workflow_prev' &&
+      prevTurn.disposition.targets !== 'all' &&
+      prevTurn.disposition.targets.length === 1 &&
+      prevTurn.disposition.targets[0] === 'candidate',
+      'nonzero PREV did not preserve the declared target',
+    );
+    assertQa(
+      prevTurn.disposition?.kind === 'workflow_prev' &&
+      prevTurn.disposition.note?.includes('Native PREV check') &&
+      prevTurn.disposition.note.includes('code 9') &&
+      !prevTurn.disposition.note.includes('native PREV diagnostic only'),
+      'empty stdout did not synthesize diagnostic-safe PREV feedback',
+    );
+    const correctedRounds = await deps.client.all<{ status: string }>(
+      'SELECT status FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?',
+      [deps.workspaceId, corrected.runId],
+    );
+    assertQa(
+      correctedRounds.length === 1 && correctedRounds[0]?.status === 'consumed',
+      'PREV feedback round did not complete exactly once',
+    );
+    const correctedArtifact = await deps.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'check' AND kind = 'next_result'`,
+      [deps.workspaceId, corrected.runId],
+    );
+    assertQa(
+      correctedArtifact !== undefined &&
+      JSON.parse(correctedArtifact.payload_json).result === 'native-prev-accepted',
+      'PREV resume did not consume the revised producer artifact',
+    );
+
      const failed = await defineAndStart(deps, credential, {
        manifest: canonicalManifest(
          `Native fail run ${rootId}`,
@@ -535,8 +637,8 @@ export async function runScriptWorkflowUatFixture(
          [{ name: 'result', kind: 'result', from: 'fail' }],
        ),
      }, 'Native fail QA');
-    assertQa(await waitForRun(deps.repository, failed.runId, rootId) === 'failed', 'fail_run succeeded');
-    assertQa((await deps.repository.listTurns(failed.entryTaskId)).length === 1, 'fail_run retried');
+    assertQa(await waitForRun(deps.repository, failed.runId, rootId) === 'failed', 'declared nonzero FAIL succeeded');
+    assertQa((await deps.repository.listTurns(failed.entryTaskId)).length === 1, 'declared nonzero FAIL retried');
 
     await deps.setHostRun(false);
     hostRunRestored = true;
@@ -560,10 +662,12 @@ export async function runScriptWorkflowUatFixture(
         globalBundleExecuted: true,
         packageIntegrityRejected: true,
         exactStdoutPreserved: true,
-        continueExitMetadataPreserved: true,
+        nextExitMetadataPreserved: true,
+        nonzeroPrevCorrected: true,
+        emptyPrevFeedbackSynthesized: true,
         stderrDiagnosticOnly: true,
         emptyStdoutSucceeded: true,
-        failRunFailedOnce: true,
+        nonzeroFailFailedOnce: true,
         noAcpSessionClaims: true,
         graphProjected: true,
       },

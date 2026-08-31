@@ -169,6 +169,20 @@ interpreter-compatible file, and launches with `shell: false` and literal argv.
 A changed script cannot execute through an existing definition. Runtime script
 verification does not reload or reinterpret `workflow.json` or prompt files.
 
+Each execute activation runs its script once and applies the frozen exit outcome
+through the normal durable workflow disposition path:
+
+- exit code `0` stages NEXT with bounded stdout as the result;
+- a numeric nonzero exit stages exactly the declared PREV targets with bounded
+  stdout as feedback, or stages FAIL when the manifest declares FAIL; and
+- when a nonzero PREV script emits no non-whitespace stdout, the host supplies
+  deterministic bounded feedback naming the failed check and exit code.
+
+Stderr is retained only as a bounded turn diagnostic. It never becomes a NEXT
+artifact or PREV feedback. A spawn, timeout, cancellation, package-integrity,
+missing-exit-status, or output-bound failure is operational and cannot be
+reclassified as PREV or FAIL by the manifest's numeric outcome contract.
+
 Node scripts may use `.js`, `.cjs`, `.mjs`, `.ts`, `.cts`, or `.mts`. TypeScript
 uses Node native type stripping and therefore must use erasable syntax. Muster
 does not install dependencies, invoke `npx`, or load a package-local compiler.

@@ -87,6 +87,7 @@ import type {
   WorkflowGraphProgressProjection,
   WorkflowGateStatus,
   WorkflowGateStatusProjection,
+  WorkflowExitOutcome,
   WorkflowNodeStatus,
   WorkflowRunStatus,
   WorkflowRunCompletionProjection,
@@ -1442,6 +1443,9 @@ export interface TaskRepository {
   }): Promise<{ version: number; policy: WorkflowPolicy } | undefined>;
   /** Trusted engine-only script input values and the run's frozen artifact bound. */
   getWorkflowExecutionContext(turnId: string): Promise<{
+    nodeId: string;
+    title?: string;
+    outcome: WorkflowExitOutcome;
     maxArtifactBytes: number;
     inputs: readonly {
       inputRef: string;
@@ -2756,6 +2760,9 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   async getWorkflowExecutionContext(turnId: string): Promise<{
+    nodeId: string;
+    title?: string;
+    outcome: WorkflowExitOutcome;
     maxArtifactBytes: number;
     inputs: readonly {
       inputRef: string;
@@ -2765,74 +2772,157 @@ export class SqliteTaskRepository implements TaskRepository {
     }[];
   } | undefined> {
     if (!turnId) return undefined;
+    const authority = await this.db.get<{
+      node_id: string;
+      title: string | null;
+      outcome_json: string | null;
+      policy_json: string;
+    }>(
+      `SELECT activation.node_id, definition_node.title,
+              definition_node.outcome_json, run.policy_json
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+         JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = activation.node_id
+        WHERE activation.workspace_id = ?
+          AND activation.execution_turn_id = ?
+          AND activation.status IN ('queued', 'running')
+          AND run.status = 'running'
+        LIMIT 1`,
+      [this.workspaceId, turnId],
+    );
+    if (!authority?.outcome_json) return undefined;
+    let outcome: ReturnType<typeof decodeWorkflowNodeOutcome>;
+    let maxArtifactBytes: number;
+    try {
+      outcome = decodeWorkflowNodeOutcome(JSON.parse(authority.outcome_json));
+      const policy = JSON.parse(authority.policy_json) as Record<string, unknown>;
+      if (!Number.isInteger(policy.maxArtifactBytes) || Number(policy.maxArtifactBytes) < 1) {
+        return undefined;
+      }
+      maxArtifactBytes = Number(policy.maxArtifactBytes);
+    } catch {
+      return undefined;
+    }
+    if (!outcome.ok || outcome.value.kind !== 'exit') return undefined;
+
     const rows = await this.db.all<{
       input_ref: string;
       required_kind: string;
       artifact_kind: string;
       artifact_payload_json: string;
-      policy_json: string;
     }>(
-      `SELECT binding.input_ref, binding.required_kind,
-              artifact.kind AS artifact_kind,
-              artifact.payload_json AS artifact_payload_json,
-              run.policy_json
-         FROM workflow_activations activation
-         JOIN workflow_runs run
-           ON run.workspace_id = activation.workspace_id
-          AND run.run_id = activation.run_id
-         JOIN workflow_dependency_gates gate
-           ON gate.workspace_id = activation.workspace_id
-          AND gate.run_id = activation.run_id
-          AND gate.gate_id = COALESCE(activation.source_gate_id, activation.return_gate_id)
-         JOIN workflow_gate_bindings binding
-           ON binding.workspace_id = gate.workspace_id
-          AND binding.run_id = gate.run_id
-          AND binding.gate_id = gate.gate_id
-         JOIN workflow_gate_fills fill
-           ON fill.workspace_id = binding.workspace_id
-          AND fill.run_id = binding.run_id
-          AND fill.gate_id = binding.gate_id
-          AND fill.input_ref = binding.input_ref
-         JOIN workflow_artifacts artifact
-           ON artifact.workspace_id = fill.workspace_id
-          AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
-          AND artifact.artifact_id = fill.artifact_id
-          AND artifact.revision = fill.artifact_revision
-        WHERE activation.workspace_id = ?
-          AND activation.execution_turn_id = ?
-        ORDER BY binding.input_ref`,
-      [this.workspaceId, turnId],
-    );
-    if (rows.length === 0) {
-      const run = await this.db.get<{ policy_json: string }>(
-        `SELECT run.policy_json
-           FROM workflow_activations activation
-           JOIN workflow_runs run
-             ON run.workspace_id = activation.workspace_id
-            AND run.run_id = activation.run_id
-          WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
-          LIMIT 1`,
-        [this.workspaceId, turnId],
-      );
-      if (!run) return undefined;
-      try {
-        const policy = JSON.parse(run.policy_json) as Record<string, unknown>;
-        return Number.isInteger(policy.maxArtifactBytes) && Number(policy.maxArtifactBytes) > 0
-          ? { maxArtifactBytes: Number(policy.maxArtifactBytes), inputs: [] }
-          : undefined;
-      } catch {
-        return undefined;
-      }
-    }
+      `SELECT input_ref, required_kind, artifact_kind, artifact_payload_json
+         FROM (
+           SELECT binding.input_ref, binding.required_kind,
+                  artifact.kind AS artifact_kind,
+                  artifact.payload_json AS artifact_payload_json
+             FROM workflow_activations activation
+             JOIN workflow_dependency_gates gate
+               ON gate.workspace_id = activation.workspace_id
+              AND gate.run_id = activation.run_id
+              AND gate.gate_id = COALESCE(activation.source_gate_id, activation.return_gate_id)
+             JOIN workflow_gate_bindings binding
+               ON binding.workspace_id = gate.workspace_id
+              AND binding.run_id = gate.run_id
+              AND binding.gate_id = gate.gate_id
+             JOIN workflow_gate_fills fill
+               ON fill.workspace_id = binding.workspace_id
+              AND fill.run_id = binding.run_id
+              AND fill.gate_id = binding.gate_id
+              AND fill.input_ref = binding.input_ref
+             JOIN workflow_artifacts artifact
+               ON artifact.workspace_id = fill.workspace_id
+              AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+              AND artifact.artifact_id = fill.artifact_id
+              AND artifact.revision = fill.artifact_revision
+            WHERE activation.workspace_id = ?
+              AND activation.execution_turn_id = ?
 
-    let maxArtifactBytes: number;
-    try {
-      const policy = JSON.parse(rows[0]!.policy_json) as Record<string, unknown>;
-      if (!Number.isInteger(policy.maxArtifactBytes) || Number(policy.maxArtifactBytes) < 1) return undefined;
-      maxArtifactBytes = Number(policy.maxArtifactBytes);
-    } catch {
-      return undefined;
-    }
+           UNION ALL
+
+           SELECT binding.input_ref, binding.required_kind,
+                  artifact.kind AS artifact_kind,
+                  artifact.payload_json AS artifact_payload_json
+             FROM workflow_activations activation
+             JOIN workflow_dependency_gates gate
+               ON gate.workspace_id = activation.workspace_id
+              AND gate.run_id = activation.run_id
+              AND gate.consumer_node_id = activation.node_id
+             JOIN workflow_gate_bindings binding
+               ON binding.workspace_id = gate.workspace_id
+              AND binding.run_id = gate.run_id
+              AND binding.gate_id = gate.gate_id
+             JOIN workflow_gate_fills fill
+               ON fill.workspace_id = binding.workspace_id
+              AND fill.run_id = binding.run_id
+              AND fill.gate_id = binding.gate_id
+              AND fill.input_ref = binding.input_ref
+             JOIN workflow_artifacts artifact
+               ON artifact.workspace_id = fill.workspace_id
+              AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+              AND artifact.artifact_id = fill.artifact_id
+              AND artifact.revision = fill.artifact_revision
+            WHERE activation.workspace_id = ?
+              AND activation.execution_turn_id = ?
+              AND activation.kind = 'feedback_request'
+
+           UNION ALL
+
+           SELECT binding.input_ref, binding.required_kind,
+                  CASE WHEN target.target_node_id IS NULL
+                    THEN base_artifact.kind ELSE response_artifact.kind END AS artifact_kind,
+                  CASE WHEN target.target_node_id IS NULL
+                    THEN base_artifact.payload_json ELSE response_artifact.payload_json END AS artifact_payload_json
+             FROM workflow_activations activation
+             JOIN workflow_dependency_gates gate
+               ON gate.workspace_id = activation.workspace_id
+              AND gate.run_id = activation.run_id
+              AND gate.consumer_node_id = activation.node_id
+             JOIN workflow_gate_bindings binding
+              ON binding.workspace_id = gate.workspace_id
+              AND binding.run_id = gate.run_id
+              AND binding.gate_id = gate.gate_id
+             JOIN workflow_gate_fills fill
+               ON fill.workspace_id = binding.workspace_id
+              AND fill.run_id = binding.run_id
+              AND fill.gate_id = binding.gate_id
+              AND fill.input_ref = binding.input_ref
+             JOIN workflow_artifacts base_artifact
+               ON base_artifact.workspace_id = fill.workspace_id
+              AND base_artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+              AND base_artifact.artifact_id = fill.artifact_id
+              AND base_artifact.revision = fill.artifact_revision
+             LEFT JOIN workflow_feedback_targets target
+               ON target.workspace_id = activation.workspace_id
+              AND target.run_id = activation.run_id
+              AND target.round_id = activation.feedback_round_id
+              AND target.target_node_id = binding.producer_node_id
+             LEFT JOIN workflow_artifacts response_artifact
+               ON response_artifact.workspace_id = target.workspace_id
+              AND response_artifact.run_id = target.response_artifact_run_id
+              AND response_artifact.artifact_id = target.response_artifact_id
+              AND response_artifact.revision = target.response_artifact_revision
+            WHERE activation.workspace_id = ?
+              AND activation.execution_turn_id = ?
+              AND activation.kind = 'feedback_resume'
+              AND (
+                target.target_node_id IS NULL
+                OR (target.status = 'responded' AND response_artifact.artifact_id IS NOT NULL)
+              )
+         )
+        ORDER BY input_ref`,
+      [
+        this.workspaceId, turnId,
+        this.workspaceId, turnId,
+        this.workspaceId, turnId,
+      ],
+    );
     const inputs: Array<{
       inputRef: string;
       value: string;
@@ -2841,6 +2931,11 @@ export class SqliteTaskRepository implements TaskRepository {
     }> = [];
     for (const row of rows) {
       if (row.required_kind === 'engine_start' || row.input_ref === 'engine_start') continue;
+      if (
+        typeof row.input_ref !== 'string' ||
+        typeof row.artifact_kind !== 'string' ||
+        typeof row.artifact_payload_json !== 'string'
+      ) return undefined;
       let payload: Record<string, unknown>;
       try {
         payload = JSON.parse(row.artifact_payload_json) as Record<string, unknown>;
@@ -2865,7 +2960,13 @@ export class SqliteTaskRepository implements TaskRepository {
           : {}),
       });
     }
-    return { maxArtifactBytes, inputs };
+    return {
+      nodeId: authority.node_id,
+      ...(authority.title !== null ? { title: authority.title } : {}),
+      outcome: outcome.value,
+      maxArtifactBytes,
+      inputs,
+    };
   }
 
   async getWorkflowStartPolicy(input: {
@@ -4028,7 +4129,7 @@ export class SqliteTaskRepository implements TaskRepository {
           disposition.kind === 'workflow_prev' ||
           disposition.kind === 'workflow_fail')
       ) {
-        const authorization = await this.authorizeWorkflowAgentDisposition(
+        const authorization = await this.authorizeWorkflowDisposition(
           command.dispositionClaim.turnId,
           disposition,
         );
@@ -5714,7 +5815,7 @@ export class SqliteTaskRepository implements TaskRepository {
       disposition.kind === 'workflow_prev' ||
       disposition.kind === 'workflow_fail'
     ) {
-      const authorization = await this.authorizeWorkflowAgentDisposition(command.turnId, disposition);
+      const authorization = await this.authorizeWorkflowDisposition(command.turnId, disposition);
       if (authorization === 'invalid') {
         await this.recordWorkflowDecisionInvalidAttempt({
           kind: 'recordWorkflowDecisionInvalidAttempt',
@@ -5857,7 +5958,7 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed, ...(changed ? {} : { reason: 'workflow decision attempt not recordable' }) };
   }
 
-  private async authorizeWorkflowAgentDisposition(
+  private async authorizeWorkflowDisposition(
     turnId: string,
     disposition: Extract<TurnDisposition, {
       kind: 'workflow_next' | 'workflow_prev' | 'workflow_fail';
@@ -5896,9 +5997,35 @@ export class SqliteTaskRepository implements TaskRepository {
       return 'invalid';
     }
     if (!outcome.ok) return 'invalid';
-    // Execute outcomes are mapped by the trusted host in Phase 6. This phase
-    // restricts only agent-authored workflow dispositions.
-    if (outcome.value.kind !== 'agent') return 'valid';
+    if (outcome.value.kind === 'exit') {
+      const exitOutcome = outcome.value;
+      const turn = await this.getTurn(turnId);
+      const execution = turn?.executionResult;
+      if (
+        !execution || execution.kind !== 'script' ||
+        !Number.isSafeInteger(execution.exitCode)
+      ) return 'invalid';
+      if (execution.exitCode === 0) {
+        return disposition.kind === 'workflow_next' &&
+          disposition.execution?.kind === 'script' &&
+          disposition.execution.exitCode === 0
+          ? 'valid'
+          : 'invalid';
+      }
+      if (exitOutcome.prev) {
+        const declaredTargets = exitOutcome.prev.targets;
+        if (disposition.kind !== 'workflow_prev' || disposition.targets === 'all') return 'invalid';
+        const feedback = disposition.note?.trim();
+        if (!feedback || !fitsUtf8Bytes(disposition.note!, WORKFLOW_FEEDBACK_MAX_BYTES)) {
+          return 'invalid';
+        }
+        return disposition.targets.length === declaredTargets.length &&
+          disposition.targets.every((target, index) => target === declaredTargets[index])
+          ? 'valid'
+          : 'invalid';
+      }
+      return exitOutcome.fail && disposition.kind === 'workflow_fail' ? 'valid' : 'invalid';
+    }
     if (disposition.kind === 'workflow_next') {
       return outcome.value.next ? 'valid' : 'invalid';
     }

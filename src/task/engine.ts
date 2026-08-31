@@ -87,6 +87,7 @@ import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
 import type { WorkflowScriptSource } from './workflow-types';
+import { mapWorkflowExitResult } from './workflow-exit';
 import {
   deriveResourceClaimKeys,
   isWorkflowTransactionalCommand,
@@ -5472,6 +5473,15 @@ export class TaskEngine {
               break;
             }
             if (scriptExecution) {
+              if (!scriptContext) {
+                const message = 'script workflow outcome authority is unavailable';
+                terminalSettled = await this.settleFailed(
+                  turnId, message, observedSessionId, rawOutput, backend,
+                  { suppressAutoRetry: true, suppressRuntimeFallback: true },
+                );
+                if (terminalSettled) this.emitFailureSettlement(turn.taskId, turnId, message);
+                break;
+              }
               if (!scriptProcessResult) {
                 const message = 'script executor ended without a process result';
                 terminalSettled = await this.settleFailed(
@@ -5489,28 +5499,51 @@ export class TaskEngine {
                 seen.add(rootId);
                 rootId = state.tasks[rootId]!.parentId!;
               }
-              const continueRun = scriptProcessResult.exitCode === 0;
+              const mapped = mapWorkflowExitResult({
+                nodeId: scriptContext.nodeId,
+                ...(scriptContext.title !== undefined ? { title: scriptContext.title } : {}),
+                outcome: scriptContext.outcome,
+                exitCode: scriptProcessResult.exitCode,
+                stdout: scriptProcessResult.stdout,
+              });
+              if (!mapped.ok) {
+                terminalSettled = await this.settleFailed(
+                  turnId, mapped.reason, observedSessionId, rawOutput, backend,
+                  { suppressAutoRetry: true, suppressRuntimeFallback: true },
+                );
+                if (terminalSettled) this.emitFailureSettlement(turn.taskId, turnId, mapped.reason);
+                break;
+              }
+              const disposition = mapped.disposition;
+              const routeCommand: ToolCommand = disposition.kind === 'workflow_next'
+                ? {
+                    kind: 'workflow_next',
+                    opId: 'engine-script-workflow-next',
+                    change: disposition.change,
+                    message: disposition.result ?? '',
+                    execution: { kind: 'script', exitCode: scriptProcessResult.exitCode },
+                  }
+                : disposition.kind === 'workflow_prev'
+                  ? {
+                      kind: 'workflow_prev',
+                      opId: 'engine-script-workflow-prev',
+                      targets: disposition.targets,
+                      message: disposition.note ?? '',
+                    }
+                  : {
+                      kind: 'workflow_fail',
+                      opId: 'engine-script-workflow-fail',
+                      reason: disposition.reason,
+                    };
               const staged = await executeToolCommand(
                 this.graphDeps(),
                 {
                   callerTaskId: liveTurn?.taskId ?? turn.taskId,
                   turnId,
                   rootId,
-                  allowedActions: new Set([continueRun ? 'workflow_next' : 'workflow_fail']),
+                  allowedActions: new Set([disposition.kind]),
                 },
-                continueRun
-                  ? {
-                      kind: 'workflow_next',
-                      opId: 'engine-script-workflow-next',
-                      change: 'updated',
-                      message: scriptProcessResult.stdout,
-                      execution: { kind: 'script', exitCode: scriptProcessResult.exitCode },
-                    }
-                  : {
-                      kind: 'workflow_fail',
-                      opId: 'engine-script-workflow-fail',
-                      reason: `script exited with code ${scriptProcessResult.exitCode}`,
-                    },
+                routeCommand,
               );
               if (!staged.ok) {
                 const message = `script workflow settlement failed: ${staged.error}`;

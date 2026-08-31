@@ -107,7 +107,11 @@ An agent `outcome` may be omitted for implicit NEXT. When present it must have
 declared `next` route. PREV targets are unique inbound `inputRef` values and require the
 literal `feedback: "required"`. Execute nodes require a closed `kind: "exit"` outcome
 that maps exit code `0` to NEXT and every nonzero exit to exactly PREV with
-`feedback: "stdout"` or FAIL.
+`feedback: "stdout"` or FAIL. NEXT carries bounded stdout as its result. PREV reaches
+only its declared direct inbound `inputRef` targets and carries bounded stdout, or
+deterministic host feedback naming the check and exit code when stdout is empty.
+Stderr remains diagnostic-only; spawn, timeout, cancellation, integrity,
+missing-exit-status, and output-bound failures remain operational failures.
 
 The removed authoring fields `label`, edge `as`, start input coordinates, child
 destination coordinates, and `onFailure` are invalid. Authors also cannot provide
