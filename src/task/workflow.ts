@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { TASK_ERROR_MAX_BYTES } from './content-limits';
 import {
   decodeDefineWorkflowInput,
+  decodeWorkflowManifest,
   DEFAULT_WORKFLOW_POLICY,
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
@@ -20,27 +21,25 @@ import { WORKFLOW_RUN_GOAL_MAX_LENGTH } from './workflow-types';
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
-  GraphTopologyV1,
   StartWorkflowEntryInput,
   StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
-  WorkflowDefinitionV1,
-  WorkflowDependencyEdgeV1,
-  WorkflowEntryContractV1,
-  WorkflowPolicyV1,
-  WorkflowTopologyV1,
-  WorkflowNodeSpecV1,
+  WorkflowDefinition,
+  WorkflowDependencyEdge,
+  WorkflowEntryContract,
+  WorkflowPolicy,
+  WorkflowTopology,
+  WorkflowNodeSpec,
 } from './workflow-types';
 
 export {
   DEFAULT_WORKFLOW_POLICY,
   decodeDefineWorkflowInput,
-  decodeGraphTopology,
-  decodeOneNodeTopology,
   decodeStoredTopologyJson,
   decodeTopology,
+  decodeWorkflowManifest,
   encodeTopologyJson,
   formatWorkflowEntryAggregate,
   fingerprintWorkflowDefinition,
@@ -49,18 +48,16 @@ export {
 export type {
   DefineWorkflowInput,
   DefineWorkflowResult,
-  GraphTopologyV1,
-  OneNodeTopologyV1,
   StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
-  WorkflowDefinitionV1,
-  WorkflowDependencyEdgeV1,
-  WorkflowEntryContractV1,
-  WorkflowNodeSpecV1,
-  WorkflowPolicyV1,
-  WorkflowTopologyV1,
+  WorkflowDefinition,
+  WorkflowDependencyEdge,
+  WorkflowEntryContract,
+  WorkflowNodeSpec,
+  WorkflowPolicy,
+  WorkflowTopology,
 } from './workflow-types';
 
 /** Operations ledger key for an immutable definition claim. */
@@ -81,7 +78,7 @@ export function defineWorkflowLedgerKey(
 export function validateDefineWorkflow(
   input: DefineWorkflowInput,
 ):
-  | { ok: true; definition: WorkflowDefinitionV1; fingerprint: string; topologyJson: string }
+  | { ok: true; definition: WorkflowDefinition; fingerprint: string; topologyJson: string }
   | { ok: false; reason: string } {
   const decoded = decodeDefineWorkflowInput(input);
   if (!decoded.ok) {
@@ -97,7 +94,7 @@ export function validateDefineWorkflow(
 
 /** Shape a successful first-write define result. */
 export function defineWorkflowCreated(
-  definition: WorkflowDefinitionV1,
+  definition: WorkflowDefinition,
   fingerprint: string,
 ): DefineWorkflowResult {
   return {
@@ -111,7 +108,7 @@ export function defineWorkflowCreated(
 
 /** Shape a same-fingerprint replay result. */
 export function defineWorkflowReplay(
-  definition: WorkflowDefinitionV1,
+  definition: WorkflowDefinition,
   fingerprint: string,
 ): DefineWorkflowResult {
   return {
@@ -155,18 +152,20 @@ export function makeOneNodeDefinition(overrides?: {
   name?: string;
   nodeId?: string;
   createdAt?: string;
-  entryContracts?: readonly WorkflowEntryContractV1[];
-  policy?: WorkflowPolicyV1;
-}): WorkflowDefinitionV1 {
+  entryContracts?: readonly WorkflowEntryContract[];
+  policy?: WorkflowPolicy;
+}): WorkflowDefinition {
   const nodeId = overrides?.nodeId ?? 'entry';
   return {
     definitionId: overrides?.definitionId ?? 'wf-one',
     version: overrides?.version ?? 1,
     name: overrides?.name ?? 'one-node',
     topology: {
-      kind: 'one_node_v1',
+      kind: 'workflow',
+      inputs: [],
+      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: nodeId }],
       nodes: [{ nodeId }],
-      entryNodeId: nodeId,
+      edges: [],
     },
     entryContracts: overrides?.entryContracts ?? [],
     policy: overrides?.policy ?? DEFAULT_WORKFLOW_POLICY,
@@ -175,7 +174,7 @@ export function makeOneNodeDefinition(overrides?: {
   };
 }
 
-/** Helper for tests/fixtures: two producers → one consumer fan-in graph_v1. */
+/** Helper for tests/fixtures: two producers → one consumer fan-in graph. */
 export function makeGraphFanInDefinition(overrides?: {
   definitionId?: string;
   version?: number;
@@ -186,14 +185,16 @@ export function makeGraphFanInDefinition(overrides?: {
   consumer?: string;
   inputRef1?: string;
   inputRef2?: string;
-  entryContracts?: readonly WorkflowEntryContractV1[];
-  policy?: WorkflowPolicyV1;
-}): WorkflowDefinitionV1 {
+  entryContracts?: readonly WorkflowEntryContract[];
+  policy?: WorkflowPolicy;
+}): WorkflowDefinition {
   const p1 = overrides?.producer1 ?? 'p1';
   const p2 = overrides?.producer2 ?? 'p2';
   const consumer = overrides?.consumer ?? 'consumer';
-  const topology: GraphTopologyV1 = {
-    kind: 'graph_v1',
+  const topology: WorkflowTopology = {
+    kind: 'workflow',
+    inputs: [],
+    outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: consumer }],
     nodes: [{ nodeId: p1 }, { nodeId: p2 }, { nodeId: consumer }],
     edges: [
       { fromNodeId: p1, toNodeId: consumer, inputRef: overrides?.inputRef1 ?? 'from_p1' },
@@ -212,20 +213,14 @@ export function makeGraphFanInDefinition(overrides?: {
   };
 }
 
-/** Entry node ids: one_node entry, or graph nodes with no incoming edges. */
-export function entryNodeIds(topology: WorkflowTopologyV1): string[] {
-  if (topology.kind === 'one_node_v1') {
-    return [topology.entryNodeId];
-  }
+/** Entry node ids have no incoming edges. */
+export function entryNodeIds(topology: WorkflowTopology): string[] {
   const incoming = new Set(topology.edges.map((e) => e.toNodeId));
   return topology.nodes.map((n) => n.nodeId).filter((id) => !incoming.has(id));
 }
 
 /** Terminal sink node ids (out-degree 0), in frozen topology order. */
-export function terminalNodeIds(topology: WorkflowTopologyV1): string[] {
-  if (topology.kind === 'one_node_v1') {
-    return [topology.entryNodeId];
-  }
+export function terminalNodeIds(topology: WorkflowTopology): string[] {
   const outgoing = new Set(topology.edges.map((e) => e.fromNodeId));
   return topology.nodes.map((n) => n.nodeId).filter((id) => !outgoing.has(id));
 }
@@ -246,7 +241,7 @@ export function isReusableArtifactKindCompatible(
 }
 
 /** Return the sole terminal for callers that explicitly require a single-sink topology. */
-export function terminalNodeId(topology: WorkflowTopologyV1): string {
+export function terminalNodeId(topology: WorkflowTopology): string {
   const terminals = terminalNodeIds(topology);
   if (terminals.length !== 1) {
     throw new Error(`expected exactly one terminal, found ${terminals.length}`);
@@ -255,24 +250,22 @@ export function terminalNodeId(topology: WorkflowTopologyV1): string {
 }
 
 /** Fingerprint helper re-export for callers that already hold a definition. */
-export function fingerprintDefinition(definition: WorkflowDefinitionV1): string {
+export function fingerprintDefinition(definition: WorkflowDefinition): string {
   return fingerprintWorkflowDefinition(definition);
 }
 
 const MAX_START_KEY_LEN = 256;
 const MAX_BACKEND_LEN = 64;
 
-function workflowNodeGoalPrefix(node: WorkflowNodeSpecV1): string {
-  return node.label
-    ? `[workflow:${node.nodeId}] ${node.label}: `
-    : `[workflow:${node.nodeId}] `;
+function workflowNodeGoalPrefix(node: WorkflowNodeSpec): string {
+  return `[workflow:${node.nodeId}] `;
 }
 
-export function workflowNodeTaskGoal(node: WorkflowNodeSpecV1, runGoal: string): string {
+export function workflowNodeTaskGoal(node: WorkflowNodeSpec, runGoal: string): string {
   return `${workflowNodeGoalPrefix(node)}${runGoal}`;
 }
 
-export function workflowRunGoalFromTask(node: WorkflowNodeSpecV1, taskGoal: string): string {
+export function workflowRunGoalFromTask(node: WorkflowNodeSpec, taskGoal: string): string {
   const prefix = workflowNodeGoalPrefix(node);
   return taskGoal.startsWith(prefix) ? taskGoal.slice(prefix.length) : taskGoal;
 }
@@ -690,7 +683,7 @@ export function boundWorkflowFailReason(reason: string | undefined): string | un
 }
 
 
-/** Single outbound edge for a producer node (graph_v1 forbids fan-out). */
+/** Single outbound edge for a producer node (canonical workflows forbid fan-out). */
 
 /**
  * M018 S06 child-workflow invocation / return identities (surface scaffolding only).
@@ -811,19 +804,17 @@ export function validateInvokeChildEntryBindings(
 
 
 export function outgoingEdge(
-  topology: WorkflowTopologyV1,
+  topology: WorkflowTopology,
   fromNodeId: string,
-): WorkflowDependencyEdgeV1 | undefined {
-  if (topology.kind !== 'graph_v1') return undefined;
+): WorkflowDependencyEdge | undefined {
   return topology.edges.find((edge) => edge.fromNodeId === fromNodeId);
 }
 
 /** Destination inputRefs for a consumer in definition edge order (not arrival order). */
 export function consumerInputRefsInDefinitionOrder(
-  topology: WorkflowTopologyV1,
+  topology: WorkflowTopology,
   consumerNodeId: string,
 ): string[] {
-  if (topology.kind !== 'graph_v1') return [];
   return topology.edges
     .filter((edge) => edge.toNodeId === consumerNodeId)
     .map((edge) => edge.inputRef);
@@ -842,7 +833,7 @@ export function fingerprintStartWorkflow(input: {
   callerTurnId?: string;
   entryInputs?: readonly StartWorkflowEntryInput[];
   reuse?: readonly StartWorkflowNodeReuse[];
-  policy?: WorkflowPolicyV1;
+  policy?: WorkflowPolicy;
 }): string {
   const payload = JSON.stringify({
     definitionId: input.definitionId,
@@ -878,8 +869,8 @@ export function validateStartWorkflow(
       backend: string;
       entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
       reuse: readonly StartWorkflowNodeReuse[];
-      entryContracts: readonly WorkflowEntryContractV1[];
-      policy: WorkflowPolicyV1;
+      entryContracts: readonly WorkflowEntryContract[];
+      policy: WorkflowPolicy;
       ownerRootTaskId?: string;
       callerTaskId?: string;
       callerTurnId?: string;
@@ -959,7 +950,7 @@ export function validateStartWorkflow(
     // may come from a different definition whose node names do not appear here.
     reuseNodeIds.add(item.destinationNodeId);
   }
-  const contractByKey = new Map<string, WorkflowEntryContractV1>(
+  const contractByKey = new Map<string, WorkflowEntryContract>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
   );
   const inputByKey = new Map<string, (typeof entryInputs)[number]>();
@@ -985,7 +976,10 @@ export function validateStartWorkflow(
       if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
         return { ok: false, reason: 'entry artifact too large' };
       }
-    } else if (!isNonEmptyBounded(entryInput.fromRun, 128)) {
+    } else if (
+      !isNonEmptyBounded(entryInput.fromRun, 128) ||
+      !isNonEmptyBounded(entryInput.output, 128)
+    ) {
       return { ok: false, reason: 'invalid entry input' };
     }
     inputByKey.set(key, entryInput);

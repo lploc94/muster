@@ -5,6 +5,7 @@
  * external reconciliation, reload/replay, mixed reuse, terminal, budget, deletion guards.
  */
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -17,6 +18,7 @@ import { evaluateTaskReadiness } from './readiness';
 import { canPromoteTurn, pickRunnableTurns } from './scheduler';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { DEFAULT_WORKFLOW_POLICY, deriveNodeActivationIdentities } from './workflow';
+import type { WorkflowTopology } from './workflow-types';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 
 function tmpDir(label: string) {
@@ -42,24 +44,164 @@ async function openRepo(label: string) {
   };
 }
 
-const FAN_IN_4 = {
-  kind: 'graph_v1' as const,
-  nodes: [
+function canonicalTopology(
+  nodes: WorkflowTopology['nodes'],
+  edges: WorkflowTopology['edges'],
+  inputs: WorkflowTopology['inputs'] = [],
+): WorkflowTopology {
+  const producers = new Set(edges.map((edge) => edge.fromNodeId));
+  return {
+    kind: 'workflow',
+    inputs,
+    outputs: nodes
+      .filter((node) => !producers.has(node.nodeId))
+      .map((node) => ({
+        name: `output_${node.nodeId}`,
+        semanticKind: 'result',
+        terminalNodeId: node.nodeId,
+      })),
+    nodes,
+    edges,
+  };
+}
+
+const FAN_IN_4 = canonicalTopology([
     { nodeId: 'p1' },
     { nodeId: 'p2' },
     { nodeId: 'p3' },
     { nodeId: 'c1' },
     { nodeId: 'terminal' },
-  ],
-  edges: [
+  ], [
     { fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' },
     { fromNodeId: 'p2', toNodeId: 'c1', inputRef: 'from_p2' },
     { fromNodeId: 'p3', toNodeId: 'c1', inputRef: 'from_p3' },
     { fromNodeId: 'c1', toNodeId: 'terminal', inputRef: 'from_c1' },
-  ],
-};
+  ]);
+
+function inlineInstructions(content: string) {
+  return {
+    kind: 'inline' as const,
+    content,
+    sha256: createHash('sha256').update(content, 'utf8').digest('hex'),
+  };
+}
 
 describe('Workflow shell materialization', () => {
+  it('carries frozen instructions, never display titles, into entry and dependency activations', async () => {
+    const ctx = await openRepo('canonical-instructions');
+    const entryInstructions = 'Inspect the implementation and publish evidence.';
+    const dependencyInstructions = 'Review the pinned evidence for correctness.';
+    const entryTitle = 'Display-only research title';
+    const dependencyTitle = 'Display-only review title';
+    try {
+      const createdAt = '2026-08-31T00:00:00.000Z';
+      await ctx.repo.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-canonical-instructions',
+        version: 1,
+        name: 'Canonical instructions',
+        topology: {
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{
+            name: 'review', semanticKind: 'review', terminalNodeId: 'review',
+          }],
+          nodes: [
+            {
+              nodeId: 'research',
+              taskType: 'research',
+              title: entryTitle,
+              instructions: inlineInstructions(entryInstructions),
+            },
+            {
+              nodeId: 'review',
+              taskType: 'review',
+              title: dependencyTitle,
+              instructions: inlineInstructions(dependencyInstructions),
+            },
+          ],
+          edges: [{
+            fromNodeId: 'research',
+            toNodeId: 'review',
+            inputRef: 'research',
+            expectedArtifactKind: 'next_result',
+          }],
+        },
+        createdAt,
+      });
+      const start = await ctx.repo.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-canonical-instructions',
+        version: 1,
+        startIdempotencyKey: 'canonical-instructions-start',
+        createdAt,
+        goal: 'Review the routing implementation',
+        backend: 'grok',
+      });
+      expect(start.ok).toBe(true);
+      const data = start.operation?.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+      };
+      const entry = data.entries[0]!;
+      const entryTask = await ctx.repo.getTask(entry.taskId);
+      const entryTurn = await ctx.repo.getTurn(entry.activationTurnId);
+      expect(entryTask?.goal).toContain('Review the routing implementation');
+      expect(entryTask?.goal).not.toContain(entryTitle);
+      expect(entryTask?.goal).not.toContain(entryInstructions);
+      expect(entryTurn?.workflowInstructions).toBe(entryInstructions);
+
+      const graph = await ctx.repo.getWorkflowGraphForTask(entry.taskId);
+      expect(JSON.stringify(graph)).not.toContain(entryInstructions);
+      expect(JSON.stringify(graph)).not.toContain(dependencyInstructions);
+
+      await ctx.client.run(
+        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+        [createdAt, 'ws', entry.activationTurnId],
+      );
+      const runningTurn = await ctx.repo.getTurn(entry.activationTurnId);
+      const disposition = {
+        kind: 'workflow_next' as const,
+        change: 'updated' as const,
+        result: 'evidence',
+      };
+      await stageDispositionForSettlement(ctx.repo, runningTurn!, disposition);
+      const settled = await ctx.repo.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: entryTask!.revision,
+        task: { ...entryTask!, updatedAt: '2026-08-31T00:01:00.000Z' },
+        turn: {
+          ...runningTurn!,
+          status: 'succeeded',
+          finishedAt: '2026-08-31T00:01:00.000Z',
+          disposition,
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settled.ok).toBe(true);
+
+      const reviewIdentity = deriveNodeActivationIdentities(data.runId, 'review');
+      const reviewTask = await ctx.repo.getTask(reviewIdentity.taskId);
+      const reviewTurns = await ctx.repo.listTurns(reviewIdentity.taskId);
+      expect(reviewTurns).toHaveLength(1);
+      expect(reviewTurns[0]?.workflowInstructions).toBe(dependencyInstructions);
+      expect(reviewTask?.goal).toContain('Review the routing implementation');
+      expect(reviewTask?.goal).not.toContain(dependencyTitle);
+      expect(reviewTask?.goal).not.toContain(dependencyInstructions);
+
+      const activatedGraph = await ctx.repo.getWorkflowGraphForTask(reviewIdentity.taskId);
+      expect(JSON.stringify(activatedGraph)).not.toContain(entryInstructions);
+      expect(JSON.stringify(activatedGraph)).not.toContain(dependencyInstructions);
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('four-fan-in with terminal: every unbound node has a shell immediately, no execution records, workflow_nodes points to shell, listTasks/listSubtree visible', async () => {
     const ctx = await openRepo('fan4-shell-visibility');
     try {
@@ -307,14 +449,13 @@ describe('Workflow shell materialization', () => {
         definitionId: 'wf-activate',
         version: 1,
         name: 'activate',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
-          edges: [
+        topology: canonicalTopology(
+          [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
+          [
             { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
             { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
           ],
-        },
+        ),
         createdAt,
       });
       const start = await ctx.repo.execute({
@@ -490,11 +631,10 @@ describe('Workflow shell materialization', () => {
     try {
       const createdAt = '2026-08-01T00:00:00.000Z';
       // Create prior run to reuse
-      const priorTopology = {
-        kind: 'graph_v1' as const,
-        nodes: [{ nodeId: 'a' }, { nodeId: 'b' }],
-        edges: [{ fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' }],
-      };
+      const priorTopology = canonicalTopology(
+        [{ nodeId: 'a' }, { nodeId: 'b' }],
+        [{ fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' }],
+      );
       await ctx.repo.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -552,14 +692,13 @@ describe('Workflow shell materialization', () => {
       });
 
       // New topology with reuse of a -> c1, plus terminal sink
-      const newTopology = {
-        kind: 'graph_v1' as const,
-        nodes: [{ nodeId: 'p1' }, { nodeId: 'c1' }, { nodeId: 'terminal' }],
-        edges: [
+      const newTopology = canonicalTopology(
+        [{ nodeId: 'p1' }, { nodeId: 'c1' }, { nodeId: 'terminal' }],
+        [
           { fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' },
           { fromNodeId: 'c1', toNodeId: 'terminal', inputRef: 'from_c1' },
         ],
-      };
+      );
       await ctx.repo.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -608,11 +747,10 @@ describe('Workflow shell materialization', () => {
         definitionId: 'wf-del',
         version: 1,
         name: 'del',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'p1' }, { nodeId: 'consumer' }],
-          edges: [{ fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' }],
-        },
+        topology: canonicalTopology(
+          [{ nodeId: 'p1' }, { nodeId: 'consumer' }],
+          [{ fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' }],
+        ),
         createdAt,
       });
       const start = await ctx.repo.execute({
@@ -689,11 +827,10 @@ describe('Workflow shell materialization', () => {
         definitionId: 'wf-external',
         version: 1,
         name: 'external',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'p1' }, { nodeId: 'c1' }],
-          edges: [{ fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' }],
-        },
+        topology: canonicalTopology(
+          [{ nodeId: 'p1' }, { nodeId: 'c1' }],
+          [{ fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' }],
+        ),
         createdAt,
       });
       const revBefore = await repo1.getWorkspaceRevision();
@@ -757,14 +894,14 @@ describe('Workflow shell materialization', () => {
     try {
       const createdAt = '2026-08-01T00:00:00.000Z';
       // Child topology: entry -> middle -> sink ; middle and sink pending
-      const childTopology = {
-        kind: 'graph_v1' as const,
-        nodes: [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
-        edges: [
+      const childTopology = canonicalTopology(
+        [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
+        [
           { fromNodeId: 'entry', toNodeId: 'middle', inputRef: 'from_entry' },
           { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'from_middle' },
         ],
-      };
+        [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'engine_start' }],
+      );
       await repo.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -773,16 +910,15 @@ describe('Workflow shell materialization', () => {
         name: 'child-shell',
         topology: childTopology,
         entryContracts: [
-          { entryNodeId: 'entry', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' },
+          { entryNodeId: 'entry', inputRef: 'engine_start', expectedArtifactKind: 'workflow_input' },
         ],
         createdAt,
       });
       // Top workflow with single coordinator entry that will invoke child
-      const topTopology = {
-        kind: 'one_node_v1' as const,
-        nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
-        entryNodeId: 'entry' as const,
-      };
+      const topTopology = canonicalTopology(
+        [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
+        [],
+      );
       await repo.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -805,7 +941,7 @@ describe('Workflow shell materialization', () => {
       expect(topStart.ok).toBe(true);
       const topData = topStart.operation?.result.data as any;
       const topRunId = topData.runId as string;
-      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; gateId: string };
+      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; gateId: string; activationId: string };
       const topTask = await repo.getTask(topEntry.taskId);
       const topTurn = await repo.getTurn(topEntry.activationTurnId);
       await client.run(
@@ -814,21 +950,17 @@ describe('Workflow shell materialization', () => {
       );
       // Need artifact for child entry: use top's start artifact or create ephemeral
       // Use top's entry artifact directly via start's artifact
-      const topArtifactId = topData.entryArtifacts?.[0]?.artifactId as string | undefined;
-      const artifactIdForChild = topArtifactId ?? 'seed-art';
-      // Ensure artifact exists - if not, create one
-      if (!topArtifactId) {
-        await client.transaction([
-          {
-            sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, NULL, 'seed', 1, 'next_result', '{"value":"seed"}', ?)`,
-            params: [topRunId, artifactIdForChild, createdAt],
-          },
-          {
-            sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?)`,
-            params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId],
-          },
-        ]);
-      }
+      const artifactIdForChild = 'seed-art';
+      await client.transaction([
+        {
+          sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`,
+          params: [topRunId, artifactIdForChild, createdAt],
+        },
+        {
+          sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`,
+          params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId],
+        },
+      ]);
       const childInvocation: any = {
         kind: 'workflow_next',
         change: 'updated',
@@ -959,24 +1091,25 @@ describe('Workflow shell materialization', () => {
       await client.open(dbPath);
       const repo = new SqliteTaskRepository(client, 'ws');
       const createdAt = '2026-08-01T00:00:00.000Z';
-      const topTopology = { kind: 'one_node_v1' as const, nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }], entryNodeId: 'entry' as const };
+      const topTopology = canonicalTopology([{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }], []);
       await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, name: 'top-subtree', topology: topTopology, createdAt });
-      const childTopology = { kind: 'graph_v1' as const, nodes: [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }], edges: [{ fromNodeId: 'entry', toNodeId: 'middle', inputRef: 'from_entry' }, { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'from_middle' }] };
-      await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-child-subtree', version: 1, name: 'child-subtree', topology: childTopology, entryContracts: [{ entryNodeId: 'entry', inputRef: 'engine_start', expectedArtifactKind: 'engine_start' }], createdAt });
+      const childTopology = canonicalTopology(
+        [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
+        [{ fromNodeId: 'entry', toNodeId: 'middle', inputRef: 'from_entry' }, { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'from_middle' }],
+        [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'engine_start' }],
+      );
+      await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-child-subtree', version: 1, name: 'child-subtree', topology: childTopology, entryContracts: [{ entryNodeId: 'entry', inputRef: 'engine_start', expectedArtifactKind: 'workflow_input' }], createdAt });
       const topStart = await repo.execute({ kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, startIdempotencyKey: 'top-subtree-1', createdAt, goal: 'top', backend: 'grok' });
       expect(topStart.ok).toBe(true);
       const topData = topStart.operation?.result.data as any;
-      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string };
+      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; activationId: string };
       const topRunId = topData.runId as string;
       await client.run(`UPDATE turns SET status='running', started_at=? WHERE workspace_id='ws' AND id=?`, [createdAt, topEntry.activationTurnId]);
-      const topArtifactId = topData.entryArtifacts?.[0]?.artifactId as string | undefined;
-      const artifactIdForChild = topArtifactId ?? 'seed-subtree';
-      if (!topArtifactId) {
-        await client.transaction([
-          { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, NULL, 'seed', 1, 'next_result', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
-          { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId] },
-        ]);
-      }
+      const artifactIdForChild = 'seed-subtree';
+      await client.transaction([
+        { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
+        { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId] },
+      ]);
       const childInvocation: any = { kind: 'workflow_next', change: 'updated', route: { kind: 'child_workflow', childDefinitionId: 'wf-child-subtree', childDefinitionVersion: 1, entryBindings: [{ childEntryNodeId: 'entry', inputRef: 'engine_start', artifactId: artifactIdForChild, artifactRevision: 1 }], childIdempotencyKey: 'child-subtree-1' } };
       const freshTopTask = await repo.getTask(topEntry.taskId);
       const freshTopTurn = await repo.getTurn(topEntry.activationTurnId);
@@ -1024,11 +1157,10 @@ describe('Workflow shell materialization', () => {
         definitionId: 'wf-prior-real',
         version: 1,
         name: 'prior-real',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'a' }, { nodeId: 'b' }],
-          edges: [{ fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' }],
-        },
+        topology: canonicalTopology(
+          [{ nodeId: 'a' }, { nodeId: 'b' }],
+          [{ fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' }],
+        ),
         createdAt,
       });
       const priorStart = await ctx.repo.execute({
@@ -1077,14 +1209,13 @@ describe('Workflow shell materialization', () => {
         messages: [],
       });
       // Now new workflow that reuses 'a' from prior, but has unbound 'c' and 'terminal'
-      const newTopo = {
-        kind: 'graph_v1' as const,
-        nodes: [{ nodeId: 'a' }, { nodeId: 'c' }, { nodeId: 'terminal' }],
-        edges: [
+      const newTopo = canonicalTopology(
+        [{ nodeId: 'a' }, { nodeId: 'c' }, { nodeId: 'terminal' }],
+        [
           { fromNodeId: 'a', toNodeId: 'c', inputRef: 'from_a' },
           { fromNodeId: 'c', toNodeId: 'terminal', inputRef: 'from_c' },
         ],
-      };
+      );
       await ctx.repo.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -1136,14 +1267,17 @@ describe('Workflow shell materialization', () => {
       const repo1 = new SqliteTaskRepository(client1, 'ws');
       const repo2 = new SqliteTaskRepository(client2, 'ws');
       const createdAt = '2026-08-01T00:00:00.000Z';
-      const childTopology = {
-        kind: 'graph_v1' as const,
-        nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
-        edges: [
+      const childTopology = canonicalTopology(
+        [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
+        [
           { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
           { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
         ],
-      };
+        [
+          { name: 'first', semanticKind: 'seed', entryNodeId: 'p1', inputRef: 'engine_start_p1' },
+          { name: 'second', semanticKind: 'seed', entryNodeId: 'p2', inputRef: 'engine_start_p2' },
+        ],
+      );
       await repo1.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -1152,17 +1286,16 @@ describe('Workflow shell materialization', () => {
         name: 'child-2repo',
         topology: childTopology,
         entryContracts: [
-          { entryNodeId: 'p1', inputRef: 'engine_start_p1', expectedArtifactKind: 'engine_start' },
-          { entryNodeId: 'p2', inputRef: 'engine_start_p2', expectedArtifactKind: 'engine_start' },
+          { entryNodeId: 'p1', inputRef: 'engine_start_p1', expectedArtifactKind: 'workflow_input' },
+          { entryNodeId: 'p2', inputRef: 'engine_start_p2', expectedArtifactKind: 'workflow_input' },
         ],
         policy: { ...DEFAULT_WORKFLOW_POLICY, maxWorkflowTurnsPerRun: 2 },
         createdAt,
       });
-      const topTopology = {
-        kind: 'one_node_v1' as const,
-        nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
-        entryNodeId: 'entry' as const,
-      };
+      const topTopology = canonicalTopology(
+        [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
+        [],
+      );
       await repo1.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
@@ -1184,17 +1317,14 @@ describe('Workflow shell materialization', () => {
       });
       expect(topStart.ok).toBe(true);
       const topData = topStart.operation?.result.data as any;
-      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string };
+      const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; activationId: string };
       const topRunId = topData.runId as string;
       await client1.run(`UPDATE turns SET status='running', started_at=? WHERE workspace_id='ws' AND id=?`, [createdAt, topEntry.activationTurnId]);
-      const topArtifactId = topData.entryArtifacts?.[0]?.artifactId as string | undefined;
-      const artifactIdForChild = topArtifactId ?? 'seed-2repo';
-      if (!topArtifactId) {
-        await client1.transaction([
-          { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, NULL, 'seed', 1, 'next_result', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
-          { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId] },
-        ]);
-      }
+      const artifactIdForChild = 'seed-2repo';
+      await client1.transaction([
+        { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
+        { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId] },
+      ]);
       const childInvocation: any = {
         kind: 'workflow_next',
         change: 'updated',
@@ -1386,11 +1516,10 @@ describe('Workflow shell materialization', () => {
         definitionId: 'wf-bypass',
         version: 1,
         name: 'bypass',
-        topology: {
-          kind: 'graph_v1',
-          nodes: [{ nodeId: 'p1' }, { nodeId: 'c1' }],
-          edges: [{ fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' }],
-        },
+        topology: canonicalTopology(
+          [{ nodeId: 'p1' }, { nodeId: 'c1' }],
+          [{ fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' }],
+        ),
         createdAt,
       });
       const start = await ctx.repo.execute({

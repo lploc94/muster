@@ -71,8 +71,8 @@ import {
   workflowRunGoalFromTask,
   type DefineWorkflowResult,
   type StartWorkflowResult,
-  type WorkflowDefinitionV1,
-  type WorkflowPolicyV1,
+  type WorkflowDefinition,
+  type WorkflowPolicy,
 } from './workflow';
 import type {
   StartWorkflowEntryInput,
@@ -450,7 +450,7 @@ export type RepositoryCommand =
       name: string;
       topology: unknown;
       entryContracts?: unknown;
-      policy?: WorkflowPolicyV1;
+      policy?: WorkflowPolicy;
       ownerRootTaskId?: string;
       publicOperation?: {
         ledgerKey: string;
@@ -478,7 +478,7 @@ export type RepositoryCommand =
       callerTaskId?: string;
       callerTurnId?: string;
       resumeCallerOnCompletion?: boolean;
-      effectivePolicy?: WorkflowPolicyV1;
+      effectivePolicy?: WorkflowPolicy;
       publicOperation?: {
         ledgerKey: string;
         fingerprint: string;
@@ -1047,19 +1047,19 @@ export interface TaskRepository {
   getWorkflowDefinition(
     definitionId: string,
     version: number,
-  ): Promise<WorkflowDefinitionV1 | undefined>;
+  ): Promise<WorkflowDefinition | undefined>;
   /** Latest immutable definition revision authorized for this root-scoped caller. */
   getLatestWorkflowDefinition(
     definitionId: string,
     ownerRootTaskId: string,
-  ): Promise<WorkflowDefinitionV1 | undefined>;
+  ): Promise<WorkflowDefinition | undefined>;
   /** Existing alias-based start claim, used to freeze latest-resolution across retries. */
   getWorkflowStartResolution(input: {
     ownerRootTaskId: string;
     callerTaskId: string;
     definitionId: string;
     startIdempotencyKey: string;
-  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined>;
+  }): Promise<{ version: number; policy: WorkflowPolicy } | undefined>;
   /** Resolve semantic current-input names to exact immutable artifact pins. */
   resolveWorkflowInputArtifacts(
     turnId: string,
@@ -1087,7 +1087,7 @@ export interface TaskRepository {
     definitionId: string;
     version: number;
     startIdempotencyKey: string;
-  }): Promise<WorkflowPolicyV1 | undefined>;
+  }): Promise<WorkflowPolicy | undefined>;
   /**
    * Optional local-host read barrier supplied by the projection wrapper. The
    * callback runs between complete execute→refresh→publish lifecycles, so a
@@ -2275,7 +2275,7 @@ export class SqliteTaskRepository implements TaskRepository {
   async getWorkflowDefinition(
     definitionId: string,
     version: number,
-  ): Promise<WorkflowDefinitionV1 | undefined> {
+  ): Promise<WorkflowDefinition | undefined> {
     if (!definitionId || !Number.isInteger(version) || version < 1) return undefined;
     const row = await this.db.get<{
       name: string;
@@ -2337,7 +2337,7 @@ export class SqliteTaskRepository implements TaskRepository {
   async getLatestWorkflowDefinition(
     definitionId: string,
     ownerRootTaskId: string,
-  ): Promise<WorkflowDefinitionV1 | undefined> {
+  ): Promise<WorkflowDefinition | undefined> {
     if (!definitionId || !ownerRootTaskId) return undefined;
     const row = await this.db.get<{ version: number }>(
       `SELECT version
@@ -2360,7 +2360,7 @@ export class SqliteTaskRepository implements TaskRepository {
     callerTaskId: string;
     definitionId: string;
     startIdempotencyKey: string;
-  }): Promise<{ version: number; policy: WorkflowPolicyV1 } | undefined> {
+  }): Promise<{ version: number; policy: WorkflowPolicy } | undefined> {
     const row = await this.db.get<{ definition_version: number; policy_json: string }>(
       `SELECT claim.definition_version, run.policy_json
          FROM workflow_start_claims claim
@@ -2588,7 +2588,7 @@ export class SqliteTaskRepository implements TaskRepository {
     definitionId: string;
     version: number;
     startIdempotencyKey: string;
-  }): Promise<WorkflowPolicyV1 | undefined> {
+  }): Promise<WorkflowPolicy | undefined> {
     const row = await this.db.get<{ policy_json: string }>(
       `SELECT run.policy_json
          FROM workflow_start_claims claim
@@ -3078,12 +3078,7 @@ export class SqliteTaskRepository implements TaskRepository {
     ]);
 
     const diagnostics: Array<{ code: string }> = [];
-    try {
-      const topology = JSON.parse(run.topology_json) as { kind?: unknown };
-      if (topology.kind !== 'one_node_v1' && topology.kind !== 'graph_v1') {
-        diagnostics.push({ code: 'workflow_graph_topology_undecodable' });
-      }
-    } catch {
+    if (!decodeStoredTopologyJson(run.topology_json).ok) {
       diagnostics.push({ code: 'workflow_graph_topology_undecodable' });
     }
     if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_graph_nodes_truncated' });
@@ -5869,8 +5864,7 @@ export class SqliteTaskRepository implements TaskRepository {
         ],
       }),
     );
-    if (definition.topology.kind === 'graph_v1') {
-      for (const [ordinal, edge] of definition.topology.edges.entries()) {
+    for (const [ordinal, edge] of definition.topology.edges.entries()) {
         normalizedTopologyStatements.push({
           sql: `INSERT INTO workflow_definition_edges
                 (workspace_id, definition_id, definition_version, source_node_id,
@@ -5889,7 +5883,6 @@ export class SqliteTaskRepository implements TaskRepository {
             edge.expectedArtifactKind ?? 'next_result',
           ],
         });
-      }
     }
     for (const [ordinal, contract] of definition.entryContracts.entries()) {
       normalizedTopologyStatements.push({
@@ -6166,7 +6159,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
     let effectivePolicy = storedDefinition.definition.policy;
     if (command.effectivePolicy) {
-      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicyV1, 'failWorkflow'>> = [
+      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicy, 'failWorkflow'>> = [
         'maxFeedbackRoundsPerRun',
         'maxTurnsPerTask',
         'maxWorkflowTurnsPerRun',
@@ -6197,8 +6190,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const allNodeIds = topo.nodes.map((n) => n.nodeId);
     if (
       startEntryNodeIds.length === 0 ||
-      !startEntryNodeIds.includes(defRow.entry_node_id) ||
-      (topo.kind === 'one_node_v1' && topo.entryNodeId !== defRow.entry_node_id)
+      !startEntryNodeIds.includes(defRow.entry_node_id)
     ) {
       return invalidStart('invalid start');
     }
@@ -6403,20 +6395,18 @@ export class SqliteTaskRepository implements TaskRepository {
     const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.destinationNodeId);
     const reusedNodeIds: ReadonlySet<string> = new Set(declaredReuseNodeIds);
     const readyReusedNodeIds = new Set<string>();
-    if (topo.kind === 'graph_v1') {
-      for (const entryNodeId of startEntryNodeIds) {
-        if (reusedNodeIds.has(entryNodeId)) readyReusedNodeIds.add(entryNodeId);
-      }
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const nodeId of reusedNodeIds) {
-          if (readyReusedNodeIds.has(nodeId)) continue;
-          const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
-          if (incoming.length > 0 && incoming.every((edge) => readyReusedNodeIds.has(edge.fromNodeId))) {
-            readyReusedNodeIds.add(nodeId);
-            changed = true;
-          }
+    for (const entryNodeId of startEntryNodeIds) {
+      if (reusedNodeIds.has(entryNodeId)) readyReusedNodeIds.add(entryNodeId);
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const nodeId of reusedNodeIds) {
+        if (readyReusedNodeIds.has(nodeId)) continue;
+        const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
+        if (incoming.length > 0 && incoming.every((edge) => readyReusedNodeIds.has(edge.fromNodeId))) {
+          readyReusedNodeIds.add(nodeId);
+          changed = true;
         }
       }
     }
@@ -6430,9 +6420,7 @@ export class SqliteTaskRepository implements TaskRepository {
      * no-op once the budget is exhausted while the task/turn/message rows still committed,
      * letting a run exceed maxWorkflowTurnsPerRun.
      */
-    const reuseOutputEdges = topo.kind === 'graph_v1'
-      ? topo.edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId))
-      : [];
+    const reuseOutputEdges = topo.edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId));
     for (const edge of reuseOutputEdges) {
       const artifact = resolvedReuseByNode.get(edge.fromNodeId);
       const expectedKind = edge.expectedArtifactKind ?? 'next_result';
@@ -6444,13 +6432,12 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     }
     const startReuseEdges = reuseOutputEdges.filter((edge) => readyReusedNodeIds.has(edge.fromNodeId));
-    const materializedBoundaryNodeIds = topo.kind === 'graph_v1'
-      ? [...new Set(startReuseEdges.map((edge) => edge.toNodeId))].filter((nodeId) =>
-          !reusedNodeIds.has(nodeId) &&
-          topo.edges
-            .filter((edge) => edge.toNodeId === nodeId)
-            .every((edge) => startReuseEdges.includes(edge)))
-      : [];
+    const materializedBoundaryNodeIds = [...new Set(startReuseEdges.map((edge) => edge.toNodeId))]
+      .filter((nodeId) =>
+        !reusedNodeIds.has(nodeId) &&
+        topo.edges
+          .filter((edge) => edge.toNodeId === nodeId)
+          .every((edge) => startReuseEdges.includes(edge)));
     const executableEntries = identities.entries.filter((entry) => !reusedNodeIds.has(entry.nodeId));
     const reservedWorkflowTurns = executableEntries.length + materializedBoundaryNodeIds.length;
     if (reservedWorkflowTurns > validated.policy.maxWorkflowTurnsPerRun) {
@@ -6790,14 +6777,12 @@ export class SqliteTaskRepository implements TaskRepository {
       rest.push(taskStatement(this.workspaceId, task, false));
     }
 
-    const shellNodeIds = topo.kind === 'graph_v1'
-      ? allNodeIds.filter(
-          (nodeId) =>
-            !reusedNodeIds.has(nodeId) &&
-            !entryNodeSet.has(nodeId) &&
-            !materializedBoundaryNodeIds.includes(nodeId),
-        )
-      : [];
+    const shellNodeIds = allNodeIds.filter(
+      (nodeId) =>
+        !reusedNodeIds.has(nodeId) &&
+        !entryNodeSet.has(nodeId) &&
+        !materializedBoundaryNodeIds.includes(nodeId),
+    );
     const shellByNode = new Map<string, string>();
     const shellTasks: MusterTask[] = [];
     for (const nodeId of shellNodeIds) {
@@ -6883,6 +6868,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     for (const entry of executableEntries) {
+      const node = nodeById.get(entry.nodeId)!;
       const contracts = validated.entryContracts.filter((contract) => contract.entryNodeId === entry.nodeId);
       const bindings = contracts.length > 0
         ? contracts
@@ -6907,6 +6893,9 @@ export class SqliteTaskRepository implements TaskRepository {
         status: 'queued',
         trigger: 'engine',
         inputs: [{ kind: 'message', messageId: entry.messageId }],
+        ...(node.instructions?.content !== undefined
+          ? { workflowInstructions: node.instructions.content }
+          : {}),
         createdAt: validated.createdAt,
       };
       for (const binding of bindings) {
@@ -7018,7 +7007,7 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
 
-    if (topo.kind === 'graph_v1') {
+    {
       const graphBindings: SqlStatement[] = [];
       const boundaryFills: SqlStatement[] = [];
       for (const edge of topo.edges) {
@@ -7086,6 +7075,9 @@ export class SqliteTaskRepository implements TaskRepository {
         const turn: TaskTurn = {
           id: activation.activationTurnId, taskId: activation.taskId, sequence: 1, status: 'queued',
           trigger: 'engine', inputs: [{ kind: 'message', messageId: activation.messageId }], createdAt: validated.createdAt,
+          ...(node.instructions?.content !== undefined
+            ? { workflowInstructions: node.instructions.content }
+            : {}),
         };
         const message: TaskMessage = {
           id: activation.messageId, taskId: activation.taskId, role: 'system', content: aggregate,
@@ -7969,8 +7961,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const topology = topologyDecoded.topology;
     if (
-      topology.kind === 'one_node_v1' &&
-      topology.nodes[0]?.nodeId !== producerNode.node_id
+      !topology.nodes.some((node) => node.nodeId === producerNode.node_id)
     ) {
       return empty;
     }
@@ -7990,9 +7981,7 @@ export class SqliteTaskRepository implements TaskRepository {
       disposition.result,
       disposition.execution?.kind === 'script',
     );
-    const initialEdge = topology.kind === 'graph_v1'
-      ? outgoingEdge(topology, producerNode.node_id)
-      : undefined;
+    const initialEdge = outgoingEdge(topology, producerNode.node_id);
     if (!initialEdge) {
       const terminalIds = terminalNodeIds(topology);
       const terminalCompletion = await this.workflowTerminalCompletion(
@@ -8165,8 +8154,6 @@ export class SqliteTaskRepository implements TaskRepository {
         changes: [...perNodeWorkflowChange, ...taskClosure.changes, ...ownerChange],
       };
     }
-    if (topology.kind !== 'graph_v1') return empty;
-
     const artifactId = deriveProducerArtifactId(producerNode.run_id, producerNode.node_id);
     // D050 / R027: contribution-scoped revision is deterministic (not priorMax+1).
     const revision = deriveProducerArtifactRevision((disposition as any).change);
@@ -8563,7 +8550,11 @@ export class SqliteTaskRepository implements TaskRepository {
         executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
         releasedAt: finishedAt,
       });
-      const turnPayloadJson = encodePayload({});
+      const turnPayloadJson = encodePayload({
+        ...(consumerSpec.instructions?.content !== undefined
+          ? { workflowInstructions: consumerSpec.instructions.content }
+          : {}),
+      });
       const messagePayloadJson = encodePayload({});
 
       statements.push({
@@ -8870,17 +8861,6 @@ export class SqliteTaskRepository implements TaskRepository {
     const topologyDecoded = decodeStoredTopologyJson(defRow.topology_json);
     if (!topologyDecoded.ok) {
       return empty;
-    }
-    // M018 S05: non-graph topologies have no direct PREV producers — fail the run
-    // (not silent empty). graph_v1 continues into gate/binding resolution below.
-    if (topologyDecoded.topology.kind !== 'graph_v1') {
-      return this.planWorkflowFailClosure({
-        runId: requesterNode.run_id,
-        reasonCode: 'invalid_route',
-        at: command.turn.finishedAt ?? new Date().toISOString(),
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
     }
     const topology = topologyDecoded.topology;
 
@@ -10191,7 +10171,7 @@ export class SqliteTaskRepository implements TaskRepository {
     ) return empty;
     let childEffectivePolicy = childDefinition.definition.policy;
     if (disposition.effectivePolicy) {
-      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicyV1, 'failWorkflow'>> = [
+      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicy, 'failWorkflow'>> = [
         'maxFeedbackRoundsPerRun',
         'maxTurnsPerTask',
         'maxWorkflowTurnsPerRun',
@@ -10554,8 +10534,7 @@ export class SqliteTaskRepository implements TaskRepository {
       });
     }
 
-    if (childTopology.kind === 'graph_v1') {
-      for (const edge of childTopology.edges) {
+    for (const edge of childTopology.edges) {
         const consumerGate = identities.nodeGates.find((g) => g.nodeId === edge.toNodeId);
         if (!consumerGate) continue;
         statements.push({
@@ -10572,7 +10551,6 @@ export class SqliteTaskRepository implements TaskRepository {
             edge.expectedArtifactKind ?? 'next_result',
           ],
         });
-      }
     }
 
     for (const entry of identities.entries) {
@@ -10606,6 +10584,9 @@ export class SqliteTaskRepository implements TaskRepository {
         trigger: 'engine' as const,
         status: 'queued' as const,
         inputs: [{ kind: 'message' as const, messageId: entry.messageId }],
+        ...(node?.instructions?.content !== undefined
+          ? { workflowInstructions: node.instructions.content }
+          : {}),
         createdAt: finishedAt,
       };
       const message = {
@@ -12760,7 +12741,7 @@ function childInvocationFingerprint(input: {
     artifactId: string;
     artifactRevision: number;
   }[];
-  effectivePolicy: WorkflowPolicyV1;
+  effectivePolicy: WorkflowPolicy;
 }): string {
   const entryBindings = input.entryBindings
     .map((binding) => ({

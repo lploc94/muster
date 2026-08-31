@@ -173,6 +173,27 @@ describe('compileTaskPrompt', () => {
     expect(brief.objective).toBe(objective);
     expect(compileTaskPrompt(brief)).toContain(objective);
   });
+
+  it('adds frozen workflow instructions as a bounded host-owned section', () => {
+    const brief = synthesizeBriefFromGoal('Inspect routing', undefined, 'research');
+    const prompt = compileTaskPrompt(brief, [], {
+      taskId: 'inspect',
+      goal: 'Inspect routing',
+      workflowInstructions: 'Trace persistence and report concrete evidence.',
+    });
+    expect(prompt).toContain('# Objective\nInspect routing');
+    expect(prompt).toContain(
+      '# Workflow instructions\nTrace persistence and report concrete evidence.',
+    );
+    expect(prompt).not.toContain('<untrusted-input name="workflowInstructions"');
+    expect(prompt).not.toContain('Display-only workflow title');
+  });
+
+  it('omits the workflow instructions section when the node has none', () => {
+    const brief = synthesizeBriefFromGoal('Inspect routing', undefined, 'research');
+    expect(compileTaskPrompt(brief, [], { goal: 'Inspect routing' }))
+      .not.toContain('# Workflow instructions');
+  });
 });
 
 describe('clampSection', () => {
@@ -311,6 +332,33 @@ describe('assembleFirstTurnPrompt', () => {
     for (const r of HOST_RULES_COORDINATOR) expect(prompt).toContain(r);
     expect(prompt).toContain('<untrusted-input name="plan"');
     expect(prompt).toContain('</untrusted-input>');
+  });
+
+  it('keeps frozen workflow instructions between the objective and dependency pins', () => {
+    const result = assembleFirstTurnPrompt({
+      snapshot: hostSnap(),
+      self: { taskId: 'review', role: 'worker', backend: 'opencode' },
+      brief: synthesizeBriefFromGoal('Review the implementation', undefined, 'verify'),
+      resolvedInputs: [{
+        as: 'implementation',
+        fromTaskId: 'implement',
+        output: 'summary',
+        producerResultRevision: 1,
+        text: 'dependency body',
+      }],
+      meta: {
+        goal: 'Review the implementation',
+        workflowInstructions: 'Check correctness and report actionable findings.',
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    const objectiveIndex = result.prompt.indexOf('# Objective');
+    const instructionsIndex = result.prompt.indexOf('# Workflow instructions');
+    const pinIndex = result.prompt.indexOf('<untrusted-input name="implementation"');
+    expect(instructionsIndex).toBeGreaterThan(objectiveIndex);
+    expect(pinIndex).toBeGreaterThan(instructionsIndex);
+    expect(result.prompt).toContain('Check correctness and report actionable findings.');
   });
 
   it('worker tier: host base + scope; no backends section', () => {

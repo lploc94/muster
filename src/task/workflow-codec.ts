@@ -1,40 +1,48 @@
 /**
- * Bounded codecs for workflow topology and definition fingerprints.
- * Fail closed on unsupported, incomplete, or corrupt topology.
- * Fingerprints never include prompt text, message bodies, or artifact bodies.
+ * Bounded codecs for the canonical workflow manifest, normalized topology, and
+ * deterministic definition/start fingerprints.
  */
 
 import { createHash } from 'node:crypto';
 import {
+  WORKFLOW_DESCRIPTION_MAX_LENGTH,
+  WORKFLOW_ENTRY_CONTRACTS_MAX,
   WORKFLOW_GRAPH_MAX_EDGES,
   WORKFLOW_GRAPH_MAX_NODES,
-  WORKFLOW_INPUT_REF_MAX_LENGTH,
-  WORKFLOW_NODE_LABEL_MAX_LENGTH,
+  WORKFLOW_INSTRUCTIONS_MAX_LENGTH,
+  WORKFLOW_NAME_MAX_LENGTH,
+  WORKFLOW_OUTCOME_WHEN_MAX_LENGTH,
   WORKFLOW_PACKAGE_HASH_LENGTH,
   WORKFLOW_PACKAGE_PATH_MAX_LENGTH,
+  WORKFLOW_SCHEMA,
   WORKFLOW_SCRIPT_ARG_MAX_LENGTH,
   WORKFLOW_SCRIPT_FILE_MAX_LENGTH,
   WORKFLOW_SCRIPT_MAX_ARGS,
+  WORKFLOW_TITLE_MAX_LENGTH,
   isValidWorkflowScriptFile,
   type DefineWorkflowInput,
-  type GraphTopologyV1,
-  type OneNodeTopologyV1,
+  type ScriptExecutionSpec,
   type StartWorkflowEntryInput,
   type StartWorkflowNodeReuse,
-  type WorkflowDefinitionV1,
-  type WorkflowDependencyEdgeV1,
-  type WorkflowEntryContractV1,
-  type WorkflowNodeSpecV1,
-  type WorkflowPolicyV1,
-  type ScriptExecutionSpecV1,
-  type WorkflowScriptSourceV1,
-  type WorkflowTopologyV1,
+  type WorkflowAgentOutcome,
+  type WorkflowDefinition,
+  type WorkflowDependencyEdge,
+  type WorkflowEntryContract,
+  type WorkflowExitOutcome,
+  type WorkflowInputContract,
+  type WorkflowInstructions,
+  type WorkflowNodeOutcome,
+  type WorkflowNodeSpec,
+  type WorkflowOutputContract,
+  type WorkflowPolicy,
+  type WorkflowScriptSource,
+  type WorkflowTopology,
 } from './workflow-types';
 
 const MAX_ID_LEN = 128;
-const MAX_NAME_LEN = 256;
 const MAX_CAPABILITIES = 16;
 const MAX_ARTIFACT_KIND_LEN = 128;
+const STABLE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
 const TASK_CAPABILITIES = new Set([
   'create_child',
   'start_child',
@@ -44,7 +52,7 @@ const TASK_CAPABILITIES = new Set([
   'read_subtree',
 ]);
 
-export const DEFAULT_WORKFLOW_POLICY: WorkflowPolicyV1 = {
+export const DEFAULT_WORKFLOW_POLICY: WorkflowPolicy = {
   maxFeedbackRoundsPerRun: 8,
   maxTurnsPerTask: 50,
   maxWorkflowTurnsPerRun: 64,
@@ -72,161 +80,871 @@ export const WORKFLOW_POLICY_BOUNDS = {
 } as const;
 
 export type TopologyDecodeResult =
-  | { ok: true; topology: WorkflowTopologyV1 }
+  | { ok: true; topology: WorkflowTopology }
   | { ok: false; reason: string };
 
 export type DefinitionDecodeResult =
-  | { ok: true; definition: WorkflowDefinitionV1; fingerprint: string }
+  | { ok: true; definition: WorkflowDefinition; fingerprint: string }
   | { ok: false; reason: string };
+
+export type WorkflowManifestDecodeResult =
+  | {
+      ok: true;
+      name: string;
+      topology: WorkflowTopology;
+      entryContracts: WorkflowEntryContract[];
+    }
+  | { ok: false; reason: string };
+
+type RecordValue = Record<string, unknown>;
+
+function isRecord(value: unknown): value is RecordValue {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
 
 function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
-function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSourceV1 | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const rec = raw as Record<string, unknown>;
-  const allowed = new Set([
+function isStableId(value: unknown): value is string {
+  return isNonEmptyString(value, MAX_ID_LEN) && STABLE_ID_RE.test(value);
+}
+
+function onlyKeys(record: RecordValue, allowed: readonly string[]): boolean {
+  const set = new Set(allowed);
+  return Object.keys(record).every((key) => set.has(key));
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value, 'utf8').digest('hex');
+}
+
+function isSafeRelativePath(value: string, allowDot = false): boolean {
+  if (value === '.' && allowDot) return true;
+  const portable = value.replace(/\\/g, '/');
+  return !portable.startsWith('/') &&
+    !/^[A-Za-z]:/.test(portable) &&
+    !/[\x00-\x1f\x7f]/.test(portable) &&
+    !portable.split('/').some((part) => part === '' || part === '..');
+}
+
+function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSource | undefined {
+  if (!isRecord(raw)) return undefined;
+  if (!onlyKeys(raw, [
     'kind', 'scope', 'packageKind', 'catalogRootKind', 'packagePath',
     'entryFile', 'workflowRef', 'packageSha256', 'scriptSha256',
-  ]);
-  if (Object.keys(rec).some((key) => !allowed.has(key))) return undefined;
+  ])) return undefined;
   if (
-    rec.kind !== 'predefined' ||
-    (rec.scope !== 'workspace' && rec.scope !== 'global') ||
-    (rec.packageKind !== 'file' && rec.packageKind !== 'bundle') ||
-    (rec.catalogRootKind !== 'canonical' && rec.catalogRootKind !== 'legacy' && rec.catalogRootKind !== 'custom') ||
-    !isNonEmptyString(rec.packagePath, WORKFLOW_PACKAGE_PATH_MAX_LENGTH) ||
-    !isNonEmptyString(rec.entryFile, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
-    !isNonEmptyString(rec.workflowRef, 64) ||
-    !isNonEmptyString(rec.packageSha256, WORKFLOW_PACKAGE_HASH_LENGTH) ||
-    !isNonEmptyString(rec.scriptSha256, WORKFLOW_PACKAGE_HASH_LENGTH)
+    raw.kind !== 'predefined' ||
+    (raw.scope !== 'workspace' && raw.scope !== 'global') ||
+    (raw.packageKind !== 'file' && raw.packageKind !== 'bundle') ||
+    (raw.catalogRootKind !== 'canonical' && raw.catalogRootKind !== 'legacy' && raw.catalogRootKind !== 'custom') ||
+    !isNonEmptyString(raw.packagePath, WORKFLOW_PACKAGE_PATH_MAX_LENGTH) ||
+    !isNonEmptyString(raw.entryFile, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
+    !isNonEmptyString(raw.workflowRef, 64) ||
+    !isNonEmptyString(raw.packageSha256, WORKFLOW_PACKAGE_HASH_LENGTH) ||
+    !isNonEmptyString(raw.scriptSha256, WORKFLOW_PACKAGE_HASH_LENGTH)
   ) return undefined;
-  const packagePath = rec.packagePath;
-  const entryFile = rec.entryFile;
-  const isSafeRelative = (value: string, allowDot = false): boolean => {
-    if (value === '.' && allowDot) return true;
-    const portable = value.replace(/\\/g, '/');
-    return !portable.startsWith('/') &&
-      !/^[A-Za-z]:/.test(portable) &&
-      !/[\x00-\x1f\x7f]/.test(portable) &&
-      !portable.split('/').some((part) => part === '' || part === '..');
-  };
   if (
-    !isSafeRelative(packagePath, true) ||
-    !isSafeRelative(entryFile) ||
-    (rec.packageKind === 'file' ? packagePath !== '.' : packagePath === '.') ||
-    !/^pwf_[a-f0-9]{32}$/.test(rec.workflowRef) ||
-    !/^[a-f0-9]{64}$/.test(rec.packageSha256) ||
-    !/^[a-f0-9]{64}$/.test(rec.scriptSha256)
+    !isSafeRelativePath(raw.packagePath, true) ||
+    !isSafeRelativePath(raw.entryFile) ||
+    (raw.packageKind === 'file' ? raw.packagePath !== '.' : raw.packagePath === '.') ||
+    !/^pwf_[a-f0-9]{32}$/.test(raw.workflowRef) ||
+    !/^[a-f0-9]{64}$/.test(raw.packageSha256) ||
+    !/^[a-f0-9]{64}$/.test(raw.scriptSha256)
   ) return undefined;
   return {
     kind: 'predefined',
-    scope: rec.scope,
-    packageKind: rec.packageKind,
-    catalogRootKind: rec.catalogRootKind,
-    packagePath,
-    entryFile,
-    workflowRef: rec.workflowRef,
-    packageSha256: rec.packageSha256,
-    scriptSha256: rec.scriptSha256,
+    scope: raw.scope,
+    packageKind: raw.packageKind,
+    catalogRootKind: raw.catalogRootKind,
+    packagePath: raw.packagePath,
+    entryFile: raw.entryFile,
+    workflowRef: raw.workflowRef,
+    packageSha256: raw.packageSha256,
+    scriptSha256: raw.scriptSha256,
   };
 }
 
-function decodeScriptExecution(raw: unknown): ScriptExecutionSpecV1 | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const rec = raw as Record<string, unknown>;
-  if (rec.kind !== 'script') return undefined;
-  if (rec.interpreter !== 'node' && rec.interpreter !== 'python' && rec.interpreter !== 'python3') {
+function decodeNormalizedInstructions(raw: unknown): WorkflowInstructions | undefined {
+  if (!isRecord(raw) || raw.kind !== 'inline' && raw.kind !== 'file') return undefined;
+  if (raw.kind === 'inline') {
+    if (
+      !onlyKeys(raw, ['kind', 'content', 'sha256']) ||
+      !isNonEmptyString(raw.content, WORKFLOW_INSTRUCTIONS_MAX_LENGTH) ||
+      raw.sha256 !== sha256(raw.content)
+    ) return undefined;
+    return { kind: 'inline', content: raw.content, sha256: raw.sha256 };
+  }
+  if (!onlyKeys(raw, ['kind', 'file', 'content', 'sha256'])) return undefined;
+  if (
+    !isNonEmptyString(raw.file, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
+    !isSafeRelativePath(raw.file)
+  ) return undefined;
+  if ((raw.content === undefined) !== (raw.sha256 === undefined)) return undefined;
+  if (raw.content !== undefined) {
+    if (
+      !isNonEmptyString(raw.content, WORKFLOW_INSTRUCTIONS_MAX_LENGTH) ||
+      raw.sha256 !== sha256(raw.content)
+    ) return undefined;
+    return { kind: 'file', file: raw.file, content: raw.content, sha256: raw.sha256 as string };
+  }
+  return { kind: 'file', file: raw.file };
+}
+
+function decodeManifestInstructions(
+  raw: unknown,
+  source: 'inline' | 'saved',
+): { ok: true; instructions?: WorkflowInstructions } | { ok: false; reason: string } {
+  if (raw === undefined) return { ok: true };
+  if (!isRecord(raw) || !onlyKeys(raw, ['inline', 'file'])) {
+    return { ok: false, reason: 'invalid instructions' };
+  }
+  const hasInline = Object.prototype.hasOwnProperty.call(raw, 'inline');
+  const hasFile = Object.prototype.hasOwnProperty.call(raw, 'file');
+  if (hasInline === hasFile) return { ok: false, reason: 'instructions require exactly one of inline or file' };
+  if (hasInline) {
+    if (!isNonEmptyString(raw.inline, WORKFLOW_INSTRUCTIONS_MAX_LENGTH)) {
+      return { ok: false, reason: 'invalid instructions inline content' };
+    }
+    return {
+      ok: true,
+      instructions: { kind: 'inline', content: raw.inline, sha256: sha256(raw.inline) },
+    };
+  }
+  if (
+    source !== 'saved' ||
+    !isNonEmptyString(raw.file, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
+    !isSafeRelativePath(raw.file)
+  ) {
+    return { ok: false, reason: 'file instructions require a saved package' };
+  }
+  return { ok: true, instructions: { kind: 'file', file: raw.file } };
+}
+
+function decodeScriptExecution(raw: unknown): ScriptExecutionSpec | undefined {
+  if (!isRecord(raw) || raw.kind !== 'script') return undefined;
+  if (!onlyKeys(raw, ['kind', 'interpreter', 'file', 'args', 'source'])) return undefined;
+  if (raw.interpreter !== 'node' && raw.interpreter !== 'python' && raw.interpreter !== 'python3') {
     return undefined;
   }
-  if (!isValidWorkflowScriptFile(rec.file, rec.interpreter)) return undefined;
+  if (!isValidWorkflowScriptFile(raw.file, raw.interpreter)) return undefined;
   if (
-    !Array.isArray(rec.args) ||
-    rec.args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
-    !rec.args.every((arg) =>
+    !Array.isArray(raw.args) ||
+    raw.args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
+    !raw.args.every((arg) =>
       typeof arg === 'string' &&
       arg.length <= WORKFLOW_SCRIPT_ARG_MAX_LENGTH &&
       !arg.includes('\0'))
   ) return undefined;
-  if (rec.onFailure !== 'fail_run' && rec.onFailure !== 'continue') return undefined;
-  let source: WorkflowScriptSourceV1 | undefined;
-  if (rec.source !== undefined) {
-    source = decodeWorkflowScriptSource(rec.source);
+  let source: WorkflowScriptSource | undefined;
+  if (raw.source !== undefined) {
+    source = decodeWorkflowScriptSource(raw.source);
     if (!source) return undefined;
-  }
-  if (Object.keys(rec).some((key) =>
-    key !== 'kind' && key !== 'interpreter' && key !== 'file' && key !== 'args' &&
-    key !== 'onFailure' && key !== 'source')) {
-    return undefined;
   }
   return {
     kind: 'script',
-    interpreter: rec.interpreter,
-    file: rec.file,
-    args: [...rec.args] as string[],
-    onFailure: rec.onFailure,
-    ...(source !== undefined ? { source } : {}),
+    interpreter: raw.interpreter,
+    file: raw.file,
+    args: [...raw.args] as string[],
+    ...(source ? { source } : {}),
   };
 }
 
+function decodeManifestScript(raw: unknown): ScriptExecutionSpec | undefined {
+  if (!isRecord(raw) || !onlyKeys(raw, ['interpreter', 'file', 'args'])) return undefined;
+  if (raw.interpreter !== 'node' && raw.interpreter !== 'python' && raw.interpreter !== 'python3') {
+    return undefined;
+  }
+  const args = raw.args === undefined ? [] : raw.args;
+  if (
+    !isValidWorkflowScriptFile(raw.file, raw.interpreter) ||
+    !Array.isArray(args) ||
+    args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
+    !args.every((arg) =>
+      typeof arg === 'string' &&
+      arg.length <= WORKFLOW_SCRIPT_ARG_MAX_LENGTH &&
+      !arg.includes('\0'))
+  ) return undefined;
+  return {
+    kind: 'script',
+    interpreter: raw.interpreter,
+    file: raw.file,
+    args: [...args] as string[],
+  };
+}
+
+type ValueDecodeResult<T> = { ok: true; value: T } | { ok: false; reason: string };
+
+function decodeAgentOutcome(raw: Record<string, unknown>): ValueDecodeResult<WorkflowAgentOutcome> {
+  if (!onlyKeys(raw, ['kind', 'requireExplicitDisposition', 'next', 'prev', 'fail'])) {
+    return { ok: false, reason: 'invalid agent outcome field' };
+  }
+  if (typeof raw.requireExplicitDisposition !== 'boolean') {
+    return { ok: false, reason: 'agent outcome requireExplicitDisposition must be boolean' };
+  }
+
+  let next: WorkflowAgentOutcome['next'];
+  if (raw.next !== undefined) {
+    if (
+      !isRecord(raw.next) || !onlyKeys(raw.next, ['when']) ||
+      !isNonEmptyString(raw.next.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH)
+    ) return { ok: false, reason: 'invalid agent NEXT outcome route' };
+    next = { when: raw.next.when };
+  }
+
+  let prev: WorkflowAgentOutcome['prev'];
+  if (raw.prev !== undefined) {
+    if (!Array.isArray(raw.prev) || raw.prev.length === 0 || raw.prev.length > WORKFLOW_GRAPH_MAX_EDGES) {
+      return { ok: false, reason: 'agent PREV routes require a nonempty bounded array' };
+    }
+    const routes: Array<NonNullable<WorkflowAgentOutcome['prev']>[number]> = [];
+    for (const value of raw.prev) {
+      if (!isRecord(value) || !onlyKeys(value, ['when', 'targets', 'feedback'])) {
+        return { ok: false, reason: 'invalid agent PREV outcome field' };
+      }
+      if (!isNonEmptyString(value.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH)) {
+        return { ok: false, reason: 'invalid agent PREV outcome condition' };
+      }
+      if (
+        !Array.isArray(value.targets) || value.targets.length === 0 ||
+        value.targets.length > WORKFLOW_GRAPH_MAX_EDGES ||
+        !value.targets.every(isStableId)
+      ) return { ok: false, reason: 'agent PREV targets require nonempty bounded inputRef names' };
+      if (new Set(value.targets).size !== value.targets.length) {
+        return { ok: false, reason: 'duplicate agent PREV target' };
+      }
+      if (value.feedback !== 'required') {
+        return { ok: false, reason: 'agent PREV feedback must be required' };
+      }
+      routes.push({ when: value.when, targets: [...value.targets] as string[], feedback: 'required' as const });
+    }
+    prev = routes;
+  }
+
+  let fail: WorkflowAgentOutcome['fail'];
+  if (raw.fail !== undefined) {
+    if (
+      !isRecord(raw.fail) || !onlyKeys(raw.fail, ['when']) ||
+      !isNonEmptyString(raw.fail.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH)
+    ) return { ok: false, reason: 'invalid agent FAIL outcome route' };
+    fail = { when: raw.fail.when };
+  }
+
+  if (!next && !prev && !fail) {
+    return { ok: false, reason: 'agent outcome requires at least one route' };
+  }
+  if (!raw.requireExplicitDisposition && !next) {
+    return { ok: false, reason: 'agent outcome with requireExplicitDisposition false requires a NEXT route' };
+  }
+  return {
+    ok: true,
+    value: {
+      kind: 'agent',
+      requireExplicitDisposition: raw.requireExplicitDisposition,
+      ...(next ? { next } : {}),
+      ...(prev ? { prev } : {}),
+      ...(fail ? { fail } : {}),
+    },
+  };
+}
+
+function isExitZeroWhen(raw: unknown): boolean {
+  return isRecord(raw) && onlyKeys(raw, ['exitCode']) && raw.exitCode === 0;
+}
+
+function isExitNonzeroWhen(raw: unknown): boolean {
+  return isRecord(raw) && onlyKeys(raw, ['exitCode']) && raw.exitCode === 'nonzero';
+}
+
+function decodeExitOutcome(raw: Record<string, unknown>): ValueDecodeResult<WorkflowExitOutcome> {
+  if (!onlyKeys(raw, ['kind', 'next', 'prev', 'fail'])) {
+    return { ok: false, reason: 'invalid exit outcome field' };
+  }
+  if (
+    !isRecord(raw.next) || !onlyKeys(raw.next, ['when']) ||
+    !isExitZeroWhen(raw.next.when)
+  ) return { ok: false, reason: 'exit outcome NEXT route must match exitCode zero' };
+  const hasPrev = raw.prev !== undefined;
+  const hasFail = raw.fail !== undefined;
+  if (hasPrev === hasFail) {
+    return { ok: false, reason: 'exit outcome requires exactly one nonzero PREV or FAIL route for complete coverage' };
+  }
+  if (hasPrev) {
+    if (!isRecord(raw.prev) || !onlyKeys(raw.prev, ['when', 'targets', 'feedback'])) {
+      return { ok: false, reason: 'invalid exit PREV outcome field' };
+    }
+    if (!isExitNonzeroWhen(raw.prev.when)) {
+      return { ok: false, reason: 'exit PREV outcome must match exitCode nonzero' };
+    }
+    if (
+      !Array.isArray(raw.prev.targets) || raw.prev.targets.length === 0 ||
+      raw.prev.targets.length > WORKFLOW_GRAPH_MAX_EDGES ||
+      !raw.prev.targets.every(isStableId)
+    ) return { ok: false, reason: 'exit PREV targets require nonempty bounded inputRef names' };
+    if (new Set(raw.prev.targets).size !== raw.prev.targets.length) {
+      return { ok: false, reason: 'duplicate exit PREV target' };
+    }
+    if (raw.prev.feedback !== 'stdout') {
+      return { ok: false, reason: 'exit PREV feedback must be stdout' };
+    }
+    return {
+      ok: true,
+      value: {
+        kind: 'exit',
+        next: { when: { exitCode: 0 } },
+        prev: {
+          when: { exitCode: 'nonzero' },
+          targets: [...raw.prev.targets] as string[],
+          feedback: 'stdout',
+        },
+      },
+    };
+  }
+  if (
+    !isRecord(raw.fail) || !onlyKeys(raw.fail, ['when']) ||
+    !isExitNonzeroWhen(raw.fail.when)
+  ) return { ok: false, reason: 'exit FAIL outcome must match exitCode nonzero' };
+  return {
+    ok: true,
+    value: {
+      kind: 'exit',
+      next: { when: { exitCode: 0 } },
+      fail: { when: { exitCode: 'nonzero' } },
+    },
+  };
+}
+
+function decodeOutcome(raw: unknown): ValueDecodeResult<WorkflowNodeOutcome> {
+  if (!isRecord(raw)) return { ok: false, reason: 'node outcome must be an object' };
+  return raw.kind === 'agent'
+    ? decodeAgentOutcome(raw)
+    : raw.kind === 'exit'
+      ? decodeExitOutcome(raw)
+      : { ok: false, reason: 'unsupported node outcome kind' };
+}
+
+function decodeNormalizedNode(raw: unknown): WorkflowNodeSpec | undefined {
+  if (!isRecord(raw) || !isStableId(raw.nodeId)) return undefined;
+  if (!onlyKeys(raw, [
+    'nodeId', 'title', 'instructions', 'role', 'taskType', 'backend', 'model',
+    'capabilities', 'execution', 'outcome',
+  ])) return undefined;
+  if (raw.title !== undefined && !isNonEmptyString(raw.title, WORKFLOW_TITLE_MAX_LENGTH)) return undefined;
+  for (const key of ['taskType', 'backend', 'model'] as const) {
+    if (raw[key] !== undefined && !isNonEmptyString(raw[key], MAX_ID_LEN)) return undefined;
+  }
+  if (raw.role !== undefined && raw.role !== 'coordinator' && raw.role !== 'worker') return undefined;
+  const instructions = raw.instructions === undefined
+    ? undefined
+    : decodeNormalizedInstructions(raw.instructions);
+  if (raw.instructions !== undefined && !instructions) return undefined;
+  let capabilities: string[] | undefined;
+  if (raw.capabilities !== undefined) {
+    if (
+      !Array.isArray(raw.capabilities) || raw.capabilities.length > MAX_CAPABILITIES ||
+      !raw.capabilities.every((value) => isNonEmptyString(value, MAX_ID_LEN) && TASK_CAPABILITIES.has(value)) ||
+      new Set(raw.capabilities).size !== raw.capabilities.length
+    ) return undefined;
+    capabilities = [...raw.capabilities] as string[];
+  }
+  const execution = raw.execution === undefined ? undefined : decodeScriptExecution(raw.execution);
+  if (raw.execution !== undefined && !execution) return undefined;
+  const decodedOutcome = raw.outcome === undefined ? undefined : decodeOutcome(raw.outcome);
+  if (decodedOutcome && !decodedOutcome.ok) return undefined;
+  const outcome = decodedOutcome?.value;
+  if (execution) {
+    if (
+      raw.backend !== 'script' || raw.model !== undefined || raw.taskType !== undefined ||
+      raw.role === 'coordinator' || (capabilities?.length ?? 0) > 0 || outcome?.kind !== 'exit'
+    ) return undefined;
+  } else {
+    if (raw.backend === 'script' || outcome?.kind === 'exit') return undefined;
+  }
+  return {
+    nodeId: raw.nodeId,
+    ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
+    ...(instructions ? { instructions } : {}),
+    ...(raw.role === 'coordinator' || raw.role === 'worker' ? { role: raw.role } : {}),
+    ...(typeof raw.taskType === 'string' ? { taskType: raw.taskType } : {}),
+    ...(typeof raw.backend === 'string' ? { backend: raw.backend } : {}),
+    ...(typeof raw.model === 'string' ? { model: raw.model } : {}),
+    ...(capabilities ? { capabilities } : {}),
+    ...(execution ? { execution } : {}),
+    ...(outcome ? { outcome } : {}),
+  };
+}
+
+function decodeNormalizedEdge(raw: unknown): WorkflowDependencyEdge | undefined {
+  if (!isRecord(raw) || !onlyKeys(raw, ['fromNodeId', 'toNodeId', 'inputRef', 'expectedArtifactKind'])) {
+    return undefined;
+  }
+  if (
+    !isStableId(raw.fromNodeId) || !isStableId(raw.toNodeId) ||
+    !isStableId(raw.inputRef)
+  ) return undefined;
+  if (
+    raw.expectedArtifactKind !== undefined &&
+    !isNonEmptyString(raw.expectedArtifactKind, MAX_ARTIFACT_KIND_LEN)
+  ) return undefined;
+  return {
+    fromNodeId: raw.fromNodeId,
+    toNodeId: raw.toNodeId,
+    inputRef: raw.inputRef,
+    ...(typeof raw.expectedArtifactKind === 'string'
+      ? { expectedArtifactKind: raw.expectedArtifactKind }
+      : {}),
+  };
+}
+
+function decodeNormalizedInput(raw: unknown): WorkflowInputContract | undefined {
+  if (!isRecord(raw) || !onlyKeys(raw, ['name', 'semanticKind', 'entryNodeId', 'inputRef'])) return undefined;
+  if (
+    !isStableId(raw.name) ||
+    !isNonEmptyString(raw.semanticKind, MAX_ARTIFACT_KIND_LEN) ||
+    !isStableId(raw.entryNodeId) ||
+    !isStableId(raw.inputRef)
+  ) return undefined;
+  return {
+    name: raw.name,
+    semanticKind: raw.semanticKind,
+    entryNodeId: raw.entryNodeId,
+    inputRef: raw.inputRef,
+  };
+}
+
+function decodeNormalizedOutput(raw: unknown): WorkflowOutputContract | undefined {
+  if (!isRecord(raw) || !onlyKeys(raw, ['name', 'semanticKind', 'terminalNodeId'])) return undefined;
+  if (
+    !isStableId(raw.name) ||
+    !isNonEmptyString(raw.semanticKind, MAX_ARTIFACT_KIND_LEN) ||
+    !isStableId(raw.terminalNodeId)
+  ) return undefined;
+  return {
+    name: raw.name,
+    semanticKind: raw.semanticKind,
+    terminalNodeId: raw.terminalNodeId,
+  };
+}
+
+function hasCycle(nodeIds: readonly string[], edges: readonly WorkflowDependencyEdge[]): boolean {
+  const outgoing = new Map<string, string[]>();
+  for (const id of nodeIds) outgoing.set(id, []);
+  for (const edge of edges) outgoing.get(edge.fromNodeId)?.push(edge.toNodeId);
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (id: string): boolean => {
+    if (visiting.has(id)) return true;
+    if (visited.has(id)) return false;
+    visiting.add(id);
+    for (const next of outgoing.get(id) ?? []) if (visit(next)) return true;
+    visiting.delete(id);
+    visited.add(id);
+    return false;
+  };
+  return nodeIds.some(visit);
+}
+
+function validateTopologySemantics(topology: WorkflowTopology): string | undefined {
+  if (topology.nodes.length < 1 || topology.nodes.length > WORKFLOW_GRAPH_MAX_NODES) {
+    return 'workflow requires 1..64 nodes';
+  }
+  if (topology.edges.length > WORKFLOW_GRAPH_MAX_EDGES) return 'workflow edges exceed bounds';
+  if (topology.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX) return 'workflow inputs exceed bounds';
+
+  const nodeIds = topology.nodes.map((node) => node.nodeId);
+  if (new Set(nodeIds).size !== nodeIds.length) return 'duplicate node';
+  const nodeIdSet = new Set(nodeIds);
+  const inDegree = new Map(nodeIds.map((id) => [id, 0]));
+  const outDegree = new Map(nodeIds.map((id) => [id, 0]));
+  const consumerSlots = new Set<string>();
+  const inboundRefs = new Map<string, Set<string>>(nodeIds.map((id) => [id, new Set<string>()]));
+  for (const edge of topology.edges) {
+    if (!nodeIdSet.has(edge.fromNodeId) || !nodeIdSet.has(edge.toNodeId)) {
+      return 'edge references unknown node';
+    }
+    if (edge.fromNodeId === edge.toNodeId) return 'cycle not allowed';
+    const slot = `${edge.toNodeId}\0${edge.inputRef}`;
+    if (consumerSlots.has(slot)) return 'duplicate inputRef on consumer';
+    consumerSlots.add(slot);
+    inboundRefs.get(edge.toNodeId)!.add(edge.inputRef);
+    outDegree.set(edge.fromNodeId, outDegree.get(edge.fromNodeId)! + 1);
+    inDegree.set(edge.toNodeId, inDegree.get(edge.toNodeId)! + 1);
+  }
+  for (const [nodeId, degree] of outDegree) {
+    if (degree > 1) return `fan-out not allowed: node ${nodeId}`;
+  }
+  if (hasCycle(nodeIds, topology.edges)) return 'cycle not allowed';
+  if (nodeIds.length > 1) {
+    for (const nodeId of nodeIds) {
+      if (inDegree.get(nodeId) === 0 && outDegree.get(nodeId) === 0) return 'isolated node';
+    }
+  }
+
+  const entryIds = new Set(nodeIds.filter((id) => inDegree.get(id) === 0));
+  const terminalIds = nodeIds.filter((id) => outDegree.get(id) === 0);
+  const inputNames = new Set<string>();
+  const publicSlots = new Set<string>();
+  const publicInputCounts = new Map<string, number>();
+  for (const input of topology.inputs) {
+    if (inputNames.has(input.name)) return 'duplicate workflow input name';
+    inputNames.add(input.name);
+    if (!entryIds.has(input.entryNodeId)) return 'workflow input must bind an entry node';
+    const slot = `${input.entryNodeId}\0${input.inputRef}`;
+    if (publicSlots.has(slot)) return 'duplicate workflow input binding';
+    publicSlots.add(slot);
+    const count = (publicInputCounts.get(input.entryNodeId) ?? 0) + 1;
+    if (count > WORKFLOW_POLICY_BOUNDS.maxInputsPerGate.max) {
+      return `workflow entry input gate exceeds ${WORKFLOW_POLICY_BOUNDS.maxInputsPerGate.max} inputs`;
+    }
+    publicInputCounts.set(input.entryNodeId, count);
+  }
+
+  const outputNames = new Set<string>();
+  const outputTerminals = new Set<string>();
+  for (const output of topology.outputs) {
+    if (outputNames.has(output.name)) return 'duplicate workflow output name';
+    outputNames.add(output.name);
+    if (!terminalIds.includes(output.terminalNodeId)) return 'workflow output must reference a terminal node';
+    if (outputTerminals.has(output.terminalNodeId)) return 'every terminal must be exported exactly once';
+    outputTerminals.add(output.terminalNodeId);
+  }
+  if (outputTerminals.size !== terminalIds.length) return 'unexported terminal: every terminal must be exported';
+
+  for (const node of topology.nodes) {
+    const outcome = node.outcome;
+    if (!outcome) continue;
+    const inbound = inboundRefs.get(node.nodeId)!;
+    const targets = outcome.kind === 'agent'
+      ? outcome.prev?.flatMap((route) => route.targets) ?? []
+      : outcome.prev?.targets ?? [];
+    if (targets.length > 0 && inbound.size === 0) return 'entry nodes cannot declare PREV';
+    for (const target of targets) {
+      if (!inbound.has(target)) return 'PREV target must be a unique inbound inputRef';
+    }
+  }
+  return undefined;
+}
+
+export function decodeTopology(raw: unknown): TopologyDecodeResult {
+  if (!isRecord(raw) || raw.kind !== 'workflow') {
+    return { ok: false, reason: 'unsupported topology kind' };
+  }
+  if (!onlyKeys(raw, ['kind', 'description', 'inputs', 'outputs', 'nodes', 'edges'])) {
+    return { ok: false, reason: 'unsupported topology field' };
+  }
+  if (
+    raw.description !== undefined &&
+    !isNonEmptyString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
+  ) return { ok: false, reason: 'invalid workflow description' };
+  if (!Array.isArray(raw.nodes) || !Array.isArray(raw.edges) || !Array.isArray(raw.inputs) || !Array.isArray(raw.outputs)) {
+    return { ok: false, reason: 'workflow topology arrays are required' };
+  }
+  if (raw.nodes.length < 1 || raw.nodes.length > WORKFLOW_GRAPH_MAX_NODES) {
+    return { ok: false, reason: 'workflow nodes exceed bounds' };
+  }
+  if (raw.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
+    return { ok: false, reason: 'workflow edges exceed bounds' };
+  }
+  if (raw.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX) {
+    return { ok: false, reason: 'workflow inputs exceed bounds' };
+  }
+  if (raw.outputs.length < 1 || raw.outputs.length > WORKFLOW_GRAPH_MAX_NODES) {
+    return { ok: false, reason: 'workflow outputs exceed bounds' };
+  }
+  const nodes = raw.nodes.map(decodeNormalizedNode);
+  if (nodes.some((node) => !node)) return { ok: false, reason: 'invalid node specification' };
+  const edges = raw.edges.map(decodeNormalizedEdge);
+  if (edges.some((edge) => !edge)) return { ok: false, reason: 'invalid edge specification' };
+  const inputs = raw.inputs.map(decodeNormalizedInput);
+  if (inputs.some((input) => !input)) return { ok: false, reason: 'invalid workflow input' };
+  const outputs = raw.outputs.map(decodeNormalizedOutput);
+  if (outputs.some((output) => !output)) return { ok: false, reason: 'invalid workflow output' };
+  const topology: WorkflowTopology = {
+    kind: 'workflow',
+    ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+    inputs: inputs as WorkflowInputContract[],
+    outputs: outputs as WorkflowOutputContract[],
+    nodes: nodes as WorkflowNodeSpec[],
+    edges: edges as WorkflowDependencyEdge[],
+  };
+  const semanticError = validateTopologySemantics(topology);
+  return semanticError ? { ok: false, reason: semanticError } : { ok: true, topology };
+}
+
+function decodeManifestNode(
+  raw: unknown,
+  source: 'inline' | 'saved',
+): { ok: true; node: WorkflowNodeSpec } | { ok: false; reason: string } {
+  if (!isRecord(raw) || !onlyKeys(raw, [
+    'nodeKey', 'taskType', 'script', 'title', 'instructions', 'outcome',
+  ])) return { ok: false, reason: 'invalid node field' };
+  if (!isStableId(raw.nodeKey)) return { ok: false, reason: 'invalid nodeKey' };
+  if (raw.title !== undefined && !isNonEmptyString(raw.title, WORKFLOW_TITLE_MAX_LENGTH)) {
+    return { ok: false, reason: 'invalid node title' };
+  }
+  const instructions = decodeManifestInstructions(raw.instructions, source);
+  if (!instructions.ok) return instructions;
+  const hasTaskType = Object.prototype.hasOwnProperty.call(raw, 'taskType');
+  const hasScript = Object.prototype.hasOwnProperty.call(raw, 'script');
+  if (hasTaskType === hasScript) return { ok: false, reason: 'node requires exactly one of taskType or script' };
+  const decodedOutcome = raw.outcome === undefined ? undefined : decodeOutcome(raw.outcome);
+  if (decodedOutcome && !decodedOutcome.ok) return decodedOutcome;
+  const outcome = decodedOutcome?.value;
+  if (hasTaskType) {
+    if (!isStableId(raw.taskType) || outcome?.kind === 'exit') {
+      return { ok: false, reason: 'agent node requires taskType and optional agent outcome' };
+    }
+    return {
+      ok: true,
+      node: {
+        nodeId: raw.nodeKey,
+        taskType: raw.taskType,
+        ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
+        ...(instructions.instructions ? { instructions: instructions.instructions } : {}),
+        ...(outcome ? { outcome } : {}),
+      },
+    };
+  }
+  const execution = decodeManifestScript(raw.script);
+  if (!execution || outcome?.kind !== 'exit') {
+    return { ok: false, reason: 'execute node requires script and complete exit outcome' };
+  }
+  return {
+    ok: true,
+    node: {
+      nodeId: raw.nodeKey,
+      backend: 'script',
+      execution,
+      outcome,
+      ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
+      ...(instructions.instructions ? { instructions: instructions.instructions } : {}),
+    },
+  };
+}
+
+export function decodeWorkflowManifest(
+  raw: unknown,
+  source: 'inline' | 'saved',
+): WorkflowManifestDecodeResult {
+  if (!isRecord(raw) || !onlyKeys(raw, [
+    'schema', 'name', 'description', 'inputs', 'outputs', 'nodes', 'edges',
+  ])) return { ok: false, reason: 'unknown workflow manifest field' };
+  if (raw.schema !== WORKFLOW_SCHEMA) return { ok: false, reason: 'unsupported workflow schema' };
+  if (!isNonEmptyString(raw.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
+  if (
+    raw.description !== undefined &&
+    !isNonEmptyString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
+  ) return { ok: false, reason: 'invalid description' };
+  if (!Array.isArray(raw.nodes) || !Array.isArray(raw.edges) || !Array.isArray(raw.inputs) || !Array.isArray(raw.outputs)) {
+    return { ok: false, reason: 'manifest inputs, outputs, nodes, and edges are required arrays' };
+  }
+  if (raw.nodes.length < 1 || raw.nodes.length > WORKFLOW_GRAPH_MAX_NODES) {
+    return { ok: false, reason: 'workflow requires 1..64 nodes' };
+  }
+  if (
+    raw.edges.length > WORKFLOW_GRAPH_MAX_EDGES ||
+    raw.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX ||
+    raw.outputs.length < 1 ||
+    raw.outputs.length > WORKFLOW_GRAPH_MAX_NODES
+  ) {
+    return { ok: false, reason: 'workflow graph exceeds bounds' };
+  }
+  const nodes: WorkflowNodeSpec[] = [];
+  for (const value of raw.nodes) {
+    const decoded = decodeManifestNode(value, source);
+    if (!decoded.ok) return decoded;
+    nodes.push(decoded.node);
+  }
+  const nodeIds = new Set(nodes.map((node) => node.nodeId));
+  if (nodeIds.size !== nodes.length) return { ok: false, reason: 'duplicate node' };
+
+  const edges: WorkflowDependencyEdge[] = [];
+  for (const value of raw.edges) {
+    if (!isRecord(value) || !onlyKeys(value, ['from', 'to', 'inputRef'])) {
+      return { ok: false, reason: 'invalid edge field' };
+    }
+    if (
+      !isStableId(value.from) || !isStableId(value.to) ||
+      !isStableId(value.inputRef)
+    ) return { ok: false, reason: 'invalid edge specification' };
+    edges.push({
+      fromNodeId: value.from,
+      toNodeId: value.to,
+      inputRef: value.inputRef,
+      expectedArtifactKind: 'next_result',
+    });
+  }
+
+  const inputs: WorkflowInputContract[] = [];
+  for (const value of raw.inputs) {
+    if (!isRecord(value) || !onlyKeys(value, ['name', 'kind', 'to', 'inputRef'])) {
+      return { ok: false, reason: 'invalid workflow input field' };
+    }
+    if (
+      !isStableId(value.name) || !isNonEmptyString(value.kind, MAX_ARTIFACT_KIND_LEN) ||
+      !isStableId(value.to) || !isStableId(value.inputRef)
+    ) return { ok: false, reason: 'invalid workflow input' };
+    inputs.push({
+      name: value.name,
+      semanticKind: value.kind,
+      entryNodeId: value.to,
+      inputRef: value.inputRef,
+    });
+  }
+
+  const outputs: WorkflowOutputContract[] = [];
+  for (const value of raw.outputs) {
+    if (!isRecord(value) || !onlyKeys(value, ['name', 'kind', 'from'])) {
+      return { ok: false, reason: 'invalid workflow output field' };
+    }
+    if (
+      !isStableId(value.name) || !isNonEmptyString(value.kind, MAX_ARTIFACT_KIND_LEN) ||
+      !isStableId(value.from)
+    ) return { ok: false, reason: 'invalid workflow output' };
+    outputs.push({
+      name: value.name,
+      semanticKind: value.kind,
+      terminalNodeId: value.from,
+    });
+  }
+
+  const topology: WorkflowTopology = {
+    kind: 'workflow',
+    ...(typeof raw.description === 'string' ? { description: raw.description } : {}),
+    inputs,
+    outputs,
+    nodes,
+    edges,
+  };
+  const semanticError = validateTopologySemantics(topology);
+  if (semanticError) return { ok: false, reason: semanticError };
+  return {
+    ok: true,
+    name: raw.name,
+    topology,
+    entryContracts: inputs.map((input) => ({
+      entryNodeId: input.entryNodeId,
+      inputRef: input.inputRef,
+      expectedArtifactKind: 'workflow_input',
+    })),
+  };
+}
+
+function encodeInstructions(instructions: WorkflowInstructions): RecordValue {
+  return instructions.kind === 'inline'
+    ? { kind: 'inline', content: instructions.content, sha256: instructions.sha256 }
+    : {
+        kind: 'file',
+        file: instructions.file,
+        ...(instructions.content !== undefined ? { content: instructions.content } : {}),
+        ...(instructions.sha256 !== undefined ? { sha256: instructions.sha256 } : {}),
+      };
+}
+
+function encodeOutcome(outcome: WorkflowNodeOutcome): RecordValue {
+  if (outcome.kind === 'agent') {
+    return {
+      kind: 'agent',
+      requireExplicitDisposition: outcome.requireExplicitDisposition,
+      ...(outcome.next ? { next: { when: outcome.next.when } } : {}),
+      ...(outcome.prev ? {
+        prev: outcome.prev.map((route) => ({
+          when: route.when,
+          targets: [...route.targets],
+          feedback: 'required',
+        })),
+      } : {}),
+      ...(outcome.fail ? { fail: { when: outcome.fail.when } } : {}),
+    };
+  }
+  return {
+    kind: 'exit',
+    next: { when: { exitCode: 0 } },
+    ...(outcome.prev ? {
+      prev: {
+        when: { exitCode: 'nonzero' },
+        targets: [...outcome.prev.targets],
+        feedback: 'stdout',
+      },
+    } : {}),
+    ...(outcome.fail ? { fail: { when: { exitCode: 'nonzero' } } } : {}),
+  };
+}
+
+function encodeNodeJson(node: WorkflowNodeSpec): RecordValue {
+  return {
+    nodeId: node.nodeId,
+    ...(node.title !== undefined ? { title: node.title } : {}),
+    ...(node.instructions !== undefined ? { instructions: encodeInstructions(node.instructions) } : {}),
+    ...(node.role !== undefined ? { role: node.role } : {}),
+    ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
+    ...(node.backend !== undefined ? { backend: node.backend } : {}),
+    ...(node.model !== undefined ? { model: node.model } : {}),
+    ...(node.capabilities !== undefined ? { capabilities: [...node.capabilities] } : {}),
+    ...(node.execution !== undefined ? {
+      execution: {
+        kind: 'script',
+        interpreter: node.execution.interpreter,
+        file: node.execution.file,
+        args: [...node.execution.args],
+        ...(node.execution.source ? { source: node.execution.source } : {}),
+      },
+    } : {}),
+    ...(node.outcome !== undefined ? { outcome: encodeOutcome(node.outcome) } : {}),
+  };
+}
+
+export function encodeTopologyJson(topology: WorkflowTopology): string {
+  return JSON.stringify({
+    kind: 'workflow',
+    ...(topology.description !== undefined ? { description: topology.description } : {}),
+    inputs: topology.inputs.map((input) => ({
+      name: input.name,
+      semanticKind: input.semanticKind,
+      entryNodeId: input.entryNodeId,
+      inputRef: input.inputRef,
+    })),
+    outputs: topology.outputs.map((output) => ({
+      name: output.name,
+      semanticKind: output.semanticKind,
+      terminalNodeId: output.terminalNodeId,
+    })),
+    nodes: topology.nodes.map(encodeNodeJson),
+    edges: topology.edges.map((edge) => ({
+      fromNodeId: edge.fromNodeId,
+      toNodeId: edge.toNodeId,
+      inputRef: edge.inputRef,
+      expectedArtifactKind: edge.expectedArtifactKind ?? 'next_result',
+    })),
+  });
+}
+
+export function fingerprintWorkflowDefinition(input: {
+  definitionId: string;
+  version: number;
+  name: string;
+  topology: WorkflowTopology;
+  entryContracts: readonly WorkflowEntryContract[];
+  policy: WorkflowPolicy;
+  scope: WorkflowDefinition['scope'];
+}): string {
+  return sha256(JSON.stringify({
+    definitionId: input.definitionId,
+    version: input.version,
+    name: input.name,
+    topology: JSON.parse(encodeTopologyJson(input.topology)),
+    entryContracts: input.entryContracts.map((contract) => ({
+      entryNodeId: contract.entryNodeId,
+      inputRef: contract.inputRef,
+      expectedArtifactKind: contract.expectedArtifactKind,
+    })),
+    policy: input.policy,
+    scope: input.scope,
+  }));
+}
+
 const WORKFLOW_ENTRY_AGGREGATE_PREFIX = '[workflow-entry]';
-
-export function fingerprintStartEntryInputs(
-  entryInputs: readonly StartWorkflowEntryInput[],
-): readonly (
-  | {
-      type: 'literal';
-      entryNodeId: string;
-      inputRef: string;
-      kind: string;
-      valueSha256: string;
-    }
-  | {
-      type: 'prior_run_result';
-      entryNodeId: string;
-      inputRef: string;
-      fromRun: string;
-    }
-)[] {
-  return entryInputs.map((entryInput) => (
-    'value' in entryInput
-      ? {
-          type: 'literal',
-          entryNodeId: entryInput.entryNodeId,
-          inputRef: entryInput.inputRef,
-          kind: entryInput.kind,
-          valueSha256: createHash('sha256').update(entryInput.value, 'utf8').digest('hex'),
-        }
-      : {
-          type: 'prior_run_result',
-          entryNodeId: entryInput.entryNodeId,
-          inputRef: entryInput.inputRef,
-          fromRun: entryInput.fromRun,
-        }
-  ));
-}
-
-export function fingerprintStartNodeReuse(
-  reuse: readonly StartWorkflowNodeReuse[],
-): readonly {
-  destinationNodeId: string;
-  sourceRunId: string;
-  sourceNodeId: string;
-  sourceTaskId: string;
-}[] {
-  // All four identities are fingerprinted: two starts binding different source
-  // executions to the same destination node are different starts, so they must not
-  // collide on the start idempotency ledger.
-  return [...reuse]
-    .map(({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId }) => ({
-      destinationNodeId,
-      sourceRunId,
-      sourceNodeId,
-      sourceTaskId,
-    }))
-    .sort((left, right) => left.destinationNodeId.localeCompare(right.destinationNodeId));
-}
 
 export function formatWorkflowEntryAggregate(
   inputs: readonly { inputRef: string; value: string }[],
@@ -242,7 +960,7 @@ export function formatWorkflowEntryAggregate(
 }
 
 export function maximumWorkflowEntryAggregateBytes(
-  contracts: readonly Pick<WorkflowEntryContractV1, 'inputRef'>[],
+  contracts: readonly Pick<WorkflowEntryContract, 'inputRef'>[],
   maxArtifactBytes: number,
 ): number {
   if (contracts.length === 0) {
@@ -262,8 +980,8 @@ export function maximumWorkflowEntryAggregateBytes(
 }
 
 export function deriveDefaultWorkflowPolicy(
-  contracts: readonly Pick<WorkflowEntryContractV1, 'entryNodeId' | 'inputRef'>[],
-): WorkflowPolicyV1 {
+  contracts: readonly Pick<WorkflowEntryContract, 'entryNodeId' | 'inputRef'>[],
+): WorkflowPolicy {
   const groups = new Map<string, Array<{ inputRef: string }>>();
   for (const contract of contracts) {
     const group = groups.get(contract.entryNodeId) ?? [];
@@ -272,545 +990,189 @@ export function deriveDefaultWorkflowPolicy(
   }
   const largestGroup = [...groups.values()].sort((left, right) => right.length - left.length)[0] ?? [];
   let maxArtifactBytes = DEFAULT_WORKFLOW_POLICY.maxArtifactBytes;
-  const aggregateLimit = WORKFLOW_POLICY_BOUNDS.maxAggregateBytes.max;
   while (
     maxArtifactBytes > 1 &&
-    maximumWorkflowEntryAggregateBytes(largestGroup, maxArtifactBytes) > aggregateLimit
+    maximumWorkflowEntryAggregateBytes(largestGroup, maxArtifactBytes) > WORKFLOW_POLICY_BOUNDS.maxAggregateBytes.max
   ) {
     maxArtifactBytes = Math.max(1, Math.floor(maxArtifactBytes / 2));
   }
   const requiredAggregateBytes = maximumWorkflowEntryAggregateBytes(largestGroup, maxArtifactBytes);
   return {
     ...DEFAULT_WORKFLOW_POLICY,
-    maxInputsPerGate: Math.max(
-      DEFAULT_WORKFLOW_POLICY.maxInputsPerGate,
-      largestGroup.length,
-    ),
+    maxInputsPerGate: Math.max(DEFAULT_WORKFLOW_POLICY.maxInputsPerGate, largestGroup.length),
     maxArtifactBytes,
-    maxAggregateBytes: Math.max(
-      DEFAULT_WORKFLOW_POLICY.maxAggregateBytes,
-      requiredAggregateBytes,
-    ),
+    maxAggregateBytes: Math.max(DEFAULT_WORKFLOW_POLICY.maxAggregateBytes, requiredAggregateBytes),
   };
 }
 
-function decodeNode(raw: unknown): WorkflowNodeSpecV1 | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const rec = raw as Record<string, unknown>;
-  if (!isNonEmptyString(rec.nodeId, MAX_ID_LEN)) return undefined;
-  if (
-    rec.label !== undefined &&
-    !isNonEmptyString(rec.label, WORKFLOW_NODE_LABEL_MAX_LENGTH)
-  ) return undefined;
-  if (rec.role !== undefined && rec.role !== 'coordinator' && rec.role !== 'worker') {
-    return undefined;
+function decodePolicy(raw: unknown): { ok: true; policy: WorkflowPolicy } | { ok: false; reason: string } {
+  if (!isRecord(raw)) return { ok: false, reason: 'policy must be an object' };
+  const numericKeys = Object.keys(WORKFLOW_POLICY_BOUNDS) as Array<keyof typeof WORKFLOW_POLICY_BOUNDS>;
+  if (!onlyKeys(raw, [...numericKeys, 'failWorkflow'])) {
+    return { ok: false, reason: 'invalid policy field' };
   }
-  for (const key of ['taskType', 'backend', 'model'] as const) {
-    if (rec[key] !== undefined && !isNonEmptyString(rec[key], MAX_ID_LEN)) return undefined;
-  }
-  let capabilities: string[] | undefined;
-  if (rec.capabilities !== undefined) {
-    if (
-      !Array.isArray(rec.capabilities) ||
-      rec.capabilities.length > MAX_CAPABILITIES ||
-      !rec.capabilities.every((value) =>
-        isNonEmptyString(value, MAX_ID_LEN) && TASK_CAPABILITIES.has(value))
-    ) {
-      return undefined;
+  const policy = {} as WorkflowPolicy;
+  for (const key of numericKeys) {
+    const value = raw[key];
+    const bounds = WORKFLOW_POLICY_BOUNDS[key];
+    if (!Number.isSafeInteger(value) || (value as number) < bounds.min || (value as number) > bounds.max) {
+      return { ok: false, reason: `invalid policy ${key}: expected an integer from ${bounds.min} to ${bounds.max}` };
     }
-    capabilities = [...new Set(rec.capabilities as string[])].sort();
-    if (capabilities.length !== rec.capabilities.length) return undefined;
+    (policy as unknown as Record<string, number>)[key] = value as number;
   }
-  let execution: ScriptExecutionSpecV1 | undefined;
-  if (rec.execution !== undefined) {
-    execution = decodeScriptExecution(rec.execution);
-    if (!execution) return undefined;
-    if (
-      rec.backend !== 'script' || rec.model !== undefined || rec.taskType !== undefined ||
-      rec.role === 'coordinator' || (capabilities?.length ?? 0) > 0
-    ) return undefined;
-  } else if (rec.backend === 'script') {
-    return undefined;
-  }
-  const node: WorkflowNodeSpecV1 = { nodeId: rec.nodeId };
-  if (typeof rec.label === 'string') node.label = rec.label;
-  if (rec.role === 'coordinator' || rec.role === 'worker') node.role = rec.role;
-  if (typeof rec.taskType === 'string') node.taskType = rec.taskType;
-  if (typeof rec.backend === 'string') node.backend = rec.backend;
-  if (typeof rec.model === 'string') node.model = rec.model;
-  if (capabilities !== undefined) node.capabilities = capabilities;
-  if (execution !== undefined) node.execution = execution;
-  // Reject unknown keys so foreign payloads cannot smuggle repository identities.
-  for (const key of Object.keys(rec)) {
-    if (
-      key !== 'nodeId' && key !== 'label' && key !== 'role' && key !== 'taskType' &&
-      key !== 'backend' && key !== 'model' && key !== 'capabilities' && key !== 'execution'
-    ) return undefined;
-  }
-  return node;
-}
-
-function encodeNodeJson(node: WorkflowNodeSpecV1): Record<string, unknown> {
-  const nodeJson: Record<string, unknown> = { nodeId: node.nodeId };
-  if (node.label !== undefined) nodeJson.label = node.label;
-  if (node.role !== undefined) nodeJson.role = node.role;
-  if (node.taskType !== undefined) nodeJson.taskType = node.taskType;
-  if (node.backend !== undefined) nodeJson.backend = node.backend;
-  if (node.model !== undefined) nodeJson.model = node.model;
-  if (node.capabilities !== undefined) nodeJson.capabilities = [...node.capabilities];
-  if (node.execution !== undefined) {
-    nodeJson.execution = {
-      kind: 'script',
-      interpreter: node.execution.interpreter,
-      file: node.execution.file,
-      args: [...node.execution.args],
-      onFailure: node.execution.onFailure,
-      ...(node.execution.source !== undefined ? { source: node.execution.source } : {}),
-    };
-  }
-  return nodeJson;
-}
-
-/**
- * Validate and normalize S01 one-node topology.
- * Rejects multi-node graphs, missing entry, mismatched entry, empty ids, foreign keys.
- */
-export function decodeOneNodeTopology(
-  raw: unknown,
-): { ok: true; topology: OneNodeTopologyV1 } | { ok: false; reason: string } {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, reason: 'topology must be an object' };
-  }
-  const rec = raw as Record<string, unknown>;
-  if (rec.kind !== 'one_node_v1') {
-    return { ok: false, reason: 'unsupported topology kind' };
-  }
-  if (!Array.isArray(rec.nodes) || rec.nodes.length !== 1) {
-    return { ok: false, reason: 'one_node_v1 requires exactly one node' };
-  }
-  const node = decodeNode(rec.nodes[0]);
-  if (!node) {
-    return { ok: false, reason: 'invalid node specification' };
-  }
-  if (!isNonEmptyString(rec.entryNodeId, MAX_ID_LEN)) {
-    return { ok: false, reason: 'entryNodeId required' };
-  }
-  if (rec.entryNodeId !== node.nodeId) {
-    return { ok: false, reason: 'entryNodeId must match the sole node' };
-  }
-  // Reject unknown topology keys (edges/gates/routes arrive on graph_v1).
-  for (const key of Object.keys(rec)) {
-    if (key !== 'kind' && key !== 'nodes' && key !== 'entryNodeId') {
-      return { ok: false, reason: `unsupported topology field: ${key}` };
-    }
-  }
-  const topology: OneNodeTopologyV1 = {
-    kind: 'one_node_v1',
-    nodes: [node],
-    entryNodeId: rec.entryNodeId,
-  };
-  return { ok: true, topology };
-}
-
-function decodeEdge(raw: unknown): WorkflowDependencyEdgeV1 | undefined {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
-  const rec = raw as Record<string, unknown>;
-  if (!isNonEmptyString(rec.fromNodeId, MAX_ID_LEN)) return undefined;
-  if (!isNonEmptyString(rec.toNodeId, MAX_ID_LEN)) return undefined;
-  // Empty inputRef is a missing route-to-gate; non-string is invalid.
-  if (typeof rec.inputRef !== 'string') return undefined;
-  if (
-    rec.inputRef.length === 0 ||
-    rec.inputRef.length > WORKFLOW_INPUT_REF_MAX_LENGTH
-  ) return undefined;
-  if (
-    rec.expectedArtifactKind !== undefined &&
-    !isNonEmptyString(rec.expectedArtifactKind, MAX_ARTIFACT_KIND_LEN)
-  ) return undefined;
-  for (const key of Object.keys(rec)) {
-    if (
-      key !== 'fromNodeId' && key !== 'toNodeId' && key !== 'inputRef' &&
-      key !== 'expectedArtifactKind'
-    ) return undefined;
-  }
-  return {
-    fromNodeId: rec.fromNodeId,
-    toNodeId: rec.toNodeId,
-    inputRef: rec.inputRef,
-    ...(typeof rec.expectedArtifactKind === 'string'
-      ? { expectedArtifactKind: rec.expectedArtifactKind }
-      : {}),
-  };
-}
-
-function hasCycle(nodeIds: readonly string[], edges: readonly WorkflowDependencyEdgeV1[]): boolean {
-  const outgoing = new Map<string, string[]>();
-  for (const id of nodeIds) outgoing.set(id, []);
-  for (const e of edges) {
-    outgoing.get(e.fromNodeId)?.push(e.toNodeId);
-  }
-  const visiting = new Set<string>();
-  const visited = new Set<string>();
-  const dfs = (id: string): boolean => {
-    if (visiting.has(id)) return true;
-    if (visited.has(id)) return false;
-    visiting.add(id);
-    for (const next of outgoing.get(id) ?? []) {
-      if (dfs(next)) return true;
-    }
-    visiting.delete(id);
-    visited.add(id);
-    return false;
-  };
-  for (const id of nodeIds) {
-    if (dfs(id)) return true;
-  }
-  return false;
-}
-
-/**
- * Validate and normalize multi-node graph_v1 topology.
- * Fail closed on fan-out, cycles, duplicate per-consumer inputRef, missing route-to-gate,
- * and zero terminals. Multiple terminal sinks are valid and return their reports as
- * one aggregate result to the caller.
- */
-export function decodeGraphTopology(
-  raw: unknown,
-): { ok: true; topology: GraphTopologyV1 } | { ok: false; reason: string } {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, reason: 'topology must be an object' };
-  }
-  const rec = raw as Record<string, unknown>;
-  if (rec.kind !== 'graph_v1') {
-    return { ok: false, reason: 'unsupported topology kind' };
-  }
-  for (const key of Object.keys(rec)) {
-    if (key !== 'kind' && key !== 'nodes' && key !== 'edges') {
-      return { ok: false, reason: `unsupported topology field: ${key}` };
-    }
-  }
-  if (
-    !Array.isArray(rec.nodes) ||
-    rec.nodes.length < 2 ||
-    rec.nodes.length > WORKFLOW_GRAPH_MAX_NODES
-  ) {
-    return { ok: false, reason: 'graph_v1 requires 2..64 nodes' };
-  }
-  if (!Array.isArray(rec.edges) || rec.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
-    return { ok: false, reason: 'graph_v1 edges must be an array' };
-  }
-
-  const nodes: WorkflowNodeSpecV1[] = [];
-  const nodeIds = new Set<string>();
-  for (const rawNode of rec.nodes) {
-    const node = decodeNode(rawNode);
-    if (!node) return { ok: false, reason: 'invalid node specification' };
-    if (nodeIds.has(node.nodeId)) {
-      return { ok: false, reason: 'duplicate nodeId' };
-    }
-    nodeIds.add(node.nodeId);
-    nodes.push(node);
-  }
-
-  const edges: WorkflowDependencyEdgeV1[] = [];
-  const outDegree = new Map<string, number>();
-  const inDegree = new Map<string, number>();
-  for (const id of nodeIds) {
-    outDegree.set(id, 0);
-    inDegree.set(id, 0);
-  }
-  // Per-consumer inputRef uniqueness: key = `${toNodeId}\0${inputRef}`
-  const consumerInputRefs = new Set<string>();
-
-  for (const rawEdge of rec.edges) {
-    // Distinguish empty inputRef (missing route-to-gate) from other edge malformation.
-    if (rawEdge && typeof rawEdge === 'object' && !Array.isArray(rawEdge)) {
-      const er = rawEdge as Record<string, unknown>;
-      if (er.inputRef === '') {
-        return { ok: false, reason: 'missing route-to-gate: empty inputRef' };
-      }
-    }
-    const edge = decodeEdge(rawEdge);
-    if (!edge) {
-      return { ok: false, reason: 'invalid edge specification' };
-    }
-    if (!nodeIds.has(edge.fromNodeId) || !nodeIds.has(edge.toNodeId)) {
-      return { ok: false, reason: 'edge references unknown node' };
-    }
-    if (edge.fromNodeId === edge.toNodeId) {
-      return { ok: false, reason: 'cycle not allowed: self-loop' };
-    }
-    const refKey = `${edge.toNodeId}\0${edge.inputRef}`;
-    if (consumerInputRefs.has(refKey)) {
-      return { ok: false, reason: 'duplicate inputRef on consumer' };
-    }
-    consumerInputRefs.add(refKey);
-    outDegree.set(edge.fromNodeId, (outDegree.get(edge.fromNodeId) ?? 0) + 1);
-    inDegree.set(edge.toNodeId, (inDegree.get(edge.toNodeId) ?? 0) + 1);
-    edges.push(edge);
-  }
-
-  // Fan-out: at most one outgoing route per node.
-  for (const [nodeId, degree] of outDegree) {
-    if (degree > 1) {
-      return { ok: false, reason: `fan-out not allowed: node ${nodeId}` };
-    }
-  }
-
-  // Cycles before terminal-count so pure loops report cycle (not zero-terminals).
-  if (hasCycle([...nodeIds], edges)) {
-    return { ok: false, reason: 'cycle not allowed' };
-  }
-
-  // At least one terminal sink (out-degree 0). Non-terminals have exactly one outgoing route.
-  const terminals = [...nodeIds].filter((id) => (outDegree.get(id) ?? 0) === 0);
-  if (terminals.length === 0) {
-    return { ok: false, reason: 'at least one terminal required: zero terminals' };
-  }
-  // Non-terminals (everything else) already have out-degree 1 by fan-out check + not terminal.
-
-  // Every non-entry node must be reachable as a consumer (have ≥1 incoming).
-  // Reject isolated nodes even though multiple independent entry/sink paths are valid.
-  for (const id of nodeIds) {
-    const out = outDegree.get(id) ?? 0;
-    const inn = inDegree.get(id) ?? 0;
-    if (out === 0 && inn === 0 && nodeIds.size > 1) {
-      return { ok: false, reason: 'isolated node is not a valid workflow path' };
-    }
-  }
-
-  const topology: GraphTopologyV1 = {
-    kind: 'graph_v1',
-    nodes,
-    edges,
-  };
-  return { ok: true, topology };
-}
-
-/** Decode any supported topology kind. */
-export function decodeTopology(raw: unknown): TopologyDecodeResult {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, reason: 'topology must be an object' };
-  }
-  const kind = (raw as Record<string, unknown>).kind;
-  if (kind === 'one_node_v1') return decodeOneNodeTopology(raw);
-  if (kind === 'graph_v1') return decodeGraphTopology(raw);
-  return { ok: false, reason: 'unsupported topology kind' };
-}
-
-/** Canonical JSON for fingerprinting (stable key order; array order is semantic). */
-export function encodeTopologyJson(topology: WorkflowTopologyV1): string {
-  if (topology.kind === 'one_node_v1') {
-    const node = topology.nodes[0];
-    return JSON.stringify({
-      kind: topology.kind,
-      nodes: [encodeNodeJson(node)],
-      entryNodeId: topology.entryNodeId,
-    });
-  }
-  const nodes = topology.nodes.map(encodeNodeJson);
-  const edges = topology.edges.map((e) => ({
-      fromNodeId: e.fromNodeId,
-      toNodeId: e.toNodeId,
-      inputRef: e.inputRef,
-      expectedArtifactKind: e.expectedArtifactKind ?? 'next_result',
-    }));
-  return JSON.stringify({
-    kind: topology.kind,
-    nodes,
-    edges,
-  });
-}
-
-/**
- * Definition fingerprint over identity + topology only.
- * Does not include createdAt (replay compares content, not wall-clock).
- */
-export function fingerprintWorkflowDefinition(input: {
-  definitionId: string;
-  version: number;
-  name: string;
-  topology: WorkflowTopologyV1;
-  entryContracts: readonly WorkflowEntryContractV1[];
-  policy: WorkflowPolicyV1;
-  scope: WorkflowDefinitionV1['scope'];
-}): string {
-  const payload = JSON.stringify({
-    definitionId: input.definitionId,
-    version: input.version,
-    name: input.name,
-    topology: JSON.parse(encodeTopologyJson(input.topology)),
-    entryContracts: input.entryContracts.map((contract) => ({
-      entryNodeId: contract.entryNodeId,
-      inputRef: contract.inputRef,
-      expectedArtifactKind: contract.expectedArtifactKind,
-    })),
-    policy: input.policy,
-    scope: input.scope,
-  });
-  return createHash('sha256').update(payload, 'utf8').digest('hex');
+  if (typeof raw.failWorkflow !== 'boolean') return { ok: false, reason: 'invalid policy failWorkflow' };
+  policy.failWorkflow = raw.failWorkflow;
+  if (policy.maxConcurrency > policy.maxTaskCount) return { ok: false, reason: 'policy concurrency exceeds task count' };
+  if (policy.maxArtifactBytes > policy.maxAggregateBytes) return { ok: false, reason: 'policy artifact bound exceeds aggregate bound' };
+  return { ok: true, policy };
 }
 
 function decodeEntryContracts(
   raw: unknown,
-  topology: WorkflowTopologyV1,
-  policy: WorkflowPolicyV1,
-): { ok: true; contracts: WorkflowEntryContractV1[] } | { ok: false; reason: string } {
+  topology: WorkflowTopology,
+  policy: WorkflowPolicy,
+): { ok: true; contracts: WorkflowEntryContract[] } | { ok: false; reason: string } {
   if (!Array.isArray(raw)) return { ok: false, reason: 'entryContracts must be an array' };
-  if (raw.length > policy.maxInputsPerGate * topology.nodes.length) {
-    return { ok: false, reason: 'entryContracts exceed policy bounds' };
-  }
-  const incoming = topology.kind === 'graph_v1'
-    ? new Set(topology.edges.map((edge) => edge.toNodeId))
-    : new Set<string>();
-  const entryIds = new Set(
-    topology.kind === 'one_node_v1'
-      ? [topology.entryNodeId]
-      : topology.nodes.map((node) => node.nodeId).filter((nodeId) => !incoming.has(nodeId)),
-  );
-  const perEntryCount = new Map<string, number>();
-  const seen = new Set<string>();
-  const contracts: WorkflowEntryContractV1[] = [];
-  for (const value of raw) {
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+  const expected = topology.inputs.map((input) => ({
+    entryNodeId: input.entryNodeId,
+    inputRef: input.inputRef,
+    expectedArtifactKind: 'workflow_input',
+  }));
+  if (raw.length !== expected.length) return { ok: false, reason: 'entryContracts do not match workflow inputs' };
+  const contracts: WorkflowEntryContract[] = [];
+  const contractCounts = new Map<string, number>();
+  for (let index = 0; index < raw.length; index += 1) {
+    const value = raw[index];
+    if (!isRecord(value) || !onlyKeys(value, ['entryNodeId', 'inputRef', 'expectedArtifactKind'])) {
       return { ok: false, reason: 'invalid entry contract' };
     }
-    const rec = value as Record<string, unknown>;
-    if (Object.keys(rec).some((key) => !['entryNodeId', 'inputRef', 'expectedArtifactKind'].includes(key))) {
-      return { ok: false, reason: 'invalid entry contract' };
-    }
+    const match = expected[index]!;
     if (
-      !isNonEmptyString(rec.entryNodeId, MAX_ID_LEN) || !entryIds.has(rec.entryNodeId) ||
-      !isNonEmptyString(rec.inputRef, WORKFLOW_INPUT_REF_MAX_LENGTH) ||
-      !isNonEmptyString(rec.expectedArtifactKind, MAX_ARTIFACT_KIND_LEN)
-    ) {
-      return { ok: false, reason: 'invalid entry contract' };
-    }
-    const key = `${rec.entryNodeId}\0${rec.inputRef}`;
-    if (seen.has(key)) return { ok: false, reason: 'duplicate entry contract' };
-    seen.add(key);
-    const count = (perEntryCount.get(rec.entryNodeId) ?? 0) + 1;
+      value.entryNodeId !== match.entryNodeId ||
+      value.inputRef !== match.inputRef ||
+      value.expectedArtifactKind !== match.expectedArtifactKind
+    ) return { ok: false, reason: 'entryContracts do not match workflow inputs' };
+    contracts.push(match);
+    const count = (contractCounts.get(match.entryNodeId) ?? 0) + 1;
     if (count > policy.maxInputsPerGate) {
-      return { ok: false, reason: 'entry contract input count exceeds policy' };
+      return {
+        ok: false,
+        reason: `entry contract count exceeds policy maxInputsPerGate for ${JSON.stringify(match.entryNodeId)}`,
+      };
     }
-    perEntryCount.set(rec.entryNodeId, count);
-    contracts.push({
-      entryNodeId: rec.entryNodeId,
-      inputRef: rec.inputRef,
-      expectedArtifactKind: rec.expectedArtifactKind,
-    });
+    contractCounts.set(match.entryNodeId, count);
   }
+  const entryIds = new Set(topology.nodes.map((node) => node.nodeId));
   for (const entryNodeId of entryIds) {
-    const requiredAggregateBytes = maximumWorkflowEntryAggregateBytes(
+    const required = maximumWorkflowEntryAggregateBytes(
       contracts.filter((contract) => contract.entryNodeId === entryNodeId),
       policy.maxArtifactBytes,
     );
-    if (requiredAggregateBytes > policy.maxAggregateBytes) {
+    if (required > policy.maxAggregateBytes) {
       return {
         ok: false,
-        reason: `entry contract aggregate exceeds policy: maxAggregateBytes must be at least ${requiredAggregateBytes} for entry ${JSON.stringify(entryNodeId)} when maxArtifactBytes is ${policy.maxArtifactBytes}`,
+        reason: `entry contract aggregate exceeds policy: maxAggregateBytes must be at least ${required} for entry ${JSON.stringify(entryNodeId)} when maxArtifactBytes is ${policy.maxArtifactBytes}`,
       };
     }
   }
   return { ok: true, contracts };
 }
 
-function decodePolicy(raw: unknown): { ok: true; policy: WorkflowPolicyV1 } | { ok: false; reason: string } {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-    return { ok: false, reason: 'policy must be an object' };
-  }
-  const rec = raw as Record<string, unknown>;
-  const numericKeys = Object.keys(WORKFLOW_POLICY_BOUNDS) as Array<keyof typeof WORKFLOW_POLICY_BOUNDS>;
-  const allowed = new Set<string>([...numericKeys, 'failWorkflow']);
-  if (Object.keys(rec).some((key) => !allowed.has(key))) {
-    return { ok: false, reason: 'invalid policy field' };
-  }
-  const policy = {} as WorkflowPolicyV1;
-  for (const key of numericKeys) {
-    const value = rec[key];
-    const bounds = WORKFLOW_POLICY_BOUNDS[key];
-    if (!Number.isSafeInteger(value) || (value as number) < bounds.min || (value as number) > bounds.max) {
-      return {
-        ok: false,
-        reason: `invalid policy ${key}: expected an integer from ${bounds.min} to ${bounds.max}`,
-      };
-    }
-    (policy as unknown as Record<string, number>)[key] = value as number;
-  }
-  if (typeof rec.failWorkflow !== 'boolean') {
-    return { ok: false, reason: 'invalid policy failWorkflow' };
-  }
-  policy.failWorkflow = rec.failWorkflow;
-  if (policy.maxConcurrency > policy.maxTaskCount) {
-    return { ok: false, reason: 'policy concurrency exceeds task count' };
-  }
-  if (policy.maxArtifactBytes > policy.maxAggregateBytes) {
-    return { ok: false, reason: 'policy artifact bound exceeds aggregate bound' };
-  }
-  return { ok: true, policy };
-}
-
-/** Validate define input and produce a durable definition + fingerprint. */
 export function decodeDefineWorkflowInput(input: DefineWorkflowInput): DefinitionDecodeResult {
-  if (!isNonEmptyString(input.definitionId, MAX_ID_LEN)) {
-    return { ok: false, reason: 'invalid definitionId' };
-  }
-  if (!Number.isInteger(input.version) || input.version < 1) {
-    return { ok: false, reason: 'invalid version' };
-  }
-  if (!isNonEmptyString(input.name, MAX_NAME_LEN)) {
-    return { ok: false, reason: 'invalid name' };
-  }
+  if (!isStableId(input.definitionId)) return { ok: false, reason: 'invalid definitionId' };
+  if (!Number.isInteger(input.version) || input.version < 1) return { ok: false, reason: 'invalid version' };
+  if (!isNonEmptyString(input.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
   if (
     !isNonEmptyString(input.createdAt, 64) ||
     !Number.isFinite(Date.parse(input.createdAt)) ||
     new Date(input.createdAt).toISOString() !== input.createdAt
-  ) {
-    return { ok: false, reason: 'invalid createdAt' };
-  }
-  const decoded = decodeTopology(input.topology);
-  if (!decoded.ok) {
-    return { ok: false, reason: decoded.reason };
-  }
+  ) return { ok: false, reason: 'invalid createdAt' };
+  const decodedTopology = decodeTopology(input.topology);
+  if (!decodedTopology.ok) return decodedTopology;
   const decodedPolicy = decodePolicy(input.policy);
   if (!decodedPolicy.ok) return decodedPolicy;
-  if (decoded.topology.nodes.length > decodedPolicy.policy.maxTaskCount) {
+  if (decodedTopology.topology.nodes.length > decodedPolicy.policy.maxTaskCount) {
     return { ok: false, reason: 'topology exceeds policy task count' };
   }
-  const decodedContracts = decodeEntryContracts(
-    input.entryContracts,
-    decoded.topology,
-    decodedPolicy.policy,
-  );
+  const decodedContracts = decodeEntryContracts(input.entryContracts, decodedTopology.topology, decodedPolicy.policy);
   if (!decodedContracts.ok) return decodedContracts;
   const scope = input.scope ?? { kind: 'workspace' as const };
   if (
     (scope.kind !== 'workspace' && scope.kind !== 'root') ||
-    (scope.kind === 'root' && !isNonEmptyString(scope.ownerRootTaskId, MAX_ID_LEN))
-  ) {
-    return { ok: false, reason: 'invalid scope' };
-  }
-  const definition: WorkflowDefinitionV1 = {
+    (scope.kind === 'root' && !isStableId(scope.ownerRootTaskId))
+  ) return { ok: false, reason: 'invalid scope' };
+  const definition: WorkflowDefinition = {
     definitionId: input.definitionId,
     version: input.version,
     name: input.name,
-    topology: decoded.topology,
+    topology: decodedTopology.topology,
     entryContracts: decodedContracts.contracts,
     policy: decodedPolicy.policy,
     scope,
     createdAt: input.createdAt,
   };
-  const fingerprint = fingerprintWorkflowDefinition(definition);
-  return { ok: true, definition, fingerprint };
+  return { ok: true, definition, fingerprint: fingerprintWorkflowDefinition(definition) };
 }
 
-/** Parse topology_json from a stored row; fail closed on corruption. */
 export function decodeStoredTopologyJson(topologyJson: string): TopologyDecodeResult {
-  let raw: unknown;
   try {
-    raw = JSON.parse(topologyJson);
+    return decodeTopology(JSON.parse(topologyJson));
   } catch {
     return { ok: false, reason: 'corrupt topology_json' };
   }
-  return decodeTopology(raw);
+}
+
+export function fingerprintStartEntryInputs(
+  entryInputs: readonly StartWorkflowEntryInput[],
+): readonly (
+  | {
+      type: 'literal';
+      entryNodeId: string;
+      inputRef: string;
+      kind: string;
+      valueSha256: string;
+    }
+  | {
+      type: 'prior_run_result';
+      entryNodeId: string;
+      inputRef: string;
+      fromRun: string;
+      output: string;
+    }
+)[] {
+  return entryInputs.map((entryInput) => (
+    'value' in entryInput
+      ? {
+          type: 'literal',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          kind: entryInput.kind,
+          valueSha256: sha256(entryInput.value),
+        }
+      : {
+          type: 'prior_run_result',
+          entryNodeId: entryInput.entryNodeId,
+          inputRef: entryInput.inputRef,
+          fromRun: entryInput.fromRun,
+          output: entryInput.output,
+        }
+  ));
+}
+
+export function fingerprintStartNodeReuse(
+  reuse: readonly StartWorkflowNodeReuse[],
+): readonly {
+  destinationNodeId: string;
+  sourceRunId: string;
+  sourceNodeId: string;
+  sourceTaskId: string;
+}[] {
+  return [...reuse]
+    .map(({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId }) => ({
+      destinationNodeId,
+      sourceRunId,
+      sourceNodeId,
+      sourceTaskId,
+    }))
+    .sort((left, right) => left.destinationNodeId.localeCompare(right.destinationNodeId));
 }

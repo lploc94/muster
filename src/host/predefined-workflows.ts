@@ -14,8 +14,8 @@ import type {
   ScriptInterpreter,
   WorkflowCatalogRootKind,
   WorkflowPackageKind,
-  WorkflowPackageSourceV1,
-  WorkflowScriptSourceV1,
+  WorkflowPackageSource,
+  WorkflowScriptSource,
 } from '../task/workflow-types';
 
 export const PREDEFINED_WORKFLOW_CATALOG_DIRECTORY = 'workflows';
@@ -61,13 +61,13 @@ export interface PredefinedWorkflowCatalogOptions {
 
 export interface ResolvedPredefinedWorkflow {
   document: PredefinedWorkflowDocument;
-  source: WorkflowPackageSourceV1;
+  source: WorkflowPackageSource;
   /** Canonical package root, retained only inside the host resolution path. */
   packageRoot: string;
 }
 
 interface CatalogEntry extends PredefinedWorkflowDocument {
-  source: WorkflowPackageSourceV1;
+  source: WorkflowPackageSource;
   packageRoot: string;
   collisionKey: string;
 }
@@ -144,7 +144,7 @@ function normalizedRelativePath(value: string): string | undefined {
   return parts.join('/');
 }
 
-function sourceDescriptorValid(source: WorkflowPackageSourceV1): boolean {
+function sourceDescriptorValid(source: WorkflowPackageSource): boolean {
   const packagePath = normalizedRelativePath(source.packagePath);
   const entryFile = normalizedRelativePath(source.entryFile);
   return source.kind === 'predefined' &&
@@ -438,7 +438,7 @@ async function scanScope(
         entryFile,
         packageSha256,
       );
-      const source: WorkflowPackageSourceV1 = {
+      const source: WorkflowPackageSource = {
         kind: 'predefined',
         scope,
         packageKind: candidate.packageKind,
@@ -566,7 +566,7 @@ export async function resolvePredefinedWorkflow(
 
 function catalogRootForSource(
   options: PredefinedWorkflowCatalogOptions,
-  source: WorkflowPackageSourceV1,
+  source: WorkflowPackageSource,
 ): string | undefined {
   if (source.catalogRootKind === 'custom') {
     return source.scope === 'global' ? options.globalWorkflowFolder : undefined;
@@ -584,7 +584,7 @@ function catalogRootForSource(
 /** Resolve a persisted package source without consulting current shadowing or catalog truncation. */
 export async function resolvePredefinedWorkflowSource(
   options: PredefinedWorkflowCatalogOptions,
-  source: WorkflowPackageSourceV1,
+  source: WorkflowPackageSource,
 ): Promise<ResolvedPredefinedWorkflow | undefined> {
   if (!sourceDescriptorValid(source)) return undefined;
   const catalogRoot = catalogRootForSource(options, source);
@@ -660,7 +660,7 @@ export async function resolvePredefinedWorkflowScript(
   resolved: ResolvedPredefinedWorkflow,
   file: string,
   interpreter: ScriptInterpreter,
-): Promise<WorkflowScriptSourceV1 | undefined> {
+): Promise<WorkflowScriptSource | undefined> {
   const normalized = normalizedRelativePath(file);
   if (!normalized) return undefined;
   const packageInfo = await lstat(resolved.packageRoot).catch(() => undefined);

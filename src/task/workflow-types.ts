@@ -4,10 +4,15 @@
  * Never carries database paths, SQL, credentials, prompt text, or artifact bodies.
  */
 
-/** Supported frozen topology kinds. */
-export type WorkflowTopologyKind = 'one_node_v1' | 'graph_v1';
+/** The single normalized topology kind owned by the workflow engine. */
+export type WorkflowTopologyKind = 'workflow';
 
-export const WORKFLOW_NODE_LABEL_MAX_LENGTH = 120_000;
+export const WORKFLOW_SCHEMA = 'muster.workflow/v2';
+export const WORKFLOW_NAME_MAX_LENGTH = 200;
+export const WORKFLOW_DESCRIPTION_MAX_LENGTH = 4_096;
+export const WORKFLOW_TITLE_MAX_LENGTH = 200;
+export const WORKFLOW_INSTRUCTIONS_MAX_LENGTH = 120_000;
+export const WORKFLOW_OUTCOME_WHEN_MAX_LENGTH = 4_096;
 export const WORKFLOW_RUN_GOAL_MAX_LENGTH = 120_000;
 export const WORKFLOW_INPUT_REF_MAX_LENGTH = 128;
 export const WORKFLOW_GRAPH_MAX_NODES = 64;
@@ -21,13 +26,12 @@ export const WORKFLOW_PACKAGE_PATH_MAX_LENGTH = 1_024;
 export const WORKFLOW_PACKAGE_HASH_LENGTH = 64;
 
 export type ScriptInterpreter = 'node' | 'python' | 'python3';
-export type ScriptOnFailure = 'fail_run' | 'continue';
 
 export type WorkflowPackageKind = 'file' | 'bundle';
 export type WorkflowCatalogRootKind = 'canonical' | 'legacy' | 'custom';
 
 /** Host-authored provenance for a predefined workflow package. */
-export interface WorkflowPackageSourceV1 {
+export interface WorkflowPackageSource {
   kind: 'predefined';
   scope: 'workspace' | 'global';
   packageKind: WorkflowPackageKind;
@@ -41,7 +45,7 @@ export interface WorkflowPackageSourceV1 {
 }
 
 /** Package provenance plus the exact script bytes approved at definition time. */
-export interface WorkflowScriptSourceV1 extends WorkflowPackageSourceV1 {
+export interface WorkflowScriptSource extends WorkflowPackageSource {
   scriptSha256: string;
 }
 
@@ -70,24 +74,84 @@ export function isValidWorkflowScriptFile(
 }
 
 /** Frozen local-process execution contract for one deterministic workflow node. */
-export interface ScriptExecutionSpecV1 {
+export interface ScriptExecutionSpec {
   kind: 'script';
   interpreter: ScriptInterpreter;
   /** Package-relative path, or workspace-relative for an ad-hoc definition. */
   file: string;
   /** Exact argv values after the script path; never parsed as a shell string. */
   args: readonly string[];
-  onFailure: ScriptOnFailure;
   /** Present only when the node was compiled from a predefined package. */
-  source?: WorkflowScriptSourceV1;
+  source?: WorkflowScriptSource;
 }
 
-/** A single ordinary workflow node (entry + only node for one_node_v1). */
-export interface WorkflowNodeSpecV1 {
+export type WorkflowInstructions =
+  | {
+      kind: 'inline';
+      content: string;
+      sha256: string;
+    }
+  | {
+      kind: 'file';
+      file: string;
+      /** Populated when the saved package loader freezes the referenced asset. */
+      content?: string;
+      sha256?: string;
+    };
+
+export interface WorkflowAgentNextRoute {
+  when: string;
+}
+
+export interface WorkflowAgentPrevRoute {
+  when: string;
+  targets: readonly string[];
+  feedback: 'required';
+}
+
+export interface WorkflowAgentFailRoute {
+  when: string;
+}
+
+export interface WorkflowAgentOutcome {
+  kind: 'agent';
+  requireExplicitDisposition: boolean;
+  next?: WorkflowAgentNextRoute;
+  prev?: readonly WorkflowAgentPrevRoute[];
+  fail?: WorkflowAgentFailRoute;
+}
+
+export interface WorkflowExitNextRoute {
+  when: { exitCode: 0 };
+}
+
+export interface WorkflowExitPrevRoute {
+  when: { exitCode: 'nonzero' };
+  targets: readonly string[];
+  feedback: 'stdout';
+}
+
+export interface WorkflowExitFailRoute {
+  when: { exitCode: 'nonzero' };
+}
+
+export interface WorkflowExitOutcome {
+  kind: 'exit';
+  next: WorkflowExitNextRoute;
+  prev?: WorkflowExitPrevRoute;
+  fail?: WorkflowExitFailRoute;
+}
+
+export type WorkflowNodeOutcome = WorkflowAgentOutcome | WorkflowExitOutcome;
+
+/** One normalized workflow node. Author fields and host-frozen routing share one model. */
+export interface WorkflowNodeSpec {
   /** Stable node id within the definition (not a task id). */
   nodeId: string;
-  /** Optional human label; never used as identity. */
-  label?: string;
+  /** Optional short display metadata; never executable task content. */
+  title?: string;
+  /** Optional frozen executable task content. */
+  instructions?: WorkflowInstructions;
   /** Required host role when specified. */
   role?: 'coordinator' | 'worker';
   /** Optional configured task type requirement resolved before run creation. */
@@ -98,56 +162,56 @@ export interface WorkflowNodeSpecV1 {
   model?: string;
   /** Host-issued task capabilities required by this node. */
   capabilities?: readonly string[];
-  /** Absent means the historical ACP-agent execution path. */
-  execution?: ScriptExecutionSpecV1;
-}
-
-/**
- * Canonical one-node topology. Exactly one node; entryNodeId must equal that node.
- * No edges — multi-node routes live on graph_v1.
- */
-export interface OneNodeTopologyV1 {
-  kind: 'one_node_v1';
-  nodes: readonly [WorkflowNodeSpecV1];
-  entryNodeId: string;
+  /** Absent for an agent node. */
+  execution?: ScriptExecutionSpec;
+  outcome?: WorkflowNodeOutcome;
 }
 
 /**
  * Forward dependency edge: producer → consumer gate fill by destination inputRef.
  * inputRefs are unique among edges into the same toNodeId (per-consumer).
  */
-export interface WorkflowDependencyEdgeV1 {
+export interface WorkflowDependencyEdge {
   fromNodeId: string;
   toNodeId: string;
   /** Destination gate input ref frozen on the definition. */
   inputRef: string;
-  /** Exact v1 artifact kind accepted by the destination binding. */
+  /** Exact transport artifact kind accepted by the destination binding. */
   expectedArtifactKind?: string;
 }
 
-/**
- * Multi-node graph topology (S02+).
- * N >= 2 nodes; each node has at most one outgoing edge; one or more terminal sinks;
- * acyclic; per-consumer inputRefs unique. Entry nodes are those with no incoming edges.
- */
-export interface GraphTopologyV1 {
-  kind: 'graph_v1';
-  nodes: readonly WorkflowNodeSpecV1[];
-  edges: readonly WorkflowDependencyEdgeV1[];
+export interface WorkflowInputContract {
+  name: string;
+  semanticKind: string;
+  entryNodeId: string;
+  inputRef: string;
 }
 
-/** Union of supported frozen topologies. */
-export type WorkflowTopologyV1 = OneNodeTopologyV1 | GraphTopologyV1;
+export interface WorkflowOutputContract {
+  name: string;
+  semanticKind: string;
+  terminalNodeId: string;
+}
+
+/** The one normalized topology used for one-node and multi-node workflows alike. */
+export interface WorkflowTopology {
+  kind: 'workflow';
+  description?: string;
+  inputs: readonly WorkflowInputContract[];
+  outputs: readonly WorkflowOutputContract[];
+  nodes: readonly WorkflowNodeSpec[];
+  edges: readonly WorkflowDependencyEdge[];
+}
 
 /** Explicit caller-input contract for one workflow entry. */
-export interface WorkflowEntryContractV1 {
+export interface WorkflowEntryContract {
   entryNodeId: string;
   inputRef: string;
   expectedArtifactKind: string;
 }
 
 /** Frozen, host-bounded workflow policy. */
-export interface WorkflowPolicyV1 {
+export interface WorkflowPolicy {
   maxFeedbackRoundsPerRun: number;
   maxTurnsPerTask: number;
   maxWorkflowTurnsPerRun: number;
@@ -162,13 +226,13 @@ export interface WorkflowPolicyV1 {
 }
 
 /** Immutable workflow definition identity + topology. */
-export interface WorkflowDefinitionV1 {
+export interface WorkflowDefinition {
   definitionId: string;
   version: number;
   name: string;
-  topology: WorkflowTopologyV1;
-  entryContracts: readonly WorkflowEntryContractV1[];
-  policy: WorkflowPolicyV1;
+  topology: WorkflowTopology;
+  entryContracts: readonly WorkflowEntryContract[];
+  policy: WorkflowPolicy;
   scope: { kind: 'workspace' } | { kind: 'root'; ownerRootTaskId: string };
   createdAt: string;
 }
@@ -219,17 +283,30 @@ export interface StartWorkflowEntryLiteralInput {
   value: string;
 }
 
-/** Caller-authorized reference to a prior workflow run's terminal result. */
+/** Caller-authorized reference to one named output of a prior workflow run. */
 export interface StartWorkflowEntryRunReferenceInput {
   entryNodeId: string;
   inputRef: string;
   fromRun: string;
+  output: string;
 }
 
 /** Exactly one literal value or prior-run result reference for an entry contract. */
 export type StartWorkflowEntryInput =
   | StartWorkflowEntryLiteralInput
   | StartWorkflowEntryRunReferenceInput;
+
+/** Public canonical start input retained by name until trusted host resolution. */
+export type WorkflowStartInput =
+  | {
+      name: string;
+      value: string;
+    }
+  | {
+      name: string;
+      fromRun: string;
+      output: string;
+    };
 
 /**
  * Caller-authorized reuse of one exact completed prior execution for one graph node.
@@ -284,13 +361,13 @@ export interface StartWorkflowInput {
   /** Prior-run references for graph nodes reused by this start. */
   reuse?: readonly StartWorkflowNodeReuse[];
   /** Frozen definition contracts loaded by the repository. */
-  entryContracts?: readonly WorkflowEntryContractV1[];
+  entryContracts?: readonly WorkflowEntryContract[];
   /** Caller/root authority included in fingerprint and identity derivation. */
   ownerRootTaskId?: string;
   callerTaskId?: string;
   callerTurnId?: string;
   /** Frozen effective policy copied onto the run. */
-  policy?: WorkflowPolicyV1;
+  policy?: WorkflowPolicy;
 }
 
 /** Per-entry activation identities created when an entry gate is satisfied at start. */

@@ -12,7 +12,7 @@ import {
   TASK_RESULT_MAX_BYTES,
   WORKFLOW_FEEDBACK_MAX_BYTES,
 } from './content-limits';
-import { WORKFLOW_NODE_LABEL_MAX_LENGTH } from './workflow-types';
+import { WORKFLOW_INSTRUCTIONS_MAX_LENGTH } from './workflow-types';
 
 function ctx(actions: string[]): CredentialContext {
   return {
@@ -28,6 +28,47 @@ function ctx(actions: string[]): CredentialContext {
 
 function generatedWorkflowId(hex: string): string {
   return `workflow-${hex.repeat(32)}`;
+}
+
+interface WorkflowManifestFixture extends Record<string, unknown> {
+  schema: string;
+  name: string;
+  inputs: Array<Record<string, unknown>>;
+  outputs: Array<Record<string, unknown>>;
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<Record<string, unknown>>;
+}
+
+function canonicalManifest(): WorkflowManifestFixture {
+  return {
+    schema: 'muster.workflow/v2',
+    name: 'Review flow',
+    inputs: [
+      { name: 'request', kind: 'request', to: 'research', inputRef: 'request' },
+    ],
+    outputs: [
+      { name: 'review', kind: 'review', from: 'review' },
+    ],
+    nodes: [
+      {
+        nodeKey: 'research',
+        taskType: 'research',
+        title: 'Research',
+        instructions: { inline: 'Inspect the request and report evidence.' },
+      },
+      {
+        nodeKey: 'review',
+        taskType: 'review',
+        title: 'Review',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: false,
+          next: { when: 'The review is complete.' },
+        },
+      },
+    ],
+    edges: [{ from: 'research', to: 'review', inputRef: 'research' }],
+  };
 }
 
 describe('coordinator-tools dispatch', () => {
@@ -390,18 +431,10 @@ describe('coordinator-tools dispatch', () => {
     expect(badTopology.ok).toBe(false);
   });
 
-  it('compiles semantic workflow definitions and starts into internal commands', () => {
+  it('parses only canonical inline definitions and public named starts', () => {
     const defined = dispatch(
       'define_workflow',
-      {
-        name: 'Review flow',
-        nodes: [
-          { nodeKey: 'research', taskType: 'research' },
-          { nodeKey: 'review', taskType: 'review' },
-        ],
-        edges: [{ from: 'research', to: 'review', as: 'research' }],
-        inputs: [{ to: 'research', name: 'request' }],
-      },
+      { manifest: canonicalManifest() },
       ctx(['define_workflow']),
     );
     expect(defined).toMatchObject({
@@ -411,10 +444,19 @@ describe('coordinator-tools dispatch', () => {
         definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
         name: 'Review flow',
         topology: {
-          kind: 'graph_v1',
+          kind: 'workflow',
           nodes: [
-            { nodeId: 'research', taskType: 'research' },
-            { nodeId: 'review', taskType: 'review' },
+            {
+              nodeId: 'research',
+              taskType: 'research',
+              title: 'Research',
+              instructions: {
+                kind: 'inline',
+                content: 'Inspect the request and report evidence.',
+                sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+              },
+            },
+            { nodeId: 'review', taskType: 'review', title: 'Review' },
           ],
           edges: [{
             fromNodeId: 'research',
@@ -444,7 +486,7 @@ describe('coordinator-tools dispatch', () => {
       {
         workflow: workflowRef,
         goal: 'Review the subsystem',
-        inputs: [{ node: 'research', input: 'request', value: 'Inspect routing' }],
+        inputs: [{ name: 'request', value: 'Inspect routing' }],
       },
       ctx(['start_workflow']),
     );
@@ -457,35 +499,114 @@ describe('coordinator-tools dispatch', () => {
           : 'invalid',
         version: 3,
         goal: 'Review the subsystem',
-        entryInputs: [{
-          entryNodeId: 'research',
-          inputRef: 'request',
-          kind: 'workflow_input',
-          value: 'Inspect routing',
-        }],
+        inputs: [{ name: 'request', value: 'Inspect routing' }],
+      },
+    });
+
+    const fromRun = dispatch(
+      'start_workflow',
+      {
+        workflow: workflowRef,
+        inputs: [{ name: 'request', fromRun: 'run-prior', output: 'verifiedPlan' }],
+      },
+      ctx(['start_workflow']),
+    );
+    expect(fromRun).toMatchObject({
+      ok: true,
+      command: {
+        kind: 'start_workflow',
+        inputs: [{ name: 'request', fromRun: 'run-prior', output: 'verifiedPlan' }],
       },
     });
   });
 
-  it('compiles mixed agent and script nodes without exposing internal routing fields', () => {
+  it('rejects removed, nested unknown, and engine-owned workflow authoring fields', () => {
+    const invalidDefinitions: Array<Record<string, unknown>> = [];
+
+    const label = canonicalManifest();
+    label.nodes[0] = { ...label.nodes[0], label: 'removed' };
+    invalidDefinitions.push({ manifest: label });
+
+    const edgeAs = canonicalManifest();
+    edgeAs.edges[0] = { ...edgeAs.edges[0], as: 'removed' };
+    invalidDefinitions.push({ manifest: edgeAs });
+
+    const onFailure = canonicalManifest();
+    onFailure.nodes[0] = {
+      nodeKey: 'research',
+      script: { interpreter: 'node', file: 'scripts/check.js', onFailure: 'continue' },
+      outcome: {
+        kind: 'exit',
+        next: { when: { exitCode: 0 } },
+        fail: { when: { exitCode: 'nonzero' } },
+      },
+    };
+    invalidDefinitions.push({ manifest: onFailure });
+
+    for (const key of ['backend', 'model', 'role', 'capabilities']) {
+      const manifest = canonicalManifest();
+      manifest.nodes[0] = { ...manifest.nodes[0], [key]: key === 'capabilities' ? [] : 'forged' };
+      invalidDefinitions.push({ manifest });
+    }
+    for (const key of ['definitionId', 'version', 'topology', 'entryContracts', 'policy', 'opId']) {
+      invalidDefinitions.push({ manifest: canonicalManifest(), [key]: key === 'version' ? 1 : 'forged' });
+    }
+
+    for (const args of invalidDefinitions) {
+      const result = dispatch('define_workflow', args, ctx(['define_workflow']));
+      expect(result.ok).toBe(false);
+      if (result.ok) continue;
+      if (Object.keys(args).length === 1) {
+        expect(result.toolError).toMatch(/^invalid workflow manifest: /);
+      } else {
+        expect(result.toolError).toBe('invalid define_workflow arguments');
+      }
+    }
+  });
+
+  it('rejects coordinate, mixed-source, duplicate, and artifact-bearing start inputs', () => {
+    const workflow = `${generatedWorkflowId('c')}@1`;
+    const invalidInputs: unknown[] = [
+      [{ node: 'research', input: 'request', value: 'legacy' }],
+      [{ name: 'request', value: 'x', fromRun: 'run', output: 'report' }],
+      [{ name: 'request', fromRun: 'run' }],
+      [{ name: 'request', output: 'report' }],
+      [{ name: 'request', value: 'x', artifactId: 'forged' }],
+      [{ name: 'request', value: 'x' }, { name: 'request', value: 'y' }],
+    ];
+    for (const inputs of invalidInputs) {
+      expect(dispatch(
+        'start_workflow',
+        { workflow, inputs },
+        ctx(['start_workflow']),
+      )).toEqual({ ok: false, toolError: 'invalid start_workflow inputs' });
+    }
+    expect(dispatch(
+      'start_workflow',
+      { workflow, inputs: [], policy: {} },
+      ctx(['start_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
+  });
+
+  it('normalizes canonical execute nodes without retaining onFailure', () => {
+    const manifest = canonicalManifest();
+    manifest.nodes[0] = {
+      nodeKey: 'research',
+      title: 'Run deterministic check',
+      script: {
+        interpreter: 'node',
+        file: 'scripts/check.js',
+        args: ['--json'],
+      },
+      outcome: {
+        kind: 'exit',
+        next: { when: { exitCode: 0 } },
+        fail: { when: { exitCode: 'nonzero' } },
+      },
+    };
     const defined = dispatch(
       'define_workflow',
-      {
-        name: 'Deterministic check',
-        nodes: [
-          {
-            nodeKey: 'check',
-            script: {
-              interpreter: 'node',
-              file: 'scripts/check.js',
-              args: ['--json'],
-              onFailure: 'continue',
-            },
-          },
-          { nodeKey: 'review', taskType: 'review', label: 'Review the check result.' },
-        ],
-        edges: [{ from: 'check', to: 'review', as: 'checkResult' }],
-      },
+      { manifest },
       ctx(['define_workflow']),
     );
     expect(defined).toMatchObject({
@@ -495,32 +616,60 @@ describe('coordinator-tools dispatch', () => {
         topology: {
           nodes: [
             {
-              nodeId: 'check',
+              nodeId: 'research',
               backend: 'script',
               execution: {
                 kind: 'script', interpreter: 'node', file: 'scripts/check.js',
-                args: ['--json'], onFailure: 'continue',
+                args: ['--json'],
               },
+              outcome: { kind: 'exit' },
             },
-            { nodeId: 'review', taskType: 'review', label: 'Review the check result.' },
+            { nodeId: 'review', taskType: 'review', title: 'Review' },
           ],
         },
       },
     });
+    if (defined.ok && defined.command.kind === 'define_workflow') {
+      expect(JSON.stringify(defined.command)).not.toContain('onFailure');
+    }
     expect(dispatch(
       'define_workflow',
-      { name: 'bad', nodes: [{ nodeKey: 'both', taskType: 'review', script: { interpreter: 'node', file: 'x.js' } }] },
+      {
+        manifest: {
+          ...canonicalManifest(),
+          nodes: [{
+            nodeKey: 'both',
+            taskType: 'review',
+            script: { interpreter: 'node', file: 'x.js' },
+          }],
+        },
+      },
       ctx(['define_workflow']),
     ).ok).toBe(false);
     expect(dispatch(
       'define_workflow',
-      { name: 'bad type', nodes: [{ nodeKey: 'both', taskType: 42, script: { interpreter: 'node', file: 'x.js' } }] },
+      {
+        manifest: {
+          ...canonicalManifest(),
+          nodes: [{ nodeKey: 'both', taskType: 42 }],
+        },
+      },
       ctx(['define_workflow']),
     ).ok).toBe(false);
     for (const file of ['/tmp/x.js', '../x.js', 'x.py']) {
+      const invalid = canonicalManifest();
+      invalid.nodes[0] = {
+        nodeKey: 'research',
+        script: { interpreter: 'node', file },
+        outcome: {
+          kind: 'exit',
+          next: { when: { exitCode: 0 } },
+          fail: { when: { exitCode: 'nonzero' } },
+        },
+      };
       expect(dispatch(
         'define_workflow',
-        { name: 'bad path', nodes: [{ nodeKey: 'script', script: { interpreter: 'node', file } }] },
+        { manifest: invalid },
         ctx(['define_workflow']),
       ).ok).toBe(false);
     }
@@ -539,29 +688,79 @@ describe('coordinator-tools dispatch', () => {
     ).ok).toBe(false);
   });
 
+  it('accepts exactly one define source: inline manifest or predefinedWorkflowRef', () => {
+    const workflowRef = `pwf_${'b'.repeat(32)}`;
+    expect(dispatch(
+      'define_workflow',
+      { predefinedWorkflowRef: workflowRef },
+      ctx(['define_workflow']),
+    )).toMatchObject({
+      ok: true,
+      command: { kind: 'define_workflow', predefinedWorkflowRef: workflowRef },
+    });
+    expect(dispatch(
+      'define_workflow',
+      { manifest: canonicalManifest(), predefinedWorkflowRef: workflowRef },
+      ctx(['define_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid define_workflow arguments' });
+    expect(dispatch(
+      'define_workflow',
+      {},
+      ctx(['define_workflow']),
+    )).toEqual({ ok: false, toolError: 'invalid define_workflow arguments' });
+  });
+
+  it('returns bounded actionable canonical manifest validation errors', () => {
+    const manifest = canonicalManifest();
+    delete (manifest.nodes[1]!.outcome as Record<string, unknown>).requireExplicitDisposition;
+    expect(dispatch(
+      'define_workflow',
+      { manifest },
+      ctx(['define_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError: expect.stringMatching(/workflow manifest.*requireExplicitDisposition/i),
+    });
+  });
+
   it('generates stable workflow identity from semantic content', () => {
+    const firstManifest = canonicalManifest();
     const first = dispatch(
       'define_workflow',
-      {
-        name: 'Review flow',
-        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review the change.' }],
-      },
+      { manifest: firstManifest },
       ctx(['define_workflow']),
     );
+    const reorderedManifest = {
+      edges: firstManifest.edges.map((edge) => ({
+        inputRef: edge.inputRef,
+        to: edge.to,
+        from: edge.from,
+      })),
+      nodes: firstManifest.nodes.map((node) => ({ ...node })),
+      outputs: firstManifest.outputs.map((output) => ({
+        from: output.from,
+        kind: output.kind,
+        name: output.name,
+      })),
+      inputs: firstManifest.inputs.map((input) => ({
+        inputRef: input.inputRef,
+        to: input.to,
+        kind: input.kind,
+        name: input.name,
+      })),
+      name: firstManifest.name,
+      schema: firstManifest.schema,
+    };
     const reordered = dispatch(
       'define_workflow',
-      {
-        nodes: [{ label: 'Review the change.', taskType: 'verify', nodeKey: 'review' }],
-        name: 'Review flow',
-      },
+      { manifest: reorderedManifest },
       ctx(['define_workflow']),
     );
+    const changedManifest = canonicalManifest();
+    changedManifest.nodes[0]!.instructions = { inline: 'Inspect tests too.' };
     const changed = dispatch(
       'define_workflow',
-      {
-        name: 'Review flow',
-        nodes: [{ nodeKey: 'review', taskType: 'verify', label: 'Review tests too.' }],
-      },
+      { manifest: changedManifest },
       ctx(['define_workflow']),
     );
 
@@ -609,7 +808,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: deepReviewRef,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     );
@@ -617,7 +816,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: deepReviewRef,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     );
@@ -625,7 +824,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: deepReviewRef,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'testReport' }],
+        inputs: [{ name: 'request', fromInput: 'testReport' }],
       },
       ctx(['invoke_child_workflow']),
     );
@@ -633,7 +832,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: quickReviewRef,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     );
@@ -686,7 +885,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: definitionId,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
@@ -694,7 +893,7 @@ describe('coordinator-tools dispatch', () => {
       'invoke_child_workflow',
       {
         workflow: 'caller-chosen@1',
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
@@ -1383,20 +1582,20 @@ describe('workflow_next tool surface', () => {
     });
   });
 
-  it('accepts a workflow node objective at the expanded content budget', () => {
-    const label = 'x'.repeat(WORKFLOW_NODE_LABEL_MAX_LENGTH);
+  it('accepts bounded inline workflow instructions at the exact content limit', () => {
+    const instructions = 'x'.repeat(WORKFLOW_INSTRUCTIONS_MAX_LENGTH);
+    const manifest = canonicalManifest();
+    manifest.nodes[0]!.instructions = { inline: instructions };
     const result = dispatch(
       'define_workflow',
-      {
-        name: 'Large objective',
-        nodes: [{ nodeKey: 'inspect', taskType: 'explore', label }],
-      },
+      { manifest },
       ctx(['define_workflow']),
     );
     expect(result.ok).toBe(true);
     if (result.ok && result.command.kind === 'define_workflow') {
-      expect((result.command.topology as { nodes: Array<{ label: string }> }).nodes[0]?.label)
-        .toBe(label);
+      expect((result.command.topology as {
+        nodes: Array<{ instructions: { content: string } }>;
+      }).nodes[0]?.instructions.content).toBe(instructions);
     }
   });
 
@@ -1540,13 +1739,13 @@ describe('workflow_next tool surface', () => {
     });
   });
 
-  it('maps semantic child workflow bindings without artifact coordinates', () => {
+  it('maps public child input names without destination coordinates', () => {
     const definitionId = generatedWorkflowId('d');
     const result = dispatch(
       'invoke_child_workflow',
       {
         workflow: `${definitionId}@2`,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
       },
       ctx(['invoke_child_workflow']),
     );
@@ -1557,8 +1756,7 @@ describe('workflow_next tool surface', () => {
         childDefinitionId: definitionId,
         childDefinitionVersion: 2,
         semanticEntryBindings: [{
-          childEntryNodeId: 'entry',
-          inputRef: 'request',
+          name: 'request',
           fromInputRef: 'implementation',
         }],
       },
@@ -1572,13 +1770,24 @@ describe('workflow_next tool surface', () => {
       'invoke_child_workflow',
       {
         workflow: `${definitionId}@2`,
-        bindings: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+        inputs: [{ name: 'request', fromInput: 'implementation' }],
         callKey: 'model-supplied-key',
       },
       ctx(['invoke_child_workflow']),
     )).toEqual({
       ok: false,
       toolError: 'invalid invoke_child_workflow arguments',
+    });
+    expect(dispatch(
+      'invoke_child_workflow',
+      {
+        workflow: `${definitionId}@2`,
+        inputs: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
+      },
+      ctx(['invoke_child_workflow']),
+    )).toEqual({
+      ok: false,
+      toolError: 'invalid child workflow input',
     });
   });
 });

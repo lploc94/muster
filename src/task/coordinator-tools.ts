@@ -24,19 +24,12 @@ import type { VerdictCriterionInput, VerdictInput } from './verdict';
 import {
   WORKFLOW_CHILD_BINDINGS_MAX,
   WORKFLOW_ENTRY_CONTRACTS_MAX,
-  WORKFLOW_GRAPH_MAX_EDGES,
-  WORKFLOW_GRAPH_MAX_NODES,
-  WORKFLOW_NODE_LABEL_MAX_LENGTH,
   WORKFLOW_RUN_GOAL_MAX_LENGTH,
-  WORKFLOW_SCRIPT_ARG_MAX_LENGTH,
-  WORKFLOW_SCRIPT_MAX_ARGS,
-  isValidWorkflowScriptFile,
-  type StartWorkflowEntryInput,
-  type StartWorkflowNodeReuse,
-  type WorkflowEntryContractV1,
-  type WorkflowPolicyV1,
-  type WorkflowNodeSpecV1,
+  type WorkflowEntryContract,
+  type WorkflowPolicy,
+  type WorkflowStartInput,
 } from './workflow-types';
+import { decodeWorkflowManifest } from './workflow-codec';
 
 export interface CreateChildSpec {
   goal: string;
@@ -208,8 +201,7 @@ export type ToolCommand =
         artifactRevision: number;
       }[];
       semanticEntryBindings?: readonly {
-        childEntryNodeId: string;
-        inputRef: string;
+        name: string;
         fromInputRef: string;
       }[];
       childIdempotencyKey?: string;
@@ -241,10 +233,14 @@ export type ToolCommand =
       version?: number;
       name: string;
       topology: unknown;
-      entryContracts: readonly WorkflowEntryContractV1[];
-      policy?: WorkflowPolicyV1;
+      entryContracts: readonly WorkflowEntryContract[];
+      policy?: WorkflowPolicy;
+    }
+  | {
+      kind: 'define_workflow';
+      opId: string;
       /** Opaque host-resolved source for a predefined workflow package. */
-      predefinedWorkflowRef?: string;
+      predefinedWorkflowRef: string;
     }
   | {
       kind: 'start_workflow';
@@ -254,8 +250,7 @@ export type ToolCommand =
       startIdempotencyKey: string;
       goal?: string;
       backend?: string;
-      entryInputs: readonly StartWorkflowEntryInput[];
-      reuse: readonly StartWorkflowNodeReuse[];
+      inputs: readonly WorkflowStartInput[];
     };
 
 const MUTATING_TOOLS: ReadonlySet<string> = new Set([
@@ -367,206 +362,55 @@ function parseWorkflowReference(value: unknown): { definitionId: string; version
   return Number.isSafeInteger(version) ? { definitionId, version } : undefined;
 }
 
-function parseSemanticWorkflowDefinition(args: Record<string, unknown>): {
-  name: string;
-  topology: unknown;
-  entryContracts: WorkflowEntryContractV1[];
-  predefinedWorkflowRef?: string;
-} | undefined {
-  const allowed = new Set(['name', 'nodes', 'edges', 'inputs', 'predefinedWorkflowRef']);
-  if (Object.keys(args).some((key) => !allowed.has(key))) return undefined;
-  const name = requireString(args, 'name');
-  if (!name) return undefined;
-  let predefinedWorkflowRef: string | undefined;
-  if (Object.prototype.hasOwnProperty.call(args, 'predefinedWorkflowRef')) {
-    const candidate = args.predefinedWorkflowRef;
-    if (typeof candidate !== 'string' || !/^pwf_[a-f0-9]{32}$/.test(candidate)) return undefined;
-    predefinedWorkflowRef = candidate;
-  }
-  if (
-    !Array.isArray(args.nodes) ||
-    args.nodes.length === 0 ||
-    args.nodes.length > WORKFLOW_GRAPH_MAX_NODES
-  ) {
-    return undefined;
-  }
-
-  const nodes: WorkflowNodeSpecV1[] = [];
-  const nodeIds = new Set<string>();
-  for (const raw of args.nodes) {
-    if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['nodeKey', 'taskType', 'script', 'label'].includes(key))) {
-      return undefined;
+function parseSemanticWorkflowDefinition(value: unknown):
+  | {
+      ok: true;
+      name: string;
+      topology: unknown;
+      entryContracts: WorkflowEntryContract[];
     }
-    const nodeId = requireString(raw, 'nodeKey');
-    const hasTaskType = Object.prototype.hasOwnProperty.call(raw, 'taskType');
-    const hasScript = Object.prototype.hasOwnProperty.call(raw, 'script');
-    const taskType = hasTaskType ? requireString(raw, 'taskType') : undefined;
-    const script = raw.script;
-    if (
-      !nodeId || !isStablePresentationId(nodeId) || nodeIds.has(nodeId) ||
-      hasTaskType === hasScript
-    ) {
-      return undefined;
-    }
-    if (
-      raw.label !== undefined &&
-      (
-        typeof raw.label !== 'string' ||
-        raw.label.length === 0 ||
-        raw.label.length > WORKFLOW_NODE_LABEL_MAX_LENGTH
-      )
-    ) {
-      return undefined;
-    }
-    nodeIds.add(nodeId);
-    const label = typeof raw.label === 'string' ? { label: raw.label } : {};
-    if (hasTaskType) {
-      if (!taskType) return undefined;
-      nodes.push({ nodeId, taskType, ...label });
-      continue;
-    }
-    if (!isRecord(script)) return undefined;
-    if (Object.keys(script).some((key) => !['interpreter', 'file', 'args', 'onFailure'].includes(key))) {
-      return undefined;
-    }
-    const interpreter = script.interpreter;
-    const file = script.file;
-    // Default only when the property is absent: the MCP schema permits an array and an
-    // enum string, so an explicit `null` is a contract violation, not an omission.
-    const args = 'args' in script ? script.args : [];
-    const onFailure = 'onFailure' in script ? script.onFailure : 'fail_run';
-    if (
-      (interpreter !== 'node' && interpreter !== 'python' && interpreter !== 'python3') ||
-      !isValidWorkflowScriptFile(file, interpreter) ||
-      !Array.isArray(args) || args.length > WORKFLOW_SCRIPT_MAX_ARGS ||
-      !args.every((arg) => typeof arg === 'string' && arg.length <= WORKFLOW_SCRIPT_ARG_MAX_LENGTH && !arg.includes('\0')) ||
-      (onFailure !== 'fail_run' && onFailure !== 'continue')
-    ) return undefined;
-    nodes.push({
-      nodeId,
-      backend: 'script',
-      execution: { kind: 'script', interpreter, file, args: [...args] as string[], onFailure },
-      ...label,
-    });
-  }
-
-  const edges: Array<{
-    fromNodeId: string;
-    toNodeId: string;
-    inputRef: string;
-    expectedArtifactKind: 'next_result';
-  }> = [];
-  if (args.edges !== undefined) {
-    if (!Array.isArray(args.edges) || args.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
-      return undefined;
-    }
-    for (const raw of args.edges) {
-      if (!isRecord(raw)) return undefined;
-      if (Object.keys(raw).some((key) => !['from', 'to', 'as'].includes(key))) return undefined;
-      const fromNodeId = requireString(raw, 'from');
-      const toNodeId = requireString(raw, 'to');
-      const inputRef = requireString(raw, 'as');
-      if (
-        !fromNodeId || !toNodeId || !inputRef ||
-        !nodeIds.has(fromNodeId) || !nodeIds.has(toNodeId)
-      ) return undefined;
-      edges.push({ fromNodeId, toNodeId, inputRef, expectedArtifactKind: 'next_result' });
-    }
-  }
-  if ((nodes.length === 1 && edges.length > 0) || (nodes.length > 1 && edges.length === 0)) {
-    return undefined;
-  }
-
-  const entryContracts: WorkflowEntryContractV1[] = [];
-  if (args.inputs !== undefined) {
-    if (
-      !Array.isArray(args.inputs) ||
-      args.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX
-    ) return undefined;
-    const seen = new Set<string>();
-    for (const raw of args.inputs) {
-      if (!isRecord(raw)) return undefined;
-      if (Object.keys(raw).some((key) => !['to', 'name'].includes(key))) return undefined;
-      const entryNodeId = requireString(raw, 'to');
-      const inputRef = requireString(raw, 'name');
-      if (!entryNodeId || !nodeIds.has(entryNodeId) || !inputRef) return undefined;
-      const key = `${entryNodeId}\0${inputRef}`;
-      if (seen.has(key)) return undefined;
-      seen.add(key);
-      entryContracts.push({
-        entryNodeId,
-        inputRef,
-        expectedArtifactKind: 'workflow_input',
-      });
-    }
-  }
-
-  const topology = nodes.length === 1
-    ? { kind: 'one_node_v1', entryNodeId: nodes[0]!.nodeId, nodes }
-    : { kind: 'graph_v1', nodes, edges };
-  return {
-    name,
-    topology,
-    entryContracts,
-    ...(predefinedWorkflowRef !== undefined ? { predefinedWorkflowRef } : {}),
-  };
+  | { ok: false; reason: string } {
+  const decoded = decodeWorkflowManifest(value, 'inline');
+  return decoded.ok
+    ? {
+        ok: true,
+        name: decoded.name,
+        topology: decoded.topology,
+        entryContracts: decoded.entryContracts,
+      }
+    : decoded;
 }
 
-function parseSemanticWorkflowReuse(value: unknown): StartWorkflowNodeReuse[] | undefined {
-  if (value === undefined) return [];
-  if (!Array.isArray(value) || value.length > WORKFLOW_GRAPH_MAX_NODES) return undefined;
-  const reuse: StartWorkflowNodeReuse[] = [];
-  const seen = new Set<string>();
-  for (const raw of value) {
-    if (!isRecord(raw)) return undefined;
-    if (
-      Object.keys(raw).some((key) =>
-        !['node', 'fromRun', 'fromNode', 'fromTask'].includes(key))
-    ) return undefined;
-    const destinationNodeId = requireString(raw, 'node');
-    const sourceRunId = requireString(raw, 'fromRun');
-    // Source is addressed separately from destination: the artifact may come from a
-    // differently-named node, and only `fromTask` pins the exact prior execution.
-    const sourceNodeId = requireString(raw, 'fromNode');
-    const sourceTaskId = requireString(raw, 'fromTask');
-    if (
-      !destinationNodeId || !sourceRunId || !sourceNodeId || !sourceTaskId ||
-      seen.has(destinationNodeId)
-    ) return undefined;
-    seen.add(destinationNodeId);
-    reuse.push({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId });
-  }
-  return reuse;
-}
-
-function parseSemanticWorkflowInputs(value: unknown): StartWorkflowEntryInput[] | undefined {
+function parseSemanticWorkflowInputs(value: unknown): WorkflowStartInput[] | undefined {
   if (value === undefined) return [];
   if (!Array.isArray(value) || value.length > WORKFLOW_ENTRY_CONTRACTS_MAX) return undefined;
-  const inputs: StartWorkflowEntryInput[] = [];
+  const inputs: WorkflowStartInput[] = [];
   const seen = new Set<string>();
   for (const raw of value) {
     if (!isRecord(raw)) return undefined;
-    if (Object.keys(raw).some((key) => !['node', 'input', 'value', 'fromRun'].includes(key))) return undefined;
-    const entryNodeId = requireString(raw, 'node');
-    const inputRef = requireString(raw, 'input');
+    const name = requireString(raw, 'name');
     const hasLiteralValue = Object.prototype.hasOwnProperty.call(raw, 'value');
-    const literalValue = typeof raw.value === 'string' ? raw.value : undefined;
+    const hasPriorValue = Object.prototype.hasOwnProperty.call(raw, 'fromRun') ||
+      Object.prototype.hasOwnProperty.call(raw, 'output');
+    if (!name || !isStablePresentationId(name) || hasLiteralValue === hasPriorValue) return undefined;
+    if (seen.has(name)) return undefined;
+    seen.add(name);
+    if (hasLiteralValue) {
+      if (
+        Object.keys(raw).some((key) => !['name', 'value'].includes(key)) ||
+        typeof raw.value !== 'string' ||
+        !fitsUtf8Bytes(raw.value, TASK_RESULT_MAX_BYTES)
+      ) return undefined;
+      inputs.push({ name, value: raw.value });
+      continue;
+    }
+    if (Object.keys(raw).some((key) => !['name', 'fromRun', 'output'].includes(key))) return undefined;
     const fromRun = requireString(raw, 'fromRun');
+    const output = requireString(raw, 'output');
     if (
-      !entryNodeId ||
-      !inputRef ||
-      hasLiteralValue === Boolean(fromRun) ||
-      (hasLiteralValue && literalValue === undefined)
+      !fromRun || !output || !isStablePresentationId(output)
     ) return undefined;
-    const key = `${entryNodeId}\0${inputRef}`;
-    if (seen.has(key)) return undefined;
-    seen.add(key);
-    inputs.push(
-      hasLiteralValue
-        ? { entryNodeId, inputRef, kind: 'workflow_input', value: literalValue! }
-        : { entryNodeId, inputRef, fromRun: fromRun! },
-    );
+    inputs.push({ name, fromRun, output });
   }
   return inputs;
 }
@@ -1329,41 +1173,41 @@ export function dispatch(
         const semanticReference = parseWorkflowReference(args.workflow);
         if (
           !semanticReference ||
-          Object.keys(args).some((key) => !['workflow', 'bindings'].includes(key))
+          Object.keys(args).some((key) => !['workflow', 'inputs'].includes(key))
         ) return { ok: false, toolError: 'invalid invoke_child_workflow arguments' };
         const childDefinitionId = semanticReference.definitionId;
         const childDefinitionVersion = semanticReference.version;
 
-        if (Array.isArray(args.bindings)) {
+        if (Array.isArray(args.inputs)) {
           if (
-            args.bindings.length === 0 ||
-            args.bindings.length > WORKFLOW_CHILD_BINDINGS_MAX
+            args.inputs.length === 0 ||
+            args.inputs.length > WORKFLOW_CHILD_BINDINGS_MAX
           ) {
-            return { ok: false, toolError: 'bindings must be a non-empty array' };
+            return { ok: false, toolError: 'inputs must be a non-empty array' };
           }
           const semanticEntryBindings: Array<{
-            childEntryNodeId: string;
-            inputRef: string;
+            name: string;
             fromInputRef: string;
           }> = [];
-          const seenRefs = new Set<string>();
-          for (const entry of args.bindings) {
-            if (!isRecord(entry)) return { ok: false, toolError: 'bindings entries must be objects' };
-            if (Object.keys(entry).some((key) => !['toNode', 'input', 'fromInput'].includes(key))) {
-              return { ok: false, toolError: 'invalid child workflow binding' };
+          const seenNames = new Set<string>();
+          for (const entry of args.inputs) {
+            if (!isRecord(entry)) return { ok: false, toolError: 'invalid child workflow input' };
+            if (Object.keys(entry).some((key) => !['name', 'fromInput'].includes(key))) {
+              return { ok: false, toolError: 'invalid child workflow input' };
             }
-            const childEntryNodeId = requireString(entry, 'toNode');
-            const inputRef = requireString(entry, 'input');
+            const name = requireString(entry, 'name');
             const fromInputRef = requireString(entry, 'fromInput');
-            if (!childEntryNodeId || !inputRef || !fromInputRef) {
-              return { ok: false, toolError: 'invalid child workflow binding' };
+            if (
+              !name || !isStablePresentationId(name) ||
+              !fromInputRef || !isStablePresentationId(fromInputRef)
+            ) {
+              return { ok: false, toolError: 'invalid child workflow input' };
             }
-            const bindingKey = `${childEntryNodeId}\0${inputRef}`;
-            if (seenRefs.has(bindingKey)) {
-              return { ok: false, toolError: `duplicate child workflow binding: ${childEntryNodeId}/${inputRef}` };
+            if (seenNames.has(name)) {
+              return { ok: false, toolError: `duplicate child workflow input: ${name}` };
             }
-            seenRefs.add(bindingKey);
-            semanticEntryBindings.push({ childEntryNodeId, inputRef, fromInputRef });
+            seenNames.add(name);
+            semanticEntryBindings.push({ name, fromInputRef });
           }
           return {
             ok: true,
@@ -1377,7 +1221,7 @@ export function dispatch(
             },
           };
         }
-        return { ok: false, toolError: 'bindings must be a non-empty array' };
+        return { ok: false, toolError: 'inputs must be a non-empty array' };
       }
       case 'ask_parent': {
         const questions = parseQuestions(args.questions);
@@ -1477,9 +1321,36 @@ export function dispatch(
         };
       }
       case 'define_workflow': {
-        const semantic = parseSemanticWorkflowDefinition(args);
-        if (semantic) {
-          const definitionId = `workflow-${stableHash(ctx.rootId, canonicalJson(semantic))}`;
+        if (
+          Object.keys(args).length === 1 &&
+          typeof args.predefinedWorkflowRef === 'string' &&
+          /^pwf_[a-f0-9]{32}$/.test(args.predefinedWorkflowRef)
+        ) {
+          return {
+            ok: true,
+            command: {
+              kind: 'define_workflow',
+              opId,
+              predefinedWorkflowRef: args.predefinedWorkflowRef,
+            },
+          };
+        }
+        if (
+          Object.keys(args).length === 1 &&
+          Object.prototype.hasOwnProperty.call(args, 'manifest')
+        ) {
+          const semantic = parseSemanticWorkflowDefinition(args.manifest);
+          if (!semantic.ok) {
+            return {
+              ok: false,
+              toolError: `invalid workflow manifest: ${semantic.reason}`,
+            };
+          }
+          const definitionId = `workflow-${stableHash(ctx.rootId, canonicalJson({
+            name: semantic.name,
+            topology: semantic.topology,
+            entryContracts: semantic.entryContracts,
+          }))}`;
           return {
             ok: true,
             command: {
@@ -1489,9 +1360,6 @@ export function dispatch(
               name: semantic.name,
               topology: semantic.topology,
               entryContracts: semantic.entryContracts,
-              ...(semantic.predefinedWorkflowRef !== undefined
-                ? { predefinedWorkflowRef: semantic.predefinedWorkflowRef }
-                : {}),
             },
           };
         }
@@ -1500,10 +1368,8 @@ export function dispatch(
       case 'start_workflow': {
         const semanticReference = parseWorkflowReference(args.workflow);
         if (semanticReference) {
-          const entryInputs = parseSemanticWorkflowInputs(args.inputs);
-          if (!entryInputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
-          const reuse = parseSemanticWorkflowReuse(args.reuse);
-          if (!reuse) return { ok: false, toolError: 'invalid start_workflow reuse' };
+          const inputs = parseSemanticWorkflowInputs(args.inputs);
+          if (!inputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
           if (
             'goal' in args &&
             (
@@ -1515,7 +1381,7 @@ export function dispatch(
             return { ok: false, toolError: 'invalid start_workflow goal' };
           }
           if (
-            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs', 'reuse'].includes(key))
+            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs'].includes(key))
           ) {
             return { ok: false, toolError: 'invalid start_workflow arguments' };
           }
@@ -1529,8 +1395,7 @@ export function dispatch(
               ...(semanticReference.version !== undefined ? { version: semanticReference.version } : {}),
               startIdempotencyKey,
               ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
-              entryInputs,
-              reuse,
+              inputs,
             },
           };
         }

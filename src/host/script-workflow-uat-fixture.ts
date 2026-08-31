@@ -138,6 +138,7 @@ async function defineAndStart(
 ): Promise<{ definitionId: string; runId: string; entryTaskId: string }> {
   const definition = route('define_workflow', semantic, credential);
   assertQa(definition.kind === 'define_workflow', 'define route returned the wrong command');
+  assertQa('definitionId' in definition, 'inline define route returned no definition identity');
   await invoke(deps, credential, 'define_workflow', definition);
   const start = route('start_workflow', {
     workflow: `${definition.definitionId}@1`,
@@ -323,6 +324,7 @@ export async function runScriptWorkflowUatFixture(
       edges: [{ from: 'produce', to: 'consume', as: 'dep' }],
     }, credential);
     assertQa(dataflowDefinition.kind === 'define_workflow', 'dataflow definition route failed');
+    assertQa('definitionId' in dataflowDefinition, 'inline dataflow definition returned no identity');
     await invoke(deps, credential, 'define_workflow', dataflowDefinition);
     const dataflowStart = route('start_workflow', {
       workflow: `${dataflowDefinition.definitionId}@1`,

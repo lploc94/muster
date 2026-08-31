@@ -81,7 +81,7 @@ import {
 import { selectCommittedSessionId } from './session-select';
 import { sanitizeHandoffFailureMessage } from './sanitization';
 import type { TaskReadPort } from './store-port';
-import type { WorkflowScriptSourceV1 } from './workflow-types';
+import type { WorkflowScriptSource } from './workflow-types';
 import {
   deriveResourceClaimKeys,
   isWorkflowTransactionalCommand,
@@ -317,7 +317,7 @@ function predefinedWorkflowCatalogOptions(
 }
 
 async function resolveFrozenPredefinedWorkflow(
-  source: WorkflowScriptSourceV1,
+  source: WorkflowScriptSource,
   workspaceFolder: string | undefined,
   globalWorkflowFolder: string | undefined,
 ) {
@@ -4020,7 +4020,13 @@ export class TaskEngine {
         taskCwd: draftTask.cwd,
         brief,
         resolvedInputs: pins,
-        meta: { taskId: draftTask.id, goal: draftTask.goal },
+        meta: {
+          taskId: draftTask.id,
+          goal: draftTask.goal,
+          ...(draftTurn.workflowInstructions !== undefined
+            ? { workflowInstructions: draftTurn.workflowInstructions }
+            : {}),
+        },
         ...(taskTypesForHost !== undefined ? { taskTypes: taskTypesForHost } : {}),
         ...(this.getAdvertisedCommands?.(draftTask.backend) !== undefined
           ? { advertisedCommands: this.getAdvertisedCommands!(draftTask.backend) }
@@ -5415,7 +5421,7 @@ export class TaskEngine {
                 seen.add(rootId);
                 rootId = state.tasks[rootId]!.parentId!;
               }
-              const continueRun = scriptProcessResult.exitCode === 0 || scriptExecution.onFailure === 'continue';
+              const continueRun = scriptProcessResult.exitCode === 0;
               const staged = await executeToolCommand(
                 this.graphDeps(),
                 {

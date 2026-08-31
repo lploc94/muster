@@ -7,8 +7,6 @@ import { DEFAULT_ACP_EXECUTOR_ID } from '../backends/executor-registry';
 import {
   getPredefinedWorkflow,
   listPredefinedWorkflows,
-  resolvePredefinedWorkflow,
-  resolvePredefinedWorkflowScript,
 } from '../host/predefined-workflows';
 import type { Backend, RunInput, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
@@ -55,9 +53,10 @@ import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
 import { durableDispositionClaim } from './disposition-claim';
 import type {
-  WorkflowDefinitionV1,
-  WorkflowPolicyV1,
-  WorkflowTopologyV1,
+  StartWorkflowEntryInput,
+  WorkflowDefinition,
+  WorkflowPolicy,
+  WorkflowStartInput,
 } from './workflow-types';
 import { validateDefineWorkflow } from './workflow';
 import {
@@ -361,8 +360,8 @@ const WORKFLOW_TASK_CAPABILITIES = new Set<TaskCapability>([
 function freezeWorkflowDefinitionRouting(
   deps: GraphEngineDeps,
   caller: MusterTask,
-  definition: WorkflowDefinitionV1,
-): { ok: true; definition: WorkflowDefinitionV1 } | { ok: false; error: string } {
+  definition: WorkflowDefinition,
+): { ok: true; definition: WorkflowDefinition } | { ok: false; error: string } {
   const cwd = caller.cwd ?? deps.workspaceFolder;
   const registry = deps.getTaskTypeRegistry
     ? deps.getTaskTypeRegistry(cwd)
@@ -391,9 +390,7 @@ function freezeWorkflowDefinitionRouting(
       capabilities,
     });
   }
-  const topology = definition.topology.kind === 'one_node_v1'
-    ? { ...definition.topology, nodes: [nodes[0]!] as [typeof nodes[number]] }
-    : { ...definition.topology, nodes };
+  const topology = { ...definition.topology, nodes };
   const validated = validateDefineWorkflow({ ...definition, topology });
   return validated.ok
     ? { ok: true, definition: validated.definition }
@@ -410,58 +407,6 @@ function workflowCatalogFolder(
     process.cwd();
 }
 
-async function bindPredefinedWorkflowScripts(
-  deps: GraphEngineDeps,
-  caller: MusterTask,
-  topology: WorkflowTopologyV1,
-  workflowRef: string,
-): Promise<{ ok: true; topology: WorkflowTopologyV1 } | { ok: false; error: string }> {
-  const resolved = await resolvePredefinedWorkflow(
-    {
-      workspaceFolder: workflowCatalogFolder(deps, caller),
-      ...(deps.globalWorkflowFolder !== undefined
-        ? { globalWorkflowFolder: deps.globalWorkflowFolder }
-        : {}),
-    },
-    workflowRef,
-  );
-  if (!resolved) {
-    return workflowHostPolicyError(
-      'predefined_workflow_stale',
-      'predefined workflow is not found or changed; list and retrieve it again',
-    );
-  }
-
-  const nodes = [];
-  for (const node of topology.nodes) {
-    if (node.execution?.kind !== 'script') {
-      nodes.push(node);
-      continue;
-    }
-    const source = await resolvePredefinedWorkflowScript(
-      resolved,
-      node.execution.file,
-      node.execution.interpreter,
-    );
-    if (!source) {
-      return workflowHostPolicyError(
-        'predefined_script_invalid',
-        `predefined workflow script for node ${node.nodeId} is missing or invalid`,
-      );
-    }
-    nodes.push({
-      ...node,
-      execution: { ...node.execution, source },
-    });
-  }
-  return {
-    ok: true,
-    topology: topology.kind === 'one_node_v1'
-      ? { ...topology, nodes: [nodes[0]!] as [typeof nodes[number]] }
-      : { ...topology, nodes },
-  };
-}
-
 function workflowHostPolicyError(code: string, message: string): {
   ok: false;
   error: string;
@@ -469,10 +414,56 @@ function workflowHostPolicyError(code: string, message: string): {
   return { ok: false, error: JSON.stringify({ code, message }) };
 }
 
+function resolvePublicWorkflowStartInputs(
+  definition: WorkflowDefinition,
+  inputs: readonly WorkflowStartInput[],
+): { ok: true; entryInputs: StartWorkflowEntryInput[] } | { ok: false; error: string } {
+  const byName = new Map(inputs.map((input) => [input.name, input] as const));
+  if (byName.size !== inputs.length || byName.size !== definition.topology.inputs.length) {
+    return workflowHostPolicyError(
+      'invalid_workflow_inputs',
+      'workflow inputs must cover every declared public input name exactly once',
+    );
+  }
+  const contractByCoordinate = new Map(
+    definition.entryContracts.map((contract) => [
+      `${contract.entryNodeId}\0${contract.inputRef}`,
+      contract,
+    ] as const),
+  );
+  const entryInputs: StartWorkflowEntryInput[] = [];
+  for (const declared of definition.topology.inputs) {
+    const input = byName.get(declared.name);
+    const contract = contractByCoordinate.get(`${declared.entryNodeId}\0${declared.inputRef}`);
+    if (!input || !contract) {
+      return workflowHostPolicyError(
+        'invalid_workflow_inputs',
+        'workflow inputs must use declared public input names',
+      );
+    }
+    entryInputs.push(
+      'value' in input
+        ? {
+            entryNodeId: declared.entryNodeId,
+            inputRef: declared.inputRef,
+            kind: contract.expectedArtifactKind,
+            value: input.value,
+          }
+        : {
+            entryNodeId: declared.entryNodeId,
+            inputRef: declared.inputRef,
+            fromRun: input.fromRun,
+            output: input.output,
+          },
+    );
+  }
+  return { ok: true, entryInputs };
+}
+
 function validateWorkflowDefinitionHostRequirements(
   deps: GraphEngineDeps,
   caller: MusterTask,
-  definition: WorkflowDefinitionV1,
+  definition: WorkflowDefinition,
   defaultBackend?: string,
 ): { ok: true } | { ok: false; error: string } {
   const host = deps.getHostEnvironment?.();
@@ -558,7 +549,7 @@ async function prepareWorkflowStart(
   },
   limits: ResourceLimits,
 ): Promise<
-  | { ok: true; effectivePolicy: WorkflowPolicyV1 }
+  | { ok: true; effectivePolicy: WorkflowPolicy }
   | { ok: false; error: string }
 > {
   if (deps.isWorkspaceTrusted?.() === false || deps.getHostEnvironment?.()?.trusted === false) {
@@ -622,7 +613,7 @@ async function prepareWorkflowStart(
   );
   if (!requirements.ok) return requirements;
 
-  const effectivePolicy: WorkflowPolicyV1 = {
+  const effectivePolicy: WorkflowPolicy = {
     ...definition.policy,
     maxTurnsPerTask: Math.min(definition.policy.maxTurnsPerTask, limits.maxTurnsPerTask),
     maxDepth: Math.min(definition.policy.maxDepth, availableDepth),
@@ -2703,18 +2694,44 @@ export async function executeToolCommand(
     case 'invoke_child_workflow': {
       // M018 S06: map the public invocation command to a child-workflow NEXT route.
       // Child run + continuation are owned by repository settle (T02).
-      const childDefinitionVersion = command.childDefinitionVersion ?? (
-        await deps.repository.getLatestWorkflowDefinition(command.childDefinitionId, ctx.rootId)
-      )?.version;
-      if (childDefinitionVersion === undefined) {
+      const childDefinition = command.childDefinitionVersion === undefined
+        ? await deps.repository.getLatestWorkflowDefinition(command.childDefinitionId, ctx.rootId)
+        : await deps.repository.getWorkflowDefinition(
+            command.childDefinitionId,
+            command.childDefinitionVersion,
+          );
+      if (!childDefinition) {
         return workflowHostPolicyError('definition_not_found', 'child workflow definition not found');
       }
+      const childDefinitionVersion = childDefinition.version;
       let entryBindings = command.entryBindings;
       if (command.semanticEntryBindings) {
+        const bindingByName = new Map(
+          command.semanticEntryBindings.map((binding) => [binding.name, binding] as const),
+        );
+        if (
+          bindingByName.size !== command.semanticEntryBindings.length ||
+          bindingByName.size !== childDefinition.topology.inputs.length
+        ) {
+          return workflowHostPolicyError(
+            'invalid_child_bindings',
+            'child inputs must cover every declared public input name exactly once',
+          );
+        }
+        const orderedBindings = childDefinition.topology.inputs.map((input) => ({
+          input,
+          binding: bindingByName.get(input.name),
+        }));
+        if (orderedBindings.some(({ binding }) => binding === undefined)) {
+          return workflowHostPolicyError(
+            'invalid_child_bindings',
+            'child inputs must use declared public input names',
+          );
+        }
         const resolved = await deps.repository.resolveWorkflowInputArtifacts(
           ctx.turnId,
           ctx.rootId,
-          command.semanticEntryBindings.map((binding) => binding.fromInputRef),
+          orderedBindings.map(({ binding }) => binding!.fromInputRef),
         );
         if (!resolved) {
           return workflowHostPolicyError(
@@ -2723,11 +2740,11 @@ export async function executeToolCommand(
           );
         }
         const byInputRef = new Map(resolved.map((binding) => [binding.inputRef, binding]));
-        entryBindings = command.semanticEntryBindings.map((binding) => {
-          const source = byInputRef.get(binding.fromInputRef)!;
+        entryBindings = orderedBindings.map(({ input, binding }) => {
+          const source = byInputRef.get(binding!.fromInputRef)!;
           return {
-            childEntryNodeId: binding.childEntryNodeId,
-            inputRef: binding.inputRef,
+            childEntryNodeId: input.entryNodeId,
+            inputRef: input.inputRef,
             artifactId: source.artifactId,
             artifactRevision: source.artifactRevision,
           };
@@ -2912,6 +2929,12 @@ export async function executeToolCommand(
     }
 
     case 'define_workflow': {
+      if ('predefinedWorkflowRef' in command) {
+        return workflowHostPolicyError(
+          'predefined_workflow_manifest_unavailable',
+          'saved workflow packages require a canonical workflow manifest',
+        );
+      }
       const caller = await deps.repository.getTask(ctx.callerTaskId);
       if (!caller || caller.lifecycle !== 'open') {
         return workflowHostPolicyError('caller_not_open', 'caller task is not open');
@@ -2933,18 +2956,7 @@ export async function executeToolCommand(
       if (!validated.ok) {
         return workflowHostPolicyError('invalid_workflow_definition', validated.reason);
       }
-      let definitionToFreeze = validated.definition;
-      if (command.predefinedWorkflowRef !== undefined) {
-        const bound = await bindPredefinedWorkflowScripts(
-          deps,
-          caller,
-          definitionToFreeze.topology,
-          command.predefinedWorkflowRef,
-        );
-        if (!bound.ok) return bound;
-        definitionToFreeze = { ...definitionToFreeze, topology: bound.topology };
-      }
-      const frozen = freezeWorkflowDefinitionRouting(deps, caller, definitionToFreeze);
+      const frozen = freezeWorkflowDefinitionRouting(deps, caller, validated.definition);
       if (!frozen.ok) return frozen;
       let definition = frozen.definition;
       if (
@@ -3050,11 +3062,16 @@ export async function executeToolCommand(
             {
               definitionId: command.definitionId,
               version,
-              ...(command.backend !== undefined ? { backend: command.backend } : {}),
             },
             limits,
           );
       if (!prepared.ok) return prepared;
+      const definition = await deps.repository.getWorkflowDefinition(command.definitionId, version);
+      if (!definition) {
+        return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+      }
+      const resolvedInputs = resolvePublicWorkflowStartInputs(definition, command.inputs);
+      if (!resolvedInputs.ok) return resolvedInputs;
       const suspendCaller =
         deps.onWorkflowStartAccepted !== undefined && deps.liveRuns.has(ctx.turnId);
       const started = await deps.repository.execute({
@@ -3065,9 +3082,8 @@ export async function executeToolCommand(
         startIdempotencyKey: command.startIdempotencyKey,
         createdAt: now,
         ...(command.goal !== undefined ? { goal: command.goal } : {}),
-        ...(command.backend !== undefined ? { backend: command.backend } : {}),
-        entryInputs: command.entryInputs,
-        reuse: command.reuse,
+        entryInputs: resolvedInputs.entryInputs,
+        reuse: [],
         ownerRootTaskId: ctx.rootId,
         callerTaskId: ctx.callerTaskId,
         callerTurnId: ctx.turnId,

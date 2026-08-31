@@ -270,6 +270,8 @@ export function mergeBriefFromCreate(args: {
 export interface CompileTaskPromptMeta {
   taskId?: string;
   goal?: string;
+  /** Frozen workflow-node executable content; display title is intentionally separate. */
+  workflowInstructions?: string;
 }
 
 function formatListSection(
@@ -295,7 +297,12 @@ export function compileBriefBody(
 ): { role: string; objective: string; optional: string[] } {
   const preamble = KIND_PREAMBLES[brief.kind] ?? KIND_PREAMBLES.generic;
   const role = `# Role\n${preamble}`;
-  const objective = `# Objective\n${clampSection(brief.objective || meta.goal || brief.title)}`;
+  const objective = [
+    `# Objective\n${clampSection(brief.objective || meta.goal || brief.title)}`,
+    ...(meta.workflowInstructions
+      ? [`# Workflow instructions\n${clampSection(meta.workflowInstructions)}`]
+      : []),
+  ].join('\n\n');
   const optional: string[] = [];
 
   if (brief.context) {

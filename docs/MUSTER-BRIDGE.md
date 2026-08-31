@@ -13,7 +13,7 @@ The public MCP catalog is exactly:
 | `list_task_types` | Refresh semantic workflow-node profiles and diagnostics |
 | `inspect_workflow_run` | Inspect semantic durable state for an owned workflow run |
 | `get_host_context` | Refresh trusted host, self, profile, and role context |
-| `define_workflow` | Save an engine-identified workflow from semantic nodes and inputs |
+| `define_workflow` | Save an engine-identified canonical workflow manifest or referenced saved workflow |
 | `start_workflow` | Idempotently start a workflow, suspend the caller, and resume it with the terminal result |
 | `workflow_next` | Publish the current node result to its forward route |
 | `workflow_prev` | Request correction from one or all direct producers |
@@ -28,55 +28,133 @@ specialized child-workflow `NEXT` route, or an implicit host-generated `NEXT` fr
 the final assistant message when the model ends without a disposition.
 
 The public boundary is semantic. Models provide definition-local node keys, configured
-`taskType` values, dependency aliases, named inputs, values,
+`taskType` values, named semantic workflow interfaces, dependency `inputRef` values,
 disposition intent, and presentation content. The bridge derives operation slots,
-workflow and presentation identities, immutable versions, topology kinds, entry nodes,
-routing snapshots, capabilities, numeric policy, artifact pins, ownership, and revisions.
+workflow and presentation identities, immutable versions, normalized topology, entry
+nodes, routing snapshots, capabilities, numeric policy, artifact pins, ownership, and
+revisions.
 
-`define_workflow` accepts:
+`define_workflow` accepts exactly one of two closed forms:
+
+- `{ "manifest": { ... } }` for an inline canonical manifest; or
+- `{ "predefinedWorkflowRef": "pwf_<32 hex>" }` for a saved workflow that the host
+  resolves and freezes authoritatively.
+
+An inline manifest uses the literal schema `muster.workflow/v2`:
 
 ```json
 {
-  "name": "Review flow",
-  "nodes": [
-    { "nodeKey": "research", "taskType": "research" },
-    { "nodeKey": "review", "taskType": "review" }
-  ],
-  "edges": [
-    { "from": "research", "to": "review", "as": "research" }
-  ],
-  "inputs": [
-    { "to": "research", "name": "request" }
-  ]
+  "manifest": {
+    "schema": "muster.workflow/v2",
+    "name": "Review flow",
+    "description": "Research and review a request.",
+    "inputs": [
+      { "name": "request", "kind": "request", "to": "research", "inputRef": "request" }
+    ],
+    "outputs": [
+      { "name": "review", "kind": "review", "from": "review" }
+    ],
+    "nodes": [
+      {
+        "nodeKey": "research",
+        "taskType": "research",
+        "title": "Research",
+        "instructions": { "inline": "Investigate the request and report evidence." }
+      },
+      {
+        "nodeKey": "review",
+        "taskType": "review",
+        "title": "Review",
+        "outcome": {
+          "kind": "agent",
+          "requireExplicitDisposition": false,
+          "next": { "when": "The review is complete." },
+          "prev": [
+            {
+              "when": "The research needs correction.",
+              "targets": ["research"],
+              "feedback": "required"
+            }
+          ]
+        }
+      }
+    ],
+    "edges": [
+      { "from": "research", "to": "review", "inputRef": "research" }
+    ]
+  }
 }
 ```
 
+The manifest and every nested object are closed. Unknown fields fail validation. Public
+input `name` and output `name` are stable caller-facing interface names; input `to` and
+`inputRef`, output `from`, node `nodeKey`, and edge `from`/`to`/`inputRef` describe the
+semantic graph. Every input targets an entry node, every output names a terminal node,
+and every terminal is exported exactly once. Duplicate semantic names, duplicate
+consumer slots, cycles, fan-out, isolated nodes, and unexported terminals are rejected.
+
+Agent nodes contain `taskType`; execute nodes contain `script`; the forms are mutually
+exclusive. `title` is optional display metadata only and never becomes executable task
+content. `instructions` is optional and contains exactly one of `inline` or `file`.
+Inline manifests may use only `instructions.inline`. `instructions.file` is accepted
+only while resolving a saved workflow package, where the host freezes the referenced
+content before persistence. Frozen instructions enter a bounded host-owned workflow
+instructions section on normal entry and dependency activations and are not exposed by
+status or graph projections.
+
+An agent `outcome` may be omitted for implicit NEXT. When present it must have
+`kind: "agent"` and an explicit `requireExplicitDisposition` boolean; `false` requires a
+declared `next` route. PREV targets are unique inbound `inputRef` values and require the
+literal `feedback: "required"`. Execute nodes require a closed `kind: "exit"` outcome
+that maps exit code `0` to NEXT and every nonzero exit to exactly PREV with
+`feedback: "stdout"` or FAIL.
+
+The removed authoring fields `label`, edge `as`, start input coordinates, child
+destination coordinates, and `onFailure` are invalid. Authors also cannot provide
+backend, model, role, capabilities, effective policy, durable IDs, artifact coordinates,
+or revisions.
+
 Workflow graphs are converging DAGs. Independent source nodes may run in parallel and
 fan in to a downstream node, but a node cannot fan out to multiple consumers. Cycles
-are rejected, every non-terminal node has exactly one outgoing edge, and branches may
-finish at one or more terminal sink nodes. When there are multiple sinks, their terminal
-reports are combined directly at completion in frozen topology order. Declare workflow
-`inputs` only on source nodes with no incoming edges. For parallel work, use `A -> C` and
-`B -> C` with the shared caller input declared separately on `A` and `B`; do not add an
-intake node that routes to both.
+are rejected and every non-terminal node has exactly one outgoing edge. For parallel
+work, use `A -> C` and `B -> C` with the shared caller input declared separately on `A`
+and `B`; do not add an intake node that routes to both.
 
 The engine returns an immutable generated `workflowRef`, for example
-`workflow-8f4c2a1b3d5e7f90123456789abcdef0@1`. Identity is derived from the owning root and normalized semantic
-content. Repeating identical `name`, `nodes`, `edges`, and `inputs` is idempotent;
-changing that content creates a distinct generated reference. Models must retain the
-returned reference and pass it to `start_workflow` or `invoke_child_workflow` rather
-than inventing a storage key. The complete generated ID and positive `@version` suffix
-are required; bare IDs and caller-named versioned keys are rejected.
+`workflow-8f4c2a1b3d5e7f90123456789abcdef0@1`. Identity is derived from the owning root and
+normalized semantic and frozen content. Object member order is not semantic, while
+declared array order is preserved. Changing an interface name or kind, declared order,
+outcome text, instruction digest, script digest, resolved profile, or effective policy
+changes the fingerprint. Models must retain the returned reference and pass it to
+`start_workflow` or `invoke_child_workflow` rather than inventing a storage key. The
+complete generated ID and positive `@version` suffix are required; bare IDs and
+caller-named versioned keys are rejected.
 
 ```json
 {
   "workflow": "workflow-8f4c2a1b3d5e7f90123456789abcdef0@1",
   "goal": "Review the subsystem",
   "inputs": [
-    { "node": "research", "input": "request", "value": "Inspect routing" }
+    { "name": "request", "value": "Inspect routing" }
   ]
 }
 ```
+
+Each `start_workflow` input uses exactly one of these public named forms:
+
+```json
+{ "name": "request", "value": "Inspect routing" }
+```
+
+```json
+{ "name": "plan", "fromRun": "run-ref", "output": "verifiedPlan" }
+```
+
+The host resolves each public input name through the frozen definition. A prior-run
+binding retains both the source run and selected named output for authoritative atomic
+resolution. Internal entry-node coordinates, artifact fields, task/backend selection,
+and policy are not public start inputs. The run `goal` remains the task objective; node
+instructions augment that objective without replacing it.
 
 ## 2. Removed protocol
 
@@ -129,10 +207,6 @@ drains the same resolver, so a terminal result cannot be lost or resumed twice.
 Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid or
 unauthorized starts return ordinary tool errors and do not suspend the caller. A live
 workflow activation must use `invoke_child_workflow` rather than `start_workflow`.
-Optional node reuse uses exact bindings
-`{node, fromRun, fromNode, fromTask}`. Read `fromRun`, `fromNode`, and `fromTask` from
-an owned completed run's `runRef`, node name, and `taskRef`; unbound predecessors execute
-normally before the bound result crosses the reused node.
 The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
 
@@ -140,6 +214,19 @@ The terminal transaction seals tasks owned by the run to the matching lifecycle
 the current activation's named inputs. The repository resolves each source to an
 authorized immutable artifact revision before staging the child route. Artifact IDs
 and revisions, operation IDs, and idempotency keys are never model inputs.
+
+```json
+{
+  "workflow": "workflow-8f4c2a1b3d5e7f90123456789abcdef0@1",
+  "inputs": [
+    { "name": "request", "fromInput": "research" }
+  ]
+}
+```
+
+`name` is the child definition's public input name. `fromInput` is an `inputRef` on the
+current live parent activation. Child node IDs and destination input coordinates are
+never accepted.
 
 `upsert_presentation` accepts `title`, `markdown`, optional display metadata, and an
 optional `presentationRef` returned by an earlier call when refreshing that document.

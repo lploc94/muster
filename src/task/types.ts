@@ -1,5 +1,5 @@
 import type { ToolFileChange } from '../types';
-import type { ScriptExecutionSpecV1 } from './workflow-types';
+import type { ScriptExecutionSpec } from './workflow-types';
 
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
@@ -289,7 +289,7 @@ export interface MusterTask {
    */
   taskType?: string;
   /** Frozen workflow-node execution mode. Absent for ordinary ACP agent tasks. */
-  execution?: ScriptExecutionSpecV1;
+  execution?: ScriptExecutionSpec;
   /**
    * Backend conversation session for this task. Set after a successful turn
    * (session/new or session/load). Next turns pass it as resumeId — process may
@@ -479,7 +479,7 @@ export type TurnDisposition =
           artifactRevision: number;
         }[];
         childIdempotencyKey?: string;
-        effectivePolicy?: import('./workflow-types').WorkflowPolicyV1;
+        effectivePolicy?: import('./workflow-types').WorkflowPolicy;
       };
     }
   /**
@@ -599,6 +599,8 @@ export interface TaskTurn {
    * Immutable once set; producer reopen must not rewrite these texts.
    */
   resolvedInputs?: ResolvedInputPin[];
+  /** Frozen executable workflow-node instructions for first-turn prompt compilation. */
+  workflowInstructions?: string;
   /** Optional frozen first-prompt text compiled from brief + resolvedInputs. */
   compiledPrompt?: string;
   /** Bounded local-process diagnostic; never used as a downstream artifact body. */
