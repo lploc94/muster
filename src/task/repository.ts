@@ -63,6 +63,8 @@ import {
   deriveWorkflowStartContinuationId,
   deriveWorkflowStartResumeTurnId,
   deriveWorkflowStartResumeMessageId,
+  deriveWorkflowDecisionRepairTurnId,
+  deriveWorkflowDecisionRepairMessageId,
   deriveChildStartIdempotencyKey,
   stableId,
   validateInvokeChildEntryBindings,
@@ -73,6 +75,10 @@ import {
   type WorkflowDefinition,
   type WorkflowPolicy,
 } from './workflow';
+import {
+  formatWorkflowDecisionRepair,
+  WORKFLOW_DECISION_PRIOR_RESPONSE_MAX_BYTES,
+} from './brief';
 import type {
   StartWorkflowEntryInput,
   WorkflowStartInput,
@@ -87,6 +93,7 @@ import type {
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
 } from './workflow-types';
+import { decodeWorkflowNodeOutcome } from './workflow-codec';
 import { durableDispositionClaim, type DurableDispositionClaim } from './disposition-claim';
 import { isMutatingTask, normalizedWritePaths } from './resources';
 import { canPromoteTurn } from './scheduler';
@@ -104,6 +111,8 @@ import {
   PRESENTATION_MARKDOWN_MAX_CHARS,
   TASK_MESSAGE_MAX_CHARS,
   TASK_RESULT_MAX_BYTES,
+  WORKFLOW_FEEDBACK_MAX_BYTES,
+  fitsUtf8Bytes,
   truncateUtf8Bytes,
 } from './content-limits';
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
@@ -309,6 +318,13 @@ export type RepositoryCommand =
       turn: TaskTurn; expectedStatuses: readonly Extract<TurnStatus, 'running' | 'waiting_user'>[];
       expectedDisposition?: TurnDisposition;
       expectedRuntimeEpoch?: number;
+    }
+  | {
+      /** Persist closed invalid-route evidence without occupying the disposition claim. */
+      kind: 'recordWorkflowDecisionInvalidAttempt'; workspaceId: string;
+      turnId: string; taskId: string; expectedRuntimeEpoch: number;
+      attemptedDisposition: 'workflow_next' | 'workflow_prev' | 'workflow_fail';
+      createdAt: string;
     }
   | {
       /** Atomically seal one task and settle/cancel its related turns. */
@@ -618,6 +634,7 @@ export type WorkflowTransactionalCommand = Extract<
     kind:
       | GraphCommand['kind']
       | 'stageDisposition'
+      | 'recordWorkflowDecisionInvalidAttempt'
       | 'applyTaskLifecycle'
       | 'cascadeTaskLifecycle'
       | 'defineWorkflowVersion'
@@ -634,6 +651,7 @@ export function isWorkflowTransactionalCommand(
 ): command is WorkflowTransactionalCommand {
   return isGraphCommand(command) || [
     'stageDisposition',
+    'recordWorkflowDecisionInvalidAttempt',
     'applyTaskLifecycle',
     'cascadeTaskLifecycle',
     'defineWorkflowVersion',
@@ -1039,6 +1057,30 @@ type WorkflowEffectPlan = {
   settlementBudgetPreconditions?: WorkflowBudgetPrecondition[];
   settlementClosurePreconditions?: WorkflowClosurePrecondition[];
   conflictReason?: string;
+};
+
+type WorkflowDecisionPrecondition = {
+  runId: string;
+  activationId: string;
+  activationStatus: 'queued' | 'running';
+  executionTurnId: string;
+  allowExpiredDeadline?: boolean;
+  repair: null | {
+    status: 'open' | 'decided' | 'exhausted';
+    attemptsUsed: number;
+    lastAttemptTurnId: string | null;
+    lastErrorCode: 'decision_missing' | 'decision_invalid' | null;
+    nextRepairTurnId: string | null;
+  };
+};
+
+type WorkflowDecisionSettlementPlan = WorkflowEffectPlan & {
+  mode: 'none' | 'implicit_next' | 'decided' | 'repair' | 'exhausted';
+  precondition?: WorkflowDecisionPrecondition;
+  /** Used only when a planned correction cannot be admitted by frozen budgets. */
+  budgetExhaustionStatements?: SqlStatement[];
+  /** Change-feed entries corresponding only to budget-exhaustion statements. */
+  budgetExhaustionChanges?: ChangeRecord[];
 };
 
 function workflowGraphNodeProjection(input: {
@@ -1849,6 +1891,12 @@ export class SqliteTaskRepository implements TaskRepository {
       has_open_feedback_round: number;
       has_pending_continuation: number;
       has_inherited_feedback_response: number;
+      outcome_json: string | null;
+      repair_status: 'open' | 'decided' | 'exhausted' | null;
+      attempts_used: number | null;
+      last_attempt_turn_id: string | null;
+      last_error_code: 'decision_missing' | 'decision_invalid' | null;
+      next_repair_turn_id: string | null;
     }>(
       `SELECT activation.execution_turn_id,
               activation.run_id,
@@ -1895,11 +1943,26 @@ export class SqliteTaskRepository implements TaskRepository {
                   AND activation.inherited_feedback_round_id IS NOT NULL
                   AND activation.inherited_feedback_target_node_id IS NOT NULL THEN 1
                  ELSE 0
-               END AS has_inherited_feedback_response
+                END AS has_inherited_feedback_response
+               , definition_node.outcome_json
+               , repair.status AS repair_status
+               , repair.attempts_used
+               , repair.last_attempt_turn_id
+               , repair.last_error_code
+               , repair.next_repair_turn_id
          FROM workflow_activations activation
          JOIN workflow_runs run
            ON run.workspace_id = activation.workspace_id
           AND run.run_id = activation.run_id
+         JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = activation.node_id
+         LEFT JOIN workflow_decision_repairs repair
+           ON repair.workspace_id = activation.workspace_id
+          AND repair.run_id = activation.run_id
+          AND repair.activation_id = activation.activation_id
         WHERE activation.workspace_id = ?
           AND activation.execution_turn_id IN (${placeholders(ids.length)})`,
       [this.workspaceId, ...ids],
@@ -1937,6 +2000,26 @@ export class SqliteTaskRepository implements TaskRepository {
       const turn = decodeTurn(row, byTurn.get(row.id) ?? []);
       const activation = activationByTurn.get(row.id);
       const wait = authorityWaitByTurn.get(row.id);
+      const decision = (() => {
+        if (!activation?.outcome_json) return undefined;
+        try {
+          const decoded = decodeWorkflowNodeOutcome(JSON.parse(activation.outcome_json));
+          if (!decoded.ok || decoded.value.kind !== 'agent') return undefined;
+          const used = activation.attempts_used ?? 0;
+          const attempt = activation.next_repair_turn_id === row.id ? used + 1 : Math.max(1, used);
+          if (attempt < 1 || attempt > 3) return undefined;
+          return {
+            outcome: decoded.value,
+            attempt: attempt as 1 | 2 | 3,
+            ...(activation.repair_status ? { repairStatus: activation.repair_status } : {}),
+            invalidEvidence:
+              activation.last_attempt_turn_id === row.id &&
+              activation.last_error_code === 'decision_invalid',
+          };
+        } catch {
+          return undefined;
+        }
+      })();
       return {
         ...turn,
         ...(activation
@@ -1953,6 +2036,7 @@ export class SqliteTaskRepository implements TaskRepository {
               hasOpenFeedbackRound: activation.has_open_feedback_round === 1,
                 hasPendingContinuation: activation.has_pending_continuation === 1,
                 hasInheritedFeedbackResponse: activation.has_inherited_feedback_response === 1,
+                ...(decision ? { decision } : {}),
               },
             }
           : {}),
@@ -3934,6 +4018,37 @@ export class SqliteTaskRepository implements TaskRepository {
     let graphTurnShellGuardIndex: number | null = null;
 
     if (command.dispositionClaim) {
+      const dispositionTurn = command.turns.find(
+        (candidate) => candidate.id === command.dispositionClaim?.turnId,
+      );
+      const disposition = dispositionTurn?.disposition;
+      if (
+        disposition &&
+        (disposition.kind === 'workflow_next' ||
+          disposition.kind === 'workflow_prev' ||
+          disposition.kind === 'workflow_fail')
+      ) {
+        const authorization = await this.authorizeWorkflowAgentDisposition(
+          command.dispositionClaim.turnId,
+          disposition,
+        );
+        if (authorization === 'invalid') {
+          await this.recordWorkflowDecisionInvalidAttempt({
+            kind: 'recordWorkflowDecisionInvalidAttempt',
+            workspaceId: this.workspaceId,
+            turnId: command.dispositionClaim.turnId,
+            taskId: command.dispositionClaim.taskId,
+            expectedRuntimeEpoch: command.dispositionClaim.runtimeEpoch,
+            attemptedDisposition: disposition.kind,
+            createdAt: command.operation?.createdAt ?? new Date().toISOString(),
+          });
+          return {
+            ok: true,
+            changed: false,
+            reason: 'workflow disposition is not declared for the current activation',
+          };
+        }
+      }
       const existing = await this.getDispositionClaim(command.dispositionClaim.turnId);
       if (existing) {
         if (existing.fingerprint !== command.dispositionClaim.fingerprint) {
@@ -4606,6 +4721,8 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.requestRuntimeHandoff(command);
       case 'stageDisposition':
         return this.stageDisposition(command);
+      case 'recordWorkflowDecisionInvalidAttempt':
+        return this.recordWorkflowDecisionInvalidAttempt(command);
       case 'applyTaskLifecycle':
         return this.applyTaskLifecycle(command);
       case 'cascadeTaskLifecycle':
@@ -5592,6 +5709,29 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const disposition = command.turn.disposition;
     if (!disposition) return { ok: true, changed: false, reason: 'disposition is required' };
+    if (
+      disposition.kind === 'workflow_next' ||
+      disposition.kind === 'workflow_prev' ||
+      disposition.kind === 'workflow_fail'
+    ) {
+      const authorization = await this.authorizeWorkflowAgentDisposition(command.turnId, disposition);
+      if (authorization === 'invalid') {
+        await this.recordWorkflowDecisionInvalidAttempt({
+          kind: 'recordWorkflowDecisionInvalidAttempt',
+          workspaceId: this.workspaceId,
+          turnId: command.turnId,
+          taskId: command.turn.taskId,
+          expectedRuntimeEpoch: command.expectedRuntimeEpoch ?? command.turn.runtimeEpoch ?? 1,
+          attemptedDisposition: disposition.kind,
+          createdAt: command.turn.startedAt ?? command.turn.createdAt,
+        });
+        return {
+          ok: true,
+          changed: false,
+          reason: 'workflow disposition is not declared for the current activation',
+        };
+      }
+    }
     const claim = durableDispositionClaim({
       turnId: command.turnId,
       taskId: command.turn.taskId,
@@ -5650,6 +5790,146 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
     return { ok: true, changed: true };
+  }
+
+  private async recordWorkflowDecisionInvalidAttempt(
+    command: Extract<RepositoryCommand, { kind: 'recordWorkflowDecisionInvalidAttempt' }>,
+  ): Promise<RepositoryCommandResult> {
+    const results = await this.writeIfFirstChanged(
+      {
+        sql: `INSERT INTO workflow_decision_repairs (
+                workspace_id, run_id, activation_id, status, attempts_used,
+                last_attempt_turn_id, last_error_code, last_response_message_id,
+                next_repair_turn_id, created_at, updated_at
+              )
+              SELECT activation.workspace_id, activation.run_id, activation.activation_id,
+                     'open', 0, turn.id, 'decision_invalid', NULL, NULL, ?, ?
+                FROM turns turn
+                JOIN tasks task
+                  ON task.workspace_id = turn.workspace_id AND task.id = turn.task_id
+                JOIN workflow_activations activation
+                  ON activation.workspace_id = turn.workspace_id
+                 AND activation.execution_turn_id = turn.id
+                JOIN workflow_runs run
+                  ON run.workspace_id = activation.workspace_id
+                 AND run.run_id = activation.run_id
+                JOIN workflow_definition_nodes definition_node
+                  ON definition_node.workspace_id = run.workspace_id
+                 AND definition_node.definition_id = run.definition_id
+                 AND definition_node.definition_version = run.definition_version
+                 AND definition_node.node_id = activation.node_id
+               WHERE turn.workspace_id = ? AND turn.id = ? AND turn.task_id = ?
+                 AND turn.status IN ('running', 'waiting_user')
+                 AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
+                 AND activation.status IN ('queued', 'running')
+                 AND run.status = 'running'
+                 AND definition_node.outcome_kind = 'agent'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM turn_disposition_claims claim
+                    WHERE claim.workspace_id = turn.workspace_id
+                      AND claim.turn_id = turn.id
+                      AND claim.status = 'staged'
+                 )
+              ON CONFLICT(workspace_id, run_id, activation_id) DO UPDATE SET
+                last_attempt_turn_id = excluded.last_attempt_turn_id,
+                last_error_code = 'decision_invalid',
+                updated_at = excluded.updated_at
+              WHERE workflow_decision_repairs.status = 'open'
+                AND workflow_decision_repairs.attempts_used BETWEEN 0 AND 2
+                AND (
+                  workflow_decision_repairs.next_repair_turn_id IS NULL
+                  OR workflow_decision_repairs.next_repair_turn_id = excluded.last_attempt_turn_id
+                )`,
+        params: [
+          command.createdAt,
+          command.createdAt,
+          this.workspaceId,
+          command.turnId,
+          command.taskId,
+          command.expectedRuntimeEpoch,
+        ],
+      },
+      [],
+      { kind: 'turn', id: command.turnId, taskId: command.taskId, change: 'workflow_decision_invalid' },
+      command.createdAt,
+    );
+    const changed = (results[0]?.changes ?? 0) > 0;
+    return { ok: true, changed, ...(changed ? {} : { reason: 'workflow decision attempt not recordable' }) };
+  }
+
+  private async authorizeWorkflowAgentDisposition(
+    turnId: string,
+    disposition: Extract<TurnDisposition, {
+      kind: 'workflow_next' | 'workflow_prev' | 'workflow_fail';
+    }>,
+  ): Promise<'ordinary' | 'valid' | 'invalid'> {
+    const row = await this.db.get<{
+      definition_id: string;
+      definition_version: number;
+      node_id: string;
+      outcome_json: string | null;
+    }>(
+      `SELECT run.definition_id, run.definition_version, activation.node_id,
+              definition_node.outcome_json
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+         JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = activation.node_id
+        WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
+          AND activation.status IN ('queued', 'running')
+          AND run.status = 'running'
+        LIMIT 1`,
+      [this.workspaceId, turnId],
+    );
+    if (!row) return 'ordinary';
+    if (!row.outcome_json) return 'ordinary';
+
+    let outcome: ReturnType<typeof decodeWorkflowNodeOutcome>;
+    try {
+      outcome = decodeWorkflowNodeOutcome(JSON.parse(row.outcome_json));
+    } catch {
+      return 'invalid';
+    }
+    if (!outcome.ok) return 'invalid';
+    // Execute outcomes are mapped by the trusted host in Phase 6. This phase
+    // restricts only agent-authored workflow dispositions.
+    if (outcome.value.kind !== 'agent') return 'valid';
+    if (disposition.kind === 'workflow_next') {
+      return outcome.value.next ? 'valid' : 'invalid';
+    }
+    if (disposition.kind === 'workflow_fail') {
+      return outcome.value.fail ? 'valid' : 'invalid';
+    }
+    const feedback = disposition.note?.trim();
+    if (
+      !feedback ||
+      feedback !== disposition.note ||
+      !fitsUtf8Bytes(feedback, WORKFLOW_FEEDBACK_MAX_BYTES)
+    ) return 'invalid';
+    const inbound = await this.db.all<{ destination_input_ref: string }>(
+      `SELECT destination_input_ref
+         FROM workflow_definition_edges
+        WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
+          AND destination_node_id = ?
+        ORDER BY ordinal, destination_input_ref`,
+      [this.workspaceId, row.definition_id, row.definition_version, row.node_id],
+    );
+    const inboundRefs = inbound.map((entry) => entry.destination_input_ref);
+    if (inboundRefs.length === 0) return 'invalid';
+    const requested = disposition.targets === 'all' ? inboundRefs : disposition.targets;
+    if (requested.length === 0 || new Set(requested).size !== requested.length) return 'invalid';
+    const requestedSet = new Set(requested);
+    const matchesDeclaredRoute = (outcome.value.prev ?? []).some((route) =>
+      route.targets.length === requestedSet.size &&
+      route.targets.every((target) => requestedSet.has(target)) &&
+      route.targets.every((target) => inboundRefs.includes(target)),
+    );
+    return matchesDeclaredRoute ? 'valid' : 'invalid';
   }
 
   private async getDispositionClaim(turnId: string): Promise<{
@@ -7713,12 +7993,325 @@ export class SqliteTaskRepository implements TaskRepository {
     return row?.task_id;
   }
 
+  private async planWorkflowDecisionSettlement(
+    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
+  ): Promise<WorkflowDecisionSettlementPlan> {
+    const empty = {
+      mode: 'none' as const,
+      statements: [] as SqlStatement[],
+      changes: [] as ChangeRecord[],
+    };
+    if (command.turn.status !== 'succeeded') return empty;
+    const row = await this.db.get<{
+      run_id: string;
+      activation_id: string;
+      activation_status: 'queued' | 'running';
+      primary_turn_id: string;
+      deadline_at: string | null;
+      outcome_json: string | null;
+      repair_status: 'open' | 'decided' | 'exhausted' | null;
+      attempts_used: number | null;
+      last_attempt_turn_id: string | null;
+      last_error_code: 'decision_missing' | 'decision_invalid' | null;
+      next_repair_turn_id: string | null;
+    }>(
+      `SELECT activation.run_id, activation.activation_id,
+              activation.status AS activation_status, activation.primary_turn_id,
+              run.deadline_at, definition_node.outcome_json,
+              repair.status AS repair_status, repair.attempts_used,
+              repair.last_attempt_turn_id, repair.last_error_code,
+              repair.next_repair_turn_id
+         FROM workflow_activations activation
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id
+          AND run.run_id = activation.run_id
+         JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = activation.node_id
+         LEFT JOIN workflow_decision_repairs repair
+           ON repair.workspace_id = activation.workspace_id
+          AND repair.run_id = activation.run_id
+          AND repair.activation_id = activation.activation_id
+        WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
+          AND activation.status IN ('queued', 'running')
+          AND run.status = 'running'
+        LIMIT 1`,
+      [this.workspaceId, command.turn.id],
+    );
+    if (!row || !row.outcome_json) return empty;
+    let decoded: ReturnType<typeof decodeWorkflowNodeOutcome>;
+    try {
+      decoded = decodeWorkflowNodeOutcome(JSON.parse(row.outcome_json));
+    } catch {
+      return { ...empty, conflictReason: 'workflow outcome authority is invalid' };
+    }
+    if (!decoded.ok) return { ...empty, conflictReason: 'workflow outcome authority is invalid' };
+    if (decoded.value.kind !== 'agent') return empty;
+
+    const repair = row.repair_status === null
+      ? null
+      : {
+          status: row.repair_status,
+          attemptsUsed: row.attempts_used ?? 0,
+          lastAttemptTurnId: row.last_attempt_turn_id,
+          lastErrorCode: row.last_error_code,
+          nextRepairTurnId: row.next_repair_turn_id,
+        };
+    const precondition: WorkflowDecisionPrecondition = {
+      runId: row.run_id,
+      activationId: row.activation_id,
+      activationStatus: row.activation_status,
+      executionTurnId: command.turn.id,
+      repair,
+    };
+    if (repair && repair.status !== 'open') {
+      return { ...empty, precondition, conflictReason: `workflow decision is already ${repair.status}` };
+    }
+    let attempt: 1 | 2 | 3;
+    if (!repair) {
+      attempt = 1;
+    } else if (
+      repair.attemptsUsed === 0 &&
+      repair.nextRepairTurnId === null &&
+      (repair.lastAttemptTurnId === null || repair.lastAttemptTurnId === command.turn.id)
+    ) {
+      attempt = 1;
+    } else if (
+      (repair.attemptsUsed === 1 || repair.attemptsUsed === 2) &&
+      repair.nextRepairTurnId === command.turn.id
+    ) {
+      attempt = (repair.attemptsUsed + 1) as 2 | 3;
+    } else {
+      return { ...empty, precondition, conflictReason: 'workflow decision attempt is stale' };
+    }
+
+    const response = await this.db.get<{ id: string; content: string }>(
+      `SELECT id, content FROM messages
+        WHERE workspace_id = ? AND turn_id = ? AND role = 'assistant'
+          AND length(trim(content)) > 0
+        ORDER BY COALESCE(ordering, -9223372036854775808) DESC, created_at DESC, id DESC
+        LIMIT 1`,
+      [this.workspaceId, command.turn.id],
+    );
+    const at = command.turn.finishedAt ?? new Date().toISOString();
+    const responseId = response?.id ?? null;
+    const repairUpsert = (input: {
+      status: 'open' | 'decided' | 'exhausted';
+      attemptsUsed: number;
+      errorCode: 'decision_missing' | 'decision_invalid' | null;
+      nextRepairTurnId: string | null;
+    }): SqlStatement => ({
+      sql: `INSERT INTO workflow_decision_repairs (
+              workspace_id, run_id, activation_id, status, attempts_used,
+              last_attempt_turn_id, last_error_code, last_response_message_id,
+              next_repair_turn_id, created_at, updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(workspace_id, run_id, activation_id) DO UPDATE SET
+              status = excluded.status,
+              attempts_used = excluded.attempts_used,
+              last_attempt_turn_id = excluded.last_attempt_turn_id,
+              last_error_code = excluded.last_error_code,
+              last_response_message_id = excluded.last_response_message_id,
+              next_repair_turn_id = excluded.next_repair_turn_id,
+              updated_at = excluded.updated_at`,
+      params: [
+        this.workspaceId,
+        row.run_id,
+        row.activation_id,
+        input.status,
+        input.attemptsUsed,
+        command.turn.id,
+        input.errorCode,
+        responseId,
+        input.nextRepairTurnId,
+        at,
+        at,
+      ],
+    });
+    const repairChange: ChangeRecord = {
+      kind: 'turn',
+      id: command.turn.id,
+      taskId: command.task.id,
+      change: 'workflow_decision',
+    };
+
+    if (row.deadline_at !== null && row.deadline_at <= at) {
+      const closure = await this.planWorkflowFailClosure({
+        runId: row.run_id,
+        reasonCode: 'run_timeout',
+        at,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+      return {
+        mode: 'exhausted',
+        precondition: { ...precondition, allowExpiredDeadline: true },
+        statements: [
+          repairUpsert({ status: 'exhausted', attemptsUsed: 3, errorCode: 'decision_missing', nextRepairTurnId: null }),
+          ...closure.statements,
+        ],
+        changes: [repairChange, ...closure.changes],
+      };
+    }
+
+    if (command.turn.disposition) {
+      return {
+        mode: 'decided',
+        precondition,
+        statements: [
+          repairUpsert({ status: 'decided', attemptsUsed: attempt, errorCode: null, nextRepairTurnId: null }),
+        ],
+        changes: [repairChange],
+      };
+    }
+    if (!decoded.value.requireExplicitDisposition && repair === null) {
+      return { ...empty, mode: 'implicit_next', precondition };
+    }
+
+    const errorCode: 'decision_missing' | 'decision_invalid' =
+      repair?.lastAttemptTurnId === command.turn.id &&
+      repair.lastErrorCode === 'decision_invalid'
+        ? 'decision_invalid'
+        : 'decision_missing';
+    if (attempt === 3) {
+      const closure = await this.planWorkflowFailClosure({
+        runId: row.run_id,
+        reasonCode: errorCode,
+        at,
+        sourceTaskId: command.task.id,
+        sourceTurnId: command.turn.id,
+      });
+      return {
+        mode: 'exhausted',
+        precondition,
+        statements: [
+          repairUpsert({ status: 'exhausted', attemptsUsed: 3, errorCode, nextRepairTurnId: null }),
+          ...closure.statements,
+        ],
+        changes: [repairChange, ...closure.changes],
+      };
+    }
+
+    const nextAttempt = (attempt + 1) as 2 | 3;
+    const nextTurnId = deriveWorkflowDecisionRepairTurnId(row.activation_id, nextAttempt);
+    const nextMessageId = deriveWorkflowDecisionRepairMessageId(row.activation_id, nextAttempt);
+    const primaryTurn = await this.getTurn(row.primary_turn_id);
+    if (!primaryTurn || primaryTurn.taskId !== command.task.id) {
+      return { ...empty, precondition, conflictReason: 'workflow decision source turn is unavailable' };
+    }
+    const previousResponse = response?.content
+      ? truncateUtf8Bytes(response.content, WORKFLOW_DECISION_PRIOR_RESPONSE_MAX_BYTES).text
+      : undefined;
+    const correction = formatWorkflowDecisionRepair({
+      errorCode,
+      attempt: nextAttempt,
+      ...(previousResponse ? { previousResponse } : {}),
+    });
+    if (correction.length > TASK_MESSAGE_MAX_CHARS) {
+      return { ...empty, precondition, conflictReason: 'workflow decision correction exceeds bounds' };
+    }
+    const nextTurn: TaskTurn = {
+      id: nextTurnId,
+      taskId: command.task.id,
+      sequence: (await this.getMaxTurnSequence(command.task.id)) + 1,
+      trigger: 'engine',
+      status: 'queued',
+      executionEpoch: command.turn.executionEpoch,
+      runtimeEpoch: command.turn.runtimeEpoch,
+      inputs: [...primaryTurn.inputs, { kind: 'message', messageId: nextMessageId }],
+      ...(primaryTurn.resolvedInputs ? { resolvedInputs: primaryTurn.resolvedInputs } : {}),
+      ...(primaryTurn.workflowInstructions !== undefined
+        ? { workflowInstructions: primaryTurn.workflowInstructions }
+        : {}),
+      ...(primaryTurn.compiledPrompt !== undefined ? { compiledPrompt: primaryTurn.compiledPrompt } : {}),
+      createdAt: at,
+    };
+    const nextMessage: TaskMessage = {
+      id: nextMessageId,
+      taskId: command.task.id,
+      turnId: nextTurnId,
+      role: 'system',
+      state: 'assigned',
+      content: correction,
+      createdAt: at,
+    };
+    const budgetExhaustionStatements = [
+      repairUpsert({ status: 'exhausted', attemptsUsed: 3, errorCode, nextRepairTurnId: null }),
+    ];
+    return {
+      mode: 'repair',
+      precondition,
+      statements: [
+        turnStatement(this.workspaceId, nextTurn, false),
+        ...nextTurn.inputs.map((input, ordering) =>
+          turnInputStatement(this.workspaceId, nextTurn.id, ordering, input)),
+        messageStatement(this.workspaceId, nextMessage, false),
+        repairUpsert({ status: 'open', attemptsUsed: attempt, errorCode, nextRepairTurnId: nextTurnId }),
+        {
+          sql: `UPDATE workflow_activations
+                  SET status = 'queued', execution_turn_id = ?, updated_at = ?
+                WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                  AND execution_turn_id = ? AND status = ?`,
+          params: [
+            nextTurnId,
+            at,
+            this.workspaceId,
+            row.run_id,
+            row.activation_id,
+            command.turn.id,
+            row.activation_status,
+          ],
+        },
+      ],
+      changes: [
+        repairChange,
+        { kind: 'turn', id: nextTurnId, taskId: command.task.id, change: 'insert' },
+        { kind: 'message', id: nextMessageId, taskId: command.task.id, change: 'insert' },
+      ],
+      turnReservations: [{ runId: row.run_id, taskId: command.task.id, count: 1 }],
+      budgetExhaustionStatements,
+      budgetExhaustionChanges: [repairChange],
+    };
+  }
+
   private async settleTurnAndApplyEffects(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
     stalePlanRetries = 0,
   ): Promise<RepositoryCommandResult> {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
+    }
+    if (command.turn.status === 'succeeded' && !command.turn.disposition) {
+      const durableTurn = await this.getTurn(command.turn.id);
+      const durableDisposition = durableTurn?.disposition;
+      if (
+        durableTurn?.taskId === command.turn.taskId
+        && command.expectedStatuses.includes(durableTurn.status as typeof command.expectedStatuses[number])
+        && (durableTurn.runtimeEpoch ?? 1) === (command.turn.runtimeEpoch ?? 1)
+        && durableDisposition
+        && (
+          durableDisposition.kind === 'workflow_next'
+          || durableDisposition.kind === 'workflow_prev'
+          || durableDisposition.kind === 'workflow_fail'
+        )
+      ) {
+        const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
+        command = {
+          ...command,
+          // The engine intentionally preserves the task while no decision is
+          // visible. A claim accepted before this transaction began must apply
+          // the same task transition as an explicit workflow disposition.
+          task: {
+            ...command.task,
+            revision: command.expectedTaskRevision + 1,
+            updatedAt: finishedAt,
+            outcomeProposal: undefined,
+          },
+          turn: { ...command.turn, disposition: durableDisposition },
+        };
+      }
     }
     const retryCandidates = command.relatedTurns.filter(
       (turn) => turn.retryOf === command.turn.id,
@@ -7769,13 +8362,23 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const dispositionClaimConflict = await this.validateSettlementDispositionClaim(command);
     if (dispositionClaimConflict) return dispositionClaimConflict;
+    const decision = await this.planWorkflowDecisionSettlement(command);
+    if (decision.conflictReason) {
+      return { ok: true, changed: false, conflict: true, reason: decision.conflictReason };
+    }
+    if (decision.mode === 'implicit_next') {
+      return { ok: true, changed: false, reason: 'clean optional workflow decision requires implicit NEXT' };
+    }
+    const decisionOwnsSettlement = decision.mode === 'repair' || decision.mode === 'exhausted';
     // M018 S05: workflow_fail / invalid-route / budget exhaustion close the run first.
     // M018 S04: feedback responses intercept workflow_next on a feedback turn before
     // the forward contribution path. PREV requests open a round; otherwise fall through
     // to the existing NEXT contribution planner.
-    const failClosure = await this.planWorkflowFailFromSettle(command);
+    const failClosure = decisionOwnsSettlement
+      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
+      : await this.planWorkflowFailFromSettle(command);
     // M018 S06: child invocation is mutually exclusive with feedback/next/prev.
-    const childInvocation = failClosure.statements.length > 0
+    const childInvocation = decisionOwnsSettlement || failClosure.statements.length > 0
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowChildInvocation(command);
     if (childInvocation.conflictReason) {
@@ -7787,13 +8390,13 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
     const feedbackResponse = (
-      failClosure.statements.length > 0
+      decisionOwnsSettlement || failClosure.statements.length > 0
       || childInvocation.statements.length > 0
     )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowFeedbackResponse(command);
     const prevRequest = (
-      failClosure.statements.length > 0
+      decisionOwnsSettlement || failClosure.statements.length > 0
       || childInvocation.statements.length > 0
       || feedbackResponse.statements.length > 0
     )
@@ -7801,7 +8404,7 @@ export class SqliteTaskRepository implements TaskRepository {
       : await this.planWorkflowPrevRequest(command);
     // M018 S06: terminal child NEXT returns to the caller before ordinary forward NEXT.
     const childReturn = (
-      failClosure.statements.length > 0
+      decisionOwnsSettlement || failClosure.statements.length > 0
       || childInvocation.statements.length > 0
       || feedbackResponse.statements.length > 0
       || prevRequest.statements.length > 0
@@ -7809,7 +8412,7 @@ export class SqliteTaskRepository implements TaskRepository {
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowChildReturn(command);
     const nextContribution = (
-      failClosure.statements.length > 0
+      decisionOwnsSettlement || failClosure.statements.length > 0
       || childInvocation.statements.length > 0
       || feedbackResponse.statements.length > 0
       || prevRequest.statements.length > 0
@@ -7818,12 +8421,14 @@ export class SqliteTaskRepository implements TaskRepository {
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowNextContribution(command);
     const budgetedRoutePlans: WorkflowEffectPlan[] = [
+      decision,
       feedbackResponse,
       prevRequest,
       childReturn,
       nextContribution,
     ];
     const routePlans: WorkflowEffectPlan[] = [
+      decision,
       failClosure,
       childInvocation,
       feedbackResponse,
@@ -7859,6 +8464,7 @@ export class SqliteTaskRepository implements TaskRepository {
     ];
     const routeEffects = {
       statements: [
+        ...decision.statements,
         ...failClosure.statements,
         ...childInvocation.statements,
         ...feedbackResponse.statements,
@@ -7867,6 +8473,7 @@ export class SqliteTaskRepository implements TaskRepository {
         ...nextContribution.statements,
       ],
       changes: [
+        ...decision.changes,
         ...failClosure.changes,
         ...childInvocation.changes,
         ...feedbackResponse.changes,
@@ -7876,7 +8483,20 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
     };
     const workflowEffects = budget.exhausted
-      ? { statements: budget.statements, changes: budget.changes }
+      ? {
+          statements: [
+            ...(decision.mode === 'decided'
+              ? decision.statements
+              : decision.budgetExhaustionStatements ?? []),
+            ...budget.statements,
+          ],
+          changes: [
+            ...(decision.mode === 'decided'
+              ? decision.changes
+              : decision.budgetExhaustionChanges ?? []),
+            ...budget.changes,
+          ],
+        }
       : {
           statements: [...budget.statements, ...routeEffects.statements],
           changes: [...budget.changes, ...routeEffects.changes],
@@ -7901,14 +8521,16 @@ export class SqliteTaskRepository implements TaskRepository {
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
       { sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
-      ...(command.turn.status === 'succeeded'
+      ...(command.turn.status === 'succeeded' && !(decision.mode === 'repair' && !budget.exhausted)
         ? workflowActivationSourceConsumptionStatements(
             this.workspaceId,
             command.turn.id,
             command.turn.finishedAt ?? new Date().toISOString(),
           )
         : []),
-      ...(workflowRetry && !budget.exhausted
+      ...(decision.mode === 'repair' && !budget.exhausted
+        ? []
+        : workflowRetry && !budget.exhausted
         ? [workflowActivationRetryStatement(
             this.workspaceId,
             workflowRetry.authority,
@@ -7948,6 +8570,7 @@ export class SqliteTaskRepository implements TaskRepository {
           budgets: settlementBudgetPreconditions,
           closures: settlementClosurePreconditions,
           retryAuthority: workflowRetry?.authority,
+          decision: decision.precondition,
         }),
         rest,
         uniqueChanges,
@@ -7974,9 +8597,12 @@ export class SqliteTaskRepository implements TaskRepository {
     if (
       (results[0]?.changes ?? 0) === 0
       && (
+        command.turn.status === 'succeeded'
+        ||
         settlementGatePreconditions.length > 0
         || settlementBudgetPreconditions.length > 0
         || settlementClosurePreconditions.length > 0
+        || decision.precondition !== undefined
       )
       && stalePlanRetries < 128
     ) {
@@ -13937,12 +14563,52 @@ function guardedSettleTurnStatement(
     budgets: readonly WorkflowBudgetPrecondition[];
     closures: readonly WorkflowClosurePrecondition[];
     retryAuthority?: Extract<WorkflowTurnDefinitionAuthority, { kind: 'valid' }>;
+    decision?: WorkflowDecisionPrecondition;
   } = { gates: [], budgets: [], closures: [] },
 ): SqlStatement {
   const turn = command.turn;
   const epoch = turn.runtimeEpoch ?? 1;
   const statePredicates: string[] = [];
   const stateParams: SqlValue[] = [];
+  if (turn.disposition) {
+    const expectedClaim = durableDispositionClaim({
+      turnId: turn.id,
+      taskId: turn.taskId,
+      runtimeEpoch: epoch,
+      opId: 'settlement-guard',
+      disposition: turn.disposition,
+    });
+    statePredicates.push(`AND json_extract(turns.payload_json, '$.disposition') = ?
+      AND EXISTS (
+        SELECT 1 FROM turn_disposition_claims claim
+         WHERE claim.workspace_id = turns.workspace_id
+           AND claim.turn_id = turns.id
+           AND claim.task_id = ?
+           AND claim.runtime_epoch = ?
+           AND claim.family = ?
+           AND claim.kind = ?
+           AND claim.fingerprint = ?
+           AND claim.payload_json = ?
+           AND claim.status = 'staged'
+      )`);
+    stateParams.push(
+      expectedClaim.payloadJson,
+      expectedClaim.taskId,
+      expectedClaim.runtimeEpoch,
+      expectedClaim.family,
+      expectedClaim.kind,
+      expectedClaim.fingerprint,
+      expectedClaim.payloadJson,
+    );
+  } else if (turn.status === 'succeeded') {
+    statePredicates.push(`AND json_type(turns.payload_json, '$.disposition') IS NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM turn_disposition_claims claim
+         WHERE claim.workspace_id = turns.workspace_id
+           AND claim.turn_id = turns.id
+           AND claim.status = 'staged'
+      )`);
+  }
   if (preconditions.retryAuthority) {
     const authority = preconditions.retryAuthority;
     statePredicates.push(`AND EXISTS (
@@ -13980,6 +14646,57 @@ function guardedSettleTurnStatement(
       authority.version,
       authority.fingerprint,
     );
+  }
+  if (preconditions.decision) {
+    const decision = preconditions.decision;
+    statePredicates.push(`AND EXISTS (
+      SELECT 1
+        FROM workflow_activations activation
+        JOIN workflow_runs run
+          ON run.workspace_id = activation.workspace_id
+         AND run.run_id = activation.run_id
+       WHERE activation.workspace_id = turns.workspace_id
+         AND activation.run_id = ?
+         AND activation.activation_id = ?
+         AND activation.execution_turn_id = ?
+         AND activation.status = ?
+         AND run.status = 'running'
+         ${decision.allowExpiredDeadline ? '' : 'AND (run.deadline_at IS NULL OR run.deadline_at > ?)'}
+    )`);
+    stateParams.push(
+      decision.runId,
+      decision.activationId,
+      decision.executionTurnId,
+      decision.activationStatus,
+      ...(decision.allowExpiredDeadline ? [] : [turn.finishedAt ?? new Date().toISOString()]),
+    );
+    if (decision.repair === null) {
+      statePredicates.push(`AND NOT EXISTS (
+        SELECT 1 FROM workflow_decision_repairs repair
+         WHERE repair.workspace_id = turns.workspace_id
+           AND repair.run_id = ? AND repair.activation_id = ?
+      )`);
+      stateParams.push(decision.runId, decision.activationId);
+    } else {
+      statePredicates.push(`AND EXISTS (
+        SELECT 1 FROM workflow_decision_repairs repair
+         WHERE repair.workspace_id = turns.workspace_id
+           AND repair.run_id = ? AND repair.activation_id = ?
+           AND repair.status = ? AND repair.attempts_used = ?
+           AND repair.last_attempt_turn_id IS ?
+           AND repair.last_error_code IS ?
+           AND repair.next_repair_turn_id IS ?
+      )`);
+      stateParams.push(
+        decision.runId,
+        decision.activationId,
+        decision.repair.status,
+        decision.repair.attemptsUsed,
+        decision.repair.lastAttemptTurnId,
+        decision.repair.lastErrorCode,
+        decision.repair.nextRepairTurnId,
+      );
+    }
   }
   for (const precondition of preconditions.gates) {
     statePredicates.push(`AND EXISTS (

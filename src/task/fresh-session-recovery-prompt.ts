@@ -17,6 +17,7 @@ import type { TaskBriefV1 } from './types';
 export const RECOVERY_PRIOR_OUTCOME_MAX = 16;
 /** Max chars per prior-outcome line (before prompt-level packing). */
 export const RECOVERY_PRIOR_OUTCOME_LINE_MAX = 1_000;
+const WORKFLOW_DECISION_CONTEXT_HEADER = '# Workflow decision context\n';
 
 export interface FreshSessionRecoveryPromptInput {
   /** Task goal — protected core material. */
@@ -37,6 +38,12 @@ export interface FreshSessionRecoveryPromptInput {
   originalPrompt?: string;
   /** Optional readiness/setup reason (e.g. session_registry_sticky). */
   recoveryReason?: string;
+  /**
+   * Protected correction prompt for an in-progress workflow decision repair.
+   * Contains the pinned activation inputs, bounded prior response, exact route
+   * contract, error category, and attempt number needed when session/load fails.
+   */
+  workflowDecisionPrompt?: string;
   /** Budget; defaults to COMPILED_PROMPT_MAX (first-turn family). */
   maxChars?: number;
 }
@@ -54,32 +61,55 @@ export type FreshSessionRecoveryPromptResult =
  * Matches the same secret family as store handoff sanitizer + explicit
  * MUSTER_BRIDGE_TOKEN / Authorization header redaction required by S06.
  */
+function lengthPreservingMask(length: number, marker: '[redacted]' | '[path]'): string {
+  if (length <= 0) return '';
+  if (length <= marker.length) return '*'.repeat(length);
+  return `${marker}${'*'.repeat(length - marker.length)}`;
+}
+
 export function sanitizeRecoveryPromptText(text: string): string {
   return text
     // Windows absolute paths
-    .replace(/[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]*/g, '[path]')
+    .replace(
+      /[A-Za-z]:\\(?:[^\\\s]+\\)*[^\\\s]*/g,
+      (match) => lengthPreservingMask(match.length, '[path]'),
+    )
     // POSIX absolute paths
     .replace(/(?:^|[\s"'`(=])(\/(?:[^\s"'`)]+\/)+[^\s"'`)]+)/g, (match, pathPart: string) =>
-      match.replace(pathPart, '[path]'),
+      match.replace(pathPart, lengthPreservingMask(pathPart.length, '[path]')),
     )
     // Authorization / cookie headers — full value through EOL
     .replace(
       /\b((?:authorization|proxy-authorization|cookie|set-cookie)\s*[:=]\s*)[^\r\n]+/gi,
-      '$1[redacted]',
+      (match, prefix: string) =>
+        `${prefix}${lengthPreservingMask(match.length - prefix.length, '[redacted]')}`,
     )
-    .replace(/\bBearer\s+[A-Za-z0-9\-._~+/]+=*/gi, 'Bearer [redacted]')
+    .replace(
+      /\b(Bearer\s+)([A-Za-z0-9\-._~+/]+=*)/gi,
+      (_match, prefix: string, value: string) =>
+        `${prefix}${lengthPreservingMask(value.length, '[redacted]')}`,
+    )
     // Explicit muster bridge token forms (assignment and bare suffix values)
-    .replace(/\bMUSTER_BRIDGE_TOKEN\s*[=:]\s*\S+/gi, 'MUSTER_BRIDGE_TOKEN=[redacted]')
-    .replace(/\bMUSTER_BRIDGE_TOKEN[_-][A-Za-z0-9._~+/-]+/gi, 'MUSTER_BRIDGE_TOKEN_[redacted]')
+    .replace(
+      /\b(MUSTER_BRIDGE_TOKEN\s*[=:]\s*)(\S+)/gi,
+      (_match, prefix: string, value: string) =>
+        `${prefix}${lengthPreservingMask(value.length, '[redacted]')}`,
+    )
+    .replace(
+      /\b(MUSTER_BRIDGE_TOKEN[_-])([A-Za-z0-9._~+/-]+)/gi,
+      (_match, prefix: string, value: string) =>
+        `${prefix}${lengthPreservingMask(value.length, '[redacted]')}`,
+    )
     // password/token/secret/key assignment forms
     .replace(
       /\b((?:password|passwd|pwd|passphrase|api[_-]?key|access[_-]?key|secret[_-]?access[_-]?key|secret|token|auth[_-]?token|private[_-]?key|aws_secret_access_key|aws_access_key_id)\s*[=:]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
-      '$1[redacted]',
+      (match, prefix: string) =>
+        `${prefix}${lengthPreservingMask(match.length - prefix.length, '[redacted]')}`,
     )
     // Common secret / token shapes (sk-…, api_key-…, etc.)
     .replace(
       /\b(?:sk|pk|api[_-]?key|token|secret|key)[-_][A-Za-z0-9][-_A-Za-z0-9]{4,}\b/gi,
-      '[redacted]',
+      (match) => lengthPreservingMask(match.length, '[redacted]'),
     )
     // Collapse long runs (conversation dumps / raw CLI)
     .replace(/([A-Za-z0-9])\1{20,}/g, '$1$1$1…');
@@ -106,6 +136,16 @@ function buildHeader(reason?: string): string {
     .join('\n');
 }
 
+/**
+ * Maximum host envelope wrapped around an already-complete decision prompt.
+ * First-turn assembly reserves this so any accepted correction can be moved to
+ * a fresh session without truncating its pins, route contract, or evidence.
+ */
+export const WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS =
+  buildHeader('0123456789abcdef'.repeat(13).slice(0, 200)).length
+  + 2
+  + WORKFLOW_DECISION_CONTEXT_HEADER.length;
+
 function buildPriorOutcomesBlock(priorOutcomes: readonly string[] | undefined): string | undefined {
   if (!priorOutcomes || priorOutcomes.length === 0) return undefined;
   const lines: string[] = [];
@@ -122,10 +162,11 @@ function buildPriorOutcomesBlock(priorOutcomes: readonly string[] | undefined): 
 /**
  * Build a durable fresh-session recovery prompt.
  *
- * Protected core (must fit budget or fail closed): recovery header + goal +
- * brief objective when present. Optional sections (context, prior outcomes,
- * original prompt) are packed greedily and dropped under budget — never emit a
- * context-less prompt when the core itself cannot fit.
+ * Protected core (must fit budget or fail closed): either recovery header plus
+ * one already-complete workflow-decision prompt, or recovery header + goal (or
+ * objective/original fallback) + frozen workflow instructions. Optional
+ * sections are packed greedily and dropped under budget. Decision recovery
+ * never duplicates task material that is already inside its projected prompt.
  */
 export function buildFreshSessionRecoveryPrompt(
   input: FreshSessionRecoveryPromptInput,
@@ -143,12 +184,15 @@ export function buildFreshSessionRecoveryPrompt(
   const workflowInstructions = typeof input.workflowInstructions === 'string'
     ? clampSection(input.workflowInstructions.replace(/\r\n/g, '\n').trim(), BRIEF_SECTION_MAX)
     : undefined;
+  const workflowDecisionPrompt = typeof input.workflowDecisionPrompt === 'string'
+    ? sanitizeRecoveryPromptText(input.workflowDecisionPrompt.replace(/\r\n/g, '\n').trim())
+    : undefined;
   const originalPrompt =
     typeof input.originalPrompt === 'string' && input.originalPrompt.trim().length > 0
       ? scrubSection(input.originalPrompt, COMPILED_PROMPT_MAX)
       : undefined;
 
-  if (!goal && !objective && !workflowInstructions && !originalPrompt) {
+  if (!goal && !objective && !workflowInstructions && !workflowDecisionPrompt && !originalPrompt) {
     return {
       ok: false,
       code: 'empty_recovery_prompt',
@@ -165,20 +209,30 @@ export function buildFreshSessionRecoveryPrompt(
   const workflowInstructionsSection = workflowInstructions
     ? `# Workflow instructions\n${workflowInstructions}`
     : undefined;
+  const workflowDecisionSection = workflowDecisionPrompt
+    ? `${WORKFLOW_DECISION_CONTEXT_HEADER}${workflowDecisionPrompt}`
+    : undefined;
   const priorSection = buildPriorOutcomesBlock(input.priorOutcomes);
   const originalSection = originalPrompt
     ? `# Original prompt\n${originalPrompt}`
     : undefined;
 
-  // Protected core: header + goal (or objective as fallback) must fit.
+  // Protected core: durable task identity plus frozen workflow execution and
+  // decision context must fit together or recovery fails before dispatch.
   const coreParts = [header];
-  if (goalSection) coreParts.push(goalSection);
-  else if (objectiveSection) coreParts.push(objectiveSection);
-  else if (originalSection) {
-    // Only original remains — still durable restatement, not invention.
-    coreParts.push(originalSection);
+  if (workflowDecisionSection) {
+    // The projected decision prompt already contains goal, frozen workflow
+    // instructions, pins, prior response, attempt, and exact outcome contract.
+    coreParts.push(workflowDecisionSection);
+  } else {
+    if (goalSection) coreParts.push(goalSection);
+    else if (objectiveSection) coreParts.push(objectiveSection);
+    else if (originalSection) {
+      // Only original remains — still durable restatement, not invention.
+      coreParts.push(originalSection);
+    }
+    if (workflowInstructionsSection) coreParts.push(workflowInstructionsSection);
   }
-  if (workflowInstructionsSection) coreParts.push(workflowInstructionsSection);
   const core = coreParts.join('\n\n');
   if (core.length > maxChars) {
     return {
@@ -191,12 +245,14 @@ export function buildFreshSessionRecoveryPrompt(
   // Optional packing order: title → objective (if not already core) → context →
   // prior outcomes → original prompt. Drop when over budget.
   const optional: string[] = [];
-  if (titleSection) optional.push(titleSection);
-  if (objectiveSection && goalSection) optional.push(objectiveSection);
-  if (contextSection) optional.push(contextSection);
-  if (priorSection) optional.push(priorSection);
-  if (originalSection && !(coreParts.includes(originalSection))) {
-    optional.push(originalSection);
+  if (!workflowDecisionSection) {
+    if (titleSection) optional.push(titleSection);
+    if (objectiveSection && goalSection) optional.push(objectiveSection);
+    if (contextSection) optional.push(contextSection);
+    if (priorSection) optional.push(priorSection);
+    if (originalSection && !(coreParts.includes(originalSection))) {
+      optional.push(originalSection);
+    }
   }
 
   let assembled = core;

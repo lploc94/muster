@@ -187,6 +187,12 @@ export type ToolCommand =
       opId: string;
       reason?: string;
     }
+  /** Internal authenticated evidence for a parser/contract-rejected route attempt. */
+  | {
+      kind: 'workflow_invalid_attempt';
+      attemptedDisposition: 'workflow_next' | 'workflow_prev' | 'workflow_fail';
+      errorCode: 'decision_invalid';
+    }
   /** M018 S06: stage child-workflow invocation (engine owns child run/continuation). */
   | {
       kind: 'invoke_child_workflow';
@@ -796,31 +802,42 @@ export function dispatch(
   tool: string,
   args: unknown,
   ctx: CredentialContext,
-): { ok: true; command: ToolCommand } | { ok: false; toolError: string } {
+):
+  | { ok: true; command: ToolCommand }
+  | { ok: false; toolError: string; invalidWorkflowAttempt?: Extract<ToolCommand, { kind: 'workflow_invalid_attempt' }> } {
+  const workflowFailure = (toolError: string): {
+    ok: false;
+    toolError: string;
+    invalidWorkflowAttempt?: Extract<ToolCommand, { kind: 'workflow_invalid_attempt' }>;
+  } => {
+    if (tool !== 'workflow_next' && tool !== 'workflow_prev' && tool !== 'workflow_fail') {
+      return { ok: false as const, toolError };
+    }
+    return {
+      ok: false as const,
+      toolError,
+      invalidWorkflowAttempt: {
+        kind: 'workflow_invalid_attempt' as const,
+        attemptedDisposition: tool as 'workflow_next' | 'workflow_prev' | 'workflow_fail',
+        errorCode: 'decision_invalid' as const,
+      },
+    };
+  };
   const action = toolActionForName(tool);
   if (!action) {
     return { ok: false, toolError: `unknown tool: ${tool}` };
   }
   if (!ctx.allowedActions.has(action)) {
-    return {
-      ok: false,
-      toolError: tool === 'upsert_presentation' ? 'unauthorized' : `action not permitted: ${tool}`,
-    };
+    return workflowFailure(tool === 'upsert_presentation' ? 'unauthorized' : `action not permitted: ${tool}`);
   }
   if (!isRecord(args)) {
-    return {
-      ok: false,
-      toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'arguments must be an object',
-    };
+    return workflowFailure(tool === 'upsert_presentation' ? 'invalid_arguments' : 'arguments must be an object');
   }
 
   if (MUTATING_TOOLS.has(tool)) {
     const suppliedOpId = requireString(args, 'opId');
     if (Object.prototype.hasOwnProperty.call(args, 'opId') && !suppliedOpId) {
-      return {
-        ok: false,
-        toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId must be a non-empty string',
-      };
+      return workflowFailure(tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId must be a non-empty string');
     }
     const semanticKey = tool === 'define_workflow' ||
       tool === 'start_workflow' ||
@@ -837,10 +854,7 @@ export function dispatch(
         : undefined
     );
     if (!opId) {
-      return {
-        ok: false,
-        toolError: tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId is required',
-      };
+      return workflowFailure(tool === 'upsert_presentation' ? 'invalid_arguments' : 'opId is required');
     }
 
     switch (tool) {
@@ -1081,12 +1095,12 @@ export function dispatch(
       case 'workflow_next': {
         const change = requireString(args, 'change') ?? 'updated';
         if (change !== 'updated' && change !== 'unchanged') {
-          return { ok: false, toolError: 'change must be "updated" or "unchanged"' };
+          return workflowFailure('change must be "updated" or "unchanged"');
         }
         const message = requireString(args, 'message');
-        if (!message) return { ok: false, toolError: 'message is required' };
+        if (!message) return workflowFailure('message is required');
         if (!fitsUtf8Bytes(message, TASK_RESULT_MAX_BYTES)) {
-          return { ok: false, toolError: `message exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes` };
+          return workflowFailure(`message exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes`);
         }
         return {
           ok: true,
@@ -1107,27 +1121,23 @@ export function dispatch(
         } else if (Array.isArray(rawTargets)) {
           if (
             rawTargets.length === 0 ||
-            !rawTargets.every((t) => typeof t === 'string' && t.length > 0)
+            !rawTargets.every((t) =>
+              typeof t === 'string' &&
+              t.length > 0 &&
+              t.length <= PRESENTATION_ID_MAX_LENGTH &&
+              STABLE_ID_PATTERN.test(t)) ||
+            new Set(rawTargets).size !== rawTargets.length
           ) {
-            return {
-              ok: false,
-              toolError: 'targets must be "all" or a non-empty string array of inputRefs',
-            };
+            return workflowFailure('targets must be "all" or a non-empty string array of inputRefs');
           }
           targets = rawTargets as string[];
         } else {
-          return {
-            ok: false,
-            toolError: 'targets must be "all" or a non-empty string array of inputRefs',
-          };
+          return workflowFailure('targets must be "all" or a non-empty string array of inputRefs');
         }
-        const message = requireString(args, 'message');
-        if (!message) return { ok: false, toolError: 'message is required' };
+        const message = requireString(args, 'message')?.trim();
+        if (!message) return workflowFailure('message is required');
         if (!fitsUtf8Bytes(message, WORKFLOW_FEEDBACK_MAX_BYTES)) {
-          return {
-            ok: false,
-            toolError: `message exceeds ${WORKFLOW_FEEDBACK_MAX_BYTES} UTF-8 bytes`,
-          };
+          return workflowFailure(`message exceeds ${WORKFLOW_FEEDBACK_MAX_BYTES} UTF-8 bytes`);
         }
         return {
           ok: true,
@@ -1143,14 +1153,11 @@ export function dispatch(
         // Optional reason; empty string rejected at parse time. Closure is repository-owned (T02).
         let reason: string | undefined;
         if (Object.prototype.hasOwnProperty.call(args, 'reason')) {
-          if (typeof args.reason !== 'string' || args.reason.length === 0) {
-            return { ok: false, toolError: 'reason must be a non-empty string when provided' };
+          if (typeof args.reason !== 'string' || args.reason.trim().length === 0) {
+            return workflowFailure('reason must be a non-empty string when provided');
           }
           if (!fitsUtf8Bytes(args.reason, TASK_ERROR_MAX_BYTES)) {
-            return {
-              ok: false,
-              toolError: `reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`,
-            };
+            return workflowFailure(`reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`);
           }
           reason = args.reason;
         }

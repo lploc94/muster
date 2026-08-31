@@ -3,11 +3,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { CredentialRegistry } from '../bridge/credentials';
+import { durableDispositionClaim } from './disposition-claim';
 import { executeToolCommand, type GraphEngineDeps } from './engine-graph';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
 import type { EngineProjection, MusterTask, TaskTurn, TurnDisposition } from './types';
+import type { WorkflowAgentOutcome } from './workflow-types';
 import { DEFAULT_WORKFLOW_POLICY } from './workflow';
 
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
@@ -76,28 +78,32 @@ async function stage(
   });
 }
 
-async function bindWorkflowActivation(client: DbClient, turn: TaskTurn): Promise<void> {
+async function bindWorkflowActivation(
+  repository: SqliteTaskRepository,
+  client: DbClient,
+  turn: TaskTurn,
+  outcome?: WorkflowAgentOutcome,
+): Promise<void> {
   const runId = `run-${turn.id}`;
   const messageId = `message-${turn.id}`;
+  await repository.execute({
+    kind: 'defineWorkflowVersion',
+    workspaceId: 'ws',
+    definitionId: `definition-${turn.id}`,
+    version: 1,
+    name: 'Disposition race',
+    topology: {
+      kind: 'workflow',
+      inputs: [],
+      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'node' }],
+      nodes: [{ nodeId: 'node', ...(outcome ? { outcome } : {}) }],
+      edges: [],
+    },
+    entryContracts: [],
+    policy: DEFAULT_WORKFLOW_POLICY,
+    createdAt: turn.createdAt,
+  });
   await client.transaction([
-    {
-      sql: `INSERT INTO workflow_definitions (
-              workspace_id, definition_id, version, name, entry_node_id,
-              topology_json, fingerprint, created_at
-            ) VALUES ('ws', ?, 1, 'Disposition race', 'node', ?, ?, ?)`,
-      params: [
-        `definition-${turn.id}`,
-        JSON.stringify({ kind: 'one_node_v1', nodes: [{ nodeId: 'node' }], entryNodeId: 'node' }),
-        `fingerprint-${turn.id}`,
-        turn.createdAt,
-      ],
-    },
-    {
-      sql: `INSERT INTO workflow_definition_nodes (
-              workspace_id, definition_id, definition_version, node_id, ordinal, is_terminal
-            ) VALUES ('ws', ?, 1, 'node', 0, 1)`,
-      params: [`definition-${turn.id}`],
-    },
     {
       sql: `INSERT INTO workflow_runs (
               workspace_id, run_id, definition_id, definition_version,
@@ -198,7 +204,7 @@ describe('M018 universal durable disposition claims', () => {
     await first.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask() });
     const turn = makeTurn('turn-race', 1);
     await first.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
-    await bindWorkflowActivation(firstClient, turn);
+    await bindWorkflowActivation(first, firstClient, turn);
 
     const results = await Promise.all([
       stage(first, turn, 'op-complete', { kind: 'complete', result: 'done' }),
@@ -240,6 +246,287 @@ describe('M018 universal durable disposition claims', () => {
     ).resolves.toMatchObject({ status: 'discarded' });
   });
 
+  it('keeps one declared valid route authoritative across concurrent invalid and valid calls', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s08-outcome-race-'));
+    tempDirs.push(dir);
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const firstClient = makeClient();
+    const secondClient = makeClient();
+    await firstClient.open(dbPath);
+    await secondClient.open(dbPath);
+    await firstClient.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES ('ws', 'identity', 'Workspace', 'now', 'now')`,
+    );
+    const first = new SqliteTaskRepository(firstClient, 'ws');
+    const second = new SqliteTaskRepository(secondClient, 'ws');
+    await first.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask() });
+    const turn = makeTurn('turn-outcome-race', 1);
+    await first.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
+    await bindWorkflowActivation(first, firstClient, turn, {
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The result is ready.' },
+    });
+
+    const [invalid, valid] = await Promise.all([
+      stage(first, turn, 'op-invalid-fail', {
+        kind: 'workflow_fail',
+        reason: 'undeclared route',
+      }),
+      stage(second, turn, 'op-valid-next', {
+        kind: 'workflow_next',
+        change: 'updated',
+        result: 'declared result',
+      }),
+    ]);
+    expect(invalid).toMatchObject({ changed: false });
+    expect(valid).toMatchObject({ changed: true });
+    await expect(firstClient.all(
+      `SELECT family, kind, status FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      ['ws', turn.id],
+    )).resolves.toEqual([{ family: 'workflow', kind: 'next', status: 'staged' }]);
+    const repairRows = await firstClient.all<{
+      status: string;
+      attempts_used: number;
+      last_error_code: string | null;
+    }>(
+      `SELECT status, attempts_used, last_error_code
+         FROM workflow_decision_repairs
+        WHERE workspace_id = ? AND run_id = ?`,
+      ['ws', `run-${turn.id}`],
+    );
+    expect(repairRows.length).toBeLessThanOrEqual(1);
+    if (repairRows[0]) {
+      expect(repairRows[0]).toEqual({
+        status: 'open',
+        attempts_used: 0,
+        last_error_code: 'decision_invalid',
+      });
+    }
+
+    await expect(stage(first, turn, 'op-invalid-after-valid', {
+      kind: 'workflow_fail',
+      reason: 'still undeclared',
+    })).resolves.toMatchObject({ changed: false });
+    await expect(firstClient.all(
+      `SELECT family, kind, status FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      ['ws', turn.id],
+    )).resolves.toEqual([{ family: 'workflow', kind: 'next', status: 'staged' }]);
+
+    const validRaceTask = { ...makeTask(), id: 'task-two-valid-race' };
+    await first.execute({ kind: 'createTask', workspaceId: 'ws', task: validRaceTask });
+    const validRaceTurn = {
+      ...makeTurn('turn-two-valid-race', 1),
+      taskId: validRaceTask.id,
+    };
+    await first.execute({ kind: 'createTurn', workspaceId: 'ws', turn: validRaceTurn });
+    await bindWorkflowActivation(first, firstClient, validRaceTurn, {
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The result is ready.' },
+    });
+    const validRace = await Promise.all([
+      stage(first, validRaceTurn, 'op-valid-a', {
+        kind: 'workflow_next',
+        change: 'updated',
+        result: 'result a',
+      }),
+      stage(second, validRaceTurn, 'op-valid-b', {
+        kind: 'workflow_next',
+        change: 'updated',
+        result: 'result b',
+      }),
+    ]);
+    expect(validRace.filter((result) => result.changed === true)).toHaveLength(1);
+    expect(validRace.filter((result) => result.conflict === true)).toHaveLength(1);
+    await expect(firstClient.all(
+      `SELECT family, kind, status FROM turn_disposition_claims
+        WHERE workspace_id = ? AND turn_id = ?`,
+      ['ws', validRaceTurn.id],
+    )).resolves.toEqual([{ family: 'workflow', kind: 'next', status: 'staged' }]);
+  });
+
+  it('settles a valid claim committed while a stale settlement waits for the SQLite writer lock', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s08-settlement-claim-lock-'));
+    tempDirs.push(dir);
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const claimClient = makeClient();
+    const settlementClient = makeClient();
+    await claimClient.open(dbPath);
+    await settlementClient.open(dbPath);
+    await claimClient.run(
+      `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+       VALUES ('ws', 'identity', 'Workspace', 'now', 'now')`,
+    );
+    const claimRepository = new SqliteTaskRepository(claimClient, 'ws');
+    const settlementRepository = new SqliteTaskRepository(settlementClient, 'ws');
+    const createdAt = '2026-07-22T02:00:00.000Z';
+    await claimRepository.execute({
+      kind: 'defineWorkflowVersion',
+      workspaceId: 'ws',
+      definitionId: 'definition-settlement-claim-lock',
+      version: 1,
+      name: 'Settlement claim lock',
+      topology: {
+        kind: 'workflow',
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
+        nodes: [{
+          nodeId: 'producer',
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The result is ready.' },
+          },
+        }, { nodeId: 'consumer' }],
+        edges: [{ fromNodeId: 'producer', toNodeId: 'consumer', inputRef: 'source' }],
+      },
+      entryContracts: [],
+      policy: DEFAULT_WORKFLOW_POLICY,
+      createdAt,
+    });
+    const started = await claimRepository.execute({
+      kind: 'startWorkflowRun',
+      workspaceId: 'ws',
+      definitionId: 'definition-settlement-claim-lock',
+      version: 1,
+      startIdempotencyKey: 'settlement-claim-lock',
+      createdAt,
+      backend: 'grok',
+    });
+    const data = started.operation!.result.data as {
+      runId: string;
+      entryTaskId: string;
+      activationTurnId: string;
+    };
+    await expect(claimRepository.execute({
+      kind: 'claimTurn',
+      workspaceId: 'ws',
+      turnId: data.activationTurnId,
+      startedAt: '2026-07-22T02:00:01.000Z',
+      rootTaskId: data.entryTaskId,
+      maxConcurrentTurns: 10,
+      maxConcurrentPerRoot: 10,
+      maxConcurrentPerBackend: 10,
+      resourceKeys: [],
+    })).resolves.toMatchObject({ changed: true });
+    const taskPayloadRow = await claimClient.get<{ payload_json: string }>(
+      `SELECT payload_json FROM tasks WHERE workspace_id = ? AND id = ?`,
+      ['ws', data.entryTaskId],
+    );
+    const taskPayload = JSON.parse(taskPayloadRow!.payload_json) as Record<string, unknown>;
+    taskPayload.outcomeProposal = {
+      kind: 'fail',
+      error: 'stale proposal',
+      proposedByTurnId: 'older-turn',
+      proposedAt: '2026-07-22T01:59:00.000Z',
+    };
+    await claimClient.run(
+      `UPDATE tasks SET payload_json = ? WHERE workspace_id = ? AND id = ?`,
+      [JSON.stringify(taskPayload), 'ws', data.entryTaskId],
+    );
+
+    const staleTask = await settlementRepository.getTask(data.entryTaskId);
+    const staleTurn = await settlementRepository.getTurn(data.activationTurnId);
+    const payloadRow = await claimClient.get<{ payload_json: string }>(
+      `SELECT payload_json FROM turns WHERE workspace_id = ? AND id = ?`,
+      ['ws', data.activationTurnId],
+    );
+    expect(staleTask).toBeTruthy();
+    expect(staleTurn?.disposition).toBeUndefined();
+    expect(payloadRow).toBeTruthy();
+    const disposition: TurnDisposition = {
+      kind: 'workflow_next',
+      change: 'updated',
+      result: 'accepted while settlement waited',
+    };
+    const claim = durableDispositionClaim({
+      turnId: data.activationTurnId,
+      taskId: data.entryTaskId,
+      runtimeEpoch: staleTurn!.runtimeEpoch,
+      opId: 'op-lock-winner',
+      disposition,
+    });
+    const durablePayload = JSON.parse(payloadRow!.payload_json) as Record<string, unknown>;
+    durablePayload.disposition = disposition;
+
+    await claimClient.run('BEGIN IMMEDIATE TRANSACTION');
+    const settlement = settlementRepository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: staleTask!.revision,
+      task: { ...staleTask!, updatedAt: '2026-07-22T02:00:04.000Z' },
+      turn: {
+        ...staleTurn!,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:04.000Z',
+      },
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    });
+    await claimClient.run(
+      `UPDATE turns SET payload_json = ? WHERE workspace_id = ? AND id = ?`,
+      [JSON.stringify(durablePayload), 'ws', data.activationTurnId],
+    );
+    await claimClient.run(
+      `INSERT INTO turn_disposition_claims (
+         workspace_id, turn_id, task_id, runtime_epoch, op_id, family, kind,
+         fingerprint, payload_json, status, created_at, updated_at
+       ) VALUES (?,?,?,?,?,?,?,?,?,'staged',?,?)`,
+      [
+        'ws', claim.turnId, claim.taskId, claim.runtimeEpoch, claim.opId,
+        claim.family, claim.kind, claim.fingerprint, claim.payloadJson,
+        '2026-07-22T02:00:03.000Z', '2026-07-22T02:00:03.000Z',
+      ],
+    );
+    await claimClient.run('COMMIT');
+
+    await expect(settlement).resolves.toMatchObject({ changed: true });
+    await expect(claimClient.get(
+      `SELECT status FROM turn_disposition_claims WHERE workspace_id = ? AND turn_id = ?`,
+      ['ws', data.activationTurnId],
+    )).resolves.toEqual({ status: 'consumed' });
+    await expect(claimClient.get(
+      `SELECT status, attempts_used, last_error_code, next_repair_turn_id
+         FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+      ['ws', data.runId],
+    )).resolves.toEqual({
+      status: 'decided',
+      attempts_used: 1,
+      last_error_code: null,
+      next_repair_turn_id: null,
+    });
+    await expect(claimRepository.listTurns(data.entryTaskId)).resolves.toHaveLength(1);
+    const routedTask = await claimRepository.getTask(data.entryTaskId);
+    expect(routedTask).toMatchObject({
+      revision: staleTask!.revision + 1,
+      updatedAt: '2026-07-22T02:00:04.000Z',
+    });
+    expect(routedTask?.outcomeProposal).toBeUndefined();
+    await expect(claimClient.get(
+      `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+      ['ws', data.runId],
+    )).resolves.toEqual({ status: 'running' });
+    await expect(settlementRepository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: staleTask!.revision,
+      task: { ...staleTask!, updatedAt: '2026-07-22T02:00:04.000Z' },
+      turn: {
+        ...staleTurn!,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:04.000Z',
+      },
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({ changed: false });
+  });
+
   it('same canonical disposition replays across operation ids and successful settlement consumes it', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m018-s08-replay-'));
     tempDirs.push(dir);
@@ -257,7 +544,7 @@ describe('M018 universal durable disposition claims', () => {
     await first.execute({ kind: 'createTask', workspaceId: 'ws', task: makeTask() });
     const turn = makeTurn('turn-replay', 1);
     await first.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
-    await bindWorkflowActivation(firstClient, turn);
+    await bindWorkflowActivation(first, firstClient, turn);
 
     const disposition = { kind: 'complete' as const, result: 'same' };
     const results = await Promise.all([
@@ -419,7 +706,7 @@ describe('M018 universal durable disposition claims', () => {
 
     const active = makeTurn('turn-broad-active', 2);
     await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: active });
-    await bindWorkflowActivation(client, active);
+    await bindWorkflowActivation(repository, client, active);
     await expect(executeToolCommand(
       graphDeps(repository, task, active),
       { callerTaskId: task.id, turnId: active.id, rootId: task.id, allowedActions: broad },
@@ -694,7 +981,7 @@ describe('M018 universal durable disposition claims', () => {
     await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
     await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn });
     for (const [definitionId, contract] of [
-      ['wf-child-policy-source', false],
+      ['wf-child-policy-source', true],
       ['wf-child-policy', true],
     ] as const) {
       await repository.execute({
@@ -745,6 +1032,50 @@ describe('M018 universal durable disposition claims', () => {
                         'caller_turn', ?, ?)`,
         params: [root.id, turn.id],
       },
+      {
+        sql: `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+              VALUES ('ws', 'child-policy-source-run', 'entry', ?, 'active')`,
+        params: [root.id],
+      },
+      {
+        sql: `INSERT INTO workflow_dependency_gates (
+                workspace_id, run_id, gate_id, consumer_node_id, status,
+                activation_id, reserved_turn_id, aggregate_message_id
+              ) VALUES ('ws', 'child-policy-source-run', 'source-gate', 'entry',
+                        'satisfied', 'source-activation', ?, 'source-message')`,
+        params: [turn.id],
+      },
+      {
+        sql: `INSERT INTO workflow_gate_bindings (
+                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+              ) VALUES ('ws', 'child-policy-source-run', 'source-gate', 'request', NULL,
+                        'workflow_input')`,
+      },
+      {
+        sql: `INSERT INTO workflow_gate_fills (
+                workspace_id, run_id, gate_id, input_ref, artifact_run_id,
+                artifact_id, artifact_revision, filled_at
+              ) VALUES ('ws', 'child-policy-source-run', 'source-gate', 'request', NULL,
+                        'child-policy-input', 1, ?)`,
+        params: [root.createdAt],
+      },
+      {
+        sql: `INSERT INTO messages (
+                id, workspace_id, task_id, turn_id, role, state, ordering,
+                content, created_at, payload_json
+              ) VALUES ('source-message', 'ws', ?, ?, 'system', 'assigned', 0,
+                        '[source activation]', ?, '{"payloadVersion":1}')`,
+        params: [root.id, turn.id, root.createdAt],
+      },
+      {
+        sql: `INSERT INTO workflow_activations (
+                workspace_id, run_id, activation_id, node_id, kind, status,
+                source_gate_id, primary_turn_id, message_id, execution_turn_id,
+                created_at, updated_at
+              ) VALUES ('ws', 'child-policy-source-run', 'source-activation', 'entry',
+                        'entry_start', 'running', 'source-gate', ?, 'source-message', ?, ?, ?)`,
+        params: [turn.id, turn.id, root.createdAt, root.createdAt],
+      },
     ]);
 
     const command = {
@@ -753,10 +1084,8 @@ describe('M018 universal durable disposition claims', () => {
       childDefinitionId: 'wf-child-policy',
       childDefinitionVersion: 1,
       entryBindings: [{
-        childEntryNodeId: 'entry',
-        inputRef: 'request',
-        artifactId: 'child-policy-input',
-        artifactRevision: 1,
+        name: 'request',
+        fromInputRef: 'request',
       }],
     };
     const context = {

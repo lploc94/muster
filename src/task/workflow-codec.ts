@@ -429,6 +429,11 @@ function decodeOutcome(raw: unknown): ValueDecodeResult<WorkflowNodeOutcome> {
       : { ok: false, reason: 'unsupported node outcome kind' };
 }
 
+/** Strict decoder reused when hydrating immutable node outcome authority. */
+export function decodeWorkflowNodeOutcome(raw: unknown): ValueDecodeResult<WorkflowNodeOutcome> {
+  return decodeOutcome(raw);
+}
+
 function decodeNormalizedNode(raw: unknown): WorkflowNodeSpec | undefined {
   if (!isRecord(raw) || !isStableId(raw.nodeId)) return undefined;
   if (!onlyKeys(raw, [

@@ -225,9 +225,15 @@ actions stay available.
   parent edge has no invented semantic kind: each value is adapted to the frozen child input kind.
   Validation, source lookup, and every write share one transaction, so any failure leaves no start
   claim, run, gate, fill, continuation, return gate, or provenance row to clean up.
-- Schema v7 also reserves one activation-owned `workflow_decision_repairs` row for bounded decision
-  attempts. Its status, attempt count, evidence references, and next correction-turn reference are
-  closed and writer-guarded; later routing phases own the transitions, not a migration or side store.
+- Schema v7 owns one activation-scoped `workflow_decision_repairs` row for bounded agent outcome
+  repair. An authenticated invalid route attempt records only a closed error code before any
+  disposition claim; a later valid claim remains authoritative. A clean optional original attempt
+  may still use final-message NEXT, while strict missing decisions and every invalid decision settle
+  through the repair transition. Attempts one and two atomically persist bounded evidence and reserve
+  one deterministic same-task correction turn; attempt three marks the row exhausted and closes the
+  run with `decision_missing` or `decision_invalid`. Replay, reload, competing settlement, task/run
+  turn limits, and the workflow deadline are checked in that same transition, without a side store or
+  feedback round.
 - Schema v6 and every earlier marker are rejected rather than interpreted as canonical workflow
   authority. There is no `ALTER TABLE`, row reinterpretation, compatibility decoder, or automatic
   migration path. An already-open stale writer fails closed with terminal `schema_changed` and must

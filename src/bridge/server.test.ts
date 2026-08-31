@@ -868,6 +868,52 @@ describe('MusterBridgeServer auth', () => {
     expect(handled).toHaveLength(1);
     expect(handled[0]).toMatchObject({ kind: 'workflow_next', message });
   });
+
+  it('forwards authenticated parser-rejected workflow routes as closed invalid-attempt evidence', async () => {
+    const credentials = new CredentialRegistry();
+    const handled: unknown[] = [];
+    server = new MusterBridgeServer({
+      credentials,
+      toolHandler: {
+        handleToolCall: async (_ctx, _tool, command) => {
+          handled.push(command);
+          return { ok: true, result: {} };
+        },
+      },
+    });
+    const { port } = await server.listen();
+    const token = credentials.issue({
+      rootId: 'r',
+      callerTaskId: 't',
+      turnId: 'turn-invalid-route',
+      attemptId: 'a0',
+      allowedActions: new Set(['workflow_prev']),
+      ttlMs: 60_000,
+    });
+    const session = await openMcpSession(port, token);
+
+    const malformed = await session.request('tools/call', {
+      name: 'workflow_prev',
+      arguments: { targets: ['source'], message: '   ' },
+    });
+    expect(malformed.result).toMatchObject({ isError: true });
+    expect(handled).toEqual([{
+      kind: 'workflow_invalid_attempt',
+      attemptedDisposition: 'workflow_prev',
+      errorCode: 'decision_invalid',
+    }]);
+
+    const undeclared = await session.request('tools/call', {
+      name: 'workflow_fail',
+      arguments: { reason: 'cannot continue' },
+    });
+    expect(undeclared.result).toMatchObject({ isError: true });
+    expect(handled[1]).toEqual({
+      kind: 'workflow_invalid_attempt',
+      attemptedDisposition: 'workflow_fail',
+      errorCode: 'decision_invalid',
+    });
+  });
 });
 
 describe('MusterBridgeServer generation, /health, and observers', () => {

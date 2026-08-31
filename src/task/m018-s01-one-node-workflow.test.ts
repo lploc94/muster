@@ -17,9 +17,11 @@ import { SqliteTaskRepository } from './repository';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
-import type { TaskStoreFile } from './types';
+import type { EngineProjection } from './types';
 import {
   DEFAULT_WORKFLOW_POLICY,
+  deriveWorkflowDecisionRepairMessageId,
+  deriveWorkflowDecisionRepairTurnId,
   deriveStartIdentities,
   entryNodeIds,
   fingerprintStartWorkflow,
@@ -48,6 +50,42 @@ async function openRepo(label: string) {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });
     },
+  };
+}
+
+async function missingWorkflowDecisionSettlement(
+  repository: SqliteTaskRepository,
+  client: DbClient,
+  taskId: string,
+  turnId: string,
+  finishedAt: string,
+) {
+  await client.run(
+    `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL
+      WHERE workspace_id = ? AND id = ?`,
+    [finishedAt, 'ws', turnId],
+  );
+  const task = await repository.getTask(taskId);
+  const turn = await repository.getTurn(turnId);
+  expect(task).toBeTruthy();
+  expect(turn).toBeTruthy();
+  const command = {
+    kind: 'settleTurnAndApplyEffects' as const,
+    workspaceId: 'ws',
+    expectedTaskRevision: task!.revision,
+    task: { ...task!, updatedAt: finishedAt },
+    turn: {
+      ...turn!,
+      status: 'succeeded' as const,
+      finishedAt,
+    },
+    expectedStatuses: ['running' as const],
+    relatedTurns: [],
+    messages: [],
+  };
+  return {
+    command,
+    result: await repository.execute(command),
   };
 }
 
@@ -285,12 +323,16 @@ describe('M018 S01 one-node workflow activation', () => {
         engine_start_operation_key: startWorkflowLedgerKey('idem-entry-1'),
       });
 
-      const file: TaskStoreFile = {
+      const file: EngineProjection = {
         schemaVersion: 2,
         revision: 1,
         tasks: { [task!.id]: task! },
         turns: { [turns[0]!.id]: turns[0]! },
         messages: {},
+        toolCalls: {},
+        reasoning: {},
+        operations: {},
+        cancelRequests: {},
       };
       expect(canPromoteTurn(file, payload.activationTurnId, DEFAULT_RESOURCE_LIMITS)).toEqual({
         ok: true,
@@ -422,7 +464,17 @@ describe('M018 S01 one-node workflow activation', () => {
         definitionId: 'wf-implicit-next',
         version: 1,
         name: 'implicit-next',
-        topology: TOPOLOGY,
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: false,
+              next: { when: 'The final response is ready.' },
+            },
+          }],
+        },
         createdAt,
       });
       const started = await ctx.repository.execute({
@@ -492,6 +544,735 @@ describe('M018 S01 one-node workflow activation', () => {
         `SELECT status FROM turn_disposition_claims WHERE workspace_id = ? AND turn_id = ?`,
         ['ws', payload.activationTurnId],
       )).resolves.toMatchObject({ status: 'consumed' });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_error_code, next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'decided',
+        attempts_used: 1,
+        last_error_code: null,
+        next_repair_turn_id: null,
+      });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('durably repairs a strict missing workflow decision twice and exhausts attempt three', async () => {
+    const ctx = await openRepo('strict-decision-repair');
+    let engine: TaskEngine | undefined;
+    try {
+      const createdAt = new Date().toISOString();
+      const strictTopology = {
+        ...TOPOLOGY,
+        nodes: [{
+          ...TOPOLOGY.nodes[0]!,
+          outcome: {
+            kind: 'agent' as const,
+            requireExplicitDisposition: true,
+            next: { when: 'The result is complete.' },
+            fail: { when: 'The result cannot be produced.' },
+          },
+        }],
+      };
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-strict-decision-repair',
+        version: 1,
+        name: 'strict-decision-repair',
+        topology: strictTopology,
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-strict-decision-repair',
+        version: 1,
+        startIdempotencyKey: 'strict-decision-repair-1',
+        createdAt,
+        goal: 'produce a routed result',
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const calls: Array<{ prompt: string; resumeId?: string }> = [];
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* (_backend, options) {
+          if (options.input.kind !== 'agent') throw new Error('expected agent input');
+          calls.push({ prompt: options.input.prompt, resumeId: options.resumeId });
+          await options.onBeforePrompt?.();
+          yield { type: 'sessionStarted', sessionId: 'strict-decision-session' };
+          yield {
+            type: 'assistantDelta',
+            messageId: `strict-response-${calls.length}`,
+            content: `analysis without a route ${calls.length}`,
+          };
+          yield { type: 'turnCompleted' };
+        },
+      });
+
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        await engine.whenIdle();
+        const run = await ctx.client.get<{ status: string }>(
+          `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        );
+        if (run?.status === 'failed') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(calls).toHaveLength(3);
+      expect(calls[0]?.prompt).toContain('# Outcome contract');
+      expect(calls[0]?.prompt).toContain('Use workflow_next when:\nThe result is complete.');
+      expect(calls[0]?.prompt).toContain('Use workflow_fail when:\nThe result cannot be produced.');
+      expect(calls[0]?.prompt).toContain('Explicit disposition is required.');
+      expect(calls[1]?.prompt).toContain('# Workflow outcome required');
+      expect(calls[1]?.prompt).toContain('This is decision attempt 2 of 3.');
+      expect(calls[1]?.prompt).toContain('analysis without a route 1');
+      expect(calls[2]?.prompt).toContain('This is decision attempt 3 of 3.');
+      expect(calls[1]?.resumeId).toBe('strict-decision-session');
+      expect(calls[2]?.resumeId).toBe('strict-decision-session');
+
+      const turns = await ctx.repository.listTurns(payload.entryTaskId);
+      expect(turns).toHaveLength(3);
+      expect(turns.map((turn) => turn.status)).toEqual(['succeeded', 'succeeded', 'succeeded']);
+      expect(new Set(turns.map((turn) => turn.id)).size).toBe(3);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                last_response_message_id, next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'exhausted',
+        attempts_used: 3,
+        last_attempt_turn_id: turns[2]!.id,
+        last_error_code: 'decision_missing',
+        last_response_message_id: expect.any(String),
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'failed', terminal_reason_code: 'decision_missing' });
+      await expect(ctx.client.get(
+        `SELECT status, execution_turn_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'consumed', execution_turn_id: turns[2]!.id });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('replays and reloads deterministic repair transitions without duplicate correction turns', async () => {
+    const ctx = await openRepo('decision-repair-reload');
+    const clients = [ctx.client];
+    let repository = ctx.repository;
+    let client = ctx.client;
+    try {
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await expect(repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-reload',
+        version: 1,
+        name: 'decision-repair-reload',
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is complete.' },
+            },
+          }],
+        },
+        createdAt,
+      })).resolves.toMatchObject({ changed: true });
+      const started = await repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-reload',
+        version: 1,
+        startIdempotencyKey: 'decision-repair-reload-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const activation = await client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      );
+      const activationId = activation!.activation_id;
+      const expectedSecondTurnId = deriveWorkflowDecisionRepairTurnId(activationId, 2);
+      const expectedThirdTurnId = deriveWorkflowDecisionRepairTurnId(activationId, 3);
+
+      const first = await missingWorkflowDecisionSettlement(
+        repository,
+        client,
+        payload.entryTaskId,
+        payload.activationTurnId,
+        '2026-07-19T00:00:01.000Z',
+      );
+      expect(first.result).toMatchObject({ changed: true });
+      await expect(repository.execute(first.command)).resolves.toMatchObject({ changed: false });
+      await expect(repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(2);
+      await expect(repository.getTurn(expectedSecondTurnId)).resolves.toMatchObject({
+        id: expectedSecondTurnId,
+        status: 'queued',
+        inputs: expect.arrayContaining([{
+          kind: 'message',
+          messageId: deriveWorkflowDecisionRepairMessageId(activationId, 2),
+        }]),
+      });
+
+      await client.close();
+      client = new DbClient({
+        workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+        execArgv: ['--import', 'tsx'],
+      });
+      clients.push(client);
+      await client.open(ctx.dbPath);
+      repository = new SqliteTaskRepository(client, 'ws');
+      await expect(repository.getTurn(expectedSecondTurnId)).resolves.toMatchObject({ status: 'queued' });
+
+      const second = await missingWorkflowDecisionSettlement(
+        repository,
+        client,
+        payload.entryTaskId,
+        expectedSecondTurnId,
+        '2026-07-19T00:00:02.000Z',
+      );
+      expect(second.result).toMatchObject({ changed: true });
+      await expect(repository.execute(second.command)).resolves.toMatchObject({ changed: false });
+      await expect(repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(3);
+      await expect(repository.getTurn(expectedThirdTurnId)).resolves.toMatchObject({
+        id: expectedThirdTurnId,
+        status: 'queued',
+        inputs: expect.arrayContaining([{
+          kind: 'message',
+          messageId: deriveWorkflowDecisionRepairMessageId(activationId, 3),
+        }]),
+      });
+
+      const third = await missingWorkflowDecisionSettlement(
+        repository,
+        client,
+        payload.entryTaskId,
+        expectedThirdTurnId,
+        '2026-07-19T00:00:03.000Z',
+      );
+      expect(third.result).toMatchObject({ changed: true });
+      await expect(repository.execute(third.command)).resolves.toMatchObject({ changed: false });
+      const turns = await repository.listTurns(payload.entryTaskId);
+      expect(turns.map((turn) => turn.id)).toEqual([
+        payload.activationTurnId,
+        expectedSecondTurnId,
+        expectedThirdTurnId,
+      ]);
+      await expect(client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'exhausted',
+        attempts_used: 3,
+        last_attempt_turn_id: expectedThirdTurnId,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
+      await expect(client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'failed', terminal_reason_code: 'decision_missing' });
+    } finally {
+      await Promise.all(clients.map((candidate) => candidate.close().catch(() => undefined)));
+      fs.rmSync(ctx.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('uses the existing workflow budget closure instead of over-admitting a repair turn', async () => {
+    const ctx = await openRepo('decision-repair-budget');
+    try {
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-budget',
+        version: 1,
+        name: 'decision-repair-budget',
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is complete.' },
+            },
+          }],
+        },
+        policy: {
+          ...DEFAULT_WORKFLOW_POLICY,
+          maxTurnsPerTask: 1,
+          maxWorkflowTurnsPerRun: 1,
+        },
+        createdAt,
+      })).resolves.toMatchObject({ changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-budget',
+        version: 1,
+        startIdempotencyKey: 'decision-repair-budget-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const settlement = await missingWorkflowDecisionSettlement(
+        ctx.repository,
+        ctx.client,
+        payload.entryTaskId,
+        payload.activationTurnId,
+        '2026-07-19T00:00:01.000Z',
+      );
+      expect(settlement.result).toMatchObject({ changed: true });
+      await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'exhausted',
+        attempts_used: 3,
+        last_attempt_turn_id: payload.activationTurnId,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code, workflow_turns_reserved
+           FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'failed',
+        terminal_reason_code: 'turn_budget_exhausted',
+        workflow_turns_reserved: 1,
+      });
+      const activation = await ctx.client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      );
+      expect(activation).toBeTruthy();
+      const rejectedRepairTurnId = deriveWorkflowDecisionRepairTurnId(activation!.activation_id, 2);
+      const rejectedRepairMessageId = deriveWorkflowDecisionRepairMessageId(activation!.activation_id, 2);
+      await expect(ctx.client.all(
+        `SELECT entity_kind, entity_id FROM change_log
+          WHERE workspace_id = ? AND entity_id IN (?, ?)`,
+        ['ws', rejectedRepairTurnId, rejectedRepairMessageId],
+      )).resolves.toEqual([]);
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('fails an expired decision attempt through the run-timeout path without queueing repair', async () => {
+    const ctx = await openRepo('decision-repair-deadline');
+    try {
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-deadline',
+        version: 1,
+        name: 'decision-repair-deadline',
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is complete.' },
+            },
+          }],
+        },
+        policy: { ...DEFAULT_WORKFLOW_POLICY, runTimeoutMs: 1_000 },
+        createdAt,
+      })).resolves.toMatchObject({ changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-deadline',
+        version: 1,
+        startIdempotencyKey: 'decision-repair-deadline-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      const settlement = await missingWorkflowDecisionSettlement(
+        ctx.repository,
+        ctx.client,
+        payload.entryTaskId,
+        payload.activationTurnId,
+        '2026-07-19T00:00:01.000Z',
+      );
+      expect(settlement.result).toMatchObject({ changed: true });
+      await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'exhausted',
+        attempts_used: 3,
+        last_attempt_turn_id: payload.activationTurnId,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code, deadline_at
+           FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'failed',
+        terminal_reason_code: 'run_timeout',
+        deadline_at: '2026-07-19T00:00:01.000Z',
+      });
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('turns an optional authenticated invalid route into repair and accepts a valid second decision', async () => {
+    const ctx = await openRepo('optional-invalid-decision-repair');
+    let engine: TaskEngine | undefined;
+    try {
+      const createdAt = new Date().toISOString();
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-optional-invalid-decision-repair',
+        version: 1,
+        name: 'optional-invalid-decision-repair',
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: false,
+              next: { when: 'The result is ready.' },
+            },
+          }],
+        },
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-optional-invalid-decision-repair',
+        version: 1,
+        startIdempotencyKey: 'optional-invalid-decision-repair-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+      };
+      const prompts: string[] = [];
+      let freshSessionPrompt: string | undefined;
+      const readiness = {
+        beginAttempt: () => undefined,
+        evaluate: (turnId: string, attemptId: string, generation: number) => ({
+          ok: true as const,
+          turnId,
+          attemptId,
+          generation,
+          toolNames: [] as string[],
+        }),
+      } as unknown as import('../bridge/mcp-readiness').McpReadinessSupervisor;
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        bridgePort: 1,
+        mcpReadiness: readiness,
+        getBridgeGeneration: () => 1,
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* (_backend, options) {
+          if (options.input.kind !== 'agent') throw new Error('expected agent input');
+          prompts.push(options.input.prompt);
+          if (prompts.length === 2) {
+            freshSessionPrompt = await options.mcpSetup?.buildFreshSessionPrompt?.({
+              attempt: 2,
+              maxAttempts: 2,
+              recoveryMode: 'fresh_after_sticky',
+              forceFreshSession: true,
+              previousFailure: {
+                code: 'session_load_failed',
+                message: 'forced load failure',
+              },
+            });
+          }
+          await options.onBeforePrompt?.();
+          const running = (await ctx.repository.listTurns(payload.entryTaskId))
+            .find((turn) => turn.status === 'running');
+          if (!running) throw new Error('running workflow decision turn missing');
+          if (prompts.length === 1) {
+            const credential = {
+              credentialId: 'decision-invalid',
+              rootId: payload.entryTaskId,
+              callerTaskId: payload.entryTaskId,
+              turnId: running.id,
+              attemptId: 'attempt-1',
+              allowedActions: new Set(['workflow_next'] as const),
+              expiry: Date.now() + 60_000,
+            };
+            const rejected = dispatch(
+              'workflow_fail',
+              { reason: 'undeclared route' },
+              credential,
+            );
+            expect(rejected.ok).toBe(false);
+            if (rejected.ok) throw new Error('workflow_fail unexpectedly parsed');
+            const recorded = await engine!.handleToolCall(
+              credential,
+              'workflow_fail',
+              (rejected as typeof rejected & { invalidWorkflowAttempt: import('./coordinator-tools').ToolCommand })
+                .invalidWorkflowAttempt,
+            );
+            expect(recorded).toMatchObject({ ok: true });
+          } else {
+            await expect(engine!.stageDispositionAsync(
+              running.id,
+              { kind: 'workflow_next', change: 'updated', result: 'valid repaired result' },
+              'repair-valid-next',
+            )).resolves.toMatchObject({ ok: true });
+          }
+          yield { type: 'sessionStarted', sessionId: 'optional-repair-session' };
+          yield {
+            type: 'assistantDelta',
+            messageId: `optional-repair-response-${prompts.length}`,
+            content: prompts.length === 1 ? 'invalid route response' : 'valid repaired result',
+          };
+          yield { type: 'turnCompleted' };
+        },
+      });
+
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        await engine.whenIdle();
+        const run = await ctx.client.get<{ status: string }>(
+          `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        );
+        if (run?.status === 'succeeded') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(prompts).toHaveLength(2);
+      expect(prompts[1]).toContain('Your previous response attempted an invalid workflow outcome.');
+      expect(prompts[1]).toContain('This is decision attempt 2 of 3.');
+      expect(freshSessionPrompt).toContain('# Workflow decision context');
+      expect(freshSessionPrompt).toContain('invalid route response');
+      expect(freshSessionPrompt).toContain('This is decision attempt 2 of 3.');
+      expect(freshSessionPrompt).toContain('Use workflow_next when:');
+      const turns = await ctx.repository.listTurns(payload.entryTaskId);
+      expect(turns).toHaveLength(2);
+      expect(turns[0]?.disposition).toBeUndefined();
+      expect(turns[1]?.disposition).toMatchObject({
+        kind: 'workflow_next',
+        result: 'valid repaired result',
+      });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'decided',
+        attempts_used: 2,
+        last_attempt_turn_id: turns[1]!.id,
+        last_error_code: null,
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'succeeded' });
+    } finally {
+      await engine?.shutdown().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('does not restore optional implicit NEXT after an undeclared route and exhausts missing corrections', async () => {
+    const ctx = await openRepo('optional-invalid-missing-repair');
+    let engine: TaskEngine | undefined;
+    try {
+      const createdAt = new Date().toISOString();
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-optional-invalid-missing-repair',
+        version: 1,
+        name: 'optional-invalid-missing-repair',
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0]!,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: false,
+              next: { when: 'The result is ready.' },
+            },
+          }],
+        },
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-optional-invalid-missing-repair',
+        version: 1,
+        startIdempotencyKey: 'optional-invalid-missing-repair-1',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+      };
+      const prompts: string[] = [];
+      engine = await TaskEngine.loadAsync({
+        repository: ctx.repository,
+        workspaceId: 'ws',
+        credentialRegistry: new CredentialRegistry(),
+        makeBackend: (name) => ({
+          name,
+          capabilities: {
+            supportsMCP: true,
+            supportsReasoning: false,
+            supportsDetailedToolEvents: false,
+          },
+          run: async function* () {},
+        }),
+        runTurn: async function* (_backend, options) {
+          if (options.input.kind !== 'agent') throw new Error('expected agent input');
+          prompts.push(options.input.prompt);
+          await options.onBeforePrompt?.();
+          if (prompts.length === 1) {
+            const running = (await ctx.repository.listTurns(payload.entryTaskId))
+              .find((turn) => turn.status === 'running');
+            if (!running) throw new Error('running workflow decision turn missing');
+            await expect(engine!.stageDispositionAsync(
+              running.id,
+              { kind: 'workflow_fail', reason: 'undeclared route' },
+              'optional-undeclared-fail',
+            )).resolves.toMatchObject({ ok: false });
+          }
+          yield { type: 'sessionStarted', sessionId: 'optional-invalid-missing-session' };
+          yield {
+            type: 'assistantDelta',
+            messageId: `optional-invalid-missing-response-${prompts.length}`,
+            content: `response without an accepted route ${prompts.length}`,
+          };
+          yield { type: 'turnCompleted' };
+        },
+      });
+
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        await engine.whenIdle();
+        const run = await ctx.client.get<{ status: string }>(
+          `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+          ['ws', payload.runId],
+        );
+        if (run?.status === 'failed') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      expect(prompts).toHaveLength(3);
+      expect(prompts[1]).toContain('Your previous response attempted an invalid workflow outcome.');
+      expect(prompts[2]).toContain('Your previous response did not select a workflow outcome.');
+      const turns = await ctx.repository.listTurns(payload.entryTaskId);
+      expect(turns).toHaveLength(3);
+      expect(turns.every((turn) => turn.disposition === undefined)).toBe(true);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({
+        status: 'exhausted',
+        attempts_used: 3,
+        last_attempt_turn_id: turns[2]!.id,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toMatchObject({ status: 'failed', terminal_reason_code: 'decision_missing' });
+      await expect(ctx.client.get(
+        `SELECT COUNT(*) AS count FROM turn_disposition_claims
+          WHERE workspace_id = ? AND task_id = ?`,
+        ['ws', payload.entryTaskId],
+      )).resolves.toMatchObject({ count: 0 });
     } finally {
       await engine?.shutdown().catch(() => undefined);
       await ctx.close();
@@ -1111,7 +1892,10 @@ describe('M018 S01 one-node workflow activation', () => {
         kind: 'define_workflow',
         definitionId: expect.stringMatching(/^workflow-[a-f0-9]{32}$/),
       });
-      if (defineRouted.command.kind !== 'define_workflow') return;
+      if (
+        defineRouted.command.kind !== 'define_workflow' ||
+        !('definitionId' in defineRouted.command)
+      ) return;
       const firstDefinitionId = defineRouted.command.definitionId;
       const defined = await engine.handleToolCall(
         context,
@@ -1140,7 +1924,10 @@ describe('M018 S01 one-node workflow activation', () => {
       );
       expect(revisedRouted.ok).toBe(true);
       if (!revisedRouted.ok) return;
-      if (revisedRouted.command.kind !== 'define_workflow') return;
+      if (
+        revisedRouted.command.kind !== 'define_workflow' ||
+        !('definitionId' in revisedRouted.command)
+      ) return;
       const revisedDefinitionId = revisedRouted.command.definitionId;
       expect(revisedDefinitionId).not.toBe(firstDefinitionId);
       await expect(engine.handleToolCall(

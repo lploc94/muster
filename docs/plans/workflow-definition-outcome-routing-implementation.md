@@ -217,7 +217,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `feat(workflow-runtime): compose exact named outputs`
 
 ## Phase 5: Enforce Agent Outcomes with Durable Decision Repair
-- Status: pending
+- Status: complete
 - Depends on: Phase 3, Phase 4
 - Goal: Render and enforce each agent node's declared NEXT/PREV/FAIL contract and repair missing or invalid decisions durably for at most three attempts per activation.
 - Current behavior: `capabilitiesFor` exposes workflow disposition tools by activation context, `executeToolCommand` stages a durable claim, and `settleTurnAndApplyEffects` applies existing route planners. If a successful agent turn has no staged disposition, `engine.ts:settleSuccess` injects implicit NEXT immediately. No outcome-contract authorization or activation-owned decision-attempt state exists.
@@ -249,10 +249,10 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
   - Reuse existing PREV feedback planners unchanged after authorization; decision repair must not create feedback rounds, producer turns, hidden nodes, or graph cycles.
   - Schedule correction execution only after commit and preserve current task/session FIFO, runtime ownership, cancellation, terminal quiescence, and recursive closure invariants.
 - Acceptance criteria:
-  - [ ] AC-1: Declared outcomes are rendered and authorized exactly, with only direct declared PREV targets and bounded nonempty feedback accepted - proven by host-context, engine-tool, and PREV tests.
-  - [ ] AC-2: Optional implicit NEXT occurs only on an original clean attempt; after any invalid attempt, missing/invalid correction turns advance the same maximum-three-attempt repair to a valid route or exhaustion - proven by engine/repository repair tests.
-  - [ ] AC-3: Valid-first-wins, replay/reload, session reconstruction, budgets, and exhaustion are atomic and duplicate-free - proven by disposition race, reload, recovery, limits, and terminal-quiesce tests.
-  - [ ] AC-4: Parser-rejected authenticated route attempts are durable `decision_invalid` evidence and can never trigger optional implicit NEXT - proven by bridge-to-repository tests.
+  - [x] AC-1: Declared outcomes are rendered and authorized exactly, with only direct declared PREV targets and bounded nonempty feedback accepted - proven by host-context, engine-tool, and PREV tests.
+  - [x] AC-2: Optional implicit NEXT occurs only on an original clean attempt; after any invalid attempt, missing/invalid correction turns advance the same maximum-three-attempt repair to a valid route or exhaustion - proven by engine/repository repair tests.
+  - [x] AC-3: Valid-first-wins, replay/reload, session reconstruction, budgets, and exhaustion are atomic and duplicate-free - proven by disposition race, reload, recovery, limits, and terminal-quiesce tests.
+  - [x] AC-4: Parser-rejected authenticated route attempts are durable `decision_invalid` evidence and can never trigger optional implicit NEXT - proven by bridge-to-repository tests.
 - Focused verification:
   - `npx vitest run src/bridge/server.test.ts src/task/coordinator-tools.test.ts src/task/m018-s08-disposition-claims.test.ts src/task/m018-s04-prev-feedback-all-join.test.ts src/task/m018-s01-one-node-workflow.test.ts src/task/m018-s07-canonical-workflow.test.ts src/task/fresh-session-recovery-prompt.test.ts src/task/engine-terminal-quiesce.test.ts src/task/engine-stream-persist.test.ts src/task/limits.test.ts`
 - Phase gates:
@@ -346,6 +346,6 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 | 2 | complete | this phase commit (`feat(workflow-packages): make workflow json authoritative`) | Focused: 164/164; script-workflow QA: 150/150; compile; source-boundary + fixtures passed; native VS Code 1.135.0 rerun remains truthfully pending after its UAT-only workspace setting update blocked before run creation | `codex-impl-review` APPROVE in 4 rounds; 9 findings fixed |
 | 3 | complete | this phase commit (`refactor(workflow-storage): persist canonical definitions`) | Focused: 89/89; affected workflow/retry: 112/112; child-return integration: 1/1; `npx tsc -p . --noEmit`; `git diff --check`; compile; SQLite storage docs; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 5 findings fixed |
 | 4 | complete | this phase commit (`feat(workflow-runtime): compose exact named outputs`) | Focused: 126/126; repository: 41/41; one-node workflow: 10/10; `npx tsc -p . --noEmit`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 2 rounds; 1 finding fixed, 1 withdrawn after transaction-boundary evidence |
-| 5 | pending | N/A | pending | pending |
+| 5 | complete | this phase commit (`feat(workflow-routing): add durable decision repair`) | Focused: 176/176; prompt/workflow boundaries: 77/77; `npx tsc -p . --noEmit`; `git diff --check`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 7 findings fixed, 1 disputed from the approved closed error-code contract |
 | 6 | pending | N/A | pending | pending |
 | 7 | pending | N/A | pending | pending |

@@ -5,6 +5,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { formatWorkflowAgentOutcomeContract } from './brief';
 import { TASK_ERROR_MAX_BYTES } from './content-limits';
 import {
   decodeDefineWorkflowInput,
@@ -82,6 +83,18 @@ export function validateDefineWorkflow(
   const decoded = decodeDefineWorkflowInput(input);
   if (!decoded.ok) {
     return { ok: false, reason: decoded.reason };
+  }
+  try {
+    for (const node of decoded.definition.topology.nodes) {
+      if (node.outcome?.kind === 'agent') {
+        formatWorkflowAgentOutcomeContract(node.outcome);
+      }
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : 'workflow outcome contract exceeds prompt bounds',
+    };
   }
   return {
     ok: true,
@@ -573,6 +586,8 @@ export function deriveFeedbackResumeActivationId(runId: string, roundId: string)
 /** Bounded reason codes for durable TaskAttention + closure diagnostics. */
 export const WORKFLOW_FAIL_REASON_CODES = [
   'agent_fail',
+  'decision_missing',
+  'decision_invalid',
   'invalid_route',
   'run_timeout',
   'aggregate_too_large',
@@ -740,6 +755,22 @@ export function deriveWorkflowStartResumeTurnId(runId: string, callerTurnId: str
 /** System message that delivers a top-level workflow result to its caller. */
 export function deriveWorkflowStartResumeMessageId(runId: string, callerTurnId: string): string {
   return stableId('wfm', `${runId}\0start_resume_message\0${callerTurnId}`);
+}
+
+/** Same-activation correction turn for a bounded agent outcome decision attempt. */
+export function deriveWorkflowDecisionRepairTurnId(
+  activationId: string,
+  attempt: 2 | 3,
+): string {
+  return stableId('wftn', `${activationId}\0decision_repair_turn\0${attempt}`);
+}
+
+/** Host-authored correction input paired with a decision-repair turn. */
+export function deriveWorkflowDecisionRepairMessageId(
+  activationId: string,
+  attempt: 2 | 3,
+): string {
+  return stableId('wfm', `${activationId}\0decision_repair_message\0${attempt}`);
 }
 
 /** Child run start key material (optional agent key or derived from caller turn). */

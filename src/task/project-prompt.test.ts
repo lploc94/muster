@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { COMPILED_PROMPT_MAX } from './brief';
 import { projectPrompt } from './engine';
 import type { EngineProjection, MusterTask, TaskMessage, TaskTurn } from './types';
 
@@ -94,5 +95,44 @@ describe('projectPrompt', () => {
 
     expect(prompt).toContain('[truncated]');
     expect(new TextEncoder().encode(prompt).byteLength).toBeLessThanOrEqual(256);
+  });
+
+  it('fails closed when a frozen prompt plus outcome contract exceeds the aggregate bound', () => {
+    const turn: TaskTurn = {
+      id: 'bounded-outcome',
+      taskId: 'task-1',
+      sequence: 1,
+      trigger: 'engine',
+      status: 'queued',
+      inputs: [],
+      compiledPrompt: 'x'.repeat(COMPILED_PROMPT_MAX),
+      workflowActivation: {
+        runId: 'run-1',
+        activationId: 'activation-1',
+        nodeId: 'agent',
+        kind: 'entry_start',
+        runStatus: 'running',
+        activationStatus: 'queued',
+        isTerminalNode: true,
+        hasDirectDependencies: false,
+        hasOpenFeedbackRound: false,
+        hasPendingContinuation: false,
+        hasInheritedFeedbackResponse: false,
+        decision: {
+          attempt: 1,
+          invalidEvidence: false,
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The result is ready.' },
+          },
+        },
+      },
+      createdAt: '2026-07-06T00:00:00.000Z',
+    };
+
+    expect(() => projectPrompt(turn, new Map())).toThrow(
+      `Projected task prompt exceeds ${COMPILED_PROMPT_MAX} characters`,
+    );
   });
 });

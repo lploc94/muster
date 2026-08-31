@@ -1,5 +1,5 @@
 import type { ToolFileChange } from '../types';
-import type { ScriptExecutionSpec } from './workflow-types';
+import type { ScriptExecutionSpec, WorkflowAgentOutcome } from './workflow-types';
 
 // Tasks (§4.1)
 export type TaskRole = 'coordinator' | 'worker';
@@ -549,6 +549,13 @@ export interface TaskTurn {
     hasOpenFeedbackRound: boolean;
     hasPendingContinuation: boolean;
     hasInheritedFeedbackResponse: boolean;
+    /** Derived from immutable definition/repair authority; never persisted in turn payloads. */
+    decision?: {
+      outcome: WorkflowAgentOutcome;
+      attempt: 1 | 2 | 3;
+      repairStatus?: 'open' | 'decided' | 'exhausted';
+      invalidEvidence: boolean;
+    };
   };
   /** Repository-hydrated workflow authority that blocks unrelated queued turns. */
   workflowWait?: {

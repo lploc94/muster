@@ -95,8 +95,9 @@ describe('buildHostContext', () => {
     expect(ctx.rules).toContain(HOST_RULE_WORKFLOW_DISPOSITION);
     expect(ctx.rules).not.toContain(HOST_RULES_WORKER[1]);
     expect(formatHostContextMarkdown(ctx)).toContain(
-      'explicit workflow route or host fallback to final-message NEXT',
+      'workflow route via workflow_next, workflow_prev, workflow_fail',
     );
+    expect(formatHostContextMarkdown(ctx)).not.toContain('host fallback to final-message NEXT');
   });
 
   it('keeps workflow disposition guidance in the capped coordinator rules', () => {
@@ -109,6 +110,27 @@ describe('buildHostContext', () => {
 
     expect(ctx.rules).toContain(HOST_RULE_WORKFLOW_DISPOSITION);
     expect(ctx.rules).toHaveLength(10);
+  });
+
+  it('reports only the workflow disposition tools projected for this decision contract', () => {
+    const ctx = buildHostContext({
+      snapshot: baseSnapshot(),
+      self: {
+        taskId: 'workflow-worker',
+        role: 'worker',
+        backend: 'opencode',
+        parentTaskId: 'root',
+      },
+      tools: ['get_host_context', 'workflow_fail'],
+    });
+
+    expect(ctx.scope).toEqual({
+      singleTask: true,
+      workflowVia: ['workflow_fail'],
+      doNot: expect.arrayContaining(['create siblings or pick next work']),
+    });
+    expect(ctx.rules).toContain(HOST_RULE_WORKFLOW_DISPOSITION);
+    expect(formatHostContextMarkdown(ctx)).not.toContain('host fallback to final-message NEXT');
   });
 
   it('taskCwd overrides snapshot.cwd', () => {

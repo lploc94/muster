@@ -12,6 +12,10 @@ import {
   type HostEnvironmentSnapshot,
 } from './host-context';
 import type { ResolvedInputPin, TaskBriefKind, TaskBriefV1 } from './types';
+import {
+  WORKFLOW_OUTCOME_WHEN_MAX_LENGTH,
+  type WorkflowAgentOutcome,
+} from './workflow-types';
 
 /** Max chars for a single compiled prompt section. */
 export const BRIEF_SECTION_MAX = 262_144;
@@ -21,6 +25,74 @@ export const COMPILED_PROMPT_MAX = 524_288;
 export const BRIEF_LIST_MAX_ITEMS = 32;
 /** Max chars for one free-text item in a brief list. */
 export const BRIEF_LIST_ITEM_MAX = 8_192;
+/** Durable prior-response evidence retained for a workflow decision correction. */
+export const WORKFLOW_DECISION_PRIOR_RESPONSE_MAX_BYTES = 8_192;
+
+/** Render frozen author conditions inside a bounded host-owned routing contract. */
+export function formatWorkflowAgentOutcomeContract(outcome: WorkflowAgentOutcome): string {
+  const sections: string[] = ['# Outcome contract'];
+  if (outcome.next) {
+    sections.push([
+      'NEXT',
+      'Use workflow_next when:',
+      clampSection(outcome.next.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH),
+    ].join('\n'));
+  }
+  for (const route of outcome.prev ?? []) {
+    const targets = JSON.stringify([...route.targets]);
+    sections.push([
+      `PREV ${targets}`,
+      `Use workflow_prev with targets ${targets} when:`,
+      clampSection(route.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH),
+      'Include concrete feedback explaining what must be corrected.',
+    ].join('\n'));
+  }
+  if (outcome.fail) {
+    sections.push([
+      'FAIL',
+      'Use workflow_fail when:',
+      clampSection(outcome.fail.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH),
+    ].join('\n'));
+  }
+  sections.push(outcome.requireExplicitDisposition
+    ? 'Explicit disposition is required.'
+    : 'A clean original attempt may omit a disposition and use its final response as NEXT. An invalid route requires correction.');
+  const contract = sections.join('\n\n');
+  if (contract.length > BRIEF_SECTION_MAX) {
+    throw new Error(
+      `Workflow outcome contract exceeds ${BRIEF_SECTION_MAX} characters (${contract.length})`,
+    );
+  }
+  return contract;
+}
+
+export function formatWorkflowDecisionRepair(input: {
+  errorCode: 'decision_missing' | 'decision_invalid';
+  attempt: 2 | 3;
+  previousResponse?: string;
+}): string {
+  const reason = input.errorCode === 'decision_invalid'
+    ? 'Your previous response attempted an invalid workflow outcome.'
+    : 'Your previous response did not select a workflow outcome.';
+  const prior = input.previousResponse?.trim();
+  return [
+    '# Workflow outcome required',
+    '',
+    reason,
+    'Call exactly one declared NEXT, PREV, or FAIL disposition.',
+    ...(prior ? ['', '# Previous response', prior] : []),
+    '',
+    `This is decision attempt ${input.attempt} of 3.`,
+    'Do not repeat the full analysis unless needed. Select an outcome now.',
+  ].join('\n');
+}
+
+/** Largest correction tail that can be appended to a frozen first-turn prompt. */
+export const WORKFLOW_DECISION_REPAIR_PROMPT_MAX_CHARS = formatWorkflowDecisionRepair({
+  errorCode: 'decision_invalid',
+  attempt: 3,
+  previousResponse: 'x'.repeat(WORKFLOW_DECISION_PRIOR_RESPONSE_MAX_BYTES),
+}).length;
 
 const KIND_PREAMBLES: Readonly<Record<TaskBriefKind, string>> = {
   coordinate:
@@ -104,7 +176,7 @@ export type TaskBriefOverlay = {
  * opts in via `verification.hostRun` or `verification.emitVerdict`.
  */
 const VERDICT_INSTRUCTION_SECTION =
-  "# Verdict\nWhen you finish a workflow activation, you may call workflow_next with a final message that reports a structured verdict: status ('pass', 'fail', or 'inconclusive'), rationale, and checked criteria. Missing checks or missing evidence => 'inconclusive', never a default 'pass'. Use workflow_prev when a producer must revise; use workflow_fail only when the required workflow result cannot be produced. NEXT/PREV commit that message and end the turn. If you do not call a workflow disposition, the host forwards your final assistant message as an updated NEXT result.";
+  "# Verdict\nWhen a host-owned outcome contract is present, select only a route declared by that contract. A workflow_next message may report a structured verdict: status ('pass', 'fail', or 'inconclusive'), rationale, and checked criteria. Missing checks or missing evidence => 'inconclusive', never a default 'pass'. workflow_prev requires concrete correction feedback. NEXT/PREV commit that message and end the turn. Missing or invalid required routes enter bounded host repair rather than implying PREV.";
 
 function clampStringList(
   items: readonly string[] | undefined,
@@ -408,7 +480,7 @@ export interface AssembleFirstTurnInput {
    * Defaults to `/` when omitted. Threaded from the engine via getSkillPrefix.
    */
   skillPrefix?: string;
-  /** Space reserved for a deterministic continuation block appended by the engine. */
+  /** Space reserved for deterministic engine-owned sections appended after assembly. */
   reservedTailChars?: number;
 }
 

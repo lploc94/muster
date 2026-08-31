@@ -48,7 +48,7 @@ export interface HostContextV1 {
   taskTypes?: HostTaskTypeRow[];
   scope?: {
     singleTask: true;
-    workflowVia?: readonly ['workflow_next', 'workflow_prev', 'workflow_fail'];
+    workflowVia?: readonly ('workflow_next' | 'workflow_prev' | 'workflow_fail')[];
     doNot: string[];
   };
 }
@@ -90,7 +90,7 @@ export const HOST_RULES_COORDINATOR: readonly string[] = [
   'Use **`list_task_types`** for inline agent nodes. Inline execute nodes use the public `script` object with a workspace-relative JS/Python file. Define a saved package only with its opaque `predefinedWorkflowRef`; never reconstruct its nodes. Saved package metadata never supplies host policy or permission.',
   'Use **`inspect_workflow_run`** only for bounded recovery diagnostics; do not poll it as a substitute for routing.',
   'REQUIRED for user-facing plans/specs: call MCP **`upsert_presentation`** with `title` and the full markdown (Mermaid fenced blocks allowed). The host returns a `presentationRef`; pass it only when refreshing that same document. Do not invent identity, ownership, idempotency, or revision fields, and do not only paste the plan in chat.',
-  'A live workflow activation may explicitly stage `workflow_next`, contextual `workflow_prev`, or `workflow_fail`; if the turn ends without one, the host forwards the final assistant message as an updated NEXT result.',
+  'A live workflow activation must follow its host-owned outcome contract. Only projected workflow disposition tools are legal; a clean optional original attempt may use final-message NEXT, while missing required or invalid routes enter bounded repair.',
 ];
 
 /**
@@ -112,13 +112,13 @@ const HOST_RULES_COORDINATOR_PRESENTATION_INDEX = 3;
 /** Worker scope rules (appended after base). */
 export const HOST_RULES_WORKER: readonly string[] = [
   'You own **one** task (`self.taskId`); complete it and stop — do not pick siblings or “next” work.',
-  'When workflow disposition tools are present, prefer an explicit workflow outcome. NEXT/PREV require the final assistant message, commit it, and end the turn. If you finish without one, the host forwards your final assistant message as NEXT.',
+  'When workflow disposition tools are present, follow the host-owned outcome contract. NEXT/PREV commit the final message and end the turn; missing required or invalid routes enter bounded repair.',
   'Do not call coordinator-only graph mutators even if listed by mistake.',
   'Stay within brief write/read paths and constraints when present.',
 ];
 
 export const HOST_RULE_WORKFLOW_DISPOSITION =
-  'This is a live workflow activation: use **`workflow_next`**, **`workflow_prev`** (when available), or **`workflow_fail`** when you need explicit routing. A `workflow_next` message must be self-contained because the receiver cannot see earlier assistant messages. If you simply finish, the host uses your final assistant message as an updated NEXT result.';
+  'This is a live workflow activation: use only the workflow disposition tools listed for this turn and follow the host-owned `# Outcome contract`. A `workflow_next` message must be self-contained because the receiver cannot see earlier assistant messages. Missing required or invalid routes enter bounded correction; they never imply PREV.';
 
 export const WORKER_SCOPE_DO_NOT: readonly string[] = [
   'create siblings or pick next work',
@@ -191,7 +191,9 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
       })
     : undefined;
   const hasConfiguredTypes = typeRows !== undefined && typeRows.length > 0;
-  const workflowActivation = tools?.includes('workflow_next') === true;
+  const workflowTools = (tools ?? []).filter((tool): tool is 'workflow_next' | 'workflow_prev' | 'workflow_fail' =>
+    tool === 'workflow_next' || tool === 'workflow_prev' || tool === 'workflow_fail');
+  const workflowActivation = workflowTools.length > 0;
   const rules = rulesForRole(self.role, hasConfiguredTypes, workflowActivation);
   // First-turn sets suppressBackendCatalog: true. get_host_context omits or false → keep catalogs.
   const suppressCatalog =
@@ -231,7 +233,7 @@ export function buildHostContext(input: BuildHostContextInput): HostContextV1 {
     scope: {
       singleTask: true,
       ...(workflowActivation
-        ? { workflowVia: ['workflow_next', 'workflow_prev', 'workflow_fail'] as const }
+        ? { workflowVia: workflowTools }
         : {}),
       doNot: [...WORKER_SCOPE_DO_NOT],
     },
@@ -446,7 +448,7 @@ function renderHostMarkdown(ctx: HostContextV1): string {
     lines.push('', '## Scope');
     lines.push(
       ctx.scope.workflowVia
-        ? '- single task; explicit workflow route or host fallback to final-message NEXT'
+        ? `- single task; workflow route via ${ctx.scope.workflowVia.join(', ')}`
         : '- single task; no workflow disposition is active',
     );
     for (const d of ctx.scope.doNot) {

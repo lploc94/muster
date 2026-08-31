@@ -9,6 +9,7 @@ import {
   assembleFirstTurnPrompt,
   clampSection,
   compileTaskPrompt,
+  formatWorkflowAgentOutcomeContract,
   isTaskBriefKind,
   mergeBriefFromCreate,
   normalizeSkillNames,
@@ -359,6 +360,65 @@ describe('assembleFirstTurnPrompt', () => {
     expect(instructionsIndex).toBeGreaterThan(objectiveIndex);
     expect(pinIndex).toBeGreaterThan(instructionsIndex);
     expect(result.prompt).toContain('Check correctness and report actionable findings.');
+  });
+
+  it('renders every declared agent route as one bounded host-owned outcome contract', () => {
+    const contract = formatWorkflowAgentOutcomeContract({
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The implementation is correct.' },
+      prev: [
+        {
+          when: 'The plan must be revised.',
+          targets: ['plan'],
+          feedback: 'required',
+        },
+        {
+          when: 'Both evidence inputs must be refreshed.',
+          targets: ['firstEvidence', 'secondEvidence'],
+          feedback: 'required',
+        },
+      ],
+      fail: { when: 'The review cannot be completed.' },
+    });
+
+    expect(contract).toBe([
+      '# Outcome contract',
+      '',
+      'NEXT',
+      'Use workflow_next when:',
+      'The implementation is correct.',
+      '',
+      'PREV ["plan"]',
+      'Use workflow_prev with targets ["plan"] when:',
+      'The plan must be revised.',
+      'Include concrete feedback explaining what must be corrected.',
+      '',
+      'PREV ["firstEvidence","secondEvidence"]',
+      'Use workflow_prev with targets ["firstEvidence","secondEvidence"] when:',
+      'Both evidence inputs must be refreshed.',
+      'Include concrete feedback explaining what must be corrected.',
+      '',
+      'FAIL',
+      'Use workflow_fail when:',
+      'The review cannot be completed.',
+      '',
+      'Explicit disposition is required.',
+    ].join('\n'));
+    expect(contract).not.toContain('nodeId');
+    expect(contract).not.toContain('requireExplicitDisposition');
+  });
+
+  it('rejects an aggregate outcome contract that exceeds one bounded prompt section', () => {
+    expect(() => formatWorkflowAgentOutcomeContract({
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      prev: Array.from({ length: 128 }, (_, index) => ({
+        when: `${index}:`.padEnd(4_096, 'x'),
+        targets: [`input${index}`],
+        feedback: 'required' as const,
+      })),
+    })).toThrow(`Workflow outcome contract exceeds ${BRIEF_SECTION_MAX} characters`);
   });
 
   it('worker tier: host base + scope; no backends section', () => {

@@ -11,6 +11,7 @@ import {
   buildFreshSessionRecoveryPrompt,
   buildFreshSessionRecoveryPromptOrThrow,
   sanitizeRecoveryPromptText,
+  WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS,
 } from './fresh-session-recovery-prompt';
 import type { TaskBriefV1 } from './types';
 
@@ -63,6 +64,75 @@ describe('buildFreshSessionRecoveryPrompt (M017-S06 / T02)', () => {
     if (!result.ok) return;
     expect(result.prompt).toContain('# Workflow instructions');
     expect(result.prompt).toContain('Apply the frozen workflow checks before selecting a route.');
+  });
+
+  it('keeps the complete workflow decision correction in the protected recovery core', () => {
+    const decisionPrompt = [
+      '[workflow-input name="plan"]',
+      'Pinned plan result',
+      '# Workflow outcome required',
+      'Your previous response attempted an invalid workflow outcome.',
+      'Previous response: investigate further',
+      'This is decision attempt 2 of 3.',
+      '# Outcome contract',
+      'NEXT',
+      'Use workflow_next when:',
+      'The plan is accepted.',
+    ].join('\n');
+    const result = buildFreshSessionRecoveryPrompt({
+      goal: 'Continue the verifier activation',
+      workflowDecisionPrompt: decisionPrompt,
+      originalPrompt: 'optional duplicate prompt',
+      maxChars: 4_000,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt).toContain('# Workflow decision context');
+    expect(result.prompt).toContain('Pinned plan result');
+    expect(result.prompt).toContain('attempted an invalid workflow outcome');
+    expect(result.prompt).toContain('Previous response: investigate further');
+    expect(result.prompt).toContain('This is decision attempt 2 of 3.');
+    expect(result.prompt).toContain('Use workflow_next when:');
+  });
+
+  it('reconstructs a near-limit workflow correction without duplicating contained task context', () => {
+    const decisionPrompt = Array.from({
+      length: COMPILED_PROMPT_MAX - WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS,
+    }, (_, index) =>
+      String.fromCharCode(65 + (index % 26)),
+    ).join('');
+    const result = buildFreshSessionRecoveryPrompt({
+      goal: 'G'.repeat(20_000),
+      workflowInstructions: 'I'.repeat(20_000),
+      workflowDecisionPrompt: decisionPrompt,
+      originalPrompt: decisionPrompt,
+      recoveryReason: 'session_load_failed',
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.length).toBeLessThanOrEqual(COMPILED_PROMPT_MAX);
+    expect(result.prompt).toContain(decisionPrompt);
+    expect(result.prompt).not.toContain('# Goal');
+    expect(result.prompt).not.toContain('# Workflow instructions');
+    expect(result.prompt).not.toContain('# Original prompt');
+  });
+
+  it('keeps near-limit correction recovery bounded while masking repeated short secrets', () => {
+    const limit = COMPILED_PROMPT_MAX - WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS;
+    const unit = 'pwd=x ';
+    const decisionPrompt = unit.repeat(Math.ceil(limit / unit.length)).slice(0, limit);
+    const result = buildFreshSessionRecoveryPrompt({
+      goal: 'Continue the workflow decision',
+      workflowDecisionPrompt: decisionPrompt,
+      recoveryReason: 'session_load_failed',
+    });
+
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt.length).toBeLessThanOrEqual(COMPILED_PROMPT_MAX);
+    expect(result.prompt).not.toContain('pwd=x');
+    expect(result.prompt).toContain('pwd=*');
   });
 
   it('sanitizes bearer tokens, Authorization headers, and MUSTER_BRIDGE_TOKEN from all sections', () => {
@@ -169,5 +239,16 @@ describe('sanitizeRecoveryPromptText', () => {
     expect(cleaned).not.toMatch(/Bearer sk-long-secret/i);
     expect(cleaned).not.toMatch(/MUSTER_BRIDGE_TOKEN=value/);
     expect(cleaned).toContain('safe');
+  });
+
+  it('never expands short secret or path matches while fully masking their values', () => {
+    const raw = 'pwd=x Bearer y C:\\a /a/b MUSTER_BRIDGE_TOKEN=z';
+    const cleaned = sanitizeRecoveryPromptText(raw);
+    expect(cleaned.length).toBeLessThanOrEqual(raw.length);
+    expect(cleaned).not.toContain('pwd=x');
+    expect(cleaned).not.toContain('Bearer y');
+    expect(cleaned).not.toContain('C:\\a');
+    expect(cleaned).not.toContain('/a/b');
+    expect(cleaned).not.toContain('MUSTER_BRIDGE_TOKEN=z');
   });
 });

@@ -716,6 +716,21 @@ describe('canonical workflow manifest contract', () => {
       .toBe('define_workflow:workspace:workflow-contract:1');
   });
 
+  it('rejects a valid route shape whose rendered outcome contract exceeds its prompt section', () => {
+    const manifest = clone(fanInManifest());
+    const outcome = record(manifest.nodes[2]!.outcome);
+    outcome.prev = Array.from({ length: 128 }, (_, index) => ({
+      when: `${index}:`.padEnd(4_096, 'x'),
+      targets: ['plan'],
+      feedback: 'required',
+    }));
+
+    expect(validateDefineWorkflow(definitionFromManifest(manifest))).toMatchObject({
+      ok: false,
+      reason: expect.stringContaining('Workflow outcome contract exceeds'),
+    });
+  });
+
   it('retains named prior outputs in durable start validation and fingerprints', () => {
     const base = {
       definitionId: 'workflow-contract',
@@ -730,27 +745,27 @@ describe('canonical workflow manifest contract', () => {
       ownerRootTaskId: 'root-task',
       callerTaskId: 'caller-task',
       callerTurnId: 'caller-turn',
+      inputContracts: [{
+        name: 'request', semanticKind: 'result', entryNodeId: 'inspect', inputRef: 'request',
+      }],
       entryContracts: [{
         entryNodeId: 'inspect', inputRef: 'request', expectedArtifactKind: 'workflow_input',
       }],
     };
     const left = validateStartWorkflow({
       ...base,
-      entryInputs: [{
-        entryNodeId: 'inspect', inputRef: 'request', fromRun: 'prior-run', output: 'leftReport',
-      }],
+      inputs: [{ name: 'request', fromRun: 'prior-run', output: 'leftReport' }],
     });
     const right = validateStartWorkflow({
       ...base,
-      entryInputs: [{
-        entryNodeId: 'inspect', inputRef: 'request', fromRun: 'prior-run', output: 'rightReport',
-      }],
+      inputs: [{ name: 'request', fromRun: 'prior-run', output: 'rightReport' }],
     });
     expect(left.ok).toBe(true);
     expect(right.ok).toBe(true);
     if (!left.ok || !right.ok) return;
     expect(left.entryInputs).toEqual([{
-      entryNodeId: 'inspect', inputRef: 'request', fromRun: 'prior-run', output: 'leftReport',
+      name: 'request', semanticKind: 'result', entryNodeId: 'inspect', inputRef: 'request',
+      fromRun: 'prior-run', output: 'leftReport',
     }]);
     expect(left.fingerprint).not.toBe(right.fingerprint);
   });

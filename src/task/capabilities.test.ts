@@ -129,6 +129,63 @@ describe('capabilitiesFor', () => {
     expect(worker.has('ask_parent')).toBe(false);
   });
 
+  it('projects only dispositions declared by the frozen agent outcome', () => {
+    const task = {
+      role: 'worker' as const,
+      capabilities: [],
+      parentId: 'root',
+    };
+    const activation = {
+      runId: 'run',
+      activationId: 'activation',
+      nodeId: 'consumer',
+      kind: 'dependency_gate' as const,
+      runStatus: 'running' as const,
+      activationStatus: 'running' as const,
+      isTerminalNode: false,
+      hasDirectDependencies: true,
+      hasOpenFeedbackRound: false,
+      hasPendingContinuation: false,
+      hasInheritedFeedbackResponse: false,
+      decision: {
+        attempt: 1 as const,
+        outcome: {
+          kind: 'agent' as const,
+          requireExplicitDisposition: true,
+          next: { when: 'ready' },
+          fail: { when: 'cannot continue' },
+        },
+      },
+    };
+
+    const nextOrFail = capabilitiesFor(task, {
+      turn: { status: 'running', workflowActivation: activation } as any,
+    });
+    expect(nextOrFail.has('workflow_next')).toBe(true);
+    expect(nextOrFail.has('workflow_prev')).toBe(false);
+    expect(nextOrFail.has('workflow_fail')).toBe(true);
+
+    const prevOnly = capabilitiesFor(task, {
+      turn: {
+        status: 'running',
+        workflowActivation: {
+          ...activation,
+          decision: {
+            attempt: 2,
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              prev: [{ when: 'revise', targets: ['source'], feedback: 'required' }],
+            },
+          },
+        },
+      } as any,
+    });
+    expect(prevOnly.has('workflow_next')).toBe(false);
+    expect(prevOnly.has('workflow_prev')).toBe(true);
+    expect(prevOnly.has('workflow_fail')).toBe(false);
+  });
+
   it('keeps workflow authoring controls alongside workflow dispositions for coordinators', () => {
     const coordinator = capabilitiesFor({
       role: 'coordinator',

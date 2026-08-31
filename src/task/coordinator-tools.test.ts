@@ -30,6 +30,16 @@ function generatedWorkflowId(hex: string): string {
   return `workflow-${hex.repeat(32)}`;
 }
 
+function invalidWorkflowAttempt(
+  attemptedDisposition: 'workflow_next' | 'workflow_prev' | 'workflow_fail',
+) {
+  return {
+    kind: 'workflow_invalid_attempt' as const,
+    attemptedDisposition,
+    errorCode: 'decision_invalid' as const,
+  };
+}
+
 interface WorkflowManifestFixture extends Record<string, unknown> {
   schema: string;
   name: string;
@@ -1519,11 +1529,19 @@ describe('workflow_next tool surface', () => {
   it('rejects missing/invalid change and unauthorized callers', () => {
     expect(
       dispatch('workflow_next', { opId: 'op-n', change: 'maybe', message: 'done' }, ctx(['workflow_next'])),
-    ).toEqual({ ok: false, toolError: 'change must be "updated" or "unchanged"' });
+    ).toEqual({
+      ok: false,
+      toolError: 'change must be "updated" or "unchanged"',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_next'),
+    });
 
     expect(
       dispatch('workflow_next', { opId: 'op-n' }, ctx(['workflow_next'])),
-    ).toEqual({ ok: false, toolError: 'message is required' });
+    ).toEqual({
+      ok: false,
+      toolError: 'message is required',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_next'),
+    });
 
     expect(
       dispatch('workflow_next', { opId: 'op-n', message: 'done' }, ctx(['workflow_next'])),
@@ -1538,7 +1556,11 @@ describe('workflow_next tool surface', () => {
         { opId: 'op-n', change: 'updated', message: 'done' },
         ctx(['complete_task']),
       ),
-    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_next' });
+    ).toEqual({
+      ok: false,
+      toolError: 'action not permitted: workflow_next',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_next'),
+    });
   });
 
   it('rejects oversized workflow content without silently truncating it', () => {
@@ -1553,6 +1575,7 @@ describe('workflow_next tool surface', () => {
     expect(result).toEqual({
       ok: false,
       toolError: `message exceeds ${TASK_RESULT_MAX_BYTES} UTF-8 bytes`,
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_next'),
     });
 
     const feedback = dispatch(
@@ -1566,6 +1589,7 @@ describe('workflow_next tool surface', () => {
     expect(feedback).toEqual({
       ok: false,
       toolError: `message exceeds ${WORKFLOW_FEEDBACK_MAX_BYTES} UTF-8 bytes`,
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
     });
 
     const failure = dispatch(
@@ -1579,6 +1603,7 @@ describe('workflow_next tool surface', () => {
     expect(failure).toEqual({
       ok: false,
       toolError: `reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`,
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
     });
   });
 
@@ -1637,6 +1662,7 @@ describe('workflow_next tool surface', () => {
     ).toEqual({
       ok: false,
       toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
     });
     expect(
       dispatch(
@@ -1647,6 +1673,7 @@ describe('workflow_next tool surface', () => {
     ).toEqual({
       ok: false,
       toolError: 'targets must be "all" or a non-empty string array of inputRefs',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
     });
     expect(
       dispatch(
@@ -1657,6 +1684,19 @@ describe('workflow_next tool surface', () => {
     ).toEqual({
       ok: false,
       toolError: 'message is required',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
+    });
+
+    expect(
+      dispatch(
+        'workflow_prev',
+        { opId: 'op-p', targets: ['source'], message: '   ' },
+        ctx(['workflow_prev']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'message is required',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
     });
 
     expect(
@@ -1671,7 +1711,11 @@ describe('workflow_next tool surface', () => {
         { opId: 'op-p', targets: 'all', message: 'revise' },
         ctx(['complete_task']),
       ),
-    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_prev' });
+    ).toEqual({
+      ok: false,
+      toolError: 'action not permitted: workflow_prev',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_prev'),
+    });
   });
 
   it('maps workflow_fail with optional reason', () => {
@@ -1707,6 +1751,7 @@ describe('workflow_next tool surface', () => {
     ).toEqual({
       ok: false,
       toolError: 'reason must be a non-empty string when provided',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
     });
     expect(
       dispatch(
@@ -1714,7 +1759,11 @@ describe('workflow_next tool surface', () => {
         { opId: 'op-f' },
         ctx(['complete_task']),
       ),
-    ).toEqual({ ok: false, toolError: 'action not permitted: workflow_fail' });
+    ).toEqual({
+      ok: false,
+      toolError: 'action not permitted: workflow_fail',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
+    });
   });
 
   it('rejects model-supplied child artifact coordinates', () => {

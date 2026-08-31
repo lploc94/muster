@@ -15,6 +15,8 @@ import { canBindTaskToBackend } from './backend-eligibility';
 import {
   assembleFirstTurnPrompt,
   COMPILED_PROMPT_MAX,
+  formatWorkflowAgentOutcomeContract,
+  WORKFLOW_DECISION_REPAIR_PROMPT_MAX_CHARS,
   mergeBriefFromCreate,
   normalizeSkillNames,
   synthesizeBriefFromGoal,
@@ -47,7 +49,10 @@ import {
   remintTurnMcpForAttempt,
   type GraphEngineDeps,
 } from './engine-graph';
-import { buildFreshSessionRecoveryPromptOrThrow } from './fresh-session-recovery-prompt';
+import {
+  buildFreshSessionRecoveryPromptOrThrow,
+  WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS,
+} from './fresh-session-recovery-prompt';
 import {
   decideVerdictRetry,
   failureSignature,
@@ -439,7 +444,15 @@ export function projectPrompt(
       }
     }
   }
-  return parts.join('\n\n');
+  const workflowOutcome = turn.workflowActivation?.decision?.outcome;
+  if (workflowOutcome) parts.push(formatWorkflowAgentOutcomeContract(workflowOutcome));
+  const prompt = parts.join('\n\n');
+  if (prompt.length > COMPILED_PROMPT_MAX) {
+    throw new Error(
+      `Projected task prompt exceeds ${COMPILED_PROMPT_MAX} characters (${prompt.length})`,
+    );
+  }
+  return prompt;
 }
 
 /**
@@ -1446,6 +1459,22 @@ export class TaskEngine {
     if (this.storageTerminal) return { ok: false, error: 'storage terminal' };
     if (this.maintenanceHold || this.shuttingDown) {
       return { ok: false, error: 'storage maintenance in progress' };
+    }
+    if (command.kind === 'workflow_invalid_attempt') {
+      const callerTurn = await this.repository.getTurn(ctx.turnId);
+      if (!callerTurn || callerTurn.taskId !== ctx.callerTaskId) {
+        return { ok: true, result: { recorded: false } };
+      }
+      const write = await this.repository.execute({
+        kind: 'recordWorkflowDecisionInvalidAttempt',
+        workspaceId: this.workspaceId,
+        turnId: ctx.turnId,
+        taskId: ctx.callerTaskId,
+        expectedRuntimeEpoch: callerTurn.runtimeEpoch ?? 1,
+        attemptedDisposition: command.attemptedDisposition,
+        createdAt: nowIso(this.clock),
+      });
+      return { ok: true, result: { recorded: write.changed === true } };
     }
     // Test/host callers can deliver a tool invocation in the same tick that a
     // queued first turn is being promoted. Give the durable promotion a short
@@ -4004,6 +4033,30 @@ export class TaskEngine {
             status: 'empty' as const, registry: new Map(), diagnostics: [],
           }).taskTypes
           : undefined;
+      const workflowOutcome = draftTurn.workflowActivation?.decision?.outcome;
+      const projectedTailChars = (() => {
+        const {
+          compiledPrompt: _compiledPrompt,
+          resolvedInputs: _resolvedInputs,
+          ...turnWithoutFrozenPrompt
+        } = draftTurn;
+        try {
+          const tail = projectPrompt(
+            turnWithoutFrozenPrompt,
+            messageMapFromFile(draft),
+            draft,
+            this.getResourceLimits().maxResultBytes,
+          );
+          return tail.length === 0 ? 0 : tail.length + 2;
+        } catch {
+          return COMPILED_PROMPT_MAX + 1;
+        }
+      })();
+      const reservedTailChars = projectedTailChars + (workflowOutcome
+        ? WORKFLOW_DECISION_REPAIR_PROMPT_MAX_CHARS
+          + WORKFLOW_DECISION_RECOVERY_ENVELOPE_MAX_CHARS
+          + 2
+        : 0);
       const assembled = assembleFirstTurnPrompt({
         snapshot,
         self: {
@@ -4033,6 +4086,7 @@ export class TaskEngine {
           ? { advertisedCommands: this.getAdvertisedCommands!(draftTask.backend) }
           : {}),
         skillPrefix: this.getSkillPrefix?.(draftTask.backend) ?? '/',
+        reservedTailChars,
       });
 
       if (!assembled.ok) {
@@ -4065,7 +4119,10 @@ export class TaskEngine {
         return { ok: true, value: undefined };
       }
 
-      const remainingContinuationBudget = Math.max(0, COMPILED_PROMPT_MAX - assembled.prompt.length - 2);
+      const remainingContinuationBudget = Math.max(
+        0,
+        COMPILED_PROMPT_MAX - assembled.prompt.length - reservedTailChars - 2,
+      );
       const compactContinuation = claimsContinuation && remainingContinuationBudget > 0
         ? buildCompactContinuationContext(draft, draftTask.id, continuation!, Math.min(16_000, remainingContinuationBudget))
         : undefined;
@@ -4853,14 +4910,21 @@ export class TaskEngine {
                 priorOutcomes.push(tr.error);
               }
             }
+            const workflowDecisionPrompt =
+              startedTurn.workflowActivation?.decision &&
+              startedTurn.workflowActivation.decision.attempt > 1
+                ? prompt
+                : undefined;
             return buildFreshSessionRecoveryPromptOrThrow({
               goal: taskNow?.goal ?? taskForDispatch.goal,
               brief: taskNow?.brief ?? taskForDispatch.brief,
               ...(startedTurn.workflowInstructions !== undefined
                 ? { workflowInstructions: startedTurn.workflowInstructions }
                 : {}),
+              ...(workflowDecisionPrompt
+                ? { workflowDecisionPrompt }
+                : { originalPrompt: prompt }),
               priorOutcomes,
-              originalPrompt: prompt,
               recoveryReason: ctx.previousFailure?.code ?? 'session_registry_sticky',
             });
           },
@@ -5912,7 +5976,20 @@ export class TaskEngine {
         let source = await this.loadTurnAggregate(turnId);
       if (!source) return { status: 'failed', reason: 'turn settlement state not found' };
       const liveTurn = source.turns[turnId];
-      if (liveTurn?.workflowActivation && !liveTurn.disposition) {
+      const workflowDecision = liveTurn?.workflowActivation?.decision;
+      const implicitWorkflowNextEligible =
+        workflowDecision === undefined ||
+        (
+          workflowDecision.outcome.requireExplicitDisposition === false &&
+          workflowDecision.attempt === 1 &&
+          workflowDecision.invalidEvidence === false &&
+          workflowDecision.repairStatus === undefined
+        );
+      if (
+        liveTurn?.workflowActivation &&
+        !liveTurn.disposition &&
+        implicitWorkflowNextEligible
+      ) {
         const finalAssistantMessage = Object.values(source.messages)
           .filter((message) =>
             message.turnId === turnId &&
@@ -6040,8 +6117,11 @@ export class TaskEngine {
         }
 
         draft.turns[turnId] = result.next.turn;
+        const preservesWorkflowDecisionTask =
+          withObserved.workflowActivation?.decision !== undefined &&
+          withObserved.disposition === undefined;
         let nextTask: MusterTask = {
-          ...result.next.task,
+          ...(preservesWorkflowDecisionTask ? task : result.next.task),
           committedSessionId: sessionId ?? result.next.task.committedSessionId,
         };
         if (rotatesSessionBinding) {

@@ -778,6 +778,16 @@ function createMcpServer(options: CreateMcpServerOptions): McpServer {
     const args = request.params.arguments ?? {};
     const routed = dispatch(name, args, ctx);
     if (!routed.ok) {
+      if (routed.invalidWorkflowAttempt) {
+        const recorded = await toolHandler.handleToolCall(
+          ctx,
+          name,
+          routed.invalidWorkflowAttempt,
+        );
+        if (!recorded.ok) {
+          return { content: [{ type: 'text', text: formatToolError(recorded.error) }], isError: true };
+        }
+      }
       return { content: [{ type: 'text', text: formatToolError(routed.toolError) }], isError: true };
     }
 

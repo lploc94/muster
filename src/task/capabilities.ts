@@ -107,9 +107,13 @@ export function capabilitiesFor(
     activation?.runStatus === 'running' &&
     (activation.activationStatus === 'queued' || activation.activationStatus === 'running');
   if (isLiveActivation) {
-    granted.add('workflow_next');
-    if (activation.hasDirectDependencies) granted.add('workflow_prev');
-    granted.add('workflow_fail');
+    const outcome = activation.decision?.outcome;
+    if (!outcome || outcome.next) granted.add('workflow_next');
+    if (
+      activation.hasDirectDependencies &&
+      (!outcome || (outcome.prev !== undefined && outcome.prev.length > 0))
+    ) granted.add('workflow_prev');
+    if (!outcome || outcome.fail) granted.add('workflow_fail');
   }
 
   const canCreateChildWorkflow =

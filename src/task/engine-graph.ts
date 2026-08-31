@@ -974,6 +974,9 @@ export async function executeToolCommand(
   ctx: { callerTaskId: string; turnId: string; rootId: string; allowedActions?: ReadonlySet<string> },
   command: ToolCommand,
 ): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
+  if (command.kind === 'workflow_invalid_attempt') {
+    return { ok: false, error: 'internal workflow decision evidence command' };
+  }
   // One ResourceLimits snapshot for this tool-command scheduling pass.
   const limits =
     deps.getResourceLimits?.() ?? deps.resourceLimits ?? DEFAULT_RESOURCE_LIMITS;

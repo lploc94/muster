@@ -22,6 +22,7 @@ import { dispatch } from './coordinator-tools';
 import { SqliteTaskRepository } from './repository';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
+import type { WorkflowAgentOutcome } from './workflow-types';
 import {
   DEFAULT_WORKFLOW_POLICY,
   deriveFeedbackRequestMessageId,
@@ -155,9 +156,17 @@ async function defineAndStartFanIn(
   createdAt: string,
   startKey: string,
   policy = DEFAULT_WORKFLOW_POLICY,
+  consumerOutcome?: WorkflowAgentOutcome,
 ): Promise<StartPayload> {
   const def = makeGraphFanInDefinition({ createdAt, policy });
-  expect(entryNodeIds(def.topology).sort()).toEqual(['p1', 'p2']);
+  const topology = consumerOutcome
+    ? {
+        ...def.topology,
+        nodes: def.topology.nodes.map((node) =>
+          node.nodeId === 'consumer' ? { ...node, outcome: consumerOutcome } : node),
+      }
+    : def.topology;
+  expect(entryNodeIds(topology).sort()).toEqual(['p1', 'p2']);
 
   const defined = await repository.execute({
     kind: 'defineWorkflowVersion',
@@ -165,7 +174,7 @@ async function defineAndStartFanIn(
     definitionId: def.definitionId,
     version: def.version,
     name: def.name,
-    topology: def.topology,
+    topology,
     entryContracts: def.entryContracts,
     policy: def.policy,
     createdAt,
@@ -311,6 +320,121 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       ctx,
     );
     expect(empty.ok).toBe(false);
+  });
+
+  it('authorizes only an exact declared PREV target set and lets the valid claim win over invalid evidence', async () => {
+    const ctx = await openRepo('declared-prev-authorization');
+    try {
+      const createdAt = '2026-07-19T00:00:00.000Z';
+      const data = await defineAndStartFanIn(
+        ctx.repository,
+        createdAt,
+        's04-declared-prev-authorization',
+        DEFAULT_WORKFLOW_POLICY,
+        {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The combined result is ready.' },
+          prev: [{
+            when: 'Both producer results need revision.',
+            targets: ['from_p1', 'from_p2'],
+            feedback: 'required',
+          }],
+        },
+      );
+      const { consumerTaskId, consumerActivationTurnId } = await activateConsumer(
+        ctx.repository,
+        ctx.client,
+        data,
+      );
+      await ctx.client.run(
+        `UPDATE turns SET status = 'running', started_at = ?
+          WHERE workspace_id = ? AND id = ?`,
+        ['2026-07-19T00:03:00.000Z', 'ws', consumerActivationTurnId],
+      );
+      const consumerTurn = await ctx.repository.getTurn(consumerActivationTurnId);
+      expect(consumerTurn).toBeTruthy();
+
+      await expect(stageDispositionForSettlement(
+        ctx.repository,
+        consumerTurn!,
+        { kind: 'workflow_prev', targets: ['from_p1'], note: 'revise only p1' },
+        'invalid-subset',
+      )).resolves.toMatchObject({ changed: false });
+      await expect(stageDispositionForSettlement(
+        ctx.repository,
+        consumerTurn!,
+        { kind: 'workflow_prev', targets: 'all', note: ' padded feedback ' },
+        'invalid-feedback',
+      )).resolves.toMatchObject({ changed: false });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toMatchObject({
+        status: 'open',
+        attempts_used: 0,
+        last_attempt_turn_id: consumerActivationTurnId,
+        last_error_code: 'decision_invalid',
+      });
+      await expect(ctx.client.get(
+        `SELECT turn_id FROM turn_disposition_claims
+          WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', consumerActivationTurnId],
+      )).resolves.toBeUndefined();
+
+      const validDisposition = {
+        kind: 'workflow_prev' as const,
+        targets: 'all' as const,
+        note: 'revise both producer results',
+      };
+      await expect(stageDispositionForSettlement(
+        ctx.repository,
+        consumerTurn!,
+        validDisposition,
+        'valid-all',
+      )).resolves.toMatchObject({ changed: true });
+      await expect(stageDispositionForSettlement(
+        ctx.repository,
+        consumerTurn!,
+        { kind: 'workflow_fail', reason: 'undeclared after valid' },
+        'invalid-after-valid',
+      )).resolves.toMatchObject({ changed: false });
+      await expect(ctx.client.get(
+        `SELECT kind, status FROM turn_disposition_claims
+          WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', consumerActivationTurnId],
+      )).resolves.toMatchObject({ kind: 'prev', status: 'staged' });
+
+      await expect(settleSucceeded(
+        ctx.repository,
+        ctx.client,
+        consumerTaskId,
+        consumerActivationTurnId,
+        validDisposition,
+        '2026-07-19T00:03:01.000Z',
+      )).resolves.toMatchObject({ changed: true });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_error_code, next_repair_turn_id
+           FROM workflow_decision_repairs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toMatchObject({
+        status: 'decided',
+        attempts_used: 1,
+        last_error_code: null,
+        next_repair_turn_id: null,
+      });
+      const targets = await ctx.client.all<{ target_node_id: string }>(
+        `SELECT target_node_id FROM workflow_feedback_targets
+          WHERE workspace_id = ? AND run_id = ? ORDER BY target_node_id`,
+        ['ws', data.runId],
+      );
+      expect(targets).toEqual([{ target_node_id: 'p1' }, { target_node_id: 'p2' }]);
+    } finally {
+      await ctx.close();
+    }
   });
 
   it('PREV ALL-join: open round, partial no resume, final ordered resume, redelivery no-op, identities only', async () => {
