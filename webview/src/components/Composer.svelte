@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { threadStore } from '../lib/thread.svelte';
   import {
     tasks,
@@ -144,6 +145,7 @@
   let isAddContextMenuOpen = $state(false);
   let isConversationMenuOpen = $state(false);
   let conversationMenuRegion = $state<HTMLElement | undefined>(undefined);
+  let conversationMenuTriggerEl = $state<HTMLButtonElement | undefined>(undefined);
   let isModelPanelOpen = $state(false);
   let lastPrefillNonce = $state<number | null>(null);
   /** Reactive mirror of the pure autocomplete session (request scope + listbox). */
@@ -1067,12 +1069,24 @@
   }
 
   /**
+   * Focus back to the kebab that opened the panel. The panel cannot own this:
+   * the element focused at its mount is the menu item that was just clicked,
+   * and that item unmounts with the menu, so focusing it is a no-op and focus
+   * falls to `<body>`. Matches the workflow catalog opener-restore shape.
+   */
+  async function closeModelPanel(): Promise<void> {
+    isModelPanelOpen = false;
+    await tick();
+    conversationMenuTriggerEl?.focus();
+  }
+
+  /**
    * Commit an explicit model switch. Always a runtime handoff for an existing
    * task — the panel already told the user that, so no revert/dedupe dance is
    * needed here (unlike the old dropdown, which fired on stray scroll).
    */
   function commitModelSelection(value: string): void {
-    isModelPanelOpen = false;
+    void closeModelPanel();
     const focused = tasks.focusedTask;
     if (!focused) return;
     const backend = parseBackendId(value);
@@ -2031,6 +2045,7 @@
       {#if conversationActions.length > 0}
         <div bind:this={conversationMenuRegion} class="add-context">
           <button
+            bind:this={conversationMenuTriggerEl}
             type="button"
             class="icon-btn add-context__button"
             aria-label="Conversation options"
@@ -2139,7 +2154,7 @@
     options={pickerOptions}
     currentValue={taskPickerValue}
     loading={!modelsLoaded}
-    onClose={() => (isModelPanelOpen = false)}
+    onClose={() => void closeModelPanel()}
     onCommit={commitModelSelection}
   />
 {/if}

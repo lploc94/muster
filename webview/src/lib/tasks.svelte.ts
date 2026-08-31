@@ -419,14 +419,20 @@ class TasksState {
 
   /**
    * Sync task chrome from a pure workspace-patch reducer result (protocol v9).
-   * Does not touch draftMode/pending focus beyond focusedTaskId when removed.
+   *
+   * Focus adoption is gated on `draftMode` for the same reason `applySnapshot`
+   * gates it: the reducer's view still names the task the user just left, so an
+   * unguarded assignment silently re-points the draft at it. The draft keeps
+   * rendering (that branch checks `draftMode` first), but everything that falls
+   * back to `focusedTaskId` — the conversation menu's handoff/export target,
+   * the thread's read-only and running flags — starts acting on the old task.
    */
   applyPatchView(state: WorkspacePatchViewState): void {
     this.storeRevision = state.revision;
     this.needsRecovery = state.needsRecovery;
     this.tasks = new Map(state.tasks);
     this.subtree = [...state.subtree];
-    if (state.focusedTaskId) {
+    if (state.focusedTaskId && !this.draftMode) {
       this.focusedTaskId = state.focusedTaskId;
       this.queuedTurns = sortQueuedTurns(state.queuedTurns);
       this.reconcilePendingHandoffTarget(state.focusedTaskId);

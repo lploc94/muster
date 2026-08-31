@@ -30,17 +30,76 @@
   const currentLabel = $derived(options.find((o) => o.value === baseline)?.label ?? baseline);
 
   let panelEl: HTMLDivElement | undefined = $state();
+  let listEl: HTMLUListElement | undefined = $state();
   let prevActiveEl: HTMLElement | null = null;
+
+  /**
+   * Tabbable controls inside the dialog, in DOM order. Options carry a roving
+   * `tabindex` (see `optionTabIndex`), so `tabindex="-1"` must be excluded here
+   * or the trap would treat all nine rows as separate tab stops.
+   */
+  function focusables(): HTMLElement[] {
+    if (!panelEl) return [];
+    return Array.from(
+      panelEl.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter(
+      (el) =>
+        el.getAttribute('tabindex') !== '-1' &&
+        (el.offsetParent !== null || el === document.activeElement),
+    );
+  }
+
+  /**
+   * One tab stop for the whole group: the selected row, or the first row when
+   * the committed binding is not in the catalog. Arrow keys move it.
+   */
+  function optionTabIndex(value: string, index: number): 0 | -1 {
+    if (value === selected) return 0;
+    if (index === 0 && !options.some((o) => o.value === selected)) return 0;
+    return -1;
+  }
+
+  /**
+   * `aria-modal="true"` promises the rest of the page is inert. Nothing else
+   * enforces that here, so Tab is cycled inside the dialog: without this, focus
+   * walks out into the composer behind the backdrop while the dialog claims to
+   * be modal.
+   */
+  function trapTab(e: KeyboardEvent): void {
+    const items = focusables();
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement as HTMLElement | null;
+    if (e.shiftKey && (active === first || active === panelEl)) {
+      e.preventDefault();
+      last.focus();
+      return;
+    }
+    if (!e.shiftKey && active === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 
   onMount(() => {
     prevActiveEl = document.activeElement as HTMLElement | null;
-    panelEl?.focus();
+    // Focus the group's single tab stop so arrow keys work immediately. The
+    // dialog itself is the fallback while the catalog is empty or loading.
+    const stop = panelEl?.querySelector<HTMLElement>(
+      '[data-testid="model-handoff-option"][tabindex="0"]',
+    );
+    (stop ?? panelEl)?.focus();
     function onKey(e: KeyboardEvent) {
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
         onClose();
+        return;
       }
+      if (e.key === 'Tab') trapTab(e);
     }
     window.addEventListener('keydown', onKey, true);
     return () => {
@@ -48,6 +107,28 @@
       prevActiveEl?.focus();
     };
   });
+
+  /**
+   * `role="radiogroup"` promises one tab stop plus arrow navigation. These are
+   * buttons rather than native radios (each row carries a label and a badge),
+   * so roving focus is implemented here instead of inherited from the platform.
+   */
+  function onListKeydown(e: KeyboardEvent): void {
+    const keys = ['ArrowDown', 'ArrowRight', 'ArrowUp', 'ArrowLeft', 'Home', 'End'];
+    if (!keys.includes(e.key) || options.length === 0) return;
+    e.preventDefault();
+    const at = options.findIndex((o) => o.value === selected);
+    const from = at === -1 ? 0 : at;
+    let next: number;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = options.length - 1;
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') next = (from + 1) % options.length;
+    else next = (from - 1 + options.length) % options.length;
+    selected = options[next].value;
+    // Selection and focus move together, or a screen reader announces a row the
+    // user is no longer on.
+    listEl?.querySelectorAll<HTMLElement>('[data-testid="model-handoff-option"]')[next]?.focus();
+  }
 
   function commit() {
     if (!changed) return;
@@ -100,8 +181,15 @@
         No selectable models yet. Install or configure an agent CLI first.
       </div>
     {:else}
-      <ul class="model-panel__list" role="radiogroup" aria-label="Available models">
-        {#each options as option (option.value)}
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <ul
+        bind:this={listEl}
+        class="model-panel__list"
+        role="radiogroup"
+        aria-label="Available models"
+        onkeydown={onListKeydown}
+      >
+        {#each options as option, index (option.value)}
           <li>
             <button
               type="button"
@@ -109,6 +197,7 @@
               class:model-panel__option--selected={option.value === selected}
               role="radio"
               aria-checked={option.value === selected ? 'true' : 'false'}
+              tabindex={optionTabIndex(option.value, index)}
               data-testid="model-handoff-option"
               data-value={option.value}
               onclick={() => (selected = option.value)}

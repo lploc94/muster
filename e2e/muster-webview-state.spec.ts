@@ -7825,6 +7825,116 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       )
       .toBe(0);
   });
+
+  test('change-model panel is keyboard operable: roving radiogroup plus a real focus trap', async ({
+    page,
+  }) => {
+    const taskId = 'task-handoff-keyboard';
+    await openWebview(page);
+
+    const focused = task({
+      id: taskId,
+      goal: 'Keyboard-drive the model switch',
+      viewStatus: 'idle',
+      backend: 'claude',
+      model: 'sonnet',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [focused],
+      focusedTaskId: taskId,
+      subtree: [focused],
+      transcript: [{ id: 'msg-kbd', kind: 'user', content: 'Switch by keyboard.' }],
+      storeRevision: 401,
+    });
+    await postModelsAvailable(page, {
+      claude: {
+        current: 'sonnet',
+        options: [
+          { value: 'sonnet', name: 'sonnet' },
+          { value: 'opus', name: 'opus' },
+        ],
+      },
+      grok: { current: 'grok-4', options: [{ value: 'grok-4', name: 'grok-4' }] },
+    });
+
+    await clickConversationAction(page, 'change-model');
+    const panel = page.getByTestId('model-handoff-panel');
+    await expect(panel).toBeVisible();
+
+    // The picker lists every eligible backend, not just the fixture's two, so
+    // read the real option order rather than assuming it.
+    const optionValues = await page
+      .locator('[data-testid="model-handoff-option"]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute('data-value') ?? ''));
+    expect(optionValues.length).toBeGreaterThan(2);
+    expect(optionValues).toContain('claude::sonnet');
+    expect(optionValues).toContain('grok::grok-4');
+
+    // `role="radiogroup"` means ONE tab stop for the group, and it must be the
+    // committed binding — not the dialog container, or arrows do nothing until
+    // the user first tabs into a row.
+    const rovingStop = page.locator('[data-testid="model-handoff-option"][tabindex="0"]');
+    await expect(rovingStop).toHaveCount(1);
+    await expect(rovingStop).toHaveAttribute('data-value', 'claude::sonnet');
+
+    const activeOption = () =>
+      page.evaluate(() => document.activeElement?.getAttribute('data-value') ?? null);
+    await expect.poll(activeOption).toBe('claude::sonnet');
+
+    // Arrows move selection and focus together; a screen reader must never
+    // announce a row the user is no longer standing on.
+    const currentIndex = optionValues.indexOf('claude::sonnet');
+    const nextValue = optionValues[(currentIndex + 1) % optionValues.length]!;
+    await page.keyboard.press('ArrowDown');
+    await expect(panel).toHaveAttribute('data-selected', nextValue);
+    await expect.poll(activeOption).toBe(nextValue);
+
+    await page.keyboard.press('End');
+    await expect(panel).toHaveAttribute('data-selected', optionValues.at(-1)!);
+    await expect.poll(activeOption).toBe(optionValues.at(-1)!);
+
+    await page.keyboard.press('Home');
+    await expect(panel).toHaveAttribute('data-selected', optionValues[0]!);
+    // Wrap-around: Up from the first row lands on the last.
+    await page.keyboard.press('ArrowUp');
+    await expect(panel).toHaveAttribute('data-selected', optionValues.at(-1)!);
+
+    // The roving stop follows the selection, so Tab still sees one group stop.
+    await expect(rovingStop).toHaveCount(1);
+    await expect(rovingStop).toHaveAttribute('data-value', optionValues.at(-1)!);
+
+    // `aria-modal="true"` claims the rest of the page is inert. Nothing makes it
+    // inert, so Tab must cycle: walk further than the dialog has stops and
+    // confirm focus never lands in the composer behind the backdrop.
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Tab');
+      expect(await controlHasFocus(panel)).toBe(true);
+    }
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Shift+Tab');
+      expect(await controlHasFocus(panel)).toBe(true);
+    }
+
+    // Keyboard-only walk to a known binding, then commit: the host must receive
+    // the arrow-selected target, not the one the panel opened on.
+    const grokIndex = optionValues.indexOf('grok::grok-4');
+    await page.locator('[data-testid="model-handoff-option"][tabindex="0"]').focus();
+    await page.keyboard.press('Home');
+    for (let i = 0; i < grokIndex; i += 1) await page.keyboard.press('ArrowDown');
+    await expect(panel).toHaveAttribute('data-selected', 'grok::grok-4');
+
+    await page.getByTestId('model-handoff-commit').focus();
+    await page.keyboard.press('Enter');
+    await expect(panel).toHaveCount(0);
+    await expectPostedMessage(page, {
+      type: 'requestRuntimeHandoff',
+      taskId,
+      targetBackend: 'grok',
+      targetModel: 'grok-4',
+    });
+    await expectControlFocused(page.getByTestId('conversation-menu-trigger'));
+  });
 });
 
 test.describe('Task-tree chrome navigation', () => {
@@ -8191,6 +8301,56 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('task-chrome')).toContainText('Other coordinator');
     await expect(page.getByTestId('task-chrome')).toHaveAttribute('data-tree-expanded', 'true');
     await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Other worker' })).toBeVisible();
+  });
+
+  test('a patch batch during a draft does not re-adopt the departed task', async ({ page }) => {
+    await openWebview(page);
+
+    // A running task is the interesting case: its runtime flags are what leak
+    // onto the draft thread if focus is re-adopted.
+    const running = task({
+      id: 'coord-running',
+      goal: 'Long running coordinator',
+      viewStatus: 'running',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [running],
+      focusedTaskId: 'coord-running',
+      subtree: [running],
+      transcript: [{ id: 'msg-running', kind: 'user', content: 'old conversation' }],
+      storeRevision: 1,
+    });
+    await expect(page.getByTestId('task-chrome')).toContainText('Long running coordinator');
+
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+    const draftComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await expect(draftComposer).toBeEnabled();
+
+    // The host keeps streaming the old task while the draft is open. The patch
+    // view still names it as focused, so an unguarded adopt would push its
+    // running flag onto the draft's fresh thread and disable Send.
+    await postRawHostMessage(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [{ type: 'taskUpserted', task: running }],
+    });
+
+    await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveCount(0);
+    await expect(page.getByText('old conversation', { exact: true })).toHaveCount(0);
+    await expect(draftComposer).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Send' })).toBeVisible();
+
+    // Send still creates a new task rather than a turn on the departed one.
+    await draftComposer.fill('start fresh');
+    await page.getByRole('button', { name: 'Send' }).click();
+    const sends = (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'send',
+    ) as Array<{ taskId?: string }>;
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.taskId).toBeUndefined();
   });
 
   test('narrow viewport keeps selected child as compact header without horizontal overflow', async ({
