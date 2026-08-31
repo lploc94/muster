@@ -78,6 +78,12 @@ describe('openStoreDatabase', () => {
       expect(tables).toContain('turn_cancel_requests');
       // Current blank claim includes workflow tables + writer-guard triggers.
       expect(tables).toContain('workflow_definitions');
+      expect(tables).toContain('workflow_definition_inputs');
+      expect(tables).toContain('workflow_definition_outputs');
+      expect(tables).toContain('workflow_definition_nodes');
+      expect(tables).toContain('workflow_definition_edges');
+      expect(tables).toContain('workflow_decision_repairs');
+      expect(tables).not.toContain('workflow_entry_contracts');
       expect(tables).toContain('workflow_runs');
       expect(tables).toContain('workflow_nodes');
       const writerGuard = db
@@ -87,6 +93,69 @@ describe('openStoreDatabase', () => {
         )
         .get() as { name?: string } | undefined;
       expect(writerGuard?.name).toBe('trg_wg_workspaces_insert');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('creates the exact canonical workflow authority and repair schema', () => {
+    const db = openStoreDatabase({ path: tempDbPath() });
+    try {
+      const columns = (table: string) => (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+        .map((column) => column.name);
+      expect(columns('workflow_definitions')).toEqual([
+        'workspace_id', 'definition_id', 'version', 'name', 'description',
+        'scope_kind', 'owner_root_task_id', 'fingerprint', 'policy_json', 'created_at',
+      ]);
+      expect(columns('workflow_definition_inputs')).toEqual([
+        'workspace_id', 'definition_id', 'definition_version', 'name', 'semantic_kind',
+        'entry_node_id', 'input_ref', 'ordinal', 'expected_artifact_kind',
+      ]);
+      expect(columns('workflow_definition_outputs')).toEqual([
+        'workspace_id', 'definition_id', 'definition_version', 'name', 'semantic_kind',
+        'terminal_node_id', 'ordinal', 'expected_artifact_kind',
+      ]);
+      expect(columns('workflow_definition_nodes')).toEqual([
+        'workspace_id', 'definition_id', 'definition_version', 'node_id', 'ordinal', 'title',
+        'instructions_kind', 'instructions_file', 'instructions_content', 'instructions_sha256',
+        'role', 'task_type', 'backend', 'model', 'capabilities_json',
+        'execution_kind', 'script_interpreter', 'script_file', 'script_args_json',
+        'script_source_kind', 'script_source_scope', 'script_package_kind',
+        'script_catalog_root_kind', 'script_package_path', 'script_entry_file',
+        'script_workflow_ref', 'script_package_sha256', 'script_sha256',
+        'outcome_kind', 'outcome_json',
+      ]);
+      expect(columns('workflow_definition_edges')).toEqual([
+        'workspace_id', 'definition_id', 'definition_version', 'source_node_id',
+        'destination_node_id', 'destination_input_ref', 'ordinal', 'expected_artifact_kind',
+      ]);
+      expect(columns('workflow_decision_repairs')).toEqual([
+        'workspace_id', 'run_id', 'activation_id', 'status', 'attempts_used',
+        'last_attempt_turn_id', 'last_error_code', 'last_response_message_id',
+        'next_repair_turn_id', 'created_at', 'updated_at',
+      ]);
+
+      const repairForeignTables = new Set(
+        (db.prepare('PRAGMA foreign_key_list(workflow_decision_repairs)').all() as Array<{ table: string }>)
+          .map((foreignKey) => foreignKey.table),
+      );
+      expect(repairForeignTables).toEqual(new Set([
+        'workspaces', 'workflow_activations', 'turns', 'messages',
+      ]));
+      const indexes = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'index'").all() as Array<{ name: string }>)
+        .map((row) => row.name);
+      expect(indexes).toContain('idx_workflow_decision_repairs_status');
+      const triggers = (db.prepare("SELECT name FROM sqlite_schema WHERE type = 'trigger'").all() as Array<{ name: string }>)
+        .map((row) => row.name);
+      for (const table of [
+        'workflow_definition_inputs',
+        'workflow_definition_outputs',
+        'workflow_definition_nodes',
+        'workflow_definition_edges',
+      ]) {
+        expect(triggers).toContain(`trg_${table}_immutable_update`);
+        expect(triggers).toContain(`trg_${table}_immutable_delete`);
+      }
     } finally {
       db.close();
     }

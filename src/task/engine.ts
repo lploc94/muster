@@ -2546,6 +2546,7 @@ export class TaskEngine {
     const write = await this.repository.execute({
       kind: 'retryTurn', workspaceId: this.workspaceId, expectedTaskRevision: task.revision,
       maxTurnsPerTask: this.getResourceLimits().maxTurnsPerTask, task: nextTask, turn: retry.next,
+      reuseOriginalInputs: options?.reuseOriginalInputs === true,
     });
     if (!write.changed) return { ok: false, reason: write.reason ?? 'task changed; retry' };
     void this.scheduleTurn(newTurnId);
@@ -4855,6 +4856,9 @@ export class TaskEngine {
             return buildFreshSessionRecoveryPromptOrThrow({
               goal: taskNow?.goal ?? taskForDispatch.goal,
               brief: taskNow?.brief ?? taskForDispatch.brief,
+              ...(startedTurn.workflowInstructions !== undefined
+                ? { workflowInstructions: startedTurn.workflowInstructions }
+                : {}),
               priorOutcomes,
               originalPrompt: prompt,
               recoveryReason: ctx.previousFailure?.code ?? 'session_registry_sticky',

@@ -5,7 +5,11 @@ import * as path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { IncompatibleSchemaError, openStoreDatabase } from './sqlite/connection';
 import { resetDatabaseAtPath } from './sqlite/reset';
-import { MUSTER_APPLICATION_ID, SQLITE_SCHEMA_VERSION } from './sqlite/schema';
+import {
+  CURRENT_SCHEMA_STATEMENTS,
+  MUSTER_APPLICATION_ID,
+  SQLITE_SCHEMA_VERSION,
+} from './sqlite/schema';
 
 const tempDirs: string[] = [];
 
@@ -27,17 +31,18 @@ afterEach(() => {
 });
 
 describe('M024 S06 schema evidence baseline', () => {
-  it('uses schema v6 and requires an explicit reset for unsupported owned stores', () => {
-    // v6 adds an explicit additive migration from v5 for global preferences and
-    // verification. Other unsupported versions remain fail-closed/reset-only.
-    expect(SQLITE_SCHEMA_VERSION).toBe(6);
+  it('uses reset-only schema v7 and refuses schema 6 without mutation', () => {
+    expect(SQLITE_SCHEMA_VERSION).toBe(7);
 
     const dbPath = tempDbPath();
     const current = openStoreDatabase({ path: dbPath });
     current.close();
 
     const incompatible = new DatabaseSync(dbPath);
-    incompatible.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION + 1}`);
+    incompatible.exec('PRAGMA user_version = 6');
+    const beforeObjects = incompatible
+      .prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+      .all();
     incompatible.close();
 
     expect(() => openStoreDatabase({ path: dbPath })).toThrow(IncompatibleSchemaError);
@@ -45,7 +50,12 @@ describe('M024 S06 schema evidence baseline', () => {
     const beforeReset = new DatabaseSync(dbPath);
     try {
       expect(scalar(beforeReset, 'application_id')).toBe(MUSTER_APPLICATION_ID);
-      expect(scalar(beforeReset, 'user_version')).toBe(SQLITE_SCHEMA_VERSION + 1);
+      expect(scalar(beforeReset, 'user_version')).toBe(6);
+      expect(
+        beforeReset
+          .prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
+          .all(),
+      ).toEqual(beforeObjects);
     } finally {
       beforeReset.close();
     }
@@ -64,5 +74,11 @@ describe('M024 S06 schema evidence baseline', () => {
     } finally {
       reset.close();
     }
+  });
+
+  it('contains no in-place migration statements or open-path migration branch', () => {
+    expect(CURRENT_SCHEMA_STATEMENTS.some((statement) => /\bALTER\s+TABLE\b/i.test(statement))).toBe(false);
+    const source = fs.readFileSync(new URL('./sqlite/connection.ts', import.meta.url), 'utf8');
+    expect(source).not.toMatch(/Additive migration|observedVersion\s*===\s*5|\bALTER\s+TABLE\b/i);
   });
 });

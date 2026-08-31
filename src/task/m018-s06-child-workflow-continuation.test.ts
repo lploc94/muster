@@ -15,6 +15,7 @@
  * paths, or SQL.
  */
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -33,10 +34,28 @@ import type { GraphTopologyV1 } from './workflow-types';
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
 
+const ONE_NODE_INSTRUCTIONS = 'Use the frozen caller instructions after every child return.';
 const ONE_NODE = {
   kind: 'one_node_v1' as const,
   nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
   entryNodeId: 'entry',
+};
+
+const CANONICAL_ONE_NODE = {
+  kind: 'workflow' as const,
+  inputs: [],
+  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+  nodes: [{
+    nodeId: 'entry',
+    role: 'coordinator' as const,
+    capabilities: ['create_child' as const],
+    instructions: {
+      kind: 'inline' as const,
+      content: ONE_NODE_INSTRUCTIONS,
+      sha256: createHash('sha256').update(ONE_NODE_INSTRUCTIONS).digest('hex'),
+    },
+  }],
+  edges: [],
 };
 
 const MULTI_TERMINAL_CHILD: GraphTopologyV1 = {
@@ -163,6 +182,56 @@ async function defineGraphVersion(
       expectedArtifactKind: 'engine_start',
     })),
     policy,
+    createdAt,
+  });
+  expect(def.ok).toBe(true);
+}
+
+async function defineWorkflowInputVersion(
+  repository: SqliteTaskRepository,
+  createdAt: string,
+  definitionId: string,
+  name: string,
+): Promise<void> {
+  const topology = {
+    ...CANONICAL_ONE_NODE,
+    inputs: [{
+      name: 'input',
+      semanticKind: 'input',
+      entryNodeId: 'entry',
+      inputRef: 'engine_start',
+    }],
+  };
+  const def = await repository.execute({
+    kind: 'defineWorkflowVersion',
+    workspaceId: 'ws',
+    definitionId,
+    version: 1,
+    name,
+    topology,
+    entryContracts: [{
+      entryNodeId: 'entry',
+      inputRef: 'engine_start',
+      expectedArtifactKind: 'workflow_input',
+    }],
+    createdAt,
+  });
+  expect(def.ok).toBe(true);
+}
+
+async function defineCanonicalVersion(
+  repository: SqliteTaskRepository,
+  createdAt: string,
+  definitionId: string,
+  name: string,
+): Promise<void> {
+  const def = await repository.execute({
+    kind: 'defineWorkflowVersion',
+    workspaceId: 'ws',
+    definitionId,
+    version: 1,
+    name,
+    topology: CANONICAL_ONE_NODE,
     createdAt,
   });
   expect(def.ok).toBe(true);
@@ -1779,11 +1848,11 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
   }, 45_000);
 
   it('child terminal NEXT resolves continuation once and queues exactly one caller resume; redelivery is a no-op', async () => {
-    const opened = await openRepo('return');
-    try {
-      const createdAt = '2026-07-20T00:00:00.000Z';
-      await defineVersion(opened.repository, createdAt, 'wf-caller-r', 'caller-r');
-      await defineVersion(opened.repository, createdAt, 'wf-child-r', 'child-r', 'engine_start');
+      const opened = await openRepo('return');
+      try {
+        const createdAt = '2026-07-20T00:00:00.000Z';
+      await defineCanonicalVersion(opened.repository, createdAt, 'wf-caller-r', 'caller-r');
+      await defineWorkflowInputVersion(opened.repository, createdAt, 'wf-child-r', 'child-r');
       const caller = await startOneNode(
         opened.repository,
         createdAt,
@@ -1791,6 +1860,32 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
         's06-return-caller',
         'caller return goal',
       );
+      const callerActivation = await opened.client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND execution_turn_id = ?`,
+        ['ws', caller.runId, caller.activationTurnId],
+      );
+      const childInputArtifactId = 's06-return-child-input';
+      await opened.client.transaction([
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,1,'workflow_input','{"value":"child input"}',?)`,
+          params: ['ws', caller.runId, childInputArtifactId, 'entry', 'child_input', createdAt],
+        },
+        {
+          sql: `INSERT INTO workflow_artifact_sources (
+                  workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                  producer_run_id, producer_node_id, producer_task_id,
+                  producing_turn_id, producing_activation_id
+                ) VALUES (?,?,?,1,'workflow_node',?,?,?,?,?)`,
+          params: [
+            'ws', caller.runId, childInputArtifactId, caller.runId, 'entry',
+            caller.entryTaskId, caller.activationTurnId, callerActivation!.activation_id,
+          ],
+        },
+      ]);
 
       const invoke = await settleSucceeded(
         opened.repository,
@@ -1808,7 +1903,7 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
               {
                 childEntryNodeId: 'entry',
                 inputRef: 'engine_start',
-                artifactId: caller.startArtifactId,
+                artifactId: childInputArtifactId,
                 artifactRevision: 1,
               },
             ],
@@ -1850,6 +1945,9 @@ describe('M018 S06 child-workflow continuation (named flow)', () => {
       const resumeTurns = await queuedTurnsForTask(opened.client, caller.entryTaskId);
       expect(resumeTurns).toHaveLength(1);
       const resumeTurnId = resumeTurns[0]!.id;
+      await expect(opened.repository.getTurn(resumeTurnId)).resolves.toMatchObject({
+        workflowInstructions: ONE_NODE_INSTRUCTIONS,
+      });
 
       // The child run owns and seals its node task; the caller remains runnable.
       const childTask = await opened.repository.getTask(childEntry!.task_id);

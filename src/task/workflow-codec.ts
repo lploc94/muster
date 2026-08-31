@@ -901,8 +901,8 @@ function encodeNodeJson(node: WorkflowNodeSpec): RecordValue {
   };
 }
 
-export function encodeTopologyJson(topology: WorkflowTopology): string {
-  return JSON.stringify({
+function canonicalTopologyValue(topology: WorkflowTopology): RecordValue {
+  return {
     kind: 'workflow',
     ...(topology.description !== undefined ? { description: topology.description } : {}),
     inputs: topology.inputs.map((input) => ({
@@ -923,7 +923,7 @@ export function encodeTopologyJson(topology: WorkflowTopology): string {
       inputRef: edge.inputRef,
       expectedArtifactKind: edge.expectedArtifactKind ?? 'next_result',
     })),
-  });
+  };
 }
 
 export function fingerprintWorkflowDefinition(input: {
@@ -939,7 +939,7 @@ export function fingerprintWorkflowDefinition(input: {
     definitionId: input.definitionId,
     version: input.version,
     name: input.name,
-    topology: JSON.parse(encodeTopologyJson(input.topology)),
+    topology: canonicalTopologyValue(input.topology),
     entryContracts: input.entryContracts.map((contract) => ({
       entryNodeId: contract.entryNodeId,
       inputRef: contract.inputRef,
@@ -1118,14 +1118,6 @@ export function decodeDefineWorkflowInput(input: DefineWorkflowInput): Definitio
     createdAt: input.createdAt,
   };
   return { ok: true, definition, fingerprint: fingerprintWorkflowDefinition(definition) };
-}
-
-export function decodeStoredTopologyJson(topologyJson: string): TopologyDecodeResult {
-  try {
-    return decodeTopology(JSON.parse(topologyJson));
-  } catch {
-    return { ok: false, reason: 'corrupt topology_json' };
-  }
 }
 
 export function fingerprintStartEntryInputs(

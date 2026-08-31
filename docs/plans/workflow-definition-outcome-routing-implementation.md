@@ -140,10 +140,10 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `feat(workflow-packages): make workflow json authoritative`
 
 ## Phase 3: Persist Frozen Canonical Definitions and Interfaces
-- Status: pending
+- Status: complete
 - Depends on: Phase 1, Phase 2
 - Goal: Refactor the reset-only SQLite store and repository reload path to be authoritative for the one normalized canonical definition, semantic interfaces, frozen assets, and outcomes.
-- Current behavior: Schema version 6 persists `workflow_definitions`, version-suffixed node/edge shapes, and `workflow_entry_contracts`; `defineWorkflowVersion` writes these atomically and `getWorkflowDefinition`/`startWorkflowRun` decode the superseded topology JSON and revalidate its fingerprint. Existing stores with another marker fail closed and reset rebuilds only the current schema.
+- Current behavior: Schema version 7 persists one normalized canonical definition through ordered input, output, node, and edge authority rows plus activation-owned decision-repair rows; `defineWorkflowVersion` writes these atomically and `getWorkflowDefinition`/`startWorkflowRun` reconstruct and fingerprint-check the frozen relational authority. Existing stores with another marker fail closed and reset rebuilds only the current schema.
 - Code evidence: `src/task/sqlite/schema.ts:SQLITE_SCHEMA_VERSION/REQUIRED_WORKFLOW_TABLES/WORKFLOW_SCHEMA_STATEMENTS/CURRENT_SCHEMA_STATEMENTS`; `src/task/sqlite/connection.ts:tryOpenExistingCurrent/openStoreDatabase`; `src/task/sqlite/reset.ts:bootstrapCurrentSchema`; `src/task/sqlite/schema-fingerprint.ts:findSchemaFingerprintFailure`; `src/task/repository.ts:defineWorkflowVersion/getWorkflowDefinition/getLatestWorkflowDefinition/startWorkflowRun`; tests in `src/task/repository.test.ts`, `src/task/sqlite/schema-fingerprint.test.ts`, `src/task/sqlite/connection.test.ts`, `src/task/sqlite/reset.test.ts`, and `src/task/m024-s06-schema-evidence.test.ts`.
 - Pattern to follow: The current definition transaction writes an immutable definition plus relational authority rows under one operation/fingerprint claim, and every reload re-decodes/revalidates/fingerprint-checks stored data before use.
 - Behavioral contract:
@@ -166,10 +166,10 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
   - Ensure stored instruction bodies are available only to prompt compilation/execution paths and never enter status, diagnostics, catalog, or graph projections.
   - Hydrate frozen instructions through the real engine execution/brief path for initial, dependency, feedback-resume, child-return, retry, and fresh-session reconstruction contexts; never substitute mutable package reads or display title.
 - Acceptance criteria:
-  - [ ] AC-1: Schema 7 fresh-open/reset produces exactly the canonical authority schema while schema 6 fails closed without migration - proven by SQLite connection/reset/fingerprint tests.
-  - [ ] AC-2: Define replay/conflict/rollback and reopen reconstruct the complete frozen canonical definition exactly - proven by `src/task/repository.test.ts` and reload tests.
-  - [ ] AC-3: Corrupt or mismatched canonical authority rows cannot be executed or silently normalized - proven by row-mutation corruption tests.
-  - [ ] AC-4: Reopened activations execute with the persisted frozen instruction body, while title and mutated package bytes cannot alter the prompt - proven by repository reload plus brief/execution tests.
+  - [x] AC-1: Schema 7 fresh-open/reset produces exactly the canonical authority schema while schema 6 fails closed without migration - proven by SQLite connection/reset/fingerprint tests.
+  - [x] AC-2: Define replay/conflict/rollback and reopen reconstruct the complete frozen canonical definition exactly - proven by `src/task/repository.test.ts` and reload tests.
+  - [x] AC-3: Corrupt or mismatched canonical authority rows cannot be executed or silently normalized - proven by row-mutation corruption tests.
+  - [x] AC-4: Reopened activations execute with the persisted frozen instruction body, while title and mutated package bytes cannot alter the prompt - proven by repository reload plus brief/execution tests.
 - Focused verification:
   - `npx vitest run src/task/repository.test.ts src/task/sqlite/schema-fingerprint.test.ts src/task/sqlite/connection.test.ts src/task/sqlite/reset.test.ts src/task/m024-s06-schema-evidence.test.ts src/task/sqlite/privacy-redaction.test.ts`
 - Phase gates:
@@ -344,7 +344,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 |---|---|---|---|---|
 | 1 | complete | this phase commit (`refactor(workflow-definition): adopt canonical manifest contract`) | Focused: 180/180; `npx tsc -p . --noEmit`; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 3 rounds; 5 findings fixed |
 | 2 | complete | this phase commit (`feat(workflow-packages): make workflow json authoritative`) | Focused: 164/164; script-workflow QA: 150/150; compile; source-boundary + fixtures passed; native VS Code 1.135.0 rerun remains truthfully pending after its UAT-only workspace setting update blocked before run creation | `codex-impl-review` APPROVE in 4 rounds; 9 findings fixed |
-| 3 | pending | N/A | pending | pending |
+| 3 | complete | this phase commit (`refactor(workflow-storage): persist canonical definitions`) | Focused: 89/89; affected workflow/retry: 112/112; child-return integration: 1/1; `npx tsc -p . --noEmit`; `git diff --check`; compile; SQLite storage docs; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 5 findings fixed |
 | 4 | pending | N/A | pending | pending |
 | 5 | pending | N/A | pending | pending |
 | 6 | pending | N/A | pending | pending |

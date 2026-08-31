@@ -213,7 +213,9 @@ export interface QueueTurnOptions {
   retryOf?: string;
 }
 
-interface InternalQueueTurnOptions extends QueueTurnOptions {}
+interface InternalQueueTurnOptions extends QueueTurnOptions {
+  workflowInstructions?: string;
+}
 
 function bumpTask(task: MusterTask, now: string, patch: Partial<MusterTask>): MusterTask {
   return {
@@ -269,6 +271,9 @@ function queueTurn(
     executionEpoch: task.executionEpoch ?? 1,
     runtimeEpoch: task.runtimeEpoch ?? 1,
     inputs: [...options.inputs],
+    ...(options.workflowInstructions !== undefined
+      ? { workflowInstructions: options.workflowInstructions }
+      : {}),
     createdAt: options.now,
   };
 
@@ -954,6 +959,9 @@ export function retryTurn(
     trigger: 'retry',
     retryOf: oldTurn.id,
     inputs,
+    ...(oldTurn.workflowInstructions !== undefined
+      ? { workflowInstructions: oldTurn.workflowInstructions }
+      : {}),
   });
 }
 

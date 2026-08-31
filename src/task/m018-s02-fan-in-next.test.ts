@@ -28,7 +28,9 @@ import {
 } from './workflow';
 
 const FAN_IN_TOPOLOGY = {
-  kind: 'graph_v1' as const,
+  kind: 'workflow' as const,
+  inputs: [],
+  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
   nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
   edges: [
     { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1', expectedArtifactKind: 'next_result' },
@@ -71,16 +73,21 @@ describe('M018 S02 fan-in NEXT activation', () => {
     const ok = dispatch(
       'define_workflow',
       {
-        name: 'fan-in',
-        nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
-          nodeKey: node.nodeId,
-          taskType: 'worker',
-        })),
-        edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
-          from: edge.fromNodeId,
-          to: edge.toNodeId,
-          as: edge.inputRef,
-        })),
+        manifest: {
+          schema: 'muster.workflow/v2',
+          name: 'fan-in',
+          inputs: [],
+          outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+          nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+            nodeKey: node.nodeId,
+            taskType: 'worker',
+          })),
+          edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+            from: edge.fromNodeId,
+            to: edge.toNodeId,
+            inputRef: edge.inputRef,
+          })),
+        },
       },
       ctx,
     );
@@ -104,32 +111,28 @@ describe('M018 S02 fan-in NEXT activation', () => {
     const fanOut = dispatch(
       'define_workflow',
       {
-        name: 'fan-out-bad',
-        nodes: [
-          { nodeKey: 'source', taskType: 'worker' },
-          { nodeKey: 'left', taskType: 'worker' },
-          { nodeKey: 'right', taskType: 'worker' },
-        ],
-        edges: [
-          { from: 'source', to: 'left', as: 'from_source' },
-          { from: 'source', to: 'right', as: 'from_source' },
-        ],
+        manifest: {
+          schema: 'muster.workflow/v2',
+          name: 'fan-out-bad',
+          inputs: [],
+          outputs: [
+            { name: 'leftResult', kind: 'result', from: 'left' },
+            { name: 'rightResult', kind: 'result', from: 'right' },
+          ],
+          nodes: [
+            { nodeKey: 'source', taskType: 'worker' },
+            { nodeKey: 'left', taskType: 'worker' },
+            { nodeKey: 'right', taskType: 'worker' },
+          ],
+          edges: [
+            { from: 'source', to: 'left', inputRef: 'from_source' },
+            { from: 'source', to: 'right', inputRef: 'from_source' },
+          ],
+        },
       },
       ctx,
     );
-    expect(fanOut.ok).toBe(true);
-    if (fanOut.ok && fanOut.command.kind === 'define_workflow') {
-      expect(validateDefineWorkflow({
-        definitionId: fanOut.command.definitionId,
-        version: 1,
-        name: fanOut.command.name,
-        topology: fanOut.command.topology,
-        entryContracts: fanOut.command.entryContracts,
-        policy: DEFAULT_WORKFLOW_POLICY,
-        scope: { kind: 'root', ownerRootTaskId: 'root' },
-        createdAt: '2026-07-19T00:00:00.000Z',
-      }).ok).toBe(false);
-    }
+    expect(fanOut.ok).toBe(false);
   });
 
   it('two-producer fan-in NEXT: partial fill leaves consumer absent; final fill queues one aggregate turn without sealing producers', async () => {
@@ -357,7 +360,9 @@ describe('M018 S02 fan-in NEXT activation', () => {
       const first = new SqliteTaskRepository(firstClient, 'ws');
       const second = new SqliteTaskRepository(secondClient, 'ws');
       const topology = {
-        kind: 'graph_v1' as const,
+        kind: 'workflow' as const,
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
         nodes: [
           { nodeId: 'p1' },
           { nodeId: 'p2' },
@@ -631,7 +636,12 @@ describe('M018 S02 fan-in NEXT activation', () => {
         version: 1,
         name: 'two gate budget',
         topology: {
-          kind: 'graph_v1',
+          kind: 'workflow',
+          inputs: [],
+          outputs: [
+            { name: 'c1Result', semanticKind: 'result.c1', terminalNodeId: 'c1' },
+            { name: 'c2Result', semanticKind: 'result.c2', terminalNodeId: 'c2' },
+          ],
           nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'c1' }, { nodeId: 'c2' }],
           edges: [
             { fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' },
@@ -999,16 +1009,21 @@ describe('M018 S02 fan-in NEXT activation', () => {
       const defineRouted = dispatch(
         'define_workflow',
         {
-          name: 'public-fan-in',
-          nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
-            nodeKey: node.nodeId,
-            taskType: 'worker',
-          })),
-          edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
-            from: edge.fromNodeId,
-            to: edge.toNodeId,
-            as: edge.inputRef,
-          })),
+          manifest: {
+            schema: 'muster.workflow/v2',
+            name: 'public-fan-in',
+            inputs: [],
+            outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+            nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+              nodeKey: node.nodeId,
+              taskType: 'worker',
+            })),
+            edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+              from: edge.fromNodeId,
+              to: edge.toNodeId,
+              inputRef: edge.inputRef,
+            })),
+          },
         },
         context,
       );

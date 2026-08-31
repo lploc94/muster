@@ -23,7 +23,6 @@ import {
   CURRENT_SCHEMA_STATEMENTS,
   MUSTER_APPLICATION_ID,
   MUSTER_WRITER_VERSION_UDF,
-  REQUIRED_SCHEMA_TABLES,
   SQLITE_SCHEMA_VERSION,
 } from './schema';
 import { MusterSqliteError, mapToMusterSqliteError } from './errors';
@@ -193,37 +192,6 @@ function exclusiveOpenDecision(db: DatabaseSync): ExclusiveOpenDecision {
 
     if (applicationId === MUSTER_APPLICATION_ID) {
       if (userVersion === SQLITE_SCHEMA_VERSION) {
-        assertCurrentSchemaComplete(db);
-        db.exec('COMMIT');
-        return { kind: 'current' };
-      }
-      // Additive migration 5 -> 6: global tables (no data loss). Applied under exclusive lock.
-      if (userVersion === 5 && SQLITE_SCHEMA_VERSION === 6) {
-        // Create global tables if missing (idempotent)
-        db.exec(`CREATE TABLE IF NOT EXISTS global_composer_selection (
-          id INTEGER PRIMARY KEY CHECK (id = 1),
-          backend TEXT NOT NULL,
-          model TEXT,
-          updated_at TEXT NOT NULL
-        )`);
-        db.exec(`CREATE TABLE IF NOT EXISTS global_backend_verification (
-          backend_id TEXT PRIMARY KEY,
-          verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
-          version TEXT,
-          checked_at TEXT NOT NULL
-        )`);
-        // Recreate writer guards for all tables with new version (drop old 5-triggers)
-        for (const table of REQUIRED_SCHEMA_TABLES) {
-          for (const event of ['insert', 'update', 'delete'] as const) {
-            const name = `trg_wg_${table}_${event}`;
-            try { db.exec(`DROP TRIGGER IF EXISTS ${name}`); } catch {}
-            db.exec(`CREATE TRIGGER ${name}
-BEFORE ${event.toUpperCase()} ON ${table}
-WHEN muster_writer_version() IS NULL OR muster_writer_version() <> ${SQLITE_SCHEMA_VERSION}
-BEGIN SELECT RAISE(ABORT, 'schema_changed'); END`);
-          }
-        }
-        db.exec(`PRAGMA user_version = ${SQLITE_SCHEMA_VERSION}`);
         assertCurrentSchemaComplete(db);
         db.exec('COMMIT');
         return { kind: 'current' };
@@ -400,36 +368,6 @@ export function openStoreDatabase(opts: OpenOptions): DatabaseSync {
         waitBeforeOpenRetry(attempt);
         attempt += 1;
         continue;
-      }
-      // Additive migration 5 -> 6: retry via exclusive migration instead of failing closed.
-      if (
-        error instanceof IncompatibleSchemaError &&
-        error.observedVersion === 5 &&
-        SQLITE_SCHEMA_VERSION === 6
-      ) {
-        let migDb: DatabaseSync | undefined;
-        try {
-          migDb = new DatabaseSync(opts.path);
-          applyConnectionBusyTimeout(migDb, busyTimeoutMs);
-          // exclusiveOpenDecision handles 5->6 migration under lock; reuse it directly.
-          exclusiveOpenDecision(migDb);
-          // Migration succeeded — reopen as current.
-          waitBeforeOpenRetry(attempt);
-          attempt += 1;
-          continue;
-        } catch (migError) {
-          if (migError instanceof MusterSqliteError) throw migError;
-          if (isRetryableOpenLock(migError) && Date.now() < retryDeadline) {
-            waitBeforeOpenRetry(attempt);
-            attempt += 1;
-            continue;
-          }
-          throw mapToMusterSqliteError(migError, 'open');
-        } finally {
-          if (migDb) {
-            try { migDb.close(); } catch {}
-          }
-        }
       }
       // Concurrent first-open can briefly fail fingerprint while a peer finishes
       // bootstrap/WAL. Cap retries so permanently incompatible current-marker

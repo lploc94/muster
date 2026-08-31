@@ -10,7 +10,6 @@ import {
   decodeDefineWorkflowInput,
   decodeWorkflowManifest,
   DEFAULT_WORKFLOW_POLICY,
-  encodeTopologyJson,
   formatWorkflowEntryAggregate,
   fingerprintStartEntryInputs,
   fingerprintStartNodeReuse,
@@ -37,10 +36,8 @@ import type {
 export {
   DEFAULT_WORKFLOW_POLICY,
   decodeDefineWorkflowInput,
-  decodeStoredTopologyJson,
   decodeTopology,
   decodeWorkflowManifest,
-  encodeTopologyJson,
   formatWorkflowEntryAggregate,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
@@ -78,7 +75,7 @@ export function defineWorkflowLedgerKey(
 export function validateDefineWorkflow(
   input: DefineWorkflowInput,
 ):
-  | { ok: true; definition: WorkflowDefinition; fingerprint: string; topologyJson: string }
+  | { ok: true; definition: WorkflowDefinition; fingerprint: string }
   | { ok: false; reason: string } {
   const decoded = decodeDefineWorkflowInput(input);
   if (!decoded.ok) {
@@ -88,7 +85,6 @@ export function validateDefineWorkflow(
     ok: true,
     definition: decoded.definition,
     fingerprint: decoded.fingerprint,
-    topologyJson: encodeTopologyJson(decoded.definition.topology),
   };
 }
 

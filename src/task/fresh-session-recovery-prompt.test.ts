@@ -52,6 +52,19 @@ describe('buildFreshSessionRecoveryPrompt (M017-S06 / T02)', () => {
     expect(result.prompt).not.toMatch(/Please help me with something new/i);
   });
 
+  it('keeps frozen workflow instructions in the protected recovery core', () => {
+    const result = buildFreshSessionRecoveryPrompt({
+      goal: 'Continue the workflow activation',
+      workflowInstructions: 'Apply the frozen workflow checks before selecting a route.',
+      originalPrompt: 'The correction turn payload.',
+      maxChars: 2_000,
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.prompt).toContain('# Workflow instructions');
+    expect(result.prompt).toContain('Apply the frozen workflow checks before selecting a route.');
+  });
+
   it('sanitizes bearer tokens, Authorization headers, and MUSTER_BRIDGE_TOKEN from all sections', () => {
     const result = buildFreshSessionRecoveryPrompt({
       goal: 'token=MUSTER_BRIDGE_TOKEN_SECRET continue work',

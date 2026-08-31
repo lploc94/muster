@@ -137,6 +137,10 @@ Malformed durable rows remain invariant errors and are **not** silently skipped.
 - Logs, diagnostics, Extension Host debug output, UAT/evidence ledgers, change-feed metadata, and
   command error payloads use **fixed codes and redacted fields** — not prompts, tool output, SQL
   parameters, stacks, or filesystem paths.
+- Frozen workflow instruction bodies are durable executable content and therefore exist in the
+  plaintext SQLite store and user backups. Catalog, status, graph, diagnostics, change-feed, and
+  evidence projections expose only bounded metadata; they never expose those instruction bodies,
+  script bodies, package roots, or package paths.
 - There is **no telemetry framework** that uploads conversation content, workspace paths, or SQL.
 
 ---
@@ -192,19 +196,29 @@ actions stay available.
 
 ---
 
-## 8. Schema v5 and reset-only notes
+## 8. Schema v7 and reset-only notes
 
-- Current owned schema is **v5**. Muster has no in-place migration framework: opening an owned store
+- Current owned schema is **v7**. Muster has no in-place migration framework: opening an owned store
   with any incompatible version fails closed with reset guidance and never rewrites user data.
-- Schema v5 includes workflow definition/run/node/gate tables, the writer-version UDF, and write-guard
-  triggers. An already-open stale writer fails closed with terminal `schema_changed` and must reload.
-- **v3 to v4** added reuse provenance to `workflow_nodes` (`source_run_id`, `source_node_id`,
-  `source_task_id`), recording which exact prior execution a `reused` node was bound to. Because the
-  store is reset-only, a v3 store is rejected rather than upgraded: there is no in-place path that
-  preserves existing task or chat history.
-- **v4 to v5** makes reused-node status and provenance immutable, pins the exact source artifact
-  coordinates, and requires provenance exactly when `status = 'reused'`. A v4 store is rejected
-  rather than rewritten.
+- Schema v7 persists each canonical workflow definition through ordered input, output, node, and edge
+  authority rows. Node authority includes display title, frozen instruction kind/reference/content/
+  digest, normalized outcome, resolved task routing, and script execution provenance. Reload
+  reconstructs and validates this authority against the canonical definition fingerprint before use.
+- Dispatch revalidates the owning canonical authority before claiming a queued activation. Entry,
+  dependency, feedback, child-return, retry, activation-recovery, and fresh-session reconstruction
+  paths retain the same persisted frozen instruction body instead of rereading package files.
+- Manual and safe automatic retries remain owned by the same workflow activation: the retry insert,
+  per-run workflow-turn reservation, and activation `execution_turn_id` rebind commit atomically.
+  Corrupt canonical authority, stale activation ownership, or exhausted turn budgets deny the retry.
+  An original-input manual retry may coexist with queued follow-ups already marked held; live or
+  non-held queued turns still block retry allocation.
+- Schema v7 also reserves one activation-owned `workflow_decision_repairs` row for bounded decision
+  attempts. Its status, attempt count, evidence references, and next correction-turn reference are
+  closed and writer-guarded; later routing phases own the transitions, not a migration or side store.
+- Schema v6 and every earlier marker are rejected rather than interpreted as canonical workflow
+  authority. There is no `ALTER TABLE`, row reinterpretation, compatibility decoder, or automatic
+  migration path. An already-open stale writer fails closed with terminal `schema_changed` and must
+  reload.
 - A Developer Reset creates an empty current-schema store; it is destructive replacement, not a
   data-preserving migration. Back up first when existing task or chat history matters.
 - Diagnostics never expose database paths, SQL/parameters, credentials, prompt text, or artifact bodies.

@@ -40,7 +40,9 @@ const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
 
 const FAN_IN_TOPOLOGY = {
-  kind: 'graph_v1' as const,
+  kind: 'workflow' as const,
+  inputs: [],
+  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
   nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
   edges: [
     { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
@@ -256,16 +258,21 @@ describe('M018 S04 PREV feedback ALL-join', () => {
     const ok = dispatch(
       'define_workflow',
       {
-        name: 'fan-in',
-        nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
-          nodeKey: node.nodeId,
-          taskType: 'worker',
-        })),
-        edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
-          from: edge.fromNodeId,
-          to: edge.toNodeId,
-          as: edge.inputRef,
-        })),
+        manifest: {
+          schema: 'muster.workflow/v2',
+          name: 'fan-in',
+          inputs: [],
+          outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+          nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
+            nodeKey: node.nodeId,
+            taskType: 'worker',
+          })),
+          edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
+            from: edge.fromNodeId,
+            to: edge.toNodeId,
+            inputRef: edge.inputRef,
+          })),
+        },
       },
       ctx,
     );
@@ -634,7 +641,9 @@ describe('M018 S04 PREV feedback ALL-join', () => {
     try {
       const createdAt = '2026-07-22T10:00:00.000Z';
       const topology = {
-        kind: 'graph_v1' as const,
+        kind: 'workflow' as const,
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'c' }],
         nodes: [{ nodeId: 'a' }, { nodeId: 'b' }, { nodeId: 'c' }],
         edges: [
           { fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' },

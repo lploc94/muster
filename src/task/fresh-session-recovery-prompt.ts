@@ -23,6 +23,8 @@ export interface FreshSessionRecoveryPromptInput {
   goal: string;
   /** Optional structured brief (objective/context preferred when present). */
   brief?: TaskBriefV1;
+  /** Frozen executable workflow-node instructions — protected core material. */
+  workflowInstructions?: string;
   /**
    * Compact prior turn outcomes/summaries already durable on the store.
    * Treated as prior work, not as a new user request.
@@ -138,12 +140,15 @@ export function buildFreshSessionRecoveryPrompt(
   const context = input.brief?.context
     ? scrubSection(input.brief.context, BRIEF_SECTION_MAX)
     : undefined;
+  const workflowInstructions = typeof input.workflowInstructions === 'string'
+    ? clampSection(input.workflowInstructions.replace(/\r\n/g, '\n').trim(), BRIEF_SECTION_MAX)
+    : undefined;
   const originalPrompt =
     typeof input.originalPrompt === 'string' && input.originalPrompt.trim().length > 0
       ? scrubSection(input.originalPrompt, COMPILED_PROMPT_MAX)
       : undefined;
 
-  if (!goal && !objective && !originalPrompt) {
+  if (!goal && !objective && !workflowInstructions && !originalPrompt) {
     return {
       ok: false,
       code: 'empty_recovery_prompt',
@@ -157,6 +162,9 @@ export function buildFreshSessionRecoveryPrompt(
   const objectiveSection =
     objective && objective !== goal ? `# Objective\n${objective}` : undefined;
   const contextSection = context ? `# Context\n${context}` : undefined;
+  const workflowInstructionsSection = workflowInstructions
+    ? `# Workflow instructions\n${workflowInstructions}`
+    : undefined;
   const priorSection = buildPriorOutcomesBlock(input.priorOutcomes);
   const originalSection = originalPrompt
     ? `# Original prompt\n${originalPrompt}`
@@ -170,6 +178,7 @@ export function buildFreshSessionRecoveryPrompt(
     // Only original remains — still durable restatement, not invention.
     coreParts.push(originalSection);
   }
+  if (workflowInstructionsSection) coreParts.push(workflowInstructionsSection);
   const core = coreParts.join('\n\n');
   if (core.length > maxChars) {
     return {

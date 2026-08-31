@@ -27,6 +27,7 @@ import { DbClient } from './sqlite/client';
 import {
   DEFAULT_WORKFLOW_POLICY,
   makeGraphFanInDefinition,
+  makeOneNodeDefinition,
   entryNodeIds,
   type WorkflowPolicyV1,
 } from './workflow';
@@ -34,11 +35,7 @@ import {
 const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
 
-const ONE_NODE = {
-  kind: 'one_node_v1' as const,
-  nodes: [{ nodeId: 'entry' }],
-  entryNodeId: 'entry',
-};
+const ONE_NODE = makeOneNodeDefinition().topology;
 
 type OneNodeStart = {
   runId: string;

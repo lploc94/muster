@@ -5,7 +5,6 @@ import {
   WORKFLOW_FAIL_REASON_CODES,
   boundWorkflowFailReason,
   clampWorkflowRunBudgets,
-  decodeStoredTopologyJson,
   decodeTopology,
   decodeWorkflowManifest,
   defineWorkflowConflict,
@@ -700,12 +699,6 @@ describe('canonical workflow manifest contract', () => {
     expect(entryNodeIds(validated.definition.topology)).toEqual(['plan', 'research']);
     expect(terminalNodeIds(validated.definition.topology)).toEqual(['verify']);
     expect(terminalNodeId(validated.definition.topology)).toBe('verify');
-    expect(decodeStoredTopologyJson(validated.topologyJson)).toEqual({
-      ok: true,
-      topology: validated.definition.topology,
-    });
-    expect(validated.topologyJson).toContain('"kind":"workflow"');
-
     const fp = validated.fingerprint;
     expect(defineWorkflowCreated(validated.definition, fp)).toMatchObject({
       ok: true, changed: true, definitionId: 'workflow-contract', version: 1, fingerprint: fp,

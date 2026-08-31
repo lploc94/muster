@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 6 as const;
+export const SQLITE_SCHEMA_VERSION = 7 as const;
 
 /**
  * Core task-store tables.
@@ -63,11 +63,13 @@ const REQUIRED_WORKFLOW_TABLES = [
 ] as const;
 
 const REQUIRED_WORKFLOW_AUTHORITY_TABLES = [
+  'workflow_definition_inputs',
+  'workflow_definition_outputs',
   'workflow_definition_nodes',
   'workflow_definition_edges',
-  'workflow_entry_contracts',
   'workflow_start_claims',
   'workflow_activations',
+  'workflow_decision_repairs',
   'workflow_return_gates',
   'workflow_artifact_sources',
   'session_owners',
@@ -465,8 +467,7 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     definition_id TEXT NOT NULL,
     version INTEGER NOT NULL,
     name TEXT NOT NULL,
-    entry_node_id TEXT NOT NULL,
-    topology_json TEXT NOT NULL,
+    description TEXT,
     scope_kind TEXT NOT NULL DEFAULT 'workspace' CHECK (scope_kind IN ('workspace', 'root')),
     owner_root_task_id TEXT,
     fingerprint TEXT NOT NULL DEFAULT '',
@@ -753,16 +754,102 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     definition_version INTEGER NOT NULL,
     node_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    is_terminal INTEGER NOT NULL CHECK (is_terminal IN (0, 1)),
+    title TEXT,
+    instructions_kind TEXT CHECK (instructions_kind IS NULL OR instructions_kind IN ('inline', 'file')),
+    instructions_file TEXT,
+    instructions_content TEXT,
+    instructions_sha256 TEXT,
     role TEXT,
     task_type TEXT,
     backend TEXT,
     model TEXT,
-    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    capabilities_json TEXT CHECK (capabilities_json IS NULL OR json_valid(capabilities_json) = 1),
+    execution_kind TEXT CHECK (execution_kind IS NULL OR execution_kind = 'script'),
+    script_interpreter TEXT CHECK (script_interpreter IS NULL OR script_interpreter IN ('node', 'python', 'python3')),
+    script_file TEXT,
+    script_args_json TEXT CHECK (script_args_json IS NULL OR json_valid(script_args_json) = 1),
+    script_source_kind TEXT CHECK (script_source_kind IS NULL OR script_source_kind = 'predefined'),
+    script_source_scope TEXT CHECK (script_source_scope IS NULL OR script_source_scope IN ('workspace', 'global')),
+    script_package_kind TEXT CHECK (script_package_kind IS NULL OR script_package_kind = 'bundle'),
+    script_catalog_root_kind TEXT CHECK (script_catalog_root_kind IS NULL OR script_catalog_root_kind IN ('canonical', 'custom')),
+    script_package_path TEXT,
+    script_entry_file TEXT,
+    script_workflow_ref TEXT,
+    script_package_sha256 TEXT,
+    script_sha256 TEXT,
+    outcome_kind TEXT CHECK (outcome_kind IS NULL OR outcome_kind IN ('agent', 'exit')),
+    outcome_json TEXT CHECK (outcome_json IS NULL OR json_valid(outcome_json) = 1),
     PRIMARY KEY (workspace_id, definition_id, definition_version, node_id),
     UNIQUE (workspace_id, definition_id, definition_version, ordinal),
+    CHECK (
+      (instructions_kind IS NULL AND instructions_file IS NULL AND instructions_content IS NULL AND instructions_sha256 IS NULL)
+      OR (instructions_kind = 'inline' AND instructions_file IS NULL AND instructions_content IS NOT NULL
+          AND length(instructions_sha256) = 64 AND instructions_sha256 NOT GLOB '*[^0-9a-f]*')
+      OR (instructions_kind = 'file' AND instructions_file IS NOT NULL AND instructions_content IS NOT NULL
+          AND length(instructions_sha256) = 64 AND instructions_sha256 NOT GLOB '*[^0-9a-f]*')
+    ),
+    CHECK (
+      (execution_kind IS NULL AND script_interpreter IS NULL AND script_file IS NULL
+       AND script_args_json IS NULL AND script_source_kind IS NULL AND script_source_scope IS NULL
+       AND script_package_kind IS NULL AND script_catalog_root_kind IS NULL
+       AND script_package_path IS NULL AND script_entry_file IS NULL AND script_workflow_ref IS NULL
+       AND script_package_sha256 IS NULL AND script_sha256 IS NULL)
+      OR (execution_kind = 'script' AND script_interpreter IS NOT NULL AND script_file IS NOT NULL
+          AND script_args_json IS NOT NULL AND (
+            (script_source_kind IS NULL AND script_source_scope IS NULL AND script_package_kind IS NULL
+             AND script_catalog_root_kind IS NULL AND script_package_path IS NULL
+             AND script_entry_file IS NULL AND script_workflow_ref IS NULL
+             AND script_package_sha256 IS NULL AND script_sha256 IS NULL)
+            OR (script_source_kind = 'predefined' AND script_source_scope IS NOT NULL
+                AND script_package_kind = 'bundle' AND script_catalog_root_kind IS NOT NULL
+                AND script_package_path IS NOT NULL AND script_entry_file = 'workflow.json'
+                AND script_workflow_ref IS NOT NULL
+                AND length(script_package_sha256) = 64 AND script_package_sha256 NOT GLOB '*[^0-9a-f]*'
+                AND length(script_sha256) = 64 AND script_sha256 NOT GLOB '*[^0-9a-f]*')
+          ))
+    ),
+    CHECK ((outcome_kind IS NULL) = (outcome_json IS NULL)),
+    CHECK (
+      (execution_kind = 'script' AND backend = 'script' AND task_type IS NULL AND model IS NULL AND outcome_kind = 'exit')
+      OR (execution_kind IS NULL AND COALESCE(backend, '') <> 'script' AND COALESCE(outcome_kind, '') <> 'exit')
+    ),
     FOREIGN KEY (workspace_id, definition_id, definition_version)
       REFERENCES workflow_definitions(workspace_id, definition_id, version)
+      ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_definition_inputs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    definition_id TEXT NOT NULL,
+    definition_version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    semantic_kind TEXT NOT NULL,
+    entry_node_id TEXT NOT NULL,
+    input_ref TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'workflow_input'),
+    PRIMARY KEY (workspace_id, definition_id, definition_version, name),
+    UNIQUE (workspace_id, definition_id, definition_version, entry_node_id, input_ref),
+    UNIQUE (workspace_id, definition_id, definition_version, ordinal),
+    FOREIGN KEY (workspace_id, definition_id, definition_version, entry_node_id)
+      REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
+      ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_definition_outputs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    definition_id TEXT NOT NULL,
+    definition_version INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    semantic_kind TEXT NOT NULL,
+    terminal_node_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'next_result'),
+    PRIMARY KEY (workspace_id, definition_id, definition_version, name),
+    UNIQUE (workspace_id, definition_id, definition_version, terminal_node_id),
+    UNIQUE (workspace_id, definition_id, definition_version, ordinal),
+    FOREIGN KEY (workspace_id, definition_id, definition_version, terminal_node_id)
+      REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
       ON DELETE CASCADE
   )`,
 
@@ -782,21 +869,6 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
       ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, definition_id, definition_version, destination_node_id)
-      REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
-      ON DELETE CASCADE
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS workflow_entry_contracts (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    definition_id TEXT NOT NULL,
-    definition_version INTEGER NOT NULL,
-    entry_node_id TEXT NOT NULL,
-    input_ref TEXT NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
-    expected_artifact_kind TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, definition_id, definition_version, entry_node_id, input_ref),
-    UNIQUE (workspace_id, definition_id, definition_version, entry_node_id, ordinal),
-    FOREIGN KEY (workspace_id, definition_id, definition_version, entry_node_id)
       REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
       ON DELETE CASCADE
   )`,
@@ -867,6 +939,35 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES turns(workspace_id, id) ON DELETE CASCADE,
     FOREIGN KEY (workspace_id, message_id)
       REFERENCES messages(workspace_id, id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_decision_repairs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    activation_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('open', 'decided', 'exhausted')),
+    attempts_used INTEGER NOT NULL CHECK (attempts_used BETWEEN 0 AND 3),
+    last_attempt_turn_id TEXT,
+    last_error_code TEXT CHECK (last_error_code IS NULL OR last_error_code IN ('decision_missing', 'decision_invalid')),
+    last_response_message_id TEXT,
+    next_repair_turn_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, activation_id),
+    CHECK (
+      (status = 'open' AND attempts_used BETWEEN 0 AND 2)
+      OR (status = 'decided' AND attempts_used BETWEEN 1 AND 3 AND next_repair_turn_id IS NULL)
+      OR (status = 'exhausted' AND attempts_used = 3 AND next_repair_turn_id IS NULL)
+    ),
+    CHECK (next_repair_turn_id IS NULL OR (status = 'open' AND attempts_used BETWEEN 1 AND 2)),
+    FOREIGN KEY (workspace_id, run_id, activation_id)
+      REFERENCES workflow_activations(workspace_id, run_id, activation_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, last_attempt_turn_id)
+      REFERENCES turns(workspace_id, id),
+    FOREIGN KEY (workspace_id, last_response_message_id)
+      REFERENCES messages(workspace_id, id),
+    FOREIGN KEY (workspace_id, next_repair_turn_id)
+      REFERENCES turns(workspace_id, id)
   )`,
 
   `CREATE TABLE IF NOT EXISTS workflow_return_gates (
@@ -1023,6 +1124,8 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
      ON task_session_bindings(workspace_id, backend, session_id) WHERE active = 1`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_activations_status
      ON workflow_activations(workspace_id, run_id, status, updated_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_decision_repairs_status
+     ON workflow_decision_repairs(workspace_id, run_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_return_gates_status
      ON workflow_return_gates(workspace_id, child_run_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_runs_deadline_scan
@@ -1086,6 +1189,12 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
              WHERE activation.workspace_id = ${alias}.workspace_id
                AND activation.run_id = ${alias}.run_id
                AND activation.status IN ('queued', 'running')
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_decision_repairs repair
+             WHERE repair.workspace_id = ${alias}.workspace_id
+               AND repair.run_id = ${alias}.run_id
+               AND repair.status = 'open'
           )
           AND NOT EXISTS (
             SELECT 1 FROM workflow_continuations continuation
@@ -1157,16 +1266,73 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
        SELECT RAISE(ABORT, 'workflow_definition_scope_invalid');
      END`,
   `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_semantics_immutable
-     BEFORE UPDATE OF scope_kind, owner_root_task_id, fingerprint, policy_json,
-                      topology_json, entry_node_id ON workflow_definitions
-     WHEN OLD.scope_kind <> NEW.scope_kind
-       OR OLD.owner_root_task_id IS NOT NEW.owner_root_task_id
-       OR OLD.fingerprint <> NEW.fingerprint
-       OR OLD.policy_json <> NEW.policy_json
-       OR OLD.topology_json <> NEW.topology_json
-       OR OLD.entry_node_id <> NEW.entry_node_id
+     BEFORE UPDATE ON workflow_definitions
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_definition_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_inputs_immutable_update
+     BEFORE UPDATE ON workflow_definition_inputs
      BEGIN
-       SELECT RAISE(ABORT, 'workflow_definition_immutable');
+       SELECT RAISE(ABORT, 'workflow_definition_input_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_inputs_immutable_delete
+     BEFORE DELETE ON workflow_definition_inputs
+     WHEN EXISTS (
+       SELECT 1 FROM workflow_definitions definition
+        WHERE definition.workspace_id = OLD.workspace_id
+          AND definition.definition_id = OLD.definition_id
+          AND definition.version = OLD.definition_version
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_input_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_outputs_immutable_update
+     BEFORE UPDATE ON workflow_definition_outputs
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_output_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_outputs_immutable_delete
+     BEFORE DELETE ON workflow_definition_outputs
+     WHEN EXISTS (
+       SELECT 1 FROM workflow_definitions definition
+        WHERE definition.workspace_id = OLD.workspace_id
+          AND definition.definition_id = OLD.definition_id
+          AND definition.version = OLD.definition_version
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_output_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_nodes_immutable_update
+     BEFORE UPDATE ON workflow_definition_nodes
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_node_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_nodes_immutable_delete
+     BEFORE DELETE ON workflow_definition_nodes
+     WHEN EXISTS (
+       SELECT 1 FROM workflow_definitions definition
+        WHERE definition.workspace_id = OLD.workspace_id
+          AND definition.definition_id = OLD.definition_id
+          AND definition.version = OLD.definition_version
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_node_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_edges_immutable_update
+     BEFORE UPDATE ON workflow_definition_edges
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_edge_immutable');
+     END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_definition_edges_immutable_delete
+     BEFORE DELETE ON workflow_definition_edges
+     WHEN EXISTS (
+       SELECT 1 FROM workflow_definitions definition
+        WHERE definition.workspace_id = OLD.workspace_id
+          AND definition.definition_id = OLD.definition_id
+          AND definition.version = OLD.definition_version
+     )
+     BEGIN
+       SELECT RAISE(ABORT, 'workflow_definition_edge_immutable');
      END`,
   `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_authority_insert
      BEFORE INSERT ON workflow_runs

@@ -4,6 +4,7 @@
  * Uses real SQLite worker + authenticated MCP dispatch + existing scheduler readiness.
  */
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -20,17 +21,14 @@ import type { TaskStoreFile } from './types';
 import {
   DEFAULT_WORKFLOW_POLICY,
   deriveStartIdentities,
+  entryNodeIds,
   fingerprintStartWorkflow,
   makeOneNodeDefinition,
   startWorkflowLedgerKey,
   validateStartWorkflow,
 } from './workflow';
 
-const TOPOLOGY = {
-  kind: 'one_node_v1' as const,
-  nodes: [{ nodeId: 'entry' }],
-  entryNodeId: 'entry',
-};
+const TOPOLOGY = makeOneNodeDefinition().topology;
 
 async function openRepo(label: string) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `muster-m018-s01-${label}-`));
@@ -61,7 +59,7 @@ describe('M018 S01 one-node workflow activation', () => {
       version: def.version,
       startIdempotencyKey: 'start-key-1',
       createdAt: '2026-07-19T00:00:00.000Z',
-      entryNodeId: def.topology.entryNodeId,
+      entryNodeId: entryNodeIds(def.topology)[0]!,
     });
     expect(valid.ok).toBe(true);
     if (!valid.ok) return;
@@ -69,7 +67,7 @@ describe('M018 S01 one-node workflow activation', () => {
       definitionId: def.definitionId,
       version: def.version,
       startIdempotencyKey: 'start-key-1',
-      entryNodeId: def.topology.entryNodeId,
+      entryNodeId: entryNodeIds(def.topology)[0]!,
     });
     expect(ids.runId).toMatch(/^wfr_/);
     expect(ids.activationTurnId).toMatch(/^wftn_/);
@@ -114,7 +112,6 @@ describe('M018 S01 one-node workflow activation', () => {
         interpreter: 'node' as const,
         file: 'scripts/check.js',
         args: ['--format', 'json'],
-        onFailure: 'continue' as const,
       };
       const defined = await ctx.repository.execute({
         kind: 'defineWorkflowVersion',
@@ -123,9 +120,20 @@ describe('M018 S01 one-node workflow activation', () => {
         version: 1,
         name: 'script payload',
         topology: {
-          kind: 'one_node_v1',
-          nodes: [{ nodeId: 'script', backend: 'script', execution }],
-          entryNodeId: 'script',
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'script' }],
+          nodes: [{
+            nodeId: 'script',
+            backend: 'script',
+            execution,
+            outcome: {
+              kind: 'exit',
+              next: { when: { exitCode: 0 } },
+              fail: { when: { exitCode: 'nonzero' } },
+            },
+          }],
+          edges: [],
         },
         createdAt,
       });
@@ -621,13 +629,24 @@ describe('M018 S01 one-node workflow activation', () => {
     let engine: TaskEngine | undefined;
     try {
       const createdAt = new Date().toISOString();
+      const fallbackInstructions = 'Keep the frozen workflow instructions on every fallback attempt.';
       await ctx.repository.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
         definitionId: 'wf-runtime-fallback',
         version: 1,
         name: 'runtime-fallback',
-        topology: TOPOLOGY,
+        topology: {
+          ...TOPOLOGY,
+          nodes: [{
+            ...TOPOLOGY.nodes[0],
+            instructions: {
+              kind: 'inline',
+              content: fallbackInstructions,
+              sha256: createHash('sha256').update(fallbackInstructions).digest('hex'),
+            },
+          }],
+        },
         createdAt,
       });
       const started = await ctx.repository.execute({
@@ -699,6 +718,7 @@ describe('M018 S01 one-node workflow activation', () => {
       }
 
       expect(calls.map((call) => call.backend)).toEqual(['grok', 'codex', 'opencode']);
+      expect(calls.every((call) => call.prompt.includes(fallbackInstructions))).toBe(true);
       expect(calls[1]?.resumeId).toBeUndefined();
       expect(calls[1]?.prompt).toContain('[runtime-fallback-recovery]');
       expect(calls[2]?.resumeId).toBeUndefined();
@@ -720,6 +740,7 @@ describe('M018 S01 one-node workflow activation', () => {
       });
       expect(turns[1]?.inputs.some((input) => input.kind === 'recovery')).toBe(true);
       expect(turns[2]?.inputs.some((input) => input.kind === 'recovery')).toBe(true);
+      expect(turns.every((turn) => turn.workflowInstructions === fallbackInstructions)).toBe(true);
       await expect(ctx.repository.getTask(payload.entryTaskId)).resolves.toMatchObject({
         lifecycle: 'succeeded',
         backend: 'opencode',
@@ -1073,9 +1094,14 @@ describe('M018 S01 one-node workflow activation', () => {
       const defineRouted = dispatch(
         'define_workflow',
         {
-          name: 'public-one-node',
-          nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
-          inputs: [{ to: 'entry', name: 'request' }],
+          manifest: {
+            schema: 'muster.workflow/v2',
+            name: 'public-one-node',
+            inputs: [{ name: 'request', kind: 'request', to: 'entry', inputRef: 'request' }],
+            outputs: [{ name: 'result', kind: 'result', from: 'entry' }],
+            nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+            edges: [],
+          },
         },
         context,
       );
@@ -1101,9 +1127,14 @@ describe('M018 S01 one-node workflow activation', () => {
       const revisedRouted = dispatch(
         'define_workflow',
         {
-          name: 'public-one-node-revised',
-          nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
-          inputs: [{ to: 'entry', name: 'request' }],
+          manifest: {
+            schema: 'muster.workflow/v2',
+            name: 'public-one-node-revised',
+            inputs: [{ name: 'request', kind: 'request', to: 'entry', inputRef: 'request' }],
+            outputs: [{ name: 'result', kind: 'result', from: 'entry' }],
+            nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+            edges: [],
+          },
         },
         editContext,
       );
@@ -1129,7 +1160,7 @@ describe('M018 S01 one-node workflow activation', () => {
           workflow: `${revisedDefinitionId}@1`,
           goal: 'activate one-node via bridge',
           inputs: [
-            { node: 'entry', input: 'request', value: 'review this change' },
+            { name: 'request', value: 'review this change' },
           ],
         },
         context,

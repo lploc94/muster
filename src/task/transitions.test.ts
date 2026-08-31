@@ -977,6 +977,24 @@ describe('retryTurn', () => {
     }
   });
 
+  it('preserves frozen workflow instructions on retry turns', () => {
+    const workflowFailed = turn({
+      id: 'workflow-failed',
+      status: 'failed',
+      sequence: 1,
+      workflowInstructions: 'Keep these frozen workflow instructions.',
+    });
+    const result = retryTurn(task, [workflowFailed], workflowFailed, {
+      turnId: 'workflow-retry',
+      instruction: 'try again',
+      now: NOW,
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.next.workflowInstructions).toBe(workflowFailed.workflowInstructions);
+    }
+  });
+
   it('rejects foreign or non-retryable old turns', () => {
     const foreign = { ...failed, taskId: 'other-task' };
     expect(

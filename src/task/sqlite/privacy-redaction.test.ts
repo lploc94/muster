@@ -8,7 +8,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { DbClient, DbWorkerError } from './client';
@@ -205,6 +205,83 @@ afterEach(async () => {
 });
 
 describe('P5-W6 privacy canary allowlist', () => {
+  it('keeps frozen workflow instructions out of projections and metadata surfaces', async () => {
+    const canary = makeCanary();
+    const instructionBody = `Execute only these frozen instructions: ${canary}`;
+    const dir = tempDir();
+    const dbPath = path.join(dir, 'muster.sqlite3');
+    const backupPath = path.join(dir, 'workflow-backup.sqlite3');
+    const client = makeClient();
+    await client.open(dbPath);
+    const repo = new SqliteTaskRepository(client, 'ws');
+    await expect(repo.execute({
+      kind: 'defineWorkflowVersion',
+      workspaceId: 'ws',
+      definitionId: 'wf-private-instructions',
+      version: 1,
+      name: 'Private instructions',
+      topology: {
+        kind: 'workflow',
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+        nodes: [{
+          nodeId: 'entry',
+          title: 'Safe display title',
+          instructions: {
+            kind: 'inline',
+            content: instructionBody,
+            sha256: createHash('sha256').update(instructionBody).digest('hex'),
+          },
+        }],
+        edges: [],
+      },
+      createdAt: '2026-08-31T00:00:00.000Z',
+    })).resolves.toMatchObject({ ok: true, changed: true });
+    const started = await repo.execute({
+      kind: 'startWorkflowRun',
+      workspaceId: 'ws',
+      definitionId: 'wf-private-instructions',
+      version: 1,
+      startIdempotencyKey: 'private-instructions-start',
+      createdAt: '2026-08-31T00:00:01.000Z',
+    });
+    expect(started).toMatchObject({ ok: true, changed: true });
+    const data = started.operation?.result?.data as {
+      entryTaskId: string;
+      activationTurnId: string;
+    };
+
+    await expect(client.get<{ instructions_content: string }>(
+      `SELECT instructions_content FROM workflow_definition_nodes
+        WHERE workspace_id = ? AND definition_id = ?`,
+      ['ws', 'wf-private-instructions'],
+    )).resolves.toEqual({ instructions_content: instructionBody });
+    await expect(repo.getTurn(data.activationTurnId)).resolves.toMatchObject({
+      workflowInstructions: instructionBody,
+    });
+
+    for (const projection of [
+      await repo.getWorkflowStatusForTask(data.entryTaskId),
+      await repo.getWorkflowGraphForTask(data.entryTaskId),
+      await repo.getWorkspaceChangesSince(0),
+    ]) {
+      assertNoSensitiveLeak(projection, canary);
+    }
+
+    const backupMeta = await client.backup(backupPath, { overwrite: false });
+    assertNoSensitiveLeak(backupMeta, canary);
+    const backup = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      const stored = backup.prepare(
+        `SELECT instructions_content FROM workflow_definition_nodes
+          WHERE workspace_id = ? AND definition_id = ?`,
+      ).get('ws', 'wf-private-instructions') as { instructions_content: string };
+      expect(stored.instructions_content).toBe(instructionBody);
+    } finally {
+      backup.close();
+    }
+  });
+
   it('keeps a runtime canary only in durable content and user backup', async () => {
     const canary = makeCanary();
     const reasoningCanary = `${canary}_REASONING`;
