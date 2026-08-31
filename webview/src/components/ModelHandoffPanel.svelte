@@ -20,13 +20,14 @@
 
   let { options, currentValue, loading = false, onClose, onCommit }: Props = $props();
 
-  // Opened as a fresh dialog per invocation, so the initial prop value is the
-  // intended starting selection; untrack it to keep it a plain local edit.
-  let selected = $state(untrack(() => currentValue));
-  const changed = $derived(selected !== currentValue);
-  const currentLabel = $derived(
-    options.find((o) => o.value === currentValue)?.label ?? currentValue,
-  );
+  // Baseline is frozen at open. `currentValue` is reactive: if a host snapshot
+  // rebinds the task while the panel is up, comparing against the live prop
+  // either disarms an armed commit under the cursor, or arms it with `selected`
+  // still holding the old binding — committing a handoff the user never picked.
+  const baseline = untrack(() => currentValue);
+  let selected = $state(baseline);
+  const changed = $derived(selected !== baseline);
+  const currentLabel = $derived(options.find((o) => o.value === baseline)?.label ?? baseline);
 
   let panelEl: HTMLDivElement | undefined = $state();
   let prevActiveEl: HTMLElement | null = null;

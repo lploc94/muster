@@ -16,6 +16,24 @@ describe('resolveAgentLabel', () => {
     expect(resolveAgentLabel({ role: 'coordinator', briefKind: '   ' })).toBe('Coordinator');
   });
 
+  it('falls back to the role for inherited Object keys, never a prototype member', () => {
+    // A plain-object map also resolves prototype members, so a truthiness check
+    // alone would return a function and render as "function Object() {...}".
+    for (const kind of [
+      'constructor',
+      'toString',
+      'valueOf',
+      'hasOwnProperty',
+      'isPrototypeOf',
+      'propertyIsEnumerable',
+      'toLocaleString',
+      '__proto__',
+    ]) {
+      expect(resolveAgentLabel({ role: 'worker', briefKind: kind })).toBe('Agent');
+      expect(resolveAgentLabel({ role: 'coordinator', briefKind: kind })).toBe('Coordinator');
+    }
+  });
+
   it('never returns the backend or model, which are configuration not identity', () => {
     const label = resolveAgentLabel({ role: 'worker', briefKind: 'implement' });
     expect(label).toBe('Implementer');

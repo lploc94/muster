@@ -870,6 +870,24 @@ function isString(v: unknown): v is string {
   return typeof v === 'string';
 }
 
+/** Host-owned brief kinds (mirrors `TaskBriefKind` in src/task/types.ts). */
+const TASK_BRIEF_KINDS = [
+  'coordinate',
+  'plan',
+  'breakdown',
+  'implement',
+  'test',
+  'verify',
+  'research',
+  'generic',
+] as const;
+
+export type TaskBriefKind = (typeof TASK_BRIEF_KINDS)[number];
+
+function isTaskBriefKind(v: unknown): v is TaskBriefKind {
+  return isString(v) && (TASK_BRIEF_KINDS as readonly string[]).includes(v);
+}
+
 function isNumber(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v);
 }
@@ -1333,8 +1351,11 @@ function isTaskSummary(v: unknown): v is TaskSummary {
       v.ownerWorkflowStatus === 'succeeded' ||
       v.ownerWorkflowStatus === 'failed' ||
       v.ownerWorkflowStatus === 'cancelled') &&
-    // Free-form on the wire: the label resolver maps known kinds and ignores
-    // the rest, so an unrecognized host kind must not drop the whole summary.
+    // Deliberately `isString`, not the closed union: `isTaskSummary` is
+    // fail-closed, so rejecting an unknown kind would drop the whole
+    // taskUpserted/turnActivityChanged patch and break all task chrome, not
+    // just the label. A future host kind must degrade to the role fallback.
+    // `resolveAgentLabel` owns that narrowing (own-property lookup only).
     (v.briefKind === undefined || isString(v.briefKind))
   );
 }

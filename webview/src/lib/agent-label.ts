@@ -29,9 +29,12 @@ export interface AgentLabelInput {
  */
 export function resolveAgentLabel(input: AgentLabelInput): string {
   const kind = input.briefKind?.trim();
-  if (kind) {
+  // `Object.hasOwn` + string check: a plain object literal also resolves
+  // inherited prototype members, so `briefKind: 'constructor'` would otherwise
+  // return a function and render as `function Object() { [native code] }`.
+  if (kind && Object.hasOwn(BRIEF_KIND_LABELS, kind)) {
     const label = BRIEF_KIND_LABELS[kind];
-    if (label) return label;
+    if (typeof label === 'string' && label) return label;
   }
   return input.role === 'coordinator' ? 'Coordinator' : 'Agent';
 }
