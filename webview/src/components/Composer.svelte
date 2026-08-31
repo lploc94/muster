@@ -2,7 +2,6 @@
   import { threadStore } from '../lib/thread.svelte';
   import {
     tasks,
-    registerBackendSelect,
     type WebviewBackendId,
   } from '../lib/tasks.svelte';
   import { parseBackendId, parseModelFromSelectValue } from '../lib/backend-resolve';
@@ -17,6 +16,12 @@
   } from '../lib/composer-backend-setup';
   import { post, postDebug } from '../lib/protocol';
   import { ADD_CONTEXT_ACTIONS, getAddContextActionHostMessage } from '../lib/context-actions';
+  import {
+    resolveConversationMenuActions,
+    type ConversationAction,
+  } from '../lib/conversation-actions';
+  import { resolveAgentLabel } from '../lib/agent-label';
+  import ModelHandoffPanel from './ModelHandoffPanel.svelte';
   import {
     getTaskPresentation,
     getTaskStatusPresentation,
@@ -137,6 +142,9 @@
   let attachments = $state<Array<{ path: string; name: string }>>([]);
   const MAX_ATTACHMENTS = 4;
   let isAddContextMenuOpen = $state(false);
+  let isConversationMenuOpen = $state(false);
+  let conversationMenuRegion = $state<HTMLElement | undefined>(undefined);
+  let isModelPanelOpen = $state(false);
   let lastPrefillNonce = $state<number | null>(null);
   /** Reactive mirror of the pure autocomplete session (request scope + listbox). */
   let mentionAutocomplete = $state<FileMentionAutocompleteState>({
@@ -582,11 +590,6 @@
     mode === 'draft' ? tasks.selectedBackend : (tasks.focusedTask?.backend ?? tasks.selectedBackend),
   );
 
-  // Register select so resolveBackendForSend can read it for draft sends.
-  $effect(() => {
-    registerBackendSelect(backendSelect);
-  });
-
   // Native listeners (capture) — vscode-elements change can miss Svelte onchange.
   $effect(() => {
     const el = backendSelect as (HTMLElement & { value: string }) | undefined;
@@ -726,6 +729,13 @@
     }
   });
 
+  // Menu is conversation-scoped: a draft (or a scope switch) must not keep it open.
+  $effect(() => {
+    if (conversationActions.length === 0 && isConversationMenuOpen) {
+      closeConversationMenu();
+    }
+  });
+
   // Close autocomplete when focus target / draft-vs-task mode changes.
   $effect(() => {
     void mode;
@@ -744,14 +754,29 @@
   });
 
   $effect(() => {
-    if (!isAddContextMenuOpen && !mentionAutocomplete.open && !skillAutocompleteOpen) return;
+    if (
+      !isAddContextMenuOpen &&
+      !isConversationMenuOpen &&
+      !mentionAutocomplete.open &&
+      !skillAutocompleteOpen
+    )
+      return;
 
     function onPointerDown(e: PointerEvent) {
       const target = e.target;
-      if (target instanceof Node && addContextMenuRegion?.contains(target)) return;
+      const inAddContext = target instanceof Node && addContextMenuRegion?.contains(target);
+      const inConversation = target instanceof Node && conversationMenuRegion?.contains(target);
+      if (!inAddContext && !inConversation) {
+        closeAddContextMenu();
+        closeConversationMenu();
+      } else if (inAddContext) {
+        closeConversationMenu();
+      } else {
+        closeAddContextMenu();
+      }
       if (target instanceof Node && mentionListboxRegion?.contains(target)) return;
       if (target instanceof Node && skillListboxRegion?.contains(target)) return;
-      closeAddContextMenu();
+      if (inAddContext || inConversation) return;
       if (mentionAutocomplete.open) {
         closeFileMentionPopup();
       }
@@ -856,20 +881,12 @@
       return;
     }
 
-    // Prefer live picker selection so a model switch that didn't fire handoff
-    // still reaches the host (send path will hand off when binding differs).
-    const rawPicker = backendSelect?.value ?? '';
-    const pickerBackend = parseBackendId(rawPicker);
-    const pickerModel = parseModelFromSelectValue(rawPicker);
-
     if (intent.kind === 'sendLiveInput') {
       // Interrupt & send: host reserves follow-up then interrupts live turn.
       const message = buildTaskComposerMessage(intent, {
         taskId,
         text: displayText,
         llmText,
-        ...(pickerBackend ? { backend: pickerBackend } : {}),
-        ...(pickerModel ? { model: pickerModel } : {}),
       });
       if (!message) return;
       post(message);
@@ -888,8 +905,6 @@
       mentionBindings:
         mentionBindings.size > 0 ? Array.from(mentionBindings.entries()) : undefined,
       attachments: attachments.length > 0 ? attachments.map((a) => a.path) : undefined,
-      ...(pickerBackend ? { backend: pickerBackend } : {}),
-      ...(pickerModel ? { model: pickerModel } : {}),
     });
     if (!payload || payload.type !== 'send') return;
     if (payload.clientRequestId) {
@@ -1027,6 +1042,44 @@
   function toggleAddContextMenu() {
     if (!canSend) return;
     isAddContextMenuOpen = !isAddContextMenuOpen;
+  }
+
+  function closeConversationMenu() {
+    isConversationMenuOpen = false;
+  }
+
+  function toggleConversationMenu() {
+    if (conversationActions.length === 0) return;
+    isConversationMenuOpen = !isConversationMenuOpen;
+  }
+
+  function activateConversationAction(action: ConversationAction) {
+    if (action.state !== 'enabled') return;
+    closeConversationMenu();
+    if (action.id === 'change-model') {
+      isModelPanelOpen = true;
+      return;
+    }
+    const focusedId = taskId ?? tasks.focusedTaskId;
+    if (!focusedId) return;
+    tasks.setCommandError(null);
+    post({ type: 'exportTask', taskId: focusedId });
+  }
+
+  /**
+   * Commit an explicit model switch. Always a runtime handoff for an existing
+   * task — the panel already told the user that, so no revert/dedupe dance is
+   * needed here (unlike the old dropdown, which fired on stray scroll).
+   */
+  function commitModelSelection(value: string): void {
+    isModelPanelOpen = false;
+    const focused = tasks.focusedTask;
+    if (!focused) return;
+    const backend = parseBackendId(value);
+    if (!backend) return;
+    const model = parseModelFromSelectValue(value);
+    if (sameBinding(backend, model, focused)) return;
+    tasks.requestRuntimeHandoff(focused.id, backend, model);
   }
 
   function activateAddContextAction(action: AddContextAction) {
@@ -1185,9 +1238,10 @@
   );
 
   function onKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape' && isAddContextMenuOpen) {
+    if (e.key === 'Escape' && (isAddContextMenuOpen || isConversationMenuOpen)) {
       e.preventDefault();
       closeAddContextMenu();
+      closeConversationMenu();
       return;
     }
 
@@ -1397,6 +1451,21 @@
     return encodePickerValue(backend, model, tasks.modelsByBackend);
   });
 
+  /** Conversation-scoped overflow menu ("more" kebab). Empty in draft mode. */
+  const conversationActions = $derived(
+    resolveConversationMenuActions({ mode, taskId: taskId ?? tasks.focusedTaskId }),
+  );
+
+  /**
+   * Task mode names the agent, never the runtime. Backend/model is configuration
+   * (conversation menu -> Change model), so it must not appear in the footer.
+   */
+  const agentLabel = $derived.by(() => {
+    const focused = tasks.focusedTask;
+    if (mode !== 'task' || !focused) return '';
+    return resolveAgentLabel({ role: focused.role, briefKind: focused.briefKind });
+  });
+
   const pickerOptions = $derived.by(() => {
     const models = tasks.modelsByBackend;
     const opts: { value: string; label: string }[] = [];
@@ -1533,11 +1602,9 @@
     modelsLoaded ? `models:${catalogGeneration}` : `loading:${catalogGeneration}`,
   );
 
-  // Sync select value only when remount key or bound task binding changes.
-  // Never continuously overwrite on every effect tick — that fights the open
-  // dropdown / user pick and makes the task picker feel unclickable.
+  // Sync select value only when the remount key changes. Never continuously
+  // overwrite on every effect tick — that fights the open dropdown / user pick.
   let lastForcedRemountKey = '';
-  let lastTaskBindingKey = '';
   $effect(() => {
     const el = backendSelect as
       | (HTMLElement & { value: string; open?: boolean })
@@ -1548,32 +1615,17 @@
     if (el.open === true || el.getAttribute('aria-expanded') === 'true') {
       return;
     }
-    if (mode === 'task') {
-      const bindingKey = `${tasks.focusedTask?.id ?? ''}:${taskPickerValue}`;
-      // Remount or host-confirmed binding change only (not optimistic user pick).
-      if (key === lastForcedRemountKey && bindingKey === lastTaskBindingKey && el.value) {
-        return;
-      }
-      lastForcedRemountKey = key;
-      lastTaskBindingKey = bindingKey;
-      try {
-        el.value = taskPickerValue;
-      } catch {
-        // best-effort
-      }
-      return;
-    }
-    const next = currentPickerValue;
     if (key === lastForcedRemountKey && el.value) return;
     lastForcedRemountKey = key;
     try {
-      el.value = next;
+      el.value = currentPickerValue;
     } catch {
       // best-effort
     }
   });
 
   // Ensure host starts enumeration whenever draft or task composer is shown.
+  // Task mode still needs the catalog: it feeds the change-model panel options.
   let modelsRequested = false;
   $effect(() => {
     const needModels = mode === 'draft' || mode === 'task';
@@ -1602,8 +1654,6 @@
             : 'Message this task…',
   );
 
-  const BACKEND_IDS = ['claude', 'grok', 'kiro', 'codex', 'opencode'];
-
   function sameBinding(
     backend: string,
     model: string | null | undefined,
@@ -1615,119 +1665,32 @@
     return task.backend === backend && taskModel === nextModel;
   }
 
-  function revertTaskPicker(el: (HTMLElement & { value: string }) | undefined): void {
-    try {
-      if (el) el.value = taskPickerValue;
-    } catch {
-      // best-effort
-    }
-  }
-
-  /** Deduplicate change+input double-fire from vscode-single-select. */
-  let lastHandoffRequestKey = '';
-  let lastHandoffRequestAt = 0;
-
+  /**
+   * Draft-only: the inline picker exists only before a task is created, so this
+   * just records the preference. An existing task changes model through the
+   * conversation menu -> ModelHandoffPanel, which commits an explicit handoff.
+   */
   function onBackendChange(e: Event) {
     // vscode-single-select dispatches `new Event('change')` so isTrusted is always
     // false even for real user clicks — never filter on isTrusted.
-    // Prefer change over input to avoid double handoff (input often follows change).
-    if (e.type === 'input') {
-      return;
-    }
+    // Prefer change over input to avoid double-applying (input often follows change).
+    if (e.type === 'input') return;
     const el = (e.currentTarget ?? backendSelect) as (HTMLElement & { value: string }) | undefined;
     const raw = el?.value ?? '';
-    postDebug('picker.change_handler', {
-      type: e.type,
-      raw,
-      isTrusted: e.isTrusted,
-      mode,
-      focusedTaskId: tasks.focusedTask?.id ?? null,
-      focusedBackend: tasks.focusedTask?.backend ?? null,
-      focusedModel: tasks.focusedTask?.model ?? null,
-      pendingHandoff: tasks.pendingHandoffTarget,
-    });
-    const sep = raw.indexOf('::');
-    if (sep >= 0) {
-      const backend = raw.slice(0, sep);
-      const model = raw.slice(sep + 2);
-      if (BACKEND_IDS.includes(backend)) {
-        if (mode === 'draft') {
-          postDebug('picker.draft_setModelSelection', { backend, model });
-          tasks.setModelSelection(backend as WebviewBackendId, model);
-          return;
-        }
-        // Existing task: changing model always requests handoff (never chat).
-        const focused = tasks.focusedTask;
-        if (!focused) {
-          postDebug('picker.no_focused_task', { raw });
-          revertTaskPicker(el);
-          return;
-        }
-        if (sameBinding(backend, model, focused)) {
-          postDebug('picker.same_binding', {
-            backend,
-            model,
-            taskBackend: focused.backend,
-            taskModel: focused.model ?? null,
-          });
-          revertTaskPicker(el);
-          return;
-        }
-        const key = `${focused.id}|${backend}|${model}`;
-        const now = Date.now();
-        if (key === lastHandoffRequestKey && now - lastHandoffRequestAt < 1500) {
-          postDebug('picker.handoff_deduped', { key });
-          return;
-        }
-        lastHandoffRequestKey = key;
-        lastHandoffRequestAt = now;
-        postDebug('picker.request_handoff', {
-          taskId: focused.id,
-          from: { backend: focused.backend, model: focused.model ?? null },
-          to: { backend, model },
-        });
-        tasks.requestRuntimeHandoff(focused.id, backend, model);
-      } else {
-        postDebug('picker.backend_not_in_ids', { backend, raw });
-      }
-    } else if (BACKEND_IDS.includes(raw)) {
-      if (mode === 'draft') {
-        postDebug('picker.draft_setBackend', { backend: raw });
-        tasks.setBackend(raw as WebviewBackendId);
-        return;
-      }
-      const focused = tasks.focusedTask;
-      if (!focused) {
-        postDebug('picker.no_focused_task', { raw });
-        revertTaskPicker(el);
-        return;
-      }
-      if (sameBinding(raw, null, focused)) {
-        postDebug('picker.same_binding_backend_only', {
-          backend: raw,
-          taskBackend: focused.backend,
-          taskModel: focused.model ?? null,
-        });
-        revertTaskPicker(el);
-        return;
-      }
-      const key = `${focused.id}|${raw}|`;
-      const now = Date.now();
-      if (key === lastHandoffRequestKey && now - lastHandoffRequestAt < 1500) {
-        postDebug('picker.handoff_deduped', { key });
-        return;
-      }
-      lastHandoffRequestKey = key;
-      lastHandoffRequestAt = now;
-      postDebug('picker.request_handoff_backend_only', {
-        taskId: focused.id,
-        from: { backend: focused.backend, model: focused.model ?? null },
-        to: { backend: raw, model: null },
-      });
-      tasks.requestRuntimeHandoff(focused.id, raw, null);
-    } else {
+    postDebug('picker.change_handler', { type: e.type, raw, isTrusted: e.isTrusted, mode });
+    const backend = parseBackendId(raw);
+    if (!backend) {
       postDebug('picker.unparsed', { raw, isTrusted: e.isTrusted });
+      return;
     }
+    const model = parseModelFromSelectValue(raw);
+    if (model) {
+      postDebug('picker.draft_setModelSelection', { backend, model });
+      tasks.setModelSelection(backend, model);
+      return;
+    }
+    postDebug('picker.draft_setBackend', { backend });
+    tasks.setBackend(backend);
   }
 </script>
 
@@ -1995,34 +1958,35 @@
 
   <div class="flex items-center justify-between gap-2 pt-1" onkeydown={onKeydown}>
     <div class="flex items-center gap-1.5 min-w-0">
-      {#if mode === 'draft' || mode === 'task'}
-        {#key `${mode}:${pickerRemountKey}`}
+      {#if mode === 'draft'}
+        {#key `draft:${pickerRemountKey}`}
           <vscode-single-select
             bind:this={backendSelect}
-            data-testid={mode === 'task' ? 'task-model-switch' : 'draft-model-picker'}
+            data-testid="draft-model-picker"
             use:tip={
-              mode === 'draft'
-                ? modelsLoaded
-                  ? 'Select backend + model for the new task'
-                  : 'Loading models from installed CLIs… (shows backends first)'
-                : modelsLoaded
-                  ? 'Switch backend + model for this task'
-                  : 'Loading models from installed CLIs…'
+              modelsLoaded
+                ? 'Select backend + model for the new task'
+                : 'Loading models from installed CLIs… (shows backends first)'
             }
-            disabled={mode === 'draft' ? thread.running || draftBlockedByReadiness : false}
+            disabled={thread.running || draftBlockedByReadiness}
             position="above"
             onchange={onBackendChange}
             style={pickerWidthStyle}
           >
             {#each pickerOptions as opt (opt.value)}
-              <vscode-option
-                value={opt.value}
-                selected={opt.value === (mode === 'draft' ? currentPickerValue : taskPickerValue)}
+              <vscode-option value={opt.value} selected={opt.value === currentPickerValue}
                 >{opt.label}</vscode-option
               >
             {/each}
           </vscode-single-select>
         {/key}
+      {/if}
+
+      {#if agentLabel}
+        <span class="agent-label" data-testid="task-agent-label" use:tip={'Agent running this task'}>
+          <span class="codicon codicon-person" aria-hidden="true"></span>
+          <span class="agent-label__text">{agentLabel}</span>
+        </span>
       {/if}
 
       <div bind:this={addContextMenuRegion} class="add-context">
@@ -2063,6 +2027,54 @@
           </div>
         {/if}
       </div>
+
+      {#if conversationActions.length > 0}
+        <div bind:this={conversationMenuRegion} class="add-context">
+          <button
+            type="button"
+            class="icon-btn add-context__button"
+            aria-label="Conversation options"
+            aria-haspopup="menu"
+            aria-expanded={isConversationMenuOpen ? 'true' : 'false'}
+            data-testid="conversation-menu-trigger"
+            use:tip={'Conversation options'}
+            onclick={toggleConversationMenu}
+          >
+            <span class="codicon codicon-kebab-vertical"></span>
+          </button>
+
+          {#if isConversationMenuOpen}
+            <div
+              class="add-context__menu"
+              role="menu"
+              aria-label="Conversation options"
+              data-testid="conversation-menu"
+            >
+              {#each conversationActions as action (action.id)}
+                <button
+                  type="button"
+                  class="add-context__menu-item"
+                  class:add-context__menu-item--disabled={action.state !== 'enabled'}
+                  role="menuitem"
+                  aria-label={action.label}
+                  aria-disabled={action.state !== 'enabled' ? 'true' : 'false'}
+                  title={action.state === 'enabled' ? action.description : action.disabledReason}
+                  disabled={action.state !== 'enabled'}
+                  data-testid="conversation-menu-item"
+                  data-action={action.id}
+                  onclick={() => activateConversationAction(action)}
+                >
+                  <span
+                    class="codicon add-context__menu-item-icon {action.icon}"
+                    aria-hidden="true"
+                  ></span>
+                  <span class="add-context__menu-item-label">{action.label}</span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <div class="flex items-center gap-2 shrink-0">
@@ -2121,3 +2133,13 @@
     </div>
   </div>
 </div>
+
+{#if isModelPanelOpen}
+  <ModelHandoffPanel
+    options={pickerOptions}
+    currentValue={taskPickerValue}
+    loading={!modelsLoaded}
+    onClose={() => (isModelPanelOpen = false)}
+    onCommit={commitModelSelection}
+  />
+{/if}

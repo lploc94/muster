@@ -18,7 +18,10 @@
   import { workflowGraphStatusLabel } from '../lib/workflow-graph-view';
   import type { PendingAsk, TaskLifecycleState, TaskSummary } from '../lib/protocol';
   import { buildDeleteQueuedTurnMessage, queuedTurnControlState } from '../lib/queued-turns';
-  import { selectTask as navSelectTask } from '../lib/task-nav';
+  import {
+    openContinuationDraft as navOpenContinuationDraft,
+    selectTask as navSelectTask,
+  } from '../lib/task-nav';
   import {
     breadcrumbPath,
     buildTaskTree,
@@ -630,8 +633,7 @@
 
   function continueAsNewTask(): void {
     if (!focused) return;
-    tasks.openContinuationDraft(focused.id);
-    post({ type: 'newTask' });
+    navOpenContinuationDraft(focused.id);
   }
 
   /**

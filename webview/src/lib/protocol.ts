@@ -130,6 +130,8 @@ export interface TaskSummary {
   workflowNodeStatus?: string | null;
   /** Owner workflow run status for coordinators that stay open after run succeeded. */
   ownerWorkflowStatus?: string | null;
+  /** Host brief kind naming the running agent (plan → Planner). */
+  briefKind?: string;
 }
 
 export interface TranscriptItem {
@@ -1235,6 +1237,7 @@ function isTaskSummary(v: unknown): v is TaskSummary {
       'contextUsage',
       'workflowNodeStatus',
       'ownerWorkflowStatus',
+      'briefKind',
     ])
   ) {
     return false;
@@ -1329,7 +1332,10 @@ function isTaskSummary(v: unknown): v is TaskSummary {
       v.ownerWorkflowStatus === 'running' ||
       v.ownerWorkflowStatus === 'succeeded' ||
       v.ownerWorkflowStatus === 'failed' ||
-      v.ownerWorkflowStatus === 'cancelled')
+      v.ownerWorkflowStatus === 'cancelled') &&
+    // Free-form on the wire: the label resolver maps known kinds and ignores
+    // the rest, so an unrecognized host kind must not drop the whole summary.
+    (v.briefKind === undefined || isString(v.briefKind))
   );
 }
 
