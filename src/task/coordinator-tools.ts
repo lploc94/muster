@@ -22,7 +22,6 @@ import type {
 } from './types';
 import type { VerdictCriterionInput, VerdictInput } from './verdict';
 import {
-  WORKFLOW_CHILD_BINDINGS_MAX,
   WORKFLOW_ENTRY_CONTRACTS_MAX,
   WORKFLOW_RUN_GOAL_MAX_LENGTH,
   type WorkflowEntryContract,
@@ -194,13 +193,7 @@ export type ToolCommand =
       opId: string;
       childDefinitionId: string;
       childDefinitionVersion?: number;
-      entryBindings?: readonly {
-        childEntryNodeId: string;
-        inputRef: string;
-        artifactId: string;
-        artifactRevision: number;
-      }[];
-      semanticEntryBindings?: readonly {
+      entryBindings: readonly {
         name: string;
         fromInputRef: string;
       }[];
@@ -408,7 +401,8 @@ function parseSemanticWorkflowInputs(value: unknown): WorkflowStartInput[] | und
     const fromRun = requireString(raw, 'fromRun');
     const output = requireString(raw, 'output');
     if (
-      !fromRun || !output || !isStablePresentationId(output)
+      !fromRun || !isStablePresentationId(fromRun) ||
+      !output || !isStablePresentationId(output)
     ) return undefined;
     inputs.push({ name, fromRun, output });
   }
@@ -1180,12 +1174,11 @@ export function dispatch(
 
         if (Array.isArray(args.inputs)) {
           if (
-            args.inputs.length === 0 ||
-            args.inputs.length > WORKFLOW_CHILD_BINDINGS_MAX
+            args.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX
           ) {
-            return { ok: false, toolError: 'inputs must be a non-empty array' };
+            return { ok: false, toolError: 'inputs exceed bounds' };
           }
-          const semanticEntryBindings: Array<{
+          const entryBindings: Array<{
             name: string;
             fromInputRef: string;
           }> = [];
@@ -1207,7 +1200,7 @@ export function dispatch(
               return { ok: false, toolError: `duplicate child workflow input: ${name}` };
             }
             seenNames.add(name);
-            semanticEntryBindings.push({ name, fromInputRef });
+            entryBindings.push({ name, fromInputRef });
           }
           return {
             ok: true,
@@ -1216,12 +1209,12 @@ export function dispatch(
               opId,
               childDefinitionId,
               ...(childDefinitionVersion !== undefined ? { childDefinitionVersion } : {}),
-              semanticEntryBindings,
+              entryBindings,
               childIdempotencyKey: `turn-${stableHash(ctx.turnId, opId)}`,
             },
           };
         }
-        return { ok: false, toolError: 'inputs must be a non-empty array' };
+        return { ok: false, toolError: 'inputs must be an array' };
       }
       case 'ask_parent': {
         const questions = parseQuestions(args.questions);

@@ -9,7 +9,7 @@
  *   - bounded run inspection / task-bound repository projection
  *
  * Protocol under test:
- *   1. Parent one-node caller invokes a child graph_v1:
+ *   1. Parent one-node caller invokes a canonical child workflow:
  *        r1, r2 → planner (fan-in) → verifier (terminal)
  *   2. Research producers NEXT → planner activates
  *   3. Planner NEXT → verifier activates
@@ -35,7 +35,7 @@ import { SqliteTaskRepository } from './repository';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import { pickRunnableTurns } from './scheduler';
 import { DbClient } from './sqlite/client';
-import type { TaskStoreFile, TurnDisposition } from './types';
+import type { EngineProjection, MusterTask, TurnDisposition } from './types';
 import {
   DEFAULT_WORKFLOW_POLICY,
   deriveFeedbackResumeTurnId,
@@ -47,7 +47,7 @@ import {
   validateDefineWorkflow,
 } from './workflow';
 import type {
-  GraphTopologyV1,
+  WorkflowTopology,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
 } from './workflow-types';
@@ -56,8 +56,13 @@ const WORKER_TS = path.join(__dirname, 'sqlite', 'worker.ts');
 const TSX_ARGV = ['--import', 'tsx'];
 
 /** Canonical research fan-in → planner → verifier topology. */
-const CANONICAL_TOPOLOGY: GraphTopologyV1 = {
-  kind: 'graph_v1',
+const CANONICAL_TOPOLOGY: WorkflowTopology = {
+  kind: 'workflow',
+  inputs: [
+    { name: 'researchOne', semanticKind: 'research-seed', entryNodeId: 'r1', inputRef: 'research_one' },
+    { name: 'researchTwo', semanticKind: 'research-seed', entryNodeId: 'r2', inputRef: 'research_two' },
+  ],
+  outputs: [{ name: 'verified', semanticKind: 'verified-result', terminalNodeId: 'verifier' }],
   nodes: [
     { nodeId: 'r1', role: 'worker' },
     { nodeId: 'r2', role: 'worker' },
@@ -72,9 +77,13 @@ const CANONICAL_TOPOLOGY: GraphTopologyV1 = {
 };
 
 const ONE_NODE = {
-  kind: 'one_node_v1' as const,
+  kind: 'workflow' as const,
+  inputs: [{
+    name: 'source', semanticKind: 'parent-opaque', entryNodeId: 'entry', inputRef: 'source',
+  }],
+  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
   nodes: [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
-  entryNodeId: 'entry',
+  edges: [],
 };
 
 type Opened = {
@@ -96,7 +105,6 @@ type StartPayload = {
   nodeGates: Array<{ nodeId: string; gateId: string }>;
   entryTaskId?: string;
   activationTurnId?: string;
-  startArtifactId?: string;
   entryGateId?: string;
 };
 
@@ -104,7 +112,6 @@ type OneNodeStart = {
   runId: string;
   entryTaskId: string;
   activationTurnId: string;
-  startArtifactId: string;
   entryGateId: string;
 };
 
@@ -118,6 +125,22 @@ async function openRepo(label: string): Promise<Opened> {
     ['ws', `s07c-${label}`, `S07 canonical ${label}`, 'now', 'now'],
   );
   const repository = new SqliteTaskRepository(client, 'ws');
+  const root: MusterTask = {
+    id: 'root-task', role: 'coordinator', lifecycle: 'open', releaseState: 'released',
+    goal: 'coordinate canonical workflow', parentId: null, prerequisites: [],
+    backend: 'grok', capabilities: [],
+    executionPolicy: { maxTurns: 40, maxAutomaticRetries: 1 }, revision: 0,
+    createdAt: '2026-07-21T00:00:00.000Z', updatedAt: '2026-07-21T00:00:00.000Z',
+    releasedAt: '2026-07-21T00:00:00.000Z',
+  };
+  await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: root });
+  await repository.execute({
+    kind: 'createTurn', workspaceId: 'ws',
+    turn: {
+      id: 'root-turn', taskId: root.id, sequence: 1, status: 'running', trigger: 'user',
+      inputs: [], createdAt: root.createdAt, startedAt: root.createdAt,
+    },
+  });
   return {
     dir,
     dbPath,
@@ -213,10 +236,10 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
 async function buildStoreFromRepo(
   repository: SqliteTaskRepository,
   taskIds: readonly string[],
-): Promise<TaskStoreFile> {
-  const tasks: TaskStoreFile['tasks'] = {};
-  const turns: TaskStoreFile['turns'] = {};
-  const messages: TaskStoreFile['messages'] = {};
+): Promise<EngineProjection> {
+  const tasks: EngineProjection['tasks'] = {};
+  const turns: EngineProjection['turns'] = {};
+  const messages: EngineProjection['messages'] = {};
   for (const taskId of taskIds) {
     const task = await repository.getTask(taskId);
     if (task) tasks[task.id] = task;
@@ -228,7 +251,7 @@ async function buildStoreFromRepo(
     }
   }
   return {
-    version: 1,
+    schemaVersion: 1,
     revision: 1,
     tasks,
     turns,
@@ -241,13 +264,18 @@ async function buildStoreFromRepo(
 }
 
 function makeMinimalDeps(
-  file: TaskStoreFile,
+  file: EngineProjection,
   repository: SqliteTaskRepository,
 ): GraphEngineDeps {
   const credentials = new CredentialRegistry();
   const askBridge = { ask: async () => ({}) } as unknown as AskBridge;
   return {
-    store: { getFile: () => file },
+    store: {
+      getFile: () => file,
+      getTask: (taskId) => file.tasks[taskId],
+      getTurnsForTask: (taskId) => Object.values(file.turns).filter((turn) => turn.taskId === taskId),
+      viewStatusOf: () => undefined,
+    },
     repository,
     workspaceId: 'ws',
     makeBackend: () => {
@@ -270,13 +298,18 @@ async function defineVersion(
   createdAt: string,
   definitionId: string,
   name: string,
-  topology: unknown,
+  topology: WorkflowTopology,
   entryContracts?: readonly {
     entryNodeId: string;
     inputRef: string;
     expectedArtifactKind: string;
   }[],
 ): Promise<void> {
+  const contracts = entryContracts ?? topology.inputs.map((input) => ({
+    entryNodeId: input.entryNodeId,
+    inputRef: input.inputRef,
+    expectedArtifactKind: 'workflow_input',
+  }));
   const def = await repository.execute({
     kind: 'defineWorkflowVersion',
     workspaceId: 'ws',
@@ -284,7 +317,7 @@ async function defineVersion(
     version: 1,
     name,
     topology,
-    ...(entryContracts ? { entryContracts } : {}),
+    ...(contracts.length > 0 ? { entryContracts: contracts as any } : {}),
     createdAt,
   });
   expect(def.ok).toBe(true);
@@ -306,6 +339,10 @@ async function startOneNode(
     createdAt,
     goal,
     backend: 'grok',
+    inputs: [{ name: 'source', value: goal }],
+    ownerRootTaskId: 'root-task',
+    callerTaskId: 'root-task',
+    callerTurnId: 'root-turn',
   });
   expect(start.ok).toBe(true);
   return start.operation?.result?.data as OneNodeStart;
@@ -326,6 +363,13 @@ async function startCanonicalChildAsTopLevel(
     createdAt,
     goal: 'canonical research fan-in planner verifier',
     backend: 'grok',
+    inputs: [
+      { name: 'researchOne', value: 'research seed one' },
+      { name: 'researchTwo', value: 'research seed two' },
+    ],
+    ownerRootTaskId: 'root-task',
+    callerTaskId: 'root-task',
+    callerTurnId: 'root-turn',
   });
   expect(start.ok).toBe(true);
   return start.operation?.result?.data as StartPayload;
@@ -356,13 +400,17 @@ async function waitForNodeTask(
 }
 
 describe('M018 S07 canonical research → planner → verifier workflow', () => {
-  it('MCP surface accepts canonical graph_v1 and workflow_prev/next; topology validates', () => {
+  it('MCP surface accepts the canonical manifest and workflow_prev/next; topology validates', () => {
     const validated = validateDefineWorkflow({
       definitionId: 'wf-canonical',
       version: 1,
       name: 'canonical',
       topology: CANONICAL_TOPOLOGY,
-      entryContracts: [],
+      entryContracts: CANONICAL_TOPOLOGY.inputs.map((input) => ({
+        entryNodeId: input.entryNodeId,
+        inputRef: input.inputRef,
+        expectedArtifactKind: 'workflow_input' as const,
+      })),
       policy: DEFAULT_WORKFLOW_POLICY,
       createdAt: '2026-07-21T00:00:00.000Z',
     });
@@ -393,18 +441,26 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
     const def = dispatch(
       'define_workflow',
       {
-        name: 'canonical-research',
-        nodes: [
-          { nodeKey: 'r1', taskType: 'research' },
-          { nodeKey: 'r2', taskType: 'research' },
-          { nodeKey: 'planner', taskType: 'plan' },
-          { nodeKey: 'verifier', taskType: 'verify' },
-        ],
-        edges: [
-          { from: 'r1', to: 'planner', as: 'from_r1' },
-          { from: 'r2', to: 'planner', as: 'from_r2' },
-          { from: 'planner', to: 'verifier', as: 'from_planner' },
-        ],
+        manifest: {
+          schema: 'muster.workflow/v2',
+          name: 'canonical-research',
+          inputs: [
+            { name: 'researchOne', kind: 'research-seed', to: 'r1', inputRef: 'research_one' },
+            { name: 'researchTwo', kind: 'research-seed', to: 'r2', inputRef: 'research_two' },
+          ],
+          outputs: [{ name: 'verified', kind: 'verified-result', from: 'verifier' }],
+          nodes: [
+            { nodeKey: 'r1', taskType: 'research' },
+            { nodeKey: 'r2', taskType: 'research' },
+            { nodeKey: 'planner', taskType: 'plan' },
+            { nodeKey: 'verifier', taskType: 'verify' },
+          ],
+          edges: [
+            { from: 'r1', to: 'planner', inputRef: 'from_r1' },
+            { from: 'r2', to: 'planner', inputRef: 'from_r2' },
+            { from: 'planner', to: 'verifier', inputRef: 'from_planner' },
+          ],
+        },
       },
       ctx,
     );
@@ -444,10 +500,6 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         'wf-canonical',
         'canonical-research',
         CANONICAL_TOPOLOGY,
-        [
-          { entryNodeId: 'r1', inputRef: 'research_one', expectedArtifactKind: 'engine_start' },
-          { entryNodeId: 'r2', inputRef: 'research_two', expectedArtifactKind: 'engine_start' },
-        ],
       );
       const caller = await startOneNode(
         opened.repository,
@@ -456,19 +508,6 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         's07-canonical-caller',
         'caller goal',
       );
-      await opened.client.run(
-        `UPDATE workflow_runs
-            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?
-          WHERE workspace_id = ? AND run_id = ?`,
-        [
-          caller.entryTaskId,
-          caller.entryTaskId,
-          caller.activationTurnId,
-          'ws',
-          caller.runId,
-        ],
-      );
-
       // Invoke child canonical graph from the parent entry turn.
       const invoke = await settleSucceeded(
         opened.repository,
@@ -484,16 +523,12 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
             childDefinitionVersion: 1,
             entryBindings: [
               {
-                childEntryNodeId: 'r1',
-                inputRef: 'research_one',
-                artifactId: caller.startArtifactId,
-                artifactRevision: 1,
+                name: 'researchOne',
+                fromInputRef: 'source',
               },
               {
-                childEntryNodeId: 'r2',
-                inputRef: 'research_two',
-                artifactId: caller.startArtifactId,
-                artifactRevision: 1,
+                name: 'researchTwo',
+                fromInputRef: 'source',
               },
             ],
             childIdempotencyKey: 's07-canonical-child-1',
@@ -635,7 +670,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         {
           callerTaskId: caller.entryTaskId,
           turnId: caller.activationTurnId,
-          rootId: caller.entryTaskId,
+          rootId: 'root-task',
           allowedActions: new Set(['continue_child']),
         },
         {
@@ -715,8 +750,8 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
       expect(plannerTask?.goal).toMatch(/^\[workflow:planner\] /);
       expect(plannerTask?.parentId).toBe(r1Task?.parentId);
       const plannerTurn = await opened.repository.getTurn(plannerActivationTurnId);
-      const toolFile: TaskStoreFile = {
-        version: 1,
+      const toolFile: EngineProjection = {
+        schemaVersion: 1,
         revision: 1,
         tasks: { [plannerTask!.id]: plannerTask! },
         turns: { [plannerTurn!.id]: plannerTurn! },
@@ -732,7 +767,7 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         {
           callerTaskId: plannerTask!.id,
           turnId: plannerTurn!.id,
-          rootId: caller.entryTaskId,
+          rootId: 'root-task',
           allowedActions: new Set(['read_subtree', 'inspect_workflow_run']),
         },
         { kind: 'inspect_workflow_run', runId: childRunId! },

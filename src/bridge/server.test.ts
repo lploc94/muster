@@ -452,6 +452,7 @@ describe('MusterBridgeServer auth', () => {
 
     const childTool = workflowTools.find((tool) => tool.name === 'invoke_child_workflow');
     expect(childTool?.inputSchema.properties?.inputs).toMatchObject({
+      maxItems: 128,
       items: {
         required: ['name', 'fromInput'],
         additionalProperties: false,
@@ -460,6 +461,7 @@ describe('MusterBridgeServer auth', () => {
         },
       },
     });
+    expect(childTool?.inputSchema.properties?.inputs).not.toHaveProperty('minItems');
     expect(JSON.stringify(childTool?.inputSchema)).not.toContain('toNode');
 
     const defined = await session.request('tools/call', {
@@ -772,7 +774,7 @@ describe('MusterBridgeServer auth', () => {
       tool: 'invoke_child_workflow',
       command: {
         kind: 'invoke_child_workflow',
-        semanticEntryBindings: [{ name: 'request', fromInputRef: 'implementation' }],
+        entryBindings: [{ name: 'request', fromInputRef: 'implementation' }],
       },
     });
 

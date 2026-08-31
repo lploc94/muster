@@ -473,10 +473,8 @@ export type TurnDisposition =
         childDefinitionId: string;
         childDefinitionVersion: number;
         entryBindings: readonly {
-          childEntryNodeId: string;
-          inputRef: string;
-          artifactId: string;
-          artifactRevision: number;
+          name: string;
+          fromInputRef: string;
         }[];
         childIdempotencyKey?: string;
         effectivePolicy?: import('./workflow-types').WorkflowPolicy;

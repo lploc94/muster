@@ -13,16 +13,16 @@ const NOW = '2026-08-01T00:00:00.000Z';
 function rootTask(): MusterTask {
   return {
     id: 'root-task', role: 'coordinator', lifecycle: 'open', releaseState: 'released',
-    goal: 'coordinate reusable workflow results', parentId: null, prerequisites: [],
+    goal: 'coordinate named workflow outputs', parentId: null, prerequisites: [],
     backend: 'grok', capabilities: [],
-    executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 }, revision: 0,
+    executionPolicy: { maxTurns: 20, maxAutomaticRetries: 1 }, revision: 0,
     createdAt: NOW, updatedAt: NOW, releasedAt: NOW,
   };
 }
 
-describe('M024 S02 durable cross-run entry reuse', () => {
-  it('fills an entry gate from a prior terminal result, activates with its body, and pins the producer', async () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s02-durable-'));
+describe('M024 S02 durable named output composition', () => {
+  it('selects each declared terminal artifact instead of the multi-sink aggregate and pins its provenance', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s02-named-output-'));
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
       execArgv: ['--import', 'tsx'],
@@ -32,7 +32,7 @@ describe('M024 S02 durable cross-run entry reuse', () => {
       await client.run(
         `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
          VALUES (?,?,?,?,?)`,
-        [WORKSPACE_ID, 'm024-s02-durable', 'M024 S02 durable', NOW, NOW],
+        [WORKSPACE_ID, 'm024-s02-named-output', 'M024 S02 named output', NOW, NOW],
       );
       const repository = new SqliteTaskRepository(client, WORKSPACE_ID);
       await repository.execute({ kind: 'createTask', workspaceId: WORKSPACE_ID, task: rootTask() });
@@ -43,113 +43,233 @@ describe('M024 S02 durable cross-run entry reuse', () => {
           inputs: [], createdAt: NOW, startedAt: NOW,
         },
       });
-      await repository.execute({
-        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-producer', version: 1,
-        name: 'producer', topology: {
-          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
-        }, createdAt: NOW,
-      });
-      await repository.execute({
-        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-consumer', version: 1,
-        name: 'consumer', topology: {
-          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
-        }, entryContracts: [{
-          entryNodeId: 'entry', inputRef: 'prior_result', expectedArtifactKind: 'workflow_input',
-        }], createdAt: NOW,
-      });
+      await expect(repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-producer', version: 1, name: 'producer',
+        topology: {
+          kind: 'workflow',
+          inputs: [],
+          outputs: [
+            { name: 'leftPlan', semanticKind: 'plan', terminalNodeId: 'left' },
+            { name: 'rightPlan', semanticKind: 'plan', terminalNodeId: 'right' },
+          ],
+          nodes: [
+            { nodeId: 'leftSource' }, { nodeId: 'left' },
+            { nodeId: 'rightSource' }, { nodeId: 'right' },
+          ],
+          edges: [
+            { fromNodeId: 'leftSource', toNodeId: 'left', inputRef: 'leftSeed' },
+            { fromNodeId: 'rightSource', toNodeId: 'right', inputRef: 'rightSeed' },
+          ],
+        },
+        createdAt: NOW,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-consumer', version: 1, name: 'consumer',
+        topology: {
+          kind: 'workflow',
+          inputs: [{ name: 'plan', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'plan' }],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+          nodes: [{ nodeId: 'entry' }],
+          edges: [],
+        },
+        entryContracts: [{ entryNodeId: 'entry', inputRef: 'plan', expectedArtifactKind: 'workflow_input' }],
+        createdAt: NOW,
+      })).resolves.toMatchObject({ ok: true, changed: true });
 
       const producerStart = await repository.execute({
-        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-producer', version: 1,
-        startIdempotencyKey: 'producer', createdAt: NOW, goal: 'produce a reusable result', backend: 'grok',
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-producer', version: 1,
+        startIdempotencyKey: 'producer', createdAt: NOW,
         ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
       });
       expect(producerStart).toMatchObject({ ok: true, changed: true });
       const producer = producerStart.operation!.result.data as {
-        runId: string; entryTaskId: string; activationTurnId: string;
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
       };
-      await client.run(
-        `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
-        ['2026-08-01T00:00:01.000Z', WORKSPACE_ID, producer.activationTurnId],
+      const settle = async (taskId: string, turnId: string, result: string, index: number) => {
+        await client.run(
+          `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
+          [`2026-08-01T00:00:${String(index).padStart(2, '0')}.000Z`, WORKSPACE_ID, turnId],
+        );
+        const turn = await repository.getTurn(turnId);
+        const task = await repository.getTask(taskId);
+        const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+        await stageDispositionForSettlement(repository, turn!, disposition);
+        await expect(repository.execute({
+          kind: 'settleTurnAndApplyEffects', workspaceId: WORKSPACE_ID,
+          expectedTaskRevision: task!.revision,
+          task: { ...task!, updatedAt: `2026-08-01T00:00:${String(index).padStart(2, '0')}.500Z` },
+          turn: {
+            ...turn!, status: 'succeeded', disposition,
+            finishedAt: `2026-08-01T00:00:${String(index).padStart(2, '0')}.500Z`,
+          },
+          expectedStatuses: ['running'], relatedTurns: [], messages: [],
+        })).resolves.toMatchObject({ ok: true, changed: true });
+      };
+      const entriesByNode = new Map(producer.entries.map((entry) => [entry.nodeId, entry] as const));
+      await settle(
+        entriesByNode.get('leftSource')!.taskId,
+        entriesByNode.get('leftSource')!.activationTurnId,
+        'left seed',
+        1,
       );
-      const producerTurn = await repository.getTurn(producer.activationTurnId);
-      const producerTask = await repository.getTask(producer.entryTaskId);
-      const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result: 'reused terminal body' };
-      await stageDispositionForSettlement(repository, producerTurn!, disposition);
-      await expect(repository.execute({
-        kind: 'settleTurnAndApplyEffects', workspaceId: WORKSPACE_ID,
-        expectedTaskRevision: producerTask!.revision,
-        task: { ...producerTask!, lifecycle: 'succeeded', updatedAt: '2026-08-01T00:00:02.000Z' },
-        turn: {
-          ...producerTurn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:02.000Z', disposition,
-        }, expectedStatuses: ['running'], relatedTurns: [], messages: [],
-      })).resolves.toMatchObject({ ok: true, changed: true });
+      await settle(
+        entriesByNode.get('rightSource')!.taskId,
+        entriesByNode.get('rightSource')!.activationTurnId,
+        'right seed',
+        2,
+      );
+      const terminals = await client.all<{ node_id: string; task_id: string }>(
+        `SELECT node_id, task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id IN ('left', 'right')
+          ORDER BY node_id`,
+        [WORKSPACE_ID, producer.runId],
+      );
+      const terminalByNode = new Map(terminals.map((node) => [node.node_id, node.task_id] as const));
+      const rightTurn = (await repository.listTurns(terminalByNode.get('right')!))[0]!;
+      const leftTurn = (await repository.listTurns(terminalByNode.get('left')!))[0]!;
+      // Reverse completion order is deliberate: output names, not last completion, select authority.
+      await settle(terminalByNode.get('right')!, rightTurn.id, 'RIGHT terminal value', 3);
+      await settle(terminalByNode.get('left')!, leftTurn.id, 'LEFT terminal value', 4);
 
-      const terminal = await client.get<{
-        terminal_result_run_id: string; terminal_result_artifact_id: string; terminal_result_artifact_revision: number;
-      }>(`SELECT terminal_result_run_id, terminal_result_artifact_id, terminal_result_artifact_revision
-            FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`, [WORKSPACE_ID, producer.runId]);
-      expect(terminal).toMatchObject({
-        terminal_result_run_id: producer.runId,
-        terminal_result_artifact_id: expect.any(String),
-        terminal_result_artifact_revision: 1,
-      });
+      const terminalPointer = await client.get<{
+        terminal_result_artifact_id: string;
+        terminal_result_artifact_revision: number;
+      }>(
+        `SELECT terminal_result_artifact_id, terminal_result_artifact_revision
+           FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+        [WORKSPACE_ID, producer.runId],
+      );
+      const terminalArtifacts = await client.all<{
+        producer_node_id: string;
+        artifact_id: string;
+        revision: number;
+        payload_json: string;
+      }>(
+         `SELECT producer_node_id, artifact_id, revision, payload_json
+            FROM workflow_artifacts
+           WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'
+             AND logical_name = 'next_result' AND producer_node_id IN ('left', 'right')
+          ORDER BY producer_node_id`,
+        [WORKSPACE_ID, producer.runId],
+      );
+      expect(terminalArtifacts.map((artifact) => ({
+        nodeId: artifact.producer_node_id,
+        value: (JSON.parse(artifact.payload_json) as { result: string }).result,
+      }))).toEqual([
+        { nodeId: 'left', value: 'LEFT terminal value' },
+        { nodeId: 'right', value: 'RIGHT terminal value' },
+      ]);
+      expect(terminalArtifacts.map((artifact) => artifact.artifact_id))
+        .not.toContain(terminalPointer!.terminal_result_artifact_id);
 
-      await repository.execute({
-        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-consumer-kind-mismatch', version: 1,
-        name: 'consumer kind mismatch', topology: {
-          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
-        }, entryContracts: [{
-          entryNodeId: 'entry', inputRef: 'prior_result', expectedArtifactKind: 'text',
-        }], createdAt: NOW,
+      const starts = [] as Array<{
+        output: string;
+        value: string;
+        runId: string;
+        gateId: string;
+        messageId: string;
+      }>;
+      for (const [index, output, value] of [
+        [0, 'leftPlan', 'LEFT terminal value'],
+        [1, 'rightPlan', 'RIGHT terminal value'],
+      ] as const) {
+        const started = await repository.execute({
+          kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+          definitionId: 'wf-consumer', version: 1,
+          startIdempotencyKey: `consumer-${index}`, createdAt: `2026-08-01T00:00:1${index}.000Z`,
+          inputs: [{ name: 'plan', fromRun: producer.runId, output }],
+          ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
+        });
+        expect(started).toMatchObject({ ok: true, changed: true });
+        const data = started.operation!.result.data as {
+          runId: string; entryGateId: string; entryMessageId: string;
+        };
+        starts.push({ output, value, runId: data.runId, gateId: data.entryGateId, messageId: data.entryMessageId });
+      }
+
+      for (const started of starts) {
+        const fill = await client.get<{
+          artifact_run_id: string | null;
+          artifact_id: string;
+          artifact_revision: number;
+          kind: string;
+          payload_json: string;
+          source_kind: string;
+          source_artifact_run_id: string;
+          source_artifact_id: string;
+          source_artifact_revision: number;
+          producer_run_id: string;
+          producer_node_id: string;
+        }>(
+          `SELECT fill.artifact_run_id, fill.artifact_id, fill.artifact_revision,
+                   artifact.kind, artifact.payload_json, source.source_kind,
+                   source.source_artifact_run_id, source.source_artifact_id,
+                   source.source_artifact_revision,
+                   original_source.producer_run_id, original_source.producer_node_id
+             FROM workflow_gate_fills fill
+             JOIN workflow_artifacts artifact
+               ON artifact.workspace_id = fill.workspace_id
+              AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+              AND artifact.artifact_id = fill.artifact_id
+              AND artifact.revision = fill.artifact_revision
+             JOIN workflow_artifact_sources source
+               ON source.workspace_id = artifact.workspace_id
+              AND source.run_id = artifact.run_id
+               AND source.artifact_id = artifact.artifact_id
+               AND source.artifact_revision = artifact.revision
+             JOIN workflow_artifacts source_artifact
+               ON source_artifact.workspace_id = source.workspace_id
+              AND source_artifact.run_id = source.source_artifact_run_id
+              AND source_artifact.artifact_id = source.source_artifact_id
+              AND source_artifact.revision = source.source_artifact_revision
+             JOIN workflow_artifact_sources original_source
+               ON original_source.workspace_id = source_artifact.workspace_id
+              AND original_source.run_id = source_artifact.run_id
+              AND original_source.artifact_id = source_artifact.artifact_id
+              AND original_source.artifact_revision = source_artifact.revision
+            WHERE fill.workspace_id = ? AND fill.run_id = ? AND fill.gate_id = ? AND fill.input_ref = 'plan'`,
+          [WORKSPACE_ID, started.runId, started.gateId],
+        );
+        expect(fill).toMatchObject({
+          artifact_run_id: null,
+          kind: 'workflow_input',
+          source_kind: 'workflow_artifact',
+          source_artifact_run_id: producer.runId,
+          source_artifact_id: terminalArtifacts.find((artifact) =>
+            artifact.producer_node_id === (started.output === 'leftPlan' ? 'left' : 'right'))!.artifact_id,
+          source_artifact_revision: 1,
+          producer_run_id: producer.runId,
+          producer_node_id: started.output === 'leftPlan' ? 'left' : 'right',
+        });
+        expect(JSON.parse(fill!.payload_json)).toMatchObject({ value: started.value, semanticKind: 'plan' });
+        await expect(client.get<{ content: string }>(
+          `SELECT content FROM messages WHERE workspace_id = ? AND id = ?`,
+          [WORKSPACE_ID, started.messageId],
+        )).resolves.toEqual({
+          content: `[workflow-entry]\ninputRef="plan" utf8Bytes=${Buffer.byteLength(started.value, 'utf8')}\n${started.value}`,
+        });
+      }
+
+      const replay = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-consumer', version: 1,
+        startIdempotencyKey: 'consumer-0', createdAt: '2026-08-01T00:00:10.000Z',
+        inputs: [{ name: 'plan', fromRun: producer.runId, output: 'leftPlan' }],
+        ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
       });
+      expect(replay).toMatchObject({ ok: true, changed: false });
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
-        definitionId: 'wf-consumer-kind-mismatch', version: 1,
-        startIdempotencyKey: 'consumer-kind-mismatch', createdAt: '2026-08-01T00:00:02.500Z',
-        entryInputs: [{ entryNodeId: 'entry', inputRef: 'prior_result', fromRun: producer.runId }],
+        definitionId: 'wf-consumer', version: 1,
+        startIdempotencyKey: 'consumer-0', createdAt: '2026-08-01T00:00:10.000Z',
+        inputs: [{ name: 'plan', fromRun: producer.runId, output: 'rightPlan' }],
         ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
-      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'reuse artifact kind mismatch' });
-      await expect(client.all(
-        `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?`,
-        [WORKSPACE_ID, 'wf-consumer-kind-mismatch'],
-      )).resolves.toEqual([]);
+      })).resolves.toMatchObject({ ok: false, conflict: true, reason: 'start fingerprint conflict' });
 
-      const consumerStart = await repository.execute({
-        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-consumer', version: 1,
-        startIdempotencyKey: 'consumer', createdAt: '2026-08-01T00:00:03.000Z',
-        goal: 'consume a reusable result', backend: 'grok',
-        entryInputs: [{ entryNodeId: 'entry', inputRef: 'prior_result', fromRun: producer.runId }],
-        ownerRootTaskId: 'root-task', callerTaskId: 'root-task', callerTurnId: 'root-turn',
-      });
-      expect(consumerStart).toMatchObject({ ok: true, changed: true });
-      const consumer = consumerStart.operation!.result.data as {
-        runId: string; entryGateId: string; entryMessageId: string;
-      };
-
-      await expect(client.get(
-        `SELECT artifact_run_id, artifact_id, artifact_revision FROM workflow_gate_fills
-          WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?`,
-        [WORKSPACE_ID, consumer.runId, consumer.entryGateId, 'prior_result'],
-      )).resolves.toEqual({
-        artifact_run_id: producer.runId,
-        artifact_id: terminal!.terminal_result_artifact_id,
-        artifact_revision: 1,
-      });
-      await expect(client.get(
-        `SELECT required_kind FROM workflow_gate_bindings
-          WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND input_ref = ?`,
-        [WORKSPACE_ID, consumer.runId, consumer.entryGateId, 'prior_result'],
-      )).resolves.toEqual({ required_kind: 'next_result' });
-      await expect(client.get(
-        `SELECT content FROM messages WHERE workspace_id = ? AND id = ?`,
-        [WORKSPACE_ID, consumer.entryMessageId],
-      )).resolves.toEqual({
-        content: '[workflow-entry]\ninputRef="prior_result" utf8Bytes=20\nreused terminal body',
-      });
-      // Reclamation no longer deletes workflow_runs (that cascaded start claims and
-      // broke idempotent replay); it only strips routed message bodies of terminal,
-      // unpinned runs. This producer is pinned by the consumer gate fill above, so the
-      // pass must report no change and leave the producer addressable.
       await expect(repository.execute({
         kind: 'reclaimTerminalWorkflowMetadata', workspaceId: WORKSPACE_ID,
       })).resolves.toMatchObject({ ok: true, changed: false });
@@ -157,6 +277,7 @@ describe('M024 S02 durable cross-run entry reuse', () => {
         `SELECT run_id FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
         [WORKSPACE_ID, producer.runId],
       )).resolves.toEqual({ run_id: producer.runId });
+      await expect(client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

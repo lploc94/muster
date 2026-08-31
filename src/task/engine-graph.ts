@@ -54,11 +54,9 @@ import { canPromoteTurn } from './scheduler';
 import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repository';
 import { durableDispositionClaim } from './disposition-claim';
 import type {
-  StartWorkflowEntryInput,
   WorkflowEntryContract,
   WorkflowDefinition,
   WorkflowPolicy,
-  WorkflowStartInput,
 } from './workflow-types';
 import { validateDefineWorkflow } from './workflow';
 import {
@@ -421,52 +419,6 @@ function predefinedWorkflowDefinitionId(rootId: string, workflowRef: string): st
     .update(rootId).update('\0')
     .update(workflowRef)
     .digest('hex').slice(0, 32)}`;
-}
-
-function resolvePublicWorkflowStartInputs(
-  definition: WorkflowDefinition,
-  inputs: readonly WorkflowStartInput[],
-): { ok: true; entryInputs: StartWorkflowEntryInput[] } | { ok: false; error: string } {
-  const byName = new Map(inputs.map((input) => [input.name, input] as const));
-  if (byName.size !== inputs.length || byName.size !== definition.topology.inputs.length) {
-    return workflowHostPolicyError(
-      'invalid_workflow_inputs',
-      'workflow inputs must cover every declared public input name exactly once',
-    );
-  }
-  const contractByCoordinate = new Map(
-    definition.entryContracts.map((contract) => [
-      `${contract.entryNodeId}\0${contract.inputRef}`,
-      contract,
-    ] as const),
-  );
-  const entryInputs: StartWorkflowEntryInput[] = [];
-  for (const declared of definition.topology.inputs) {
-    const input = byName.get(declared.name);
-    const contract = contractByCoordinate.get(`${declared.entryNodeId}\0${declared.inputRef}`);
-    if (!input || !contract) {
-      return workflowHostPolicyError(
-        'invalid_workflow_inputs',
-        'workflow inputs must use declared public input names',
-      );
-    }
-    entryInputs.push(
-      'value' in input
-        ? {
-            entryNodeId: declared.entryNodeId,
-            inputRef: declared.inputRef,
-            kind: contract.expectedArtifactKind,
-            value: input.value,
-          }
-        : {
-            entryNodeId: declared.entryNodeId,
-            inputRef: declared.inputRef,
-            fromRun: input.fromRun,
-            output: input.output,
-          },
-    );
-  }
-  return { ok: true, entryInputs };
 }
 
 function validateWorkflowDefinitionHostRequirements(
@@ -2713,55 +2665,6 @@ export async function executeToolCommand(
         return workflowHostPolicyError('definition_not_found', 'child workflow definition not found');
       }
       const childDefinitionVersion = childDefinition.version;
-      let entryBindings = command.entryBindings;
-      if (command.semanticEntryBindings) {
-        const bindingByName = new Map(
-          command.semanticEntryBindings.map((binding) => [binding.name, binding] as const),
-        );
-        if (
-          bindingByName.size !== command.semanticEntryBindings.length ||
-          bindingByName.size !== childDefinition.topology.inputs.length
-        ) {
-          return workflowHostPolicyError(
-            'invalid_child_bindings',
-            'child inputs must cover every declared public input name exactly once',
-          );
-        }
-        const orderedBindings = childDefinition.topology.inputs.map((input) => ({
-          input,
-          binding: bindingByName.get(input.name),
-        }));
-        if (orderedBindings.some(({ binding }) => binding === undefined)) {
-          return workflowHostPolicyError(
-            'invalid_child_bindings',
-            'child inputs must use declared public input names',
-          );
-        }
-        const resolved = await deps.repository.resolveWorkflowInputArtifacts(
-          ctx.turnId,
-          ctx.rootId,
-          orderedBindings.map(({ binding }) => binding!.fromInputRef),
-        );
-        if (!resolved) {
-          return workflowHostPolicyError(
-            'workflow_input_not_found',
-            'one or more child workflow source inputs are unavailable',
-          );
-        }
-        const byInputRef = new Map(resolved.map((binding) => [binding.inputRef, binding]));
-        entryBindings = orderedBindings.map(({ input, binding }) => {
-          const source = byInputRef.get(binding!.fromInputRef)!;
-          return {
-            childEntryNodeId: input.entryNodeId,
-            inputRef: input.inputRef,
-            artifactId: source.artifactId,
-            artifactRevision: source.artifactRevision,
-          };
-        });
-      }
-      if (!entryBindings || entryBindings.length === 0) {
-        return workflowHostPolicyError('invalid_child_bindings', 'child workflow bindings are required');
-      }
       const prepared = await prepareWorkflowStart(
         deps,
         ctx,
@@ -2785,7 +2688,7 @@ export async function executeToolCommand(
               kind: 'child_workflow',
               childDefinitionId: command.childDefinitionId,
               childDefinitionVersion,
-              entryBindings,
+              entryBindings: command.entryBindings,
               ...(command.childIdempotencyKey !== undefined
                 ? { childIdempotencyKey: command.childIdempotencyKey }
                 : {}),
@@ -3105,12 +3008,6 @@ export async function executeToolCommand(
             limits,
           );
       if (!prepared.ok) return prepared;
-      const definition = await deps.repository.getWorkflowDefinition(command.definitionId, version);
-      if (!definition) {
-        return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
-      }
-      const resolvedInputs = resolvePublicWorkflowStartInputs(definition, command.inputs);
-      if (!resolvedInputs.ok) return resolvedInputs;
       const suspendCaller =
         deps.onWorkflowStartAccepted !== undefined && deps.liveRuns.has(ctx.turnId);
       const started = await deps.repository.execute({
@@ -3121,8 +3018,7 @@ export async function executeToolCommand(
         startIdempotencyKey: command.startIdempotencyKey,
         createdAt: now,
         ...(command.goal !== undefined ? { goal: command.goal } : {}),
-        entryInputs: resolvedInputs.entryInputs,
-        reuse: [],
+        inputs: command.inputs,
         ownerRootTaskId: ctx.rootId,
         callerTaskId: ctx.callerTaskId,
         callerTurnId: ctx.turnId,

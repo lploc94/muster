@@ -26,7 +26,6 @@ import {
   WORKFLOW_FEEDBACK_MAX_BYTES,
 } from '../task/content-limits';
 import {
-  WORKFLOW_CHILD_BINDINGS_MAX,
   WORKFLOW_DESCRIPTION_MAX_LENGTH,
   WORKFLOW_ENTRY_CONTRACTS_MAX,
   WORKFLOW_GRAPH_MAX_EDGES,
@@ -384,8 +383,7 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
       workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
       inputs: {
         type: 'array',
-        minItems: 1,
-        maxItems: WORKFLOW_CHILD_BINDINGS_MAX,
+        maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX,
         description: 'Bind every public child input name from a named input currently available on this activation.',
         items: {
           type: 'object',

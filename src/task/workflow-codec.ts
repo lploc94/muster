@@ -22,8 +22,7 @@ import {
   isValidWorkflowScriptFile,
   type DefineWorkflowInput,
   type ScriptExecutionSpec,
-  type StartWorkflowEntryInput,
-  type StartWorkflowNodeReuse,
+  type WorkflowStartInput,
   type WorkflowAgentOutcome,
   type WorkflowDefinition,
   type WorkflowDependencyEdge,
@@ -1121,56 +1120,32 @@ export function decodeDefineWorkflowInput(input: DefineWorkflowInput): Definitio
 }
 
 export function fingerprintStartEntryInputs(
-  entryInputs: readonly StartWorkflowEntryInput[],
+  inputs: readonly WorkflowStartInput[],
 ): readonly (
   | {
       type: 'literal';
-      entryNodeId: string;
-      inputRef: string;
-      kind: string;
+      name: string;
       valueSha256: string;
     }
   | {
       type: 'prior_run_result';
-      entryNodeId: string;
-      inputRef: string;
+      name: string;
       fromRun: string;
       output: string;
     }
 )[] {
-  return entryInputs.map((entryInput) => (
-    'value' in entryInput
+  return inputs.map((input) => (
+    'value' in input
       ? {
           type: 'literal',
-          entryNodeId: entryInput.entryNodeId,
-          inputRef: entryInput.inputRef,
-          kind: entryInput.kind,
-          valueSha256: sha256(entryInput.value),
+          name: input.name,
+          valueSha256: sha256(input.value),
         }
       : {
           type: 'prior_run_result',
-          entryNodeId: entryInput.entryNodeId,
-          inputRef: entryInput.inputRef,
-          fromRun: entryInput.fromRun,
-          output: entryInput.output,
+          name: input.name,
+          fromRun: input.fromRun,
+          output: input.output,
         }
   ));
-}
-
-export function fingerprintStartNodeReuse(
-  reuse: readonly StartWorkflowNodeReuse[],
-): readonly {
-  destinationNodeId: string;
-  sourceRunId: string;
-  sourceNodeId: string;
-  sourceTaskId: string;
-}[] {
-  return [...reuse]
-    .map(({ destinationNodeId, sourceRunId, sourceNodeId, sourceTaskId }) => ({
-      destinationNodeId,
-      sourceRunId,
-      sourceNodeId,
-      sourceTaskId,
-    }))
-    .sort((left, right) => left.destinationNodeId.localeCompare(right.destinationNodeId));
 }

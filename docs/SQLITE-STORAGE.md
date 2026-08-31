@@ -212,6 +212,19 @@ actions stay available.
   Corrupt canonical authority, stale activation ownership, or exhausted turn budgets deny the retry.
   An original-input manual retry may coexist with queued follow-ups already marked held; live or
   non-held queued turns still block retry allocation.
+- Workflow starts accept only complete public input-name bindings. SQLite resolves each destination
+  name from the frozen definition while claiming the start; callers never supply entry coordinates.
+  A prior-run binding keeps `(fromRun, outputName)` as authority and selects that frozen output's
+  declared terminal `next_result` artifact and exact semantic kind. Run-level aggregate completion
+  remains continuation data and is never a named-composition source. The destination stores a local
+  `workflow_input` artifact whose `workflow_artifact` source row pins the exact source run, artifact,
+  and revision; reference accounting prevents retention from stripping required source evidence.
+- Child workflow invocation likewise resolves public child input names inside the child-start
+  transaction. Each forwarded value must come from the current activation's pinned `fromInput`, and
+  child run, return gate, continuation, provenance pin, and entry fill become durable together. The
+  parent edge has no invented semantic kind: each value is adapted to the frozen child input kind.
+  Validation, source lookup, and every write share one transaction, so any failure leaves no start
+  claim, run, gate, fill, continuation, return gate, or provenance row to clean up.
 - Schema v7 also reserves one activation-owned `workflow_decision_repairs` row for bounded decision
   attempts. Its status, attempt count, evidence references, and next correction-turn reference are
   closed and writer-guarded; later routing phases own the transitions, not a migration or side store.

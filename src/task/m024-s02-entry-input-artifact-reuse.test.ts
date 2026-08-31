@@ -28,7 +28,7 @@ describe('start_workflow entry input artifact reuse', () => {
       'start_workflow',
       {
         workflow,
-        inputs: [{ node: 'entry', input: 'request', fromRun: 'run-prior' }],
+        inputs: [{ name: 'request', fromRun: 'run-prior', output: 'verifiedPlan' }],
       },
       ctx(),
     );
@@ -37,10 +37,10 @@ describe('start_workflow entry input artifact reuse', () => {
       ok: true,
       command: {
         kind: 'start_workflow',
-        entryInputs: [{
-          entryNodeId: 'entry',
-          inputRef: 'request',
+        inputs: [{
+          name: 'request',
           fromRun: 'run-prior',
+          output: 'verifiedPlan',
         }],
       },
     });
@@ -58,13 +58,19 @@ describe('start_workflow entry input artifact reuse', () => {
         inputRef: 'request',
         expectedArtifactKind: 'workflow_input',
       }],
+      inputContracts: [{
+        name: 'request',
+        semanticKind: 'plan',
+        entryNodeId: 'entry',
+        inputRef: 'request',
+      }],
       ownerRootTaskId: 'root-1',
       callerTaskId: 'task-1',
       callerTurnId: 'turn-1',
     };
     const reference = validateStartWorkflow({
       ...base,
-      entryInputs: [{ entryNodeId: 'entry', inputRef: 'request', fromRun: 'run-prior' }],
+      inputs: [{ name: 'request', fromRun: 'run-prior', output: 'verifiedPlan' }],
     });
     const literal = fingerprintStartWorkflow({
       definitionId: base.definitionId,
@@ -76,15 +82,23 @@ describe('start_workflow entry input artifact reuse', () => {
       ownerRootTaskId: base.ownerRootTaskId,
       callerTaskId: base.callerTaskId,
       callerTurnId: base.callerTurnId,
-      entryInputs: [{
-        entryNodeId: 'entry', inputRef: 'request', kind: 'workflow_input', value: 'run-prior',
-      }],
+      inputs: [{ name: 'request', value: 'run-prior' }],
     });
 
     expect(reference.ok).toBe(true);
     if (!reference.ok) return;
+    expect(reference.inputs).toEqual([
+      { name: 'request', fromRun: 'run-prior', output: 'verifiedPlan' },
+    ]);
     expect(reference.entryInputs).toEqual([
-      { entryNodeId: 'entry', inputRef: 'request', fromRun: 'run-prior' },
+      {
+        name: 'request',
+        semanticKind: 'plan',
+        entryNodeId: 'entry',
+        inputRef: 'request',
+        fromRun: 'run-prior',
+        output: 'verifiedPlan',
+      },
     ]);
     expect(reference.fingerprint).not.toBe(literal);
   });
@@ -101,7 +115,11 @@ describe('start_workflow entry input artifact reuse', () => {
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
         name: 'consumer', topology: {
-          kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
+          kind: 'workflow',
+          inputs: [{ name: 'request', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'request' }],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+          nodes: [{ nodeId: 'entry' }],
+          edges: [],
         },
         entryContracts: [{
           entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'workflow_input',
@@ -111,10 +129,10 @@ describe('start_workflow entry input artifact reuse', () => {
       await expect(repository.execute({
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
         startIdempotencyKey: 'unresolved-reference', createdAt: '2026-08-01T00:00:00.000Z',
-        entryInputs: [{ entryNodeId: 'entry', inputRef: 'request', fromRun: 'missing-run' }],
+        inputs: [{ name: 'request', fromRun: 'missing-run', output: 'verifiedPlan' }],
         ownerRootTaskId: 'root-1', callerTaskId: 'caller-1', callerTurnId: 'turn-1',
       })).resolves.toMatchObject({
-        ok: false, conflict: true, reason: 'entry input reference unresolved',
+        ok: false, conflict: true, reason: 'workflow input reference unresolved',
       });
       await expect(client.all(
         'SELECT run_id FROM workflow_runs WHERE workspace_id = ?', ['ws'],
@@ -126,14 +144,60 @@ describe('start_workflow entry input artifact reuse', () => {
   }, 20_000);
 
   it.each([
-    ['both value and fromRun', { node: 'entry', input: 'request', value: 'literal', fromRun: 'run-prior' }],
-    ['neither value nor fromRun', { node: 'entry', input: 'request' }],
-    ['unknown key', { node: 'entry', input: 'request', fromRun: 'run-prior', extra: true }],
-    ['a non-string value alongside fromRun', { node: 'entry', input: 'request', value: 1, fromRun: 'run-prior' }],
+    ['both value and fromRun', { name: 'request', value: 'literal', fromRun: 'run-prior', output: 'result' }],
+    ['neither value nor fromRun', { name: 'request' }],
+    ['missing output', { name: 'request', fromRun: 'run-prior' }],
+    ['unknown key', { name: 'request', fromRun: 'run-prior', output: 'result', extra: true }],
+    ['a non-string value alongside fromRun', { name: 'request', value: 1, fromRun: 'run-prior', output: 'result' }],
   ])('rejects an entry input with %s', (_caseName, input) => {
     expect(dispatch('start_workflow', { workflow, inputs: [input] }, ctx())).toEqual({
       ok: false,
       toolError: 'invalid start_workflow inputs',
     });
+  });
+
+  it.each([
+    ['unknown', [{ name: 'other', value: 'x' }]],
+    ['duplicate', [{ name: 'request', value: 'x' }, { name: 'request', value: 'y' }]],
+    ['missing', []],
+  ])('rejects %s public destination coverage before allocating identities', (_caseName, inputs) => {
+    const validated = validateStartWorkflow({
+      definitionId: 'workflow-definition',
+      version: 1,
+      startIdempotencyKey: `invalid-${_caseName}`,
+      createdAt: '2026-08-01T00:00:00.000Z',
+      entryNodeId: 'entry',
+      entryContracts: [{ entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'workflow_input' }],
+      inputContracts: [{ name: 'request', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'request' }],
+      inputs,
+      ownerRootTaskId: 'root-1',
+      callerTaskId: 'task-1',
+      callerTurnId: 'turn-1',
+    });
+    expect(validated).toMatchObject({ ok: false });
+  });
+
+  it.each([
+    ['literal plus source coordinates', {
+      name: 'request', value: 'x', fromRun: 'run-prior', output: 'verifiedPlan',
+    }],
+    ['prior output plus destination coordinates', {
+      name: 'request', fromRun: 'run-prior', output: 'verifiedPlan',
+      entryNodeId: 'entry', inputRef: 'request', artifactId: 'artifact-1', artifactRevision: 1,
+    }],
+  ])('rejects trusted start input with %s', (_caseName, rawInput) => {
+    expect(validateStartWorkflow({
+      definitionId: 'workflow-definition',
+      version: 1,
+      startIdempotencyKey: `closed-${_caseName}`,
+      createdAt: '2026-08-01T00:00:00.000Z',
+      entryNodeId: 'entry',
+      entryContracts: [{ entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'workflow_input' }],
+      inputContracts: [{ name: 'request', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'request' }],
+      inputs: [rawInput as any],
+      ownerRootTaskId: 'root-1',
+      callerTaskId: 'task-1',
+      callerTurnId: 'turn-1',
+    })).toMatchObject({ ok: false, reason: 'invalid workflow input' });
   });
 });

@@ -178,7 +178,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `refactor(workflow-storage): persist canonical definitions`
 
 ## Phase 4: Resolve Named Workflow Outputs Atomically
-- Status: pending
+- Status: complete
 - Depends on: Phase 3
 - Goal: Start workflows through public named inputs and compose prior runs from the exact declared named terminal artifact with durable kind, retention, and idempotency guarantees.
 - Current behavior: `parseSemanticWorkflowInputs` and `validateStartWorkflow` bind `(entryNodeId,inputRef)` values; `startWorkflowRun` can adapt a prior succeeded run's run-level terminal result/aggregate, but no frozen named output selects one terminal artifact or participates in the start fingerprint. Nested invocation separately parses `{toNode,input,fromInput}` and carries `childEntryNodeId/inputRef` through `InvokeChildEntryBinding` into child start/continuation paths.
@@ -205,10 +205,10 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
   - Extend artifact source/provenance and reclamation/reference accounting so selected outputs cannot be reclaimed while referenced and failed starts do not leak pins.
   - Preserve deterministic gate/activation/task/message/turn identities and post-commit-only scheduling.
 - Acceptance criteria:
-  - [ ] AC-1: Literal and prior-run starts bind only by public input name and exact semantic kind - proven by rewritten M024 entry tests.
-  - [ ] AC-2: Every named output of a multi-sink run resolves its exact declared terminal artifact, never the aggregate or completion order - proven by multi-sink durable/reload tests.
-  - [ ] AC-3: Output selection is atomic, retained, replay-safe, and fingerprint-distinct with zero partial rows on every failure/race - proven by repository/reclamation/concurrency tests.
-  - [ ] AC-4: Nested child invocation uses only public child input names and preserves atomic child-run/continuation/reload behavior - proven by `src/task/m018-s06-child-workflow-continuation.test.ts` and bridge/parser tests.
+  - [x] AC-1: Literal and prior-run starts bind only by public input name and exact semantic kind - proven by rewritten M024 entry tests.
+  - [x] AC-2: Every named output of a multi-sink run resolves its exact declared terminal artifact, never the aggregate or completion order - proven by multi-sink durable/reload tests.
+  - [x] AC-3: Output selection is atomic, retained, replay-safe, and fingerprint-distinct with zero partial rows on every failure/race - proven by repository/reclamation/concurrency tests.
+  - [x] AC-4: Nested child invocation uses only public child input names and preserves atomic child-run/continuation/reload behavior - proven by `src/task/m018-s06-child-workflow-continuation.test.ts` and bridge/parser tests.
 - Focused verification:
   - `npx vitest run src/task/m018-s06-child-workflow-continuation.test.ts src/task/m024-s02-entry-input-artifact-reuse.test.ts src/task/m024-s02-entry-reuse-durable.test.ts src/task/m024-s03-fan-in-reuse-durable.test.ts src/task/m024-s03-mid-tree-node-reuse.test.ts src/task/m024-s03-mid-tree-reuse-durable.test.ts src/task/workflow-metadata-reclamation.test.ts src/task/m018-s07-canonical-workflow.test.ts src/task/coordinator-tools.test.ts src/bridge/server.test.ts`
 - Phase gates:
@@ -345,7 +345,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 | 1 | complete | this phase commit (`refactor(workflow-definition): adopt canonical manifest contract`) | Focused: 180/180; `npx tsc -p . --noEmit`; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 3 rounds; 5 findings fixed |
 | 2 | complete | this phase commit (`feat(workflow-packages): make workflow json authoritative`) | Focused: 164/164; script-workflow QA: 150/150; compile; source-boundary + fixtures passed; native VS Code 1.135.0 rerun remains truthfully pending after its UAT-only workspace setting update blocked before run creation | `codex-impl-review` APPROVE in 4 rounds; 9 findings fixed |
 | 3 | complete | this phase commit (`refactor(workflow-storage): persist canonical definitions`) | Focused: 89/89; affected workflow/retry: 112/112; child-return integration: 1/1; `npx tsc -p . --noEmit`; `git diff --check`; compile; SQLite storage docs; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 5 findings fixed |
-| 4 | pending | N/A | pending | pending |
+| 4 | complete | this phase commit (`feat(workflow-runtime): compose exact named outputs`) | Focused: 126/126; repository: 41/41; one-node workflow: 10/10; `npx tsc -p . --noEmit`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 2 rounds; 1 finding fixed, 1 withdrawn after transaction-boundary evidence |
 | 5 | pending | N/A | pending | pending |
 | 6 | pending | N/A | pending | pending |
 | 7 | pending | N/A | pending | pending |

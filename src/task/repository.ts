@@ -53,7 +53,6 @@ import {
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
-  isReusableArtifactKindCompatible,
   maximumWorkflowEntryAggregateBytes,
   deriveChildInvocationFenceId,
   deriveChildReturnFenceId,
@@ -76,7 +75,7 @@ import {
 } from './workflow';
 import type {
   StartWorkflowEntryInput,
-  StartWorkflowNodeReuse,
+  WorkflowStartInput,
   WorkflowGraphProjection,
   WorkflowGraphNodeProjection,
   WorkflowGraphProgressProjection,
@@ -473,8 +472,7 @@ export type RepositoryCommand =
       createdAt: string;
       goal?: string;
       backend?: string;
-      entryInputs?: readonly StartWorkflowEntryInput[];
-      reuse?: readonly StartWorkflowNodeReuse[];
+      inputs?: readonly WorkflowStartInput[];
       ownerRootTaskId?: string;
       callerTaskId?: string;
       callerTurnId?: string;
@@ -1400,16 +1398,6 @@ export interface TaskRepository {
     definitionId: string;
     startIdempotencyKey: string;
   }): Promise<{ version: number; policy: WorkflowPolicy } | undefined>;
-  /** Resolve semantic current-input names to exact immutable artifact pins. */
-  resolveWorkflowInputArtifacts(
-    turnId: string,
-    ownerRootTaskId: string,
-    inputRefs: readonly string[],
-  ): Promise<readonly {
-    inputRef: string;
-    artifactId: string;
-    artifactRevision: number;
-  }[] | undefined>;
   /** Trusted engine-only script input values and the run's frozen artifact bound. */
   getWorkflowExecutionContext(turnId: string): Promise<{
     maxArtifactBytes: number;
@@ -2681,78 +2669,6 @@ export class SqliteTaskRepository implements TaskRepository {
     return validated.ok
       ? { version: row.definition_version, policy: validated.definition.policy }
       : undefined;
-  }
-
-  async resolveWorkflowInputArtifacts(
-    turnId: string,
-    ownerRootTaskId: string,
-    inputRefs: readonly string[],
-  ): Promise<readonly {
-    inputRef: string;
-    artifactId: string;
-    artifactRevision: number;
-  }[] | undefined> {
-    const uniqueRefs = [...new Set(inputRefs)];
-    if (!turnId || !ownerRootTaskId || uniqueRefs.length === 0 || uniqueRefs.length > 32) {
-      return undefined;
-    }
-    const activation = await this.db.get<{
-      run_id: string;
-      source_gate_id: string | null;
-      return_gate_id: string | null;
-      primary_turn_id: string;
-    }>(
-      `SELECT activation.run_id, activation.source_gate_id,
-              activation.return_gate_id, activation.primary_turn_id
-         FROM workflow_activations activation
-         JOIN workflow_runs run
-           ON run.workspace_id = activation.workspace_id
-          AND run.run_id = activation.run_id
-        WHERE activation.workspace_id = ?
-          AND activation.execution_turn_id = ?
-          AND run.owner_root_task_id = ?
-        LIMIT 1`,
-      [this.workspaceId, turnId, ownerRootTaskId],
-    );
-    if (!activation) return undefined;
-    let gateId = activation.source_gate_id ?? activation.return_gate_id;
-    if (!gateId) {
-      const primary = await this.db.get<{ gate_id: string | null }>(
-        `SELECT COALESCE(source_gate_id, return_gate_id) AS gate_id
-           FROM workflow_activations
-          WHERE workspace_id = ?
-            AND run_id = ?
-            AND execution_turn_id = ?
-          LIMIT 1`,
-        [this.workspaceId, activation.run_id, activation.primary_turn_id],
-      );
-      gateId = primary?.gate_id ?? null;
-    }
-    if (!gateId) return undefined;
-    const placeholders = uniqueRefs.map(() => '?').join(', ');
-    const rows = await this.db.all<{
-      input_ref: string;
-      artifact_id: string;
-      artifact_revision: number;
-    }>(
-      `SELECT input_ref, artifact_id, artifact_revision
-         FROM workflow_gate_fills
-        WHERE workspace_id = ?
-          AND run_id = ?
-          AND gate_id = ?
-          AND input_ref IN (${placeholders})`,
-      [this.workspaceId, activation.run_id, gateId, ...uniqueRefs],
-    );
-    if (rows.length !== uniqueRefs.length) return undefined;
-    const byRef = new Map(rows.map((row) => [row.input_ref, row]));
-    return uniqueRefs.map((inputRef) => {
-      const row = byRef.get(inputRef)!;
-      return {
-        inputRef,
-        artifactId: row.artifact_id,
-        artifactRevision: row.artifact_revision,
-      };
-    });
   }
 
   async getWorkflowExecutionContext(turnId: string): Promise<{
@@ -6582,11 +6498,8 @@ export class SqliteTaskRepository implements TaskRepository {
         | 'definition not found'
         | 'invalid start'
         | 'invalid identity'
-        | 'entry input reference unresolved'
-        | 'terminal node cannot be reused'
-        | 'node reuse reference unresolved'
-        | 'reuse artifact kind mismatch'
-        | 'reuse aggregate exceeds policy',
+        | 'workflow input reference unresolved'
+        | 'workflow semantic kind mismatch',
     ): RepositoryCommandResult => {
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
       return {
@@ -6657,8 +6570,8 @@ export class SqliteTaskRepository implements TaskRepository {
       allNodeIds,
       goal,
       backend: command.backend,
-      entryInputs: command.entryInputs,
-      reuse: command.reuse,
+      inputs: command.inputs,
+      inputContracts: storedDefinition.topology.inputs,
       entryContracts: storedDefinition.entryContracts,
       policy: effectivePolicy,
       ownerRootTaskId: command.ownerRootTaskId,
@@ -6680,217 +6593,104 @@ export class SqliteTaskRepository implements TaskRepository {
     const { identities, fingerprint } = validated;
     const resolvedInputByKey = new Map<string, {
       value: string;
-      artifactKind: string;
-      artifactRunId?: string;
-      artifactId?: string;
-      artifactRevision?: number;
+      semanticKind: string;
+      sourceArtifactRunId?: string;
+      sourceArtifactId?: string;
+      sourceArtifactRevision?: number;
     }>();
-    const entryContractByKey = new Map<string, (typeof validated.entryContracts)[number]>(
-      validated.entryContracts.map((contract) => [
-        `${contract.entryNodeId}\0${contract.inputRef}`,
-        contract,
-      ] as const),
-    );
     for (const input of validated.entryInputs) {
       const key = `${input.entryNodeId}\0${input.inputRef}`;
       if ('value' in input) {
-        resolvedInputByKey.set(key, { value: input.value, artifactKind: input.kind });
+        resolvedInputByKey.set(key, {
+          value: input.value,
+          semanticKind: input.semanticKind,
+        });
         continue;
       }
-      if (!validated.ownerRootTaskId) return invalidStart('entry input reference unresolved');
+      if (!validated.ownerRootTaskId) return invalidStart('workflow input reference unresolved');
       const referenced = await this.db.get<{
-        terminal_result_run_id?: string | null;
-        terminal_result_artifact_id?: string | null;
-        terminal_result_artifact_revision?: number | null;
-        artifact_kind?: string | null;
+        source_run_id?: string;
+        source_artifact_id?: string;
+        source_artifact_revision?: number;
+        source_semantic_kind?: string;
+        terminal_node_id?: string;
         artifact_payload_json?: string | null;
       }>(
-        `SELECT run.terminal_result_run_id, run.terminal_result_artifact_id,
-                run.terminal_result_artifact_revision, artifact.kind AS artifact_kind,
+        `SELECT run.run_id AS source_run_id,
+                artifact.artifact_id AS source_artifact_id,
+                artifact.revision AS source_artifact_revision,
+                output.semantic_kind AS source_semantic_kind,
+                output.terminal_node_id,
                 artifact.payload_json AS artifact_payload_json
            FROM workflow_runs run
+           JOIN workflow_definition_outputs output
+             ON output.workspace_id = run.workspace_id
+            AND output.definition_id = run.definition_id
+            AND output.definition_version = run.definition_version
+            AND output.name = ?
+           JOIN workflow_nodes node
+             ON node.workspace_id = run.workspace_id
+            AND node.run_id = run.run_id
+            AND node.node_id = output.terminal_node_id
+            AND node.status = 'succeeded'
            JOIN workflow_artifacts artifact
              ON artifact.workspace_id = run.workspace_id
-            AND artifact.run_id = run.terminal_result_run_id
-            AND artifact.artifact_id = run.terminal_result_artifact_id
-            AND artifact.revision = run.terminal_result_artifact_revision
-          WHERE run.workspace_id = ? AND run.run_id = ?
-            AND run.owner_root_task_id = ?
-            -- Only a succeeded run is "done": a failed or cancelled run may have
-            -- written a terminal pointer whose result was never actually accepted.
-            AND run.status = 'succeeded'`,
-        [this.workspaceId, input.fromRun, validated.ownerRootTaskId],
-      );
-      if (
-        !referenced ||
-        typeof referenced.terminal_result_run_id !== 'string' ||
-        typeof referenced.terminal_result_artifact_id !== 'string' ||
-        !Number.isInteger(referenced.terminal_result_artifact_revision) ||
-        Number(referenced.terminal_result_artifact_revision) < 1 ||
-        typeof referenced.artifact_kind !== 'string' ||
-        typeof referenced.artifact_payload_json !== 'string'
-      ) return invalidStart('entry input reference unresolved');
-      const contract = entryContractByKey.get(key);
-      if (
-        !contract ||
-        !isReusableArtifactKindCompatible(
-          contract.expectedArtifactKind,
-          referenced.artifact_kind,
-          'entry',
-        )
-      ) {
-        return invalidStart('reuse artifact kind mismatch');
-      }
-      let value: unknown;
-      try {
-        value = (JSON.parse(referenced.artifact_payload_json) as Record<string, unknown>).result;
-      } catch {
-        return invalidStart('entry input reference unresolved');
-      }
-      if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > validated.policy.maxArtifactBytes) {
-        return invalidStart('entry input reference unresolved');
-      }
-      resolvedInputByKey.set(key, {
-        value,
-        artifactKind: referenced.artifact_kind,
-        artifactRunId: referenced.terminal_result_run_id,
-        artifactId: referenced.terminal_result_artifact_id,
-        artifactRevision: Number(referenced.terminal_result_artifact_revision),
-      });
-    }
-    const terminalNodeIdSet = new Set(terminalNodeIds(topo));
-    const resolvedReuseByNode = new Map<string, {
-      runId: string;
-      artifactId: string;
-      artifactRevision: number;
-      artifactKind: string;
-      value: string;
-      sourceNodeId: string;
-      sourceTaskId: string;
-    }>();
-    for (const reuse of validated.reuse) {
-      if (terminalNodeIdSet.has(reuse.destinationNodeId)) {
-        return invalidStart('terminal node cannot be reused');
-      }
-      const referenced = await this.db.get<{
-        run_id?: string;
-        artifact_id?: string;
-        revision?: number;
-        kind?: string;
-        payload_json?: string;
-      }>(
-        `SELECT artifact.run_id, artifact.artifact_id, artifact.revision, artifact.kind, artifact.payload_json
-           FROM workflow_artifacts artifact
-           JOIN workflow_runs run
-             ON run.workspace_id = artifact.workspace_id
-            AND run.run_id = artifact.run_id
+             AND artifact.run_id = run.run_id
+             AND artifact.producer_node_id = output.terminal_node_id
+             AND artifact.logical_name = 'next_result'
+             AND artifact.kind = 'next_result'
            JOIN workflow_artifact_sources source
              ON source.workspace_id = artifact.workspace_id
             AND source.run_id = artifact.run_id
             AND source.artifact_id = artifact.artifact_id
             AND source.artifact_revision = artifact.revision
             AND source.source_kind = 'workflow_node'
-            AND source.producer_node_id = artifact.producer_node_id
+            AND source.producer_run_id = run.run_id
+            AND source.producer_node_id = output.terminal_node_id
            JOIN turns producing_turn
              ON producing_turn.workspace_id = source.workspace_id
             AND producing_turn.id = source.producing_turn_id
             AND producing_turn.task_id = source.producer_task_id
             AND producing_turn.status = 'succeeded'
-          WHERE artifact.workspace_id = ? AND artifact.run_id = ?
-            AND artifact.producer_node_id = ? AND artifact.kind = 'next_result'
-            -- The caller names the exact completed execution. Without this the engine
-            -- would pick "latest matching row" for the node, which is a guess: one node
-            -- id maps to a different task in every run.
-            AND source.producer_task_id = ?
+          WHERE run.workspace_id = ? AND run.run_id = ?
             AND run.owner_root_task_id = ?
-            -- A completed producer remains reusable when a later node fails, but
-            -- never harvest from a still-mutating source run.
-            AND run.status IN ('succeeded', 'failed', 'cancelled')
+            AND run.status = 'succeeded'
           ORDER BY artifact.revision DESC
           LIMIT 1`,
-        [
-          this.workspaceId, reuse.sourceRunId, reuse.sourceNodeId, reuse.sourceTaskId,
-          validated.ownerRootTaskId ?? null,
-        ],
+        [input.output, this.workspaceId, input.fromRun, validated.ownerRootTaskId],
       );
       if (
         !referenced ||
-        typeof referenced.run_id !== 'string' ||
-        typeof referenced.artifact_id !== 'string' ||
-        !Number.isInteger(referenced.revision) ||
-        Number(referenced.revision) < 1 ||
-        referenced.kind !== 'next_result' ||
-        typeof referenced.payload_json !== 'string'
-      ) {
-        return invalidStart('node reuse reference unresolved');
+        typeof referenced.source_run_id !== 'string' ||
+        typeof referenced.source_artifact_id !== 'string' ||
+        !Number.isInteger(referenced.source_artifact_revision) ||
+        Number(referenced.source_artifact_revision) < 1 ||
+        typeof referenced.source_semantic_kind !== 'string' ||
+        typeof referenced.terminal_node_id !== 'string' ||
+        typeof referenced.artifact_payload_json !== 'string'
+      ) return invalidStart('workflow input reference unresolved');
+      if (referenced.source_semantic_kind !== input.semanticKind) {
+        return invalidStart('workflow semantic kind mismatch');
       }
       let value: unknown;
       try {
-        value = (JSON.parse(referenced.payload_json) as Record<string, unknown>).result;
+        value = (JSON.parse(referenced.artifact_payload_json) as Record<string, unknown>).result;
       } catch {
-        return invalidStart('node reuse reference unresolved');
+        return invalidStart('workflow input reference unresolved');
       }
       if (typeof value !== 'string' || Buffer.byteLength(value, 'utf8') > validated.policy.maxArtifactBytes) {
-        return invalidStart('node reuse reference unresolved');
+        return invalidStart('workflow input reference unresolved');
       }
-      resolvedReuseByNode.set(reuse.destinationNodeId, {
-        runId: referenced.run_id,
-        artifactId: referenced.artifact_id,
-        artifactRevision: Number(referenced.revision),
-        artifactKind: referenced.kind,
+      resolvedInputByKey.set(key, {
         value,
-        sourceNodeId: reuse.sourceNodeId,
-        sourceTaskId: reuse.sourceTaskId,
+        semanticKind: input.semanticKind,
+        sourceArtifactRunId: referenced.source_run_id,
+        sourceArtifactId: referenced.source_artifact_id,
+        sourceArtifactRevision: Number(referenced.source_artifact_revision),
       });
     }
-    const declaredReuseNodeIds = validated.reuse.map((reuse) => reuse.destinationNodeId);
-    const reusedNodeIds: ReadonlySet<string> = new Set(declaredReuseNodeIds);
-    const readyReusedNodeIds = new Set<string>();
-    for (const entryNodeId of startEntryNodeIds) {
-      if (reusedNodeIds.has(entryNodeId)) readyReusedNodeIds.add(entryNodeId);
-    }
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (const nodeId of reusedNodeIds) {
-        if (readyReusedNodeIds.has(nodeId)) continue;
-        const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
-        if (incoming.length > 0 && incoming.every((edge) => readyReusedNodeIds.has(edge.fromNodeId))) {
-          readyReusedNodeIds.add(nodeId);
-          changed = true;
-        }
-      }
-    }
-    /**
-     * Boundary consumers are live nodes whose every incoming edge is pre-filled from a
-     * reused producer, so startWorkflowRun materializes their activation directly instead
-     * of waiting for a live contribution. Each one spends a workflow turn exactly like an
-     * executable entry, so both the budget check and the reservation must account for them
-     * here, before any statement is built. Reserving them through a per-consumer
-     * `UPDATE ... WHERE workflow_turns_reserved < max_workflow_turns` instead would silently
-     * no-op once the budget is exhausted while the task/turn/message rows still committed,
-     * letting a run exceed maxWorkflowTurnsPerRun.
-     */
-    const reuseOutputEdges = topo.edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId));
-    for (const edge of reuseOutputEdges) {
-      const artifact = resolvedReuseByNode.get(edge.fromNodeId);
-      const expectedKind = edge.expectedArtifactKind ?? 'next_result';
-      if (
-        artifact &&
-        !isReusableArtifactKindCompatible(expectedKind, artifact.artifactKind, 'node')
-      ) {
-        return invalidStart('reuse artifact kind mismatch');
-      }
-    }
-    const startReuseEdges = reuseOutputEdges.filter((edge) => readyReusedNodeIds.has(edge.fromNodeId));
-    const materializedBoundaryNodeIds = [...new Set(startReuseEdges.map((edge) => edge.toNodeId))]
-      .filter((nodeId) =>
-        !reusedNodeIds.has(nodeId) &&
-        topo.edges
-          .filter((edge) => edge.toNodeId === nodeId)
-          .every((edge) => startReuseEdges.includes(edge)));
-    const executableEntries = identities.entries.filter((entry) => !reusedNodeIds.has(entry.nodeId));
-    const reservedWorkflowTurns = executableEntries.length + materializedBoundaryNodeIds.length;
+    const executableEntries = identities.entries;
+    const reservedWorkflowTurns = executableEntries.length;
     if (reservedWorkflowTurns > validated.policy.maxWorkflowTurnsPerRun) {
       return invalidStart('invalid start');
     }
@@ -7100,13 +6900,6 @@ export class SqliteTaskRepository implements TaskRepository {
         ]
       : [domainClaim];
 
-    /**
-     * Tasks created as dependency-gate consumers of reused nodes are not
-     * topology entries, so `StartWorkflowIdentities.entries` cannot describe
-     * them. Track them explicitly for projection and targeted scheduler rescan
-     * after this transaction commits.
-     */
-    const materializedBoundaryTaskIds: string[] = [];
     const rest: SqlStatement[] = [
       {
         sql: `INSERT INTO workflow_runs (
@@ -7228,12 +7021,7 @@ export class SqliteTaskRepository implements TaskRepository {
       rest.push(taskStatement(this.workspaceId, task, false));
     }
 
-    const shellNodeIds = allNodeIds.filter(
-      (nodeId) =>
-        !reusedNodeIds.has(nodeId) &&
-        !entryNodeSet.has(nodeId) &&
-        !materializedBoundaryNodeIds.includes(nodeId),
-    );
+    const shellNodeIds = allNodeIds.filter((nodeId) => !entryNodeSet.has(nodeId));
     const shellByNode = new Map<string, string>();
     const shellTasks: MusterTask[] = [];
     for (const nodeId of shellNodeIds) {
@@ -7283,37 +7071,24 @@ export class SqliteTaskRepository implements TaskRepository {
           identities.runId,
           nodeGate.gateId,
           nodeGate.nodeId,
-          readyReusedNodeIds.has(nodeGate.nodeId) ? 'consumed' : isEntry ? 'satisfied' : 'open',
+          isEntry ? 'satisfied' : 'open',
           isEntry && entry ? entry.activationId : null,
           isEntry && entry ? entry.activationTurnId : null,
           isEntry && entry ? entry.messageId : null,
         ],
       });
-      /**
-       * `reused` covers exactly the caller-bound destinations, so provenance is present
-       * for every one of them. That keeps `status = 'reused'` backed by a durable source
-       * identity instead of being an unverifiable claim on a task-less row.
-       */
-      const reuseProvenance = resolvedReuseByNode.get(nodeGate.nodeId);
       const shellTaskId = shellByNode.get(nodeGate.nodeId) ?? null;
       rest.push({
         sql: `INSERT INTO workflow_nodes (
-                workspace_id, run_id, node_id, task_id, status,
-                source_run_id, source_node_id, source_task_id,
-                source_artifact_id, source_artifact_revision
-              ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                workspace_id, run_id, node_id, task_id, status
+              ) VALUES (?,?,?,?,?)
               ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
         params: [
           this.workspaceId,
           identities.runId,
           nodeGate.nodeId,
           isEntry && entry ? entry.taskId : shellTaskId,
-          reusedNodeIds.has(nodeGate.nodeId) ? 'reused' : isEntry ? 'active' : 'pending',
-          reuseProvenance?.runId ?? null,
-          reuseProvenance?.sourceNodeId ?? null,
-          reuseProvenance?.sourceTaskId ?? null,
-          reuseProvenance?.artifactId ?? null,
-          reuseProvenance?.artifactRevision ?? null,
+          isEntry ? 'active' : 'pending',
         ],
       });
     }
@@ -7355,39 +7130,45 @@ export class SqliteTaskRepository implements TaskRepository {
         const input = inputByKey.get(key);
         const resolvedInput = resolvedInputByKey.get(key);
         if (input && !resolvedInput) return invalidStart('invalid start');
-        if (!resolvedInput?.artifactRunId) {
-          rest.push(
-            {
-              sql: `INSERT INTO workflow_artifacts (
-                      workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-                      revision, kind, payload_json, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT DO NOTHING`,
-              params: [
-                this.workspaceId, identities.runId, artifact.artifactId, null, binding.inputRef, 1,
-                binding.expectedArtifactKind,
-                input ? encodePayload({ value: resolvedInput!.value }) : encodePayload({ kind: 'engine_start', schema: 1 }),
-                validated.createdAt,
-              ],
-            },
-            {
-              sql: `INSERT INTO workflow_artifact_sources (
-                      workspace_id, run_id, artifact_id, artifact_revision, source_kind,
-                      producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
-                      producing_activation_id, caller_task_id, caller_turn_id,
-                      engine_start_operation_key
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
-              params: [
-                this.workspaceId, identities.runId, artifact.artifactId, 1,
-                input ? 'caller_turn' : 'engine_start', null, null, null, null, null,
-                input ? validated.callerTaskId ?? null : null,
-                input ? validated.callerTurnId ?? null : null,
-                input ? null : ledgerKey,
-              ],
-            },
-          );
-        }
+        const derived = resolvedInput?.sourceArtifactRunId !== undefined;
+        rest.push(
+          {
+            sql: `INSERT INTO workflow_artifacts (
+                    workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                    revision, kind, payload_json, created_at
+                  ) VALUES (?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT DO NOTHING`,
+            params: [
+              this.workspaceId, identities.runId, artifact.artifactId, null, binding.inputRef, 1,
+              binding.expectedArtifactKind,
+              input
+                ? encodePayload({ value: resolvedInput!.value, semanticKind: resolvedInput!.semanticKind })
+                : encodePayload({ kind: 'engine_start', schema: 1 }),
+              validated.createdAt,
+            ],
+          },
+          {
+            sql: `INSERT INTO workflow_artifact_sources (
+                    workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                    producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                    producing_activation_id, caller_task_id, caller_turn_id,
+                    engine_start_operation_key, source_artifact_run_id,
+                    source_artifact_id, source_artifact_revision
+                  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
+            params: [
+              this.workspaceId, identities.runId, artifact.artifactId, 1,
+              derived ? 'workflow_artifact' : input ? 'caller_turn' : 'engine_start',
+              null, null, null, null, null,
+              !derived && input ? validated.callerTaskId ?? null : null,
+              !derived && input ? validated.callerTurnId ?? null : null,
+              input ? null : ledgerKey,
+              derived ? resolvedInput!.sourceArtifactRunId! : null,
+              derived ? resolvedInput!.sourceArtifactId! : null,
+              derived ? resolvedInput!.sourceArtifactRevision! : null,
+            ],
+          },
+        );
         rest.push(
           {
             sql: `INSERT INTO workflow_gate_bindings (
@@ -7396,7 +7177,7 @@ export class SqliteTaskRepository implements TaskRepository {
                   ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
             params: [
               this.workspaceId, identities.runId, entry.gateId, binding.inputRef, null,
-              resolvedInput?.artifactKind ?? binding.expectedArtifactKind,
+              binding.expectedArtifactKind,
             ],
           },
           {
@@ -7408,9 +7189,9 @@ export class SqliteTaskRepository implements TaskRepository {
                   DO NOTHING`,
             params: [
               this.workspaceId, identities.runId, entry.gateId, binding.inputRef,
-              resolvedInput?.artifactRunId ?? null,
-              resolvedInput?.artifactId ?? artifact.artifactId,
-              resolvedInput?.artifactRevision ?? 1,
+              null,
+              artifact.artifactId,
+              1,
               validated.createdAt,
             ],
           },
@@ -7458,118 +7239,19 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
 
-    {
-      const graphBindings: SqlStatement[] = [];
-      const boundaryFills: SqlStatement[] = [];
-      for (const edge of topo.edges) {
-        const gateId = gateByNode.get(edge.toNodeId);
-        if (!gateId) continue;
-        graphBindings.push({
-          sql: `INSERT INTO workflow_gate_bindings (
-                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
-                ) VALUES (?,?,?,?,?,?)
-                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
-          params: [
-            this.workspaceId, identities.runId, gateId, edge.inputRef, edge.fromNodeId,
-            edge.expectedArtifactKind ?? 'next_result',
-          ],
-        });
-      }
-      rest.push(...graphBindings);
-      for (const edge of startReuseEdges) {
-        const gateId = gateByNode.get(edge.toNodeId)!;
-        const artifact = resolvedReuseByNode.get(edge.fromNodeId);
-        if (!artifact) return invalidStart('node reuse reference unresolved');
-        boundaryFills.push({
-          sql: `INSERT INTO workflow_gate_fills (
-                  workspace_id, run_id, gate_id, input_ref, artifact_run_id,
-                  artifact_id, artifact_revision, filled_at
-                ) VALUES (?,?,?,?,?,?,?,?)
-                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
-          params: [
-            this.workspaceId, identities.runId, gateId, edge.inputRef, artifact.runId,
-            artifact.artifactId, artifact.artifactRevision, validated.createdAt,
-          ],
-        });
-      }
-      rest.push(...boundaryFills);
-      /* T04 activation materialization follows the completed cross-run fills below. */
-      for (const nodeId of materializedBoundaryNodeIds) {
-        const incoming = topo.edges.filter((edge) => edge.toNodeId === nodeId);
-        const gateId = gateByNode.get(nodeId)!;
-        const activation = deriveNodeActivationIdentities(identities.runId, nodeId);
-        const activationId = stableId('wfact', `${identities.runId}\0next\0${gateId}\0${nodeId}`);
-        const node = nodeById.get(nodeId)!;
-        const aggregate = `[workflow-aggregate] ${incoming.map((edge) =>
-          `${edge.inputRef}=${resolvedReuseByNode.get(edge.fromNodeId)!.value}`,
-        ).join(' ')}`;
-        // Fan-in reuse concatenates N prior results into one activation message, so it
-        // must honour the same aggregate ceiling as the entry and live contribution
-        // paths. Each value is individually bounded by maxArtifactBytes at resolve time,
-        // but their sum is not. Returning here is safe and fail-closed: statements are
-        // only collected in `rest` and executed after this loop, so nothing is written.
-        if (Buffer.byteLength(aggregate, 'utf8') > validated.policy.maxAggregateBytes) {
-          return invalidStart('reuse aggregate exceeds policy');
-        }
-        materializedBoundaryTaskIds.push(activation.taskId);
-        const task: MusterTask = {
-          id: activation.taskId, role: node.role ?? 'worker', lifecycle: 'open', releaseState: 'released',
-          goal: workflowNodeTaskGoal(node, validated.goal), parentId: validated.callerTaskId ?? null,
-          prerequisites: [], backend: node.backend ?? validated.backend,
-          ...(node.model !== undefined ? { model: node.model } : {}),
-          ...(node.taskType !== undefined ? { taskType: node.taskType } : {}),
-          ...(node.execution !== undefined ? { execution: node.execution } : {}),
-          capabilities: [...(node.capabilities ?? [])] as MusterTask['capabilities'],
-          executionPolicy: { maxTurns: validated.policy.maxTurnsPerTask, maxAutomaticRetries: 1, runTimeoutOverrideMs: validated.policy.runTimeoutMs },
-          revision: 0, createdAt: validated.createdAt, updatedAt: validated.createdAt, releasedAt: validated.createdAt,
-        };
-        const turn: TaskTurn = {
-          id: activation.activationTurnId, taskId: activation.taskId, sequence: 1, status: 'queued',
-          trigger: 'engine', inputs: [{ kind: 'message', messageId: activation.messageId }], createdAt: validated.createdAt,
-          ...(node.instructions?.content !== undefined
-            ? { workflowInstructions: node.instructions.content }
-            : {}),
-        };
-        const message: TaskMessage = {
-          id: activation.messageId, taskId: activation.taskId, role: 'system', content: aggregate,
-          state: 'assigned', turnId: activation.activationTurnId, createdAt: validated.createdAt,
-        };
-        // The gate is now fully pre-filled; materialize the same deterministic consumer identities
-        // used by the normal contribution path.
-        rest.push(
-          {
-            sql: `UPDATE workflow_dependency_gates SET status = 'satisfied'
-                   WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'open'`,
-            params: [this.workspaceId, identities.runId, gateId],
-          },
-          taskStatement(this.workspaceId, task, false),
-          {
-            sql: `UPDATE workflow_nodes SET task_id = ?, status = 'active'
-                   WHERE workspace_id = ? AND run_id = ? AND node_id = ? AND task_id IS NULL AND status = 'pending'`,
-            params: [activation.taskId, this.workspaceId, identities.runId, nodeId],
-          },
-          turnStatement(this.workspaceId, turn, false),
-          messageStatement(this.workspaceId, message, false),
-          turnInputStatement(this.workspaceId, turn.id, 0, { kind: 'message', messageId: message.id }),
-          {
-            sql: `INSERT INTO workflow_activations (
-                    workspace_id, run_id, activation_id, node_id, kind, status, source_gate_id,
-                    feedback_round_id, feedback_target_node_id, continuation_id, return_gate_id,
-                    inherited_feedback_round_id, inherited_feedback_target_node_id, primary_turn_id,
-                    message_id, execution_turn_id, created_at, updated_at
-                  ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                  ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
-            params: [this.workspaceId, identities.runId, activationId, nodeId, 'dependency_gate', 'queued', gateId,
-              null, null, null, null, null, null, turn.id, message.id, turn.id, validated.createdAt, validated.createdAt],
-          },
-          {
-            sql: `UPDATE workflow_dependency_gates
-                     SET activation_id = ?, reserved_turn_id = ?, aggregate_message_id = ?
-                   WHERE workspace_id = ? AND run_id = ? AND gate_id = ? AND status = 'satisfied'`,
-            params: [activationId, turn.id, message.id, this.workspaceId, identities.runId, gateId],
-          },
-        );
-      }
+    for (const edge of topo.edges) {
+      const gateId = gateByNode.get(edge.toNodeId);
+      if (!gateId) continue;
+      rest.push({
+        sql: `INSERT INTO workflow_gate_bindings (
+                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
+              ) VALUES (?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
+        params: [
+          this.workspaceId, identities.runId, gateId, edge.inputRef, edge.fromNodeId,
+          edge.expectedArtifactKind ?? 'next_result',
+        ],
+      });
     }
 
     await this.db.run(
@@ -7587,7 +7269,6 @@ export class SqliteTaskRepository implements TaskRepository {
     const allTaskIdsForFeed = [
       ...executableEntries.map((entry) => entry.taskId),
       ...shellTasks.map((task) => task.id),
-      ...materializedBoundaryTaskIds,
     ];
     const revisionChanges: ChangeRecord[] = allTaskIdsForFeed.map((taskId) => ({
       kind: 'task',
@@ -10595,57 +10276,44 @@ export class SqliteTaskRepository implements TaskRepository {
         WHERE workspace_id = ? AND run_id = ?`,
       [this.workspaceId, callerNode.runId],
     ) : undefined;
-    if (callerNode) {
-      if (!callerRun) return empty;
-      const callerAuthority = await this.db.get<{ is_terminal: number }>(
-        `SELECT EXISTS (
-                  SELECT 1 FROM workflow_definition_outputs output
-                   WHERE output.workspace_id = run.workspace_id
-                     AND output.definition_id = run.definition_id
-                     AND output.definition_version = run.definition_version
-                     AND output.terminal_node_id = ?
-                ) AS is_terminal
-           FROM workflow_runs run
-          WHERE run.workspace_id = ? AND run.run_id = ?
-             AND run.status = 'running'`,
-        [callerNode.nodeId, this.workspaceId, callerNode.runId],
-      );
-      if (callerAuthority?.is_terminal !== 1) return empty;
-      const openRound = await this.db.get<{ round_id: string }>(
-        `SELECT round_id FROM workflow_feedback_rounds
-          WHERE workspace_id = ? AND run_id = ? AND status = 'open'
-          LIMIT 1`,
-        [this.workspaceId, callerNode.runId],
-      );
-      if (openRound) return empty;
-    } else if (
-      command.task.parentId !== null ||
-      command.task.role !== 'coordinator' ||
-      !command.task.capabilities.includes('create_child')
-    ) {
-      return empty;
-    }
+    if (!callerNode || !callerRun || typeof callerRun.owner_root_task_id !== 'string') return empty;
+    const callerAuthority = await this.db.get<{ is_terminal: number }>(
+      `SELECT EXISTS (
+                SELECT 1 FROM workflow_definition_outputs output
+                 WHERE output.workspace_id = run.workspace_id
+                   AND output.definition_id = run.definition_id
+                   AND output.definition_version = run.definition_version
+                   AND output.terminal_node_id = ?
+              ) AS is_terminal
+         FROM workflow_runs run
+        WHERE run.workspace_id = ? AND run.run_id = ?
+           AND run.status = 'running'`,
+      [callerNode.nodeId, this.workspaceId, callerNode.runId],
+    );
+    if (callerAuthority?.is_terminal !== 1) return empty;
+    const openRound = await this.db.get<{ round_id: string }>(
+      `SELECT round_id FROM workflow_feedback_rounds
+        WHERE workspace_id = ? AND run_id = ? AND status = 'open'
+        LIMIT 1`,
+      [this.workspaceId, callerNode.runId],
+    );
+    if (openRound) return empty;
 
     const pendingContinuation = await this.db.get<{
       continuation_id: string;
       invocation_key: string | null;
       invocation_fingerprint: string | null;
     }>(
-      callerNode
-        ? `SELECT continuation_id, invocation_key, invocation_fingerprint
-             FROM workflow_continuations
-            WHERE workspace_id = ? AND run_id = ? AND kind = 'child_wait'
-              AND status = 'pending'
-            LIMIT 1`
-        : `SELECT continuation_id, invocation_key, invocation_fingerprint
-             FROM workflow_continuations
-            WHERE workspace_id = ? AND caller_task_id = ? AND status = 'pending'
-            LIMIT 1`,
-      [this.workspaceId, callerNode?.runId ?? command.task.id],
+      `SELECT continuation_id, invocation_key, invocation_fingerprint
+         FROM workflow_continuations
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'child_wait'
+          AND status = 'pending'
+        LIMIT 1`,
+      [this.workspaceId, callerNode.runId],
     );
-    const callerRunId = callerNode?.runId;
-    const callerScopeId = callerRunId ?? stableId('wfcaller', command.task.id);
-    const ownerRootTaskId = callerRun?.owner_root_task_id ?? command.task.id;
+    const callerRunId = callerNode.runId;
+    const callerScopeId = callerRunId;
+    const ownerRootTaskId = callerRun.owner_root_task_id;
 
     const bindingCheck = validateInvokeChildEntryBindings(disposition.entryBindings);
     if (!bindingCheck.ok) return empty;
@@ -10733,78 +10401,116 @@ export class SqliteTaskRepository implements TaskRepository {
         contract,
       ] as const),
     );
-    if (disposition.entryBindings.length !== childContractByKey.size) return empty;
+    const bindingByName = new Map(
+      disposition.entryBindings.map((binding) => [binding.name, binding] as const),
+    );
+    if (
+      bindingByName.size !== disposition.entryBindings.length ||
+      bindingByName.size !== childTopology.inputs.length
+    ) return empty;
+
+    const callerActivation = await this.db.get<{
+      source_gate_id: string | null;
+      return_gate_id: string | null;
+      primary_turn_id: string;
+    }>(
+      `SELECT source_gate_id, return_gate_id, primary_turn_id
+         FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+          AND execution_turn_id = ?
+        LIMIT 1`,
+      [this.workspaceId, callerRunId, callerNode.nodeId, command.turn.id],
+    );
+    if (!callerActivation) return empty;
+    let callerInputGateId = callerActivation.source_gate_id ?? callerActivation.return_gate_id;
+    if (!callerInputGateId) {
+      const primary = await this.db.get<{ gate_id: string | null }>(
+        `SELECT COALESCE(source_gate_id, return_gate_id) AS gate_id
+           FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND primary_turn_id = ?
+          LIMIT 1`,
+        [this.workspaceId, callerRunId, callerActivation.primary_turn_id],
+      );
+      callerInputGateId = primary?.gate_id ?? null;
+    }
+    if (!callerInputGateId) return empty;
 
     const pinnedFills: Array<{
+      name: string;
+      fromInputRef: string;
       childEntryNodeId: string;
       inputRef: string;
-      artifactRunId: string;
-      artifactId: string;
-      artifactRevision: number;
-      producerNodeId: string;
-      payloadJson: string;
-      kind: string;
-      logicalName: string;
+      semanticKind: string;
+      sourceArtifactRunId: string;
+      sourceArtifactId: string;
+      sourceArtifactRevision: number;
+      value: string;
     }> = [];
 
-    for (const binding of disposition.entryBindings) {
-      const contract = childContractByKey.get(
-        `${binding.childEntryNodeId}\0${binding.inputRef}`,
-      );
-      if (!contract) return empty;
+    for (const declared of childTopology.inputs) {
+      const binding = bindingByName.get(declared.name);
+      const contract = childContractByKey.get(`${declared.entryNodeId}\0${declared.inputRef}`);
+      if (!binding || !contract || contract.expectedArtifactKind !== 'workflow_input') return empty;
       const art = await this.db.get<{
-        run_id: string;
+        artifact_run_id: string;
         artifact_id: string;
         revision: number;
-        producer_node_id: string;
         payload_json: string;
         kind: string;
-        logical_name: string;
       }>(
-        callerRunId
-          ? `SELECT run_id, artifact_id, revision, producer_node_id, payload_json, kind, logical_name
-               FROM workflow_artifacts
-              WHERE workspace_id = ? AND run_id = ? AND artifact_id = ? AND revision = ?`
-          : `SELECT artifact.run_id, artifact.artifact_id, artifact.revision,
-                    artifact.producer_node_id, artifact.payload_json, artifact.kind,
-                    artifact.logical_name
-               FROM workflow_artifacts artifact
-               JOIN workflow_artifact_sources source
-                 ON source.workspace_id = artifact.workspace_id
-                AND source.run_id = artifact.run_id
-                AND source.artifact_id = artifact.artifact_id
-                AND source.artifact_revision = artifact.revision
-              WHERE artifact.workspace_id = ? AND artifact.artifact_id = ?
-                AND artifact.revision = ?
-                AND (
-                  (source.source_kind = 'caller_turn'
-                   AND source.caller_task_id = ? AND source.caller_turn_id = ?)
-                  OR
-                  (source.source_kind = 'workflow_node' AND source.producer_task_id = ?)
-                )
-              LIMIT 1`,
-        callerRunId
-          ? [this.workspaceId, callerRunId, binding.artifactId, binding.artifactRevision]
-          : [
-              this.workspaceId,
-              binding.artifactId,
-              binding.artifactRevision,
-              command.task.id,
-              command.turn.id,
-              command.task.id,
-            ],
+        `SELECT COALESCE(fill.artifact_run_id, fill.run_id) AS artifact_run_id,
+                artifact.artifact_id, artifact.revision, artifact.payload_json, artifact.kind
+           FROM workflow_gate_fills fill
+           JOIN workflow_gate_bindings gate_binding
+             ON gate_binding.workspace_id = fill.workspace_id
+            AND gate_binding.run_id = fill.run_id
+            AND gate_binding.gate_id = fill.gate_id
+            AND gate_binding.input_ref = fill.input_ref
+           JOIN workflow_artifacts artifact
+             ON artifact.workspace_id = fill.workspace_id
+            AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+            AND artifact.artifact_id = fill.artifact_id
+            AND artifact.revision = fill.artifact_revision
+            AND artifact.kind = gate_binding.required_kind
+           JOIN workflow_artifact_sources source
+             ON source.workspace_id = artifact.workspace_id
+            AND source.run_id = artifact.run_id
+            AND source.artifact_id = artifact.artifact_id
+            AND source.artifact_revision = artifact.revision
+          WHERE fill.workspace_id = ? AND fill.run_id = ? AND fill.gate_id = ?
+            AND fill.input_ref = ?
+          LIMIT 1`,
+        [this.workspaceId, callerRunId, callerInputGateId, binding.fromInputRef],
       );
-      if (!art || art.kind !== contract.expectedArtifactKind) return empty;
+      if (!art || !Number.isInteger(art.revision) || art.revision < 1) return empty;
+      let payload: unknown;
+      try {
+        payload = JSON.parse(art.payload_json);
+      } catch {
+        return empty;
+      }
+      const record = payload && typeof payload === 'object'
+        ? payload as Record<string, unknown>
+        : undefined;
+      const value = typeof record?.value === 'string'
+        ? record.value
+        : typeof record?.result === 'string'
+          ? record.result
+          : undefined;
+      if (
+        value === undefined ||
+        Buffer.byteLength(value, 'utf8') > childEffectivePolicy.maxArtifactBytes
+      ) return empty;
       pinnedFills.push({
-        childEntryNodeId: binding.childEntryNodeId,
-        inputRef: binding.inputRef,
-        artifactRunId: art.run_id,
-        artifactId: art.artifact_id,
-        artifactRevision: art.revision,
-        producerNodeId: art.producer_node_id,
-        payloadJson: art.payload_json,
-        kind: art.kind,
-        logicalName: art.logical_name,
+        name: declared.name,
+        fromInputRef: binding.fromInputRef,
+        childEntryNodeId: declared.entryNodeId,
+        inputRef: declared.inputRef,
+        semanticKind: declared.semanticKind,
+        sourceArtifactRunId: art.artifact_run_id,
+        sourceArtifactId: art.artifact_id,
+        sourceArtifactRevision: art.revision,
+        value,
       });
     }
 
@@ -10820,18 +10526,9 @@ export class SqliteTaskRepository implements TaskRepository {
       for (const contract of contracts) {
         const pin = pinnedFillByKey.get(`${entryNodeId}\0${contract.inputRef}`);
         if (!pin) return empty;
-        let payload: unknown;
-        try {
-          payload = JSON.parse(pin.payloadJson);
-        } catch {
-          return empty;
-        }
-        const value = payload && typeof payload === 'object'
-          ? (payload as Record<string, unknown>).value
-          : undefined;
         values.push({
           inputRef: contract.inputRef,
-          value: typeof value === 'string' ? value : pin.payloadJson,
+          value: pin.value,
         });
       }
       const aggregate = formatWorkflowEntryAggregate(values);
@@ -10866,7 +10563,13 @@ export class SqliteTaskRepository implements TaskRepository {
       allNodeIds: allChildNodeIds,
       goal: childDefinition.name,
       backend: command.task.backend,
+      inputs: pinnedFills.map((pin) => ({ name: pin.name, value: pin.value })),
+      inputContracts: childTopology.inputs,
+      entryContracts: childDefinition.entryContracts,
       policy: childEffectivePolicy,
+      ownerRootTaskId,
+      callerTaskId: command.task.id,
+      callerTurnId: command.turn.id,
     });
     if (!validated.ok) return empty;
 
@@ -11206,6 +10909,38 @@ export class SqliteTaskRepository implements TaskRepository {
       if (!entryGate) return empty;
       const contract = childContractByKey.get(`${pin.childEntryNodeId}\0${pin.inputRef}`);
       if (!contract) return empty;
+      const childArtifact = identities.entryArtifacts.find(
+        (artifact) => artifact.entryNodeId === pin.childEntryNodeId && artifact.inputRef === pin.inputRef,
+      );
+      if (!childArtifact) return empty;
+      statements.push({
+        sql: `INSERT INTO workflow_artifacts (
+                workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                revision, kind, payload_json, created_at
+              ) VALUES (?,?,?,?,?,?,?,?,?)
+              ON CONFLICT DO NOTHING`,
+        params: [
+          this.workspaceId, childRunId, childArtifact.artifactId, null, pin.inputRef,
+          1, contract.expectedArtifactKind,
+          encodePayload({ value: pin.value, semanticKind: pin.semanticKind }),
+          finishedAt,
+        ],
+      });
+      statements.push({
+        sql: `INSERT INTO workflow_artifact_sources (
+                workspace_id, run_id, artifact_id, artifact_revision, source_kind,
+                producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
+                producing_activation_id, caller_task_id, caller_turn_id,
+                engine_start_operation_key, source_artifact_run_id,
+                source_artifact_id, source_artifact_revision
+              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+              ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
+        params: [
+          this.workspaceId, childRunId, childArtifact.artifactId, 1, 'workflow_artifact',
+          null, null, null, null, null, null, null, null,
+          pin.sourceArtifactRunId, pin.sourceArtifactId, pin.sourceArtifactRevision,
+        ],
+      });
       statements.push({
         sql: `INSERT INTO workflow_gate_bindings (
                 workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
@@ -11232,9 +10967,9 @@ export class SqliteTaskRepository implements TaskRepository {
           childRunId,
           entryGate,
           pin.inputRef,
-          pin.artifactRunId,
-          pin.artifactId,
-          pin.artifactRevision,
+          null,
+          childArtifact.artifactId,
+          1,
           finishedAt,
         ],
       });
@@ -13313,25 +13048,23 @@ function childInvocationFingerprint(input: {
   childDefinitionVersion: number;
   childIdempotencyKey: string;
   entryBindings: readonly {
-    childEntryNodeId: string;
-    inputRef: string;
-    artifactRunId: string;
-    artifactId: string;
-    artifactRevision: number;
+    name: string;
+    fromInputRef: string;
+    sourceArtifactRunId: string;
+    sourceArtifactId: string;
+    sourceArtifactRevision: number;
   }[];
   effectivePolicy: WorkflowPolicy;
 }): string {
   const entryBindings = input.entryBindings
     .map((binding) => ({
-      childEntryNodeId: binding.childEntryNodeId,
-      inputRef: binding.inputRef,
-      artifactRunId: binding.artifactRunId,
-      artifactId: binding.artifactId,
-      artifactRevision: binding.artifactRevision,
+      name: binding.name,
+      fromInputRef: binding.fromInputRef,
+      sourceArtifactRunId: binding.sourceArtifactRunId,
+      sourceArtifactId: binding.sourceArtifactId,
+      sourceArtifactRevision: binding.sourceArtifactRevision,
     }))
-    .sort((left, right) =>
-      left.childEntryNodeId.localeCompare(right.childEntryNodeId)
-      || left.inputRef.localeCompare(right.inputRef));
+    .sort((left, right) => left.name.localeCompare(right.name));
   return stableId('wfif', JSON.stringify({
     callerScopeId: input.callerScopeId,
     childDefinitionId: input.childDefinitionId,
@@ -13761,6 +13494,10 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
 } {
   const isChildWorkflowRoute =
     disposition.kind === 'workflow_next' && disposition.route?.kind === 'child_workflow';
+  if (
+    isChildWorkflowRoute &&
+    !validateInvokeChildEntryBindings(disposition.route!.entryBindings).ok
+  ) return { sql: '0', params: [] };
   const activationConditions = [
     `activation.workspace_id = turns.workspace_id`,
     `activation.execution_turn_id = turns.id`,
@@ -13885,38 +13622,39 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
   const bindingPredicates = route.entryBindings.map(() => `EXISTS (
     SELECT 1
        FROM workflow_definition_inputs child_contract
-      JOIN workflow_artifacts artifact
-        ON artifact.workspace_id = turns.workspace_id
-       AND artifact.artifact_id = ?
-       AND artifact.revision = ?
-       AND artifact.kind = child_contract.expected_artifact_kind
-      JOIN workflow_artifact_sources source
-        ON source.workspace_id = artifact.workspace_id
+       JOIN workflow_activations caller_activation
+         ON caller_activation.workspace_id = turns.workspace_id
+        AND caller_activation.execution_turn_id = turns.id
+       JOIN workflow_gate_fills fill
+         ON fill.workspace_id = caller_activation.workspace_id
+        AND fill.run_id = caller_activation.run_id
+        AND fill.gate_id = COALESCE(
+          caller_activation.source_gate_id,
+          caller_activation.return_gate_id,
+          (
+            SELECT COALESCE(primary_activation.source_gate_id, primary_activation.return_gate_id)
+              FROM workflow_activations primary_activation
+             WHERE primary_activation.workspace_id = caller_activation.workspace_id
+               AND primary_activation.run_id = caller_activation.run_id
+               AND primary_activation.execution_turn_id = caller_activation.primary_turn_id
+             LIMIT 1
+          )
+        )
+        AND fill.input_ref = ?
+       JOIN workflow_artifacts artifact
+         ON artifact.workspace_id = fill.workspace_id
+        AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+        AND artifact.artifact_id = fill.artifact_id
+        AND artifact.revision = fill.artifact_revision
+       JOIN workflow_artifact_sources source
+         ON source.workspace_id = artifact.workspace_id
        AND source.run_id = artifact.run_id
        AND source.artifact_id = artifact.artifact_id
        AND source.artifact_revision = artifact.revision
      WHERE child_contract.workspace_id = turns.workspace_id
-       AND child_contract.definition_id = ?
-       AND child_contract.definition_version = ?
-       AND child_contract.entry_node_id = ?
-       AND child_contract.input_ref = ?
-       AND (
-         EXISTS (
-           SELECT 1 FROM workflow_activations caller_activation
-            WHERE caller_activation.workspace_id = turns.workspace_id
-              AND caller_activation.execution_turn_id = turns.id
-              AND caller_activation.run_id = artifact.run_id
-         )
-         OR (
-           source.source_kind = 'caller_turn'
-           AND source.caller_task_id = turns.task_id
-           AND source.caller_turn_id = turns.id
-         )
-         OR (
-           source.source_kind = 'workflow_node'
-           AND source.producer_task_id = turns.task_id
-         )
-       )
+        AND child_contract.definition_id = ?
+        AND child_contract.definition_version = ?
+        AND child_contract.name = ?
   )`);
   const childRouteParams: SqlValue[] = [
     route.childDefinitionId,
@@ -13927,12 +13665,10 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
   ];
   for (const binding of route.entryBindings) {
     childRouteParams.push(
-      binding.artifactId,
-      binding.artifactRevision,
+      binding.fromInputRef,
       route.childDefinitionId,
       route.childDefinitionVersion,
-      binding.childEntryNodeId,
-      binding.inputRef,
+      binding.name,
     );
   }
 
@@ -13946,28 +13682,7 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
          SELECT 1 FROM json_each(COALESCE(json_extract(caller.payload_json, '$.capabilities'), '[]')) capability
           WHERE capability.value = 'create_child'
        )
-       AND (
-         ${activationExists}
-         OR (
-           caller.parent_id IS NULL
-            AND NOT EXISTS (
-              SELECT 1 FROM workflow_activations any_activation
-               WHERE any_activation.workspace_id = turns.workspace_id
-                 AND any_activation.execution_turn_id = turns.id
-            )
-            AND NOT EXISTS (
-              SELECT 1 FROM workflow_nodes caller_node
-               WHERE caller_node.workspace_id = turns.workspace_id
-                 AND caller_node.task_id = turns.task_id
-            )
-            AND NOT EXISTS (
-             SELECT 1 FROM workflow_continuations continuation
-              WHERE continuation.workspace_id = turns.workspace_id
-                AND continuation.caller_task_id = turns.task_id
-                AND continuation.status = 'pending'
-           )
-         )
-       )
+       AND ${activationExists}
        AND ${childDefinitionExists}
        AND ${exactContractCount}
        ${bindingPredicates.map((predicate) => `AND ${predicate}`).join('\n       ')}

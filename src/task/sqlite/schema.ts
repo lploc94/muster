@@ -1020,7 +1020,7 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     artifact_id TEXT NOT NULL,
     artifact_revision INTEGER NOT NULL CHECK (artifact_revision >= 1),
-    source_kind TEXT NOT NULL CHECK (source_kind IN ('workflow_node', 'caller_turn', 'engine_start')),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('workflow_node', 'caller_turn', 'engine_start', 'workflow_artifact')),
     producer_run_id TEXT,
     producer_node_id TEXT,
     producer_task_id TEXT,
@@ -1029,11 +1029,15 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     caller_task_id TEXT,
     caller_turn_id TEXT,
     engine_start_operation_key TEXT,
+    source_artifact_run_id TEXT,
+    source_artifact_id TEXT,
+    source_artifact_revision INTEGER CHECK (source_artifact_revision IS NULL OR source_artifact_revision >= 1),
     PRIMARY KEY (workspace_id, run_id, artifact_id, artifact_revision),
     CHECK (
-      (source_kind = 'workflow_node' AND producer_run_id IS NOT NULL AND producer_node_id IS NOT NULL AND producer_task_id IS NOT NULL AND producing_turn_id IS NOT NULL AND producing_activation_id IS NOT NULL AND caller_task_id IS NULL AND caller_turn_id IS NULL AND engine_start_operation_key IS NULL)
-      OR (source_kind = 'caller_turn' AND producer_run_id IS NULL AND producer_node_id IS NULL AND producer_task_id IS NULL AND producing_turn_id IS NULL AND producing_activation_id IS NULL AND caller_task_id IS NOT NULL AND caller_turn_id IS NOT NULL AND engine_start_operation_key IS NULL)
-      OR (source_kind = 'engine_start' AND producer_run_id IS NULL AND producer_node_id IS NULL AND producer_task_id IS NULL AND producing_turn_id IS NULL AND producing_activation_id IS NULL AND caller_task_id IS NULL AND caller_turn_id IS NULL AND engine_start_operation_key IS NOT NULL)
+      (source_kind = 'workflow_node' AND producer_run_id IS NOT NULL AND producer_node_id IS NOT NULL AND producer_task_id IS NOT NULL AND producing_turn_id IS NOT NULL AND producing_activation_id IS NOT NULL AND caller_task_id IS NULL AND caller_turn_id IS NULL AND engine_start_operation_key IS NULL AND source_artifact_run_id IS NULL AND source_artifact_id IS NULL AND source_artifact_revision IS NULL)
+      OR (source_kind = 'caller_turn' AND producer_run_id IS NULL AND producer_node_id IS NULL AND producer_task_id IS NULL AND producing_turn_id IS NULL AND producing_activation_id IS NULL AND caller_task_id IS NOT NULL AND caller_turn_id IS NOT NULL AND engine_start_operation_key IS NULL AND source_artifact_run_id IS NULL AND source_artifact_id IS NULL AND source_artifact_revision IS NULL)
+      OR (source_kind = 'engine_start' AND producer_run_id IS NULL AND producer_node_id IS NULL AND producer_task_id IS NULL AND producing_turn_id IS NULL AND producing_activation_id IS NULL AND caller_task_id IS NULL AND caller_turn_id IS NULL AND engine_start_operation_key IS NOT NULL AND source_artifact_run_id IS NULL AND source_artifact_id IS NULL AND source_artifact_revision IS NULL)
+      OR (source_kind = 'workflow_artifact' AND producer_run_id IS NULL AND producer_node_id IS NULL AND producer_task_id IS NULL AND producing_turn_id IS NULL AND producing_activation_id IS NULL AND caller_task_id IS NULL AND caller_turn_id IS NULL AND engine_start_operation_key IS NULL AND source_artifact_run_id IS NOT NULL AND source_artifact_id IS NOT NULL AND source_artifact_revision IS NOT NULL AND NOT (source_artifact_run_id = run_id AND source_artifact_id = artifact_id AND source_artifact_revision = artifact_revision))
     ),
     FOREIGN KEY (workspace_id, run_id, artifact_id, artifact_revision)
       REFERENCES workflow_artifacts(workspace_id, run_id, artifact_id, revision) ON DELETE CASCADE,
@@ -1050,7 +1054,9 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     FOREIGN KEY (workspace_id, caller_turn_id, caller_task_id)
       REFERENCES turns(workspace_id, id, task_id),
     FOREIGN KEY (workspace_id, engine_start_operation_key)
-      REFERENCES operations(workspace_id, ledger_key)
+      REFERENCES operations(workspace_id, ledger_key),
+    FOREIGN KEY (workspace_id, source_artifact_run_id, source_artifact_id, source_artifact_revision)
+      REFERENCES workflow_artifacts(workspace_id, run_id, artifact_id, revision)
   )`,
 
   `CREATE TABLE IF NOT EXISTS session_owners (
@@ -1221,6 +1227,13 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
              WHERE reused_node.workspace_id = ${alias}.workspace_id
                AND reused_node.source_run_id = ${alias}.run_id
                AND reused_node.run_id <> ${alias}.run_id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_artifact_sources derived_source
+             WHERE derived_source.workspace_id = ${alias}.workspace_id
+               AND derived_source.source_kind = 'workflow_artifact'
+               AND derived_source.source_artifact_run_id = ${alias}.run_id
+               AND derived_source.run_id <> ${alias}.run_id
           )
           AND NOT EXISTS (
             SELECT 1 FROM workflow_return_gates return_gate_artifact
@@ -1439,15 +1452,29 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
             AND node.node_id = NEW.producer_node_id
             AND node.task_id = NEW.producer_task_id
        )
-     ) OR (
-       NEW.source_kind = 'caller_turn' AND NOT EXISTS (
+      ) OR (
+        NEW.source_kind = 'caller_turn' AND NOT EXISTS (
          SELECT 1 FROM workflow_runs run
           WHERE run.workspace_id = NEW.workspace_id
             AND run.run_id = NEW.run_id
             AND run.caller_task_id = NEW.caller_task_id
-            AND run.caller_turn_id = NEW.caller_turn_id
-       )
-     )
+             AND run.caller_turn_id = NEW.caller_turn_id
+        )
+      ) OR (
+        NEW.source_kind = 'workflow_artifact' AND NOT EXISTS (
+          SELECT 1
+            FROM workflow_artifacts source_artifact
+            JOIN workflow_artifact_sources source_provenance
+              ON source_provenance.workspace_id = source_artifact.workspace_id
+             AND source_provenance.run_id = source_artifact.run_id
+             AND source_provenance.artifact_id = source_artifact.artifact_id
+             AND source_provenance.artifact_revision = source_artifact.revision
+           WHERE source_artifact.workspace_id = NEW.workspace_id
+             AND source_artifact.run_id = NEW.source_artifact_run_id
+             AND source_artifact.artifact_id = NEW.source_artifact_id
+             AND source_artifact.revision = NEW.source_artifact_revision
+        )
+      )
      BEGIN
        SELECT RAISE(ABORT, 'workflow_artifact_source_invalid');
      END`,

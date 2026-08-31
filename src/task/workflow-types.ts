@@ -18,7 +18,6 @@ export const WORKFLOW_INPUT_REF_MAX_LENGTH = 128;
 export const WORKFLOW_GRAPH_MAX_NODES = 64;
 export const WORKFLOW_GRAPH_MAX_EDGES = 128;
 export const WORKFLOW_ENTRY_CONTRACTS_MAX = 128;
-export const WORKFLOW_CHILD_BINDINGS_MAX = 64;
 export const WORKFLOW_SCRIPT_FILE_MAX_LENGTH = 1_024;
 export const WORKFLOW_SCRIPT_MAX_ARGS = 64;
 export const WORKFLOW_SCRIPT_ARG_MAX_LENGTH = 4_096;
@@ -275,28 +274,7 @@ export interface DefineWorkflowInput {
   createdAt: string;
 }
 
-/** Caller-authored literal value bound to one exact entry contract at start. */
-export interface StartWorkflowEntryLiteralInput {
-  entryNodeId: string;
-  inputRef: string;
-  kind: string;
-  value: string;
-}
-
-/** Caller-authorized reference to one named output of a prior workflow run. */
-export interface StartWorkflowEntryRunReferenceInput {
-  entryNodeId: string;
-  inputRef: string;
-  fromRun: string;
-  output: string;
-}
-
-/** Exactly one literal value or prior-run result reference for an entry contract. */
-export type StartWorkflowEntryInput =
-  | StartWorkflowEntryLiteralInput
-  | StartWorkflowEntryRunReferenceInput;
-
-/** Public canonical start input retained by name until trusted host resolution. */
+/** Public canonical start input retained by name through repository resolution. */
 export type WorkflowStartInput =
   | {
       name: string;
@@ -308,25 +286,10 @@ export type WorkflowStartInput =
       output: string;
     };
 
-/**
- * Caller-authorized reuse of one exact completed prior execution for one graph node.
- *
- * Source and destination are separate identities on purpose: the artifact was produced
- * by `sourceNodeId` in `sourceRunId` (possibly under a different definition, so that id
- * need not exist in this run's topology), and is bound to `destinationNodeId` here.
- * `sourceTaskId` pins the exact execution, because one node id maps to a different task
- * in every run, so "latest matching row" is a guess rather than a caller authorization.
- */
-export interface StartWorkflowNodeReuse {
-  /** Node in this run's frozen topology that receives the reused artifact. */
-  destinationNodeId: string;
-  /** Prior run that produced the artifact. */
-  sourceRunId: string;
-  /** Node in the prior run's topology that produced the artifact. */
-  sourceNodeId: string;
-  /** Exact completed task execution whose artifact is bound. */
-  sourceTaskId: string;
-}
+/** Trusted binding derived from one public name and its frozen input contract. */
+export type StartWorkflowEntryInput =
+  | (WorkflowInputContract & { value: string })
+  | (WorkflowInputContract & { fromRun: string; output: string });
 
 /**
  * Input for startWorkflowRun. Agents never supply writable run/task/turn/gate IDs;
@@ -356,10 +319,10 @@ export interface StartWorkflowInput {
   goal?: string;
   /** Optional backend id for the entry task; defaults at the repository boundary. */
   backend?: string;
-  /** Exact caller values for every declared entry contract. */
-  entryInputs?: readonly StartWorkflowEntryInput[];
-  /** Prior-run references for graph nodes reused by this start. */
-  reuse?: readonly StartWorkflowNodeReuse[];
+  /** Exact public bindings retained until frozen definition resolution. */
+  inputs?: readonly WorkflowStartInput[];
+  /** Frozen public input contracts loaded by the repository. */
+  inputContracts?: readonly WorkflowInputContract[];
   /** Frozen definition contracts loaded by the repository. */
   entryContracts?: readonly WorkflowEntryContract[];
   /** Caller/root authority included in fingerprint and identity derivation. */
@@ -449,11 +412,8 @@ export type StartWorkflowResult =
       reason:
         | 'definition not found'
         | 'invalid start'
-        | 'entry input reference unresolved'
-        | 'terminal node cannot be reused'
-        | 'node reuse reference unresolved'
-        | 'reuse artifact kind mismatch'
-        | 'reuse aggregate exceeds policy'
+        | 'workflow input reference unresolved'
+        | 'workflow semantic kind mismatch'
         | 'start fingerprint conflict'
         | 'invalid identity';
       definitionId?: string;
@@ -461,12 +421,10 @@ export type StartWorkflowResult =
     };
 
 
-/** M018 S06: agent-supplied exact child entry and artifact revision binding. */
+/** Public child input name bound to one inputRef of the current activation. */
 export interface InvokeChildEntryBinding {
-  childEntryNodeId: string;
-  inputRef: string;
-  artifactId: string;
-  artifactRevision: number;
+  name: string;
+  fromInputRef: string;
 }
 
 /** M018 S06: public child-route command payload (no SQL/paths/bodies). */

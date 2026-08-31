@@ -1202,17 +1202,6 @@ describe('M018 S01 one-node workflow activation', () => {
           artifactRevision: 1,
         },
       });
-      await expect(repository.resolveWorkflowInputArtifacts(
-        payload.activationTurnId,
-        taskId,
-        ['request'],
-      )).resolves.toEqual([
-        expect.objectContaining({
-          inputRef: 'request',
-          artifactRevision: 1,
-        }),
-      ]);
-
       const entryTurn = await repository.getTurn(payload.activationTurnId);
       expect(entryTurn).toMatchObject({
         id: payload.activationTurnId,

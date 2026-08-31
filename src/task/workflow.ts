@@ -12,23 +12,26 @@ import {
   DEFAULT_WORKFLOW_POLICY,
   formatWorkflowEntryAggregate,
   fingerprintStartEntryInputs,
-  fingerprintStartNodeReuse,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
-import { WORKFLOW_RUN_GOAL_MAX_LENGTH } from './workflow-types';
+import {
+  WORKFLOW_ENTRY_CONTRACTS_MAX,
+  WORKFLOW_RUN_GOAL_MAX_LENGTH,
+} from './workflow-types';
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
   StartWorkflowEntryInput,
-  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
   WorkflowDefinition,
   WorkflowDependencyEdge,
   WorkflowEntryContract,
+  WorkflowInputContract,
   WorkflowPolicy,
+  WorkflowStartInput,
   WorkflowTopology,
   WorkflowNodeSpec,
 } from './workflow-types';
@@ -45,7 +48,6 @@ export {
 export type {
   DefineWorkflowInput,
   DefineWorkflowResult,
-  StartWorkflowNodeReuse,
   StartWorkflowIdentities,
   StartWorkflowInput,
   StartWorkflowResult,
@@ -763,37 +765,35 @@ export function deriveChildStartIdempotencyKey(input: {
 /** Surface validation for invoke_child entry bindings (ids only; settle validates ownership). */
 export function validateInvokeChildEntryBindings(
   entryBindings: readonly {
-    childEntryNodeId: string;
-    inputRef: string;
-    artifactId: string;
-    artifactRevision: number;
+    name: string;
+    fromInputRef: string;
   }[],
 ): { ok: true } | { ok: false; reason: string } {
-  if (!Array.isArray(entryBindings) || entryBindings.length === 0) {
-    return { ok: false, reason: 'entryBindings must be non-empty' };
+  if (!Array.isArray(entryBindings) || entryBindings.length > WORKFLOW_ENTRY_CONTRACTS_MAX) {
+    return { ok: false, reason: 'entryBindings exceed bounds' };
   }
   const seen = new Set<string>();
   for (const b of entryBindings) {
-    if (!b || typeof b.childEntryNodeId !== 'string' || b.childEntryNodeId.length === 0) {
-      return { ok: false, reason: 'entryBinding childEntryNodeId required' };
+    if (
+      !b ||
+      typeof b !== 'object' ||
+      Object.keys(b).some((key) => key !== 'name' && key !== 'fromInputRef')
+    ) {
+      return { ok: false, reason: 'entryBinding fields invalid' };
     }
-    if (!b || typeof b.inputRef !== 'string' || b.inputRef.length === 0) {
-      return { ok: false, reason: 'entryBinding inputRef required' };
+    if (!isNonEmptyBounded(b.name, 128)) {
+      return { ok: false, reason: 'entryBinding name required' };
     }
-    if (typeof b.artifactId !== 'string' || b.artifactId.length === 0) {
-      return { ok: false, reason: 'entryBinding artifactId required' };
+    if (!isNonEmptyBounded(b.fromInputRef, 128)) {
+      return { ok: false, reason: 'entryBinding fromInputRef required' };
     }
-    if (!Number.isInteger(b.artifactRevision) || b.artifactRevision < 1) {
-      return { ok: false, reason: 'entryBinding artifactRevision must be positive' };
-    }
-    const bindingKey = `${b.childEntryNodeId}\0${b.inputRef}`;
-    if (seen.has(bindingKey)) {
+    if (seen.has(b.name)) {
       return {
         ok: false,
-        reason: `duplicate entryBinding: ${b.childEntryNodeId}/${b.inputRef}`,
+        reason: `duplicate entryBinding: ${b.name}`,
       };
     }
-    seen.add(bindingKey);
+    seen.add(b.name);
   }
   return { ok: true };
 }
@@ -827,8 +827,7 @@ export function fingerprintStartWorkflow(input: {
   ownerRootTaskId?: string;
   callerTaskId?: string;
   callerTurnId?: string;
-  entryInputs?: readonly StartWorkflowEntryInput[];
-  reuse?: readonly StartWorkflowNodeReuse[];
+  inputs?: readonly WorkflowStartInput[];
   policy?: WorkflowPolicy;
 }): string {
   const payload = JSON.stringify({
@@ -840,8 +839,8 @@ export function fingerprintStartWorkflow(input: {
     backend: input.backend,
     ownerRootTaskId: input.ownerRootTaskId,
     callerTaskId: input.callerTaskId,
-    entryInputs: fingerprintStartEntryInputs(input.entryInputs ?? []),
-    reuse: fingerprintStartNodeReuse(input.reuse ?? []),
+    callerTurnId: input.callerTurnId,
+    inputs: fingerprintStartEntryInputs(input.inputs ?? []),
     policy: input.policy,
   });
   return createHash('sha256').update(payload, 'utf8').digest('hex');
@@ -863,9 +862,10 @@ export function validateStartWorkflow(
       createdAt: string;
       goal: string;
       backend: string;
-      entryInputs: readonly NonNullable<StartWorkflowInput['entryInputs']>[number][];
-      reuse: readonly StartWorkflowNodeReuse[];
+      inputs: readonly WorkflowStartInput[];
+      entryInputs: readonly StartWorkflowEntryInput[];
       entryContracts: readonly WorkflowEntryContract[];
+      inputContracts: readonly WorkflowInputContract[];
       policy: WorkflowPolicy;
       ownerRootTaskId?: string;
       callerTaskId?: string;
@@ -926,72 +926,88 @@ export function validateStartWorkflow(
     }
   }
   const contracts = input.entryContracts ?? [];
-  const entryInputs = input.entryInputs ?? [];
-  const reuse = input.reuse ?? [];
-  const reuseNodeIds = new Set<string>();
-  for (const item of reuse) {
-    if (
-      !isNonEmptyBounded(item.destinationNodeId, 128) ||
-      !isNonEmptyBounded(item.sourceRunId, 128) ||
-      !isNonEmptyBounded(item.sourceNodeId, 128) ||
-      !isNonEmptyBounded(item.sourceTaskId, 128) ||
-      reuseNodeIds.has(item.destinationNodeId) ||
-      // A destination outside this topology can never be applied; accepting it would
-      // silently start a run that executes every node.
-      !allNodeIds.includes(item.destinationNodeId)
-    ) {
-      return { ok: false, reason: 'invalid reuse' };
-    }
-    // `sourceNodeId` is intentionally not checked against this topology: the artifact
-    // may come from a different definition whose node names do not appear here.
-    reuseNodeIds.add(item.destinationNodeId);
-  }
+  const inputContracts = input.inputContracts ?? [];
+  const inputs = input.inputs ?? [];
   const contractByKey = new Map<string, WorkflowEntryContract>(
     contracts.map((contract) => [`${contract.entryNodeId}\0${contract.inputRef}`, contract] as const),
   );
-  const inputByKey = new Map<string, (typeof entryInputs)[number]>();
-  for (const entryInput of entryInputs) {
+  const declaredByName = new Map<string, WorkflowInputContract>();
+  const declaredCoordinateKeys = new Set<string>();
+  for (const declared of inputContracts) {
+    const coordinateKey = `${declared.entryNodeId}\0${declared.inputRef}`;
     if (
-      !isNonEmptyBounded(entryInput.entryNodeId, 128) ||
-      !isNonEmptyBounded(entryInput.inputRef, 128)
+      !isNonEmptyBounded(declared.name, 128) ||
+      !isNonEmptyBounded(declared.semanticKind, 128) ||
+      !isNonEmptyBounded(declared.entryNodeId, 128) ||
+      !isNonEmptyBounded(declared.inputRef, 128) ||
+      declaredByName.has(declared.name) ||
+      declaredCoordinateKeys.has(coordinateKey) ||
+      !contractByKey.has(coordinateKey)
     ) {
-      return { ok: false, reason: 'invalid entry input' };
+      return { ok: false, reason: 'invalid workflow input contract' };
     }
-    const key = `${entryInput.entryNodeId}\0${entryInput.inputRef}`;
-    if (inputByKey.has(key)) return { ok: false, reason: 'duplicate entry input' };
-    const contract = contractByKey.get(key);
-    if (!contract) return { ok: false, reason: 'entry input contract mismatch' };
-    if ('value' in entryInput) {
+    declaredByName.set(declared.name, declared);
+    declaredCoordinateKeys.add(coordinateKey);
+  }
+  if (declaredByName.size !== contractByKey.size) {
+    return { ok: false, reason: 'workflow input contract mismatch' };
+  }
+  const inputByName = new Map<string, WorkflowStartInput>();
+  for (const startInput of inputs) {
+    if (!startInput || typeof startInput !== 'object' || Array.isArray(startInput)) {
+      return { ok: false, reason: 'invalid workflow input' };
+    }
+    const inputKeys = Object.keys(startInput);
+    const hasLiteralValue = Object.prototype.hasOwnProperty.call(startInput, 'value');
+    if (
+      !isNonEmptyBounded(startInput.name, 128) ||
+      (hasLiteralValue
+        ? inputKeys.length !== 2 || inputKeys.some((key) => key !== 'name' && key !== 'value')
+        : inputKeys.length !== 3 || inputKeys.some((key) =>
+            key !== 'name' && key !== 'fromRun' && key !== 'output'))
+    ) {
+      return { ok: false, reason: 'invalid workflow input' };
+    }
+    if (inputByName.has(startInput.name)) return { ok: false, reason: 'duplicate workflow input' };
+    const declared = declaredByName.get(startInput.name);
+    if (!declared) return { ok: false, reason: 'workflow input contract mismatch' };
+    if (hasLiteralValue) {
+      const literal = startInput as Extract<WorkflowStartInput, { value: string }>;
       if (
-        !isNonEmptyBounded(entryInput.kind, 128) ||
-        typeof entryInput.value !== 'string' ||
-        contract.expectedArtifactKind !== entryInput.kind
+        typeof literal.value !== 'string'
       ) {
-        return { ok: false, reason: 'entry input contract mismatch' };
+        return { ok: false, reason: 'workflow input contract mismatch' };
       }
-      if (Buffer.byteLength(entryInput.value, 'utf8') > policy.maxArtifactBytes) {
+      if (Buffer.byteLength(literal.value, 'utf8') > policy.maxArtifactBytes) {
         return { ok: false, reason: 'entry artifact too large' };
       }
-    } else if (
-      !isNonEmptyBounded(entryInput.fromRun, 128) ||
-      !isNonEmptyBounded(entryInput.output, 128)
-    ) {
-      return { ok: false, reason: 'invalid entry input' };
+    } else {
+      const referenced = startInput as Extract<WorkflowStartInput, { fromRun: string }>;
+      if (
+        !isNonEmptyBounded(referenced.fromRun, 128) ||
+        !isNonEmptyBounded(referenced.output, 128)
+      ) {
+        return { ok: false, reason: 'invalid workflow input' };
+      }
     }
-    inputByKey.set(key, entryInput);
+    inputByName.set(startInput.name, startInput);
   }
-  if (inputByKey.size !== contractByKey.size) {
-    return { ok: false, reason: 'incomplete entry inputs' };
+  if (inputByName.size !== declaredByName.size) {
+    return { ok: false, reason: 'incomplete workflow inputs' };
   }
-  for (const key of contractByKey.keys()) {
-    if (!inputByKey.has(key)) return { ok: false, reason: 'incomplete entry inputs' };
+  for (const name of declaredByName.keys()) {
+    if (!inputByName.has(name)) return { ok: false, reason: 'incomplete workflow inputs' };
   }
-  if (contracts.length > 0 && input.callerTaskId === undefined) {
-    return { ok: false, reason: 'caller authority required for entry inputs' };
+  if (inputContracts.length > 0 && input.callerTaskId === undefined) {
+    return { ok: false, reason: 'caller authority required for workflow inputs' };
   }
-  const orderedEntryInputs = contracts.map((contract) =>
-    inputByKey.get(`${contract.entryNodeId}\0${contract.inputRef}`)!,
-  );
+  const orderedInputs = inputContracts.map((declared) => inputByName.get(declared.name)!);
+  const orderedEntryInputs: StartWorkflowEntryInput[] = inputContracts.map((declared) => {
+    const startInput = inputByName.get(declared.name)!;
+    return 'value' in startInput
+      ? { ...declared, value: startInput.value }
+      : { ...declared, fromRun: startInput.fromRun, output: startInput.output };
+  });
   let identities: StartWorkflowIdentities;
   try {
     identities = deriveStartIdentities({
@@ -1019,8 +1035,7 @@ export function validateStartWorkflow(
     ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
     ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
     ...(input.callerTurnId !== undefined ? { callerTurnId: input.callerTurnId } : {}),
-    entryInputs: orderedEntryInputs,
-    reuse,
+    inputs: orderedInputs,
     policy,
   });
   return {
@@ -1032,9 +1047,10 @@ export function validateStartWorkflow(
     createdAt: input.createdAt,
     goal,
     backend,
+    inputs: orderedInputs,
     entryInputs: orderedEntryInputs,
-    reuse,
     entryContracts: contracts,
+    inputContracts,
     policy,
     ...(input.ownerRootTaskId !== undefined ? { ownerRootTaskId: input.ownerRootTaskId } : {}),
     ...(input.callerTaskId !== undefined ? { callerTaskId: input.callerTaskId } : {}),
@@ -1105,11 +1121,8 @@ export function startWorkflowInvalid(
     | 'definition not found'
     | 'invalid start'
     | 'invalid identity'
-    | 'entry input reference unresolved'
-    | 'terminal node cannot be reused'
-    | 'node reuse reference unresolved'
-    | 'reuse artifact kind mismatch'
-    | 'reuse aggregate exceeds policy',
+    | 'workflow input reference unresolved'
+    | 'workflow semantic kind mismatch',
   definitionId?: string,
   version?: number,
 ): StartWorkflowFailure {

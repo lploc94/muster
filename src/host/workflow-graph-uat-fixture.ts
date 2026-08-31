@@ -1,20 +1,15 @@
 /**
- * Seeds one deterministic workflow-reuse fixture through the real repository so
+ * Seeds one deterministic named-composition fixture through the real repository so
  * a native Extension Development Host has a genuine focused workflow task to
  * request a graph for.
  *
- * The shape mirrors M024/S03's proven closure: a single-node producer run whose
- * result is reused at node `four` of a five-node chain, so nodes one..four
- * persist as taskless `reused` and only `five` activates. Every write goes
+ * A single-node producer exports a named result which becomes the public input
+ * of a five-node chain. Every write goes
  * through `repository.execute`, so the durable state is the state production
  * would have produced — no hand-built rows.
  *
- * Deliberately NOT derived from `StartWorkflowIdentities.entryTaskId`: under
- * reuse the chain's declared entry node (`one`) falls inside the suppressed
- * ancestor closure and materializes no task at all (D090), so `entryTaskId`
- * names a task that does not exist. The live node is discovered the same way
- * the M024/S04 durable test discovers it — by reading `workflow_nodes` for the
- * single row that still carries a `task_id`.
+ * The focus task is discovered from durable `workflow_nodes` state rather than
+ * predicted by the fixture.
  */
 import type { TaskRepository } from '../task/repository';
 import type { MusterTask, TaskTurn } from '../task/types';
@@ -36,25 +31,13 @@ const ROOT_TURN_ID = 'uat-workflow-graph-root-turn';
 const PRODUCER_DEFINITION_ID = 'uat-wf-producer';
 const CHAIN_DEFINITION_ID = 'uat-wf-five-chain';
 const CHAIN_NODES = ['one', 'two', 'three', 'four', 'five'] as const;
-/** The only node the caller does not bind, so the only one that activates. */
-const LIVE_NODE_ID = 'five';
-/**
- * Deliberately unlike every chain node id. Reuse binds a source execution
- * (run + node + task) to a destination node, so the producer's node id does not
- * have to match the destination it feeds. A fixture that named it `four` could
- * not tell a real binding apart from an id coincidence.
- */
+/** The named composition activates the chain entry first. */
+const LIVE_NODE_ID = 'one';
 const PRODUCER_NODE_ID = 'produce';
-/**
- * Reuse is bind-only: binding just `four` is rejected because its predecessors
- * would otherwise be marked reused with no source and no execution behind them.
- * All four ancestors of the live node are bound to the same producer execution.
- */
-const REUSED_NODE_IDS = ['one', 'two', 'three', 'four'] as const;
 
 /** Bounded seed result: the task the harness should focus, plus shape counters. */
 export type WorkflowGraphFixtureResult = {
-  /** The live (non-reused) node's task — the one task that owns a graph. */
+  /** The active entry node's task — the task the harness focuses. */
   focusTaskId: string;
   /** Node ids are fixture-local constants, safe to report for assertion. */
   liveNodeId: string;
@@ -133,8 +116,8 @@ async function settleWithNextResult(
 }
 
 /**
- * Creates the producer run, settles it, then starts a five-node chain reusing
- * the producer result at node `four`. Returns the live node's task id, read back
+ * Creates the producer run, settles it, then starts a five-node chain from its
+ * named result. Returns the active entry node's task id, read back
  * from durable state rather than predicted.
  */
 export async function seedWorkflowGraphFixture(
@@ -165,9 +148,11 @@ export async function seedWorkflowGraphFixture(
     version: 1,
     name: 'UAT producer',
     topology: {
-      kind: 'one_node_v1',
+      kind: 'workflow',
+      inputs: [],
+      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: PRODUCER_NODE_ID }],
       nodes: [{ nodeId: PRODUCER_NODE_ID }],
-      entryNodeId: PRODUCER_NODE_ID,
+      edges: [],
     },
     createdAt: iso(0),
   });
@@ -179,7 +164,9 @@ export async function seedWorkflowGraphFixture(
     name: 'UAT five node chain',
     createdAt: iso(0),
     topology: {
-      kind: 'graph_v1',
+      kind: 'workflow',
+      inputs: [{ name: 'seed', semanticKind: 'result', entryNodeId: 'one', inputRef: 'seed' }],
+      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'five' }],
       nodes: CHAIN_NODES.map((nodeId) => ({ nodeId })),
       edges: [
         { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result' },
@@ -188,6 +175,7 @@ export async function seedWorkflowGraphFixture(
         { fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result' },
       ],
     },
+    entryContracts: [{ entryNodeId: 'one', inputRef: 'seed', expectedArtifactKind: 'workflow_input' }],
   });
 
   const producerStart = await repository.execute({
@@ -228,12 +216,7 @@ export async function seedWorkflowGraphFixture(
     version: 1,
     startIdempotencyKey: 'uat-workflow-graph-consumer',
     createdAt: iso(2_000),
-    reuse: REUSED_NODE_IDS.map((destinationNodeId) => ({
-      destinationNodeId,
-      sourceRunId: producer.runId,
-      sourceNodeId: PRODUCER_NODE_ID,
-      sourceTaskId: producer.entryTaskId,
-    })),
+    inputs: [{ name: 'seed', fromRun: producer.runId, output: 'result' }],
     ownerRootTaskId: WORKFLOW_GRAPH_FIXTURE_ROOT_TASK_ID,
     callerTaskId: WORKFLOW_GRAPH_FIXTURE_ROOT_TASK_ID,
     callerTurnId: ROOT_TURN_ID,
@@ -247,40 +230,21 @@ export async function seedWorkflowGraphFixture(
     );
   }
 
-  // Read the live node back from durable state. Exactly one node must still own
-  // a task; the other four are the suppressed reuse closure.
+  // Read the active entry back from durable state. Pending nodes retain durable
+  // shell tasks but only the entry is active.
   const nodes = await client.all<{ node_id: string; task_id: string | null; status: string }>(
     `SELECT node_id, task_id, status FROM workflow_nodes
       WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
     [workspaceId, consumer.runId],
   );
-  const live = nodes.filter((node) => node.task_id !== null);
+  const live = nodes.filter((node) => node.status === 'active');
   const reused = nodes.filter((node) => node.status === 'reused');
   if (live.length !== 1 || live[0]!.node_id !== LIVE_NODE_ID || !live[0]!.task_id) {
     throw new Error(
       `workflow graph fixture expected exactly one live node '${LIVE_NODE_ID}', found ${live.length}`,
     );
   }
-  if (reused.length !== REUSED_NODE_IDS.length) {
-    throw new Error(
-      `workflow graph fixture expected ${REUSED_NODE_IDS.length} reused nodes, found ${reused.length}`,
-    );
-  }
-  // Every reused node must carry the exact source execution the caller bound, so the
-  // fixture proves provenance is durable rather than inferred from a status string.
-  const unbound = await client.all<{ node_id: string }>(
-    `SELECT node_id FROM workflow_nodes
-      WHERE workspace_id = ? AND run_id = ? AND status = 'reused'
-        AND (source_run_id IS NOT ? OR source_node_id IS NOT ? OR source_task_id IS NOT ?)`,
-    [workspaceId, consumer.runId, producer.runId, PRODUCER_NODE_ID, producer.entryTaskId],
-  );
-  if (unbound.length > 0) {
-    throw new Error(
-      `workflow graph fixture found reused nodes without the bound source: ${unbound
-        .map((node) => node.node_id)
-        .join(', ')}`,
-    );
-  }
+  if (reused.length !== 0) throw new Error('workflow graph fixture unexpectedly created reused nodes');
 
   return {
     focusTaskId: live[0]!.task_id,

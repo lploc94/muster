@@ -1755,7 +1755,7 @@ describe('workflow_next tool surface', () => {
         kind: 'invoke_child_workflow',
         childDefinitionId: definitionId,
         childDefinitionVersion: 2,
-        semanticEntryBindings: [{
+        entryBindings: [{
           name: 'request',
           fromInputRef: 'implementation',
         }],
@@ -1788,6 +1788,33 @@ describe('workflow_next tool surface', () => {
     )).toEqual({
       ok: false,
       toolError: 'invalid child workflow input',
+    });
+
+    const empty = dispatch(
+      'invoke_child_workflow',
+      { workflow: `${definitionId}@2`, inputs: [] },
+      ctx(['invoke_child_workflow']),
+    );
+    expect(empty).toMatchObject({
+      ok: true,
+      command: { kind: 'invoke_child_workflow', entryBindings: [] },
+    });
+
+    const wideInputs = Array.from({ length: 65 }, (_, index) => ({
+      name: `input${String(index).padStart(2, '0')}`,
+      fromInput: 'implementation',
+    }));
+    const wide = dispatch(
+      'invoke_child_workflow',
+      { workflow: `${definitionId}@2`, inputs: wideInputs },
+      ctx(['invoke_child_workflow']),
+    );
+    expect(wide).toMatchObject({
+      ok: true,
+      command: { kind: 'invoke_child_workflow', entryBindings: wideInputs.map((input) => ({
+        name: input.name,
+        fromInputRef: input.fromInput,
+      })) },
     });
   });
 });

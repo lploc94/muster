@@ -2943,9 +2943,9 @@ describe('SqliteTaskRepository', () => {
         version: 1,
         startIdempotencyKey: 'canonical-storage-reload-start',
         createdAt: '2026-08-31T00:00:01.000Z',
-        entryInputs: [
-          { entryNodeId: 'right', inputRef: 'right_request', kind: 'workflow_input', value: 'right value' },
-          { entryNodeId: 'left', inputRef: 'left_request', kind: 'workflow_input', value: 'left value' },
+        inputs: [
+          { name: 'rightRequest', value: 'right value' },
+          { name: 'leftRequest', value: 'left value' },
         ],
         ownerRootTaskId: caller.id,
         callerTaskId: caller.id,
@@ -3299,9 +3299,9 @@ describe('SqliteTaskRepository', () => {
         version: 1,
         startIdempotencyKey: 'corrupt-output-start',
         createdAt: '2026-08-31T00:00:02.000Z',
-        entryInputs: [
-          { entryNodeId: 'right', inputRef: 'right_request', kind: 'workflow_input', value: 'right value' },
-          { entryNodeId: 'left', inputRef: 'left_request', kind: 'workflow_input', value: 'left value' },
+        inputs: [
+          { name: 'rightRequest', value: 'right value' },
+          { name: 'leftRequest', value: 'left value' },
         ],
       });
       expect(corruptStart).toMatchObject({ ok: false, changed: false });
