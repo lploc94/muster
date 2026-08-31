@@ -86,7 +86,7 @@ describe('routeRequestWorkflowCatalog', () => {
   it('clamps an over-cap merged list and reports the truncation', async () => {
     const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX + 5 }, (_, i) => ({
       workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',
-      scope: 'workspace' as const, packageKind: 'file' as const,
+      scope: 'workspace' as const, packageKind: 'bundle' as const,
     }));
 
     const outcome = await routeRequestWorkflowCatalog(request, deps({
@@ -103,7 +103,7 @@ describe('routeRequestWorkflowCatalog', () => {
   it('keeps the truncation diagnostic within the cap when diagnostics are already full', async () => {
     const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX + 1 }, (_, i) => ({
       workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',
-      scope: 'workspace' as const, packageKind: 'file' as const,
+      scope: 'workspace' as const, packageKind: 'bundle' as const,
     }));
     const diagnostics = Array.from({ length: WORKFLOW_CATALOG_DIAGNOSTICS_MAX }, (_, i) => ({
       file: `w${i}.md`, code: 'invalid_workflow_file', message: 'bad',
@@ -144,7 +144,7 @@ describe('routeRequestWorkflowCatalog', () => {
   it('does not report truncation at the exact workflow cap', async () => {
     const workflows = Array.from({ length: WORKFLOW_CATALOG_WORKFLOWS_MAX }, (_, i) => ({
       workflowRef: `ref-${i}`, name: `Workflow ${i}`, description: '',
-      scope: 'workspace' as const, packageKind: 'file' as const,
+      scope: 'workspace' as const, packageKind: 'bundle' as const,
     }));
     const diagnostics = Array.from({ length: WORKFLOW_CATALOG_DIAGNOSTICS_MAX }, (_, i) => ({
       file: `w${i}.md`, code: 'invalid_workflow_file', message: 'bad',

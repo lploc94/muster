@@ -403,7 +403,7 @@ describe('M018 universal durable disposition claims', () => {
     await expect(executeToolCommand(
       graphDeps(repository, task, unbound),
       { callerTaskId: task.id, turnId: unbound.id, rootId: task.id, allowedActions: broad },
-      { kind: 'workflow_next', opId: 'unbound-next', change: 'updated', result: 'x' },
+      { kind: 'workflow_next', opId: 'unbound-next', change: 'updated', message: 'x' },
     )).resolves.toEqual({
       ok: false,
       error: 'workflow_next is not authorized for the current workflow context',
@@ -423,7 +423,7 @@ describe('M018 universal durable disposition claims', () => {
     await expect(executeToolCommand(
       graphDeps(repository, task, active),
       { callerTaskId: task.id, turnId: active.id, rootId: task.id, allowedActions: broad },
-      { kind: 'workflow_next', opId: 'initial-unchanged', change: 'unchanged' },
+      { kind: 'workflow_next', opId: 'initial-unchanged', change: 'unchanged', message: 'x' },
     )).resolves.toEqual({
       ok: false,
       error: 'workflow_next unchanged requires a feedback-request activation',
@@ -431,7 +431,7 @@ describe('M018 universal durable disposition claims', () => {
     await expect(executeToolCommand(
       graphDeps(repository, task, active),
       { callerTaskId: task.id, turnId: active.id, rootId: task.id, allowedActions: broad },
-      { kind: 'workflow_next', opId: 'active-next', change: 'updated', result: 'x' },
+      { kind: 'workflow_next', opId: 'active-next', change: 'updated', message: 'x' },
     )).resolves.toEqual({ ok: true, result: { staged: true } });
   });
 
@@ -472,9 +472,11 @@ describe('M018 universal durable disposition claims', () => {
         version: 1,
         name: 'invalid host requirement',
         topology: {
-          kind: 'one_node_v1',
-          entryNodeId: 'entry',
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
           nodes: [{ nodeId: 'entry', role: 'worker', backend: 'unsupported' }],
+          edges: [],
         },
         entryContracts: [],
         policy: DEFAULT_WORKFLOW_POLICY,
@@ -490,9 +492,11 @@ describe('M018 universal durable disposition claims', () => {
       version: 1,
       name: 'host policy',
       topology: {
-        kind: 'one_node_v1',
-        entryNodeId: 'entry',
+        kind: 'workflow',
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', role: 'worker', backend: 'grok' }],
+        edges: [],
       },
       entryContracts: [],
       policy: DEFAULT_WORKFLOW_POLICY,
@@ -507,7 +511,7 @@ describe('M018 universal durable disposition claims', () => {
       version: 1,
       startIdempotencyKey: 'host-policy-start',
       backend: 'grok',
-      entryInputs: [],
+      inputs: [],
     };
     const context = {
       callerTaskId: root.id,
@@ -538,8 +542,9 @@ describe('M018 universal durable disposition claims', () => {
       version: 1,
       name: 'host policy script',
       topology: {
-        kind: 'one_node_v1',
-        entryNodeId: 'script',
+        kind: 'workflow',
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'script' }],
         nodes: [{
           nodeId: 'script',
           backend: 'script',
@@ -548,9 +553,14 @@ describe('M018 universal durable disposition claims', () => {
             interpreter: 'node',
             file: 'scripts/check.js',
             args: [],
-            onFailure: 'fail_run',
+          },
+          outcome: {
+            kind: 'exit',
+            next: { when: { exitCode: 0 } },
+            fail: { when: { exitCode: 'nonzero' } },
           },
         }],
+        edges: [],
       },
       entryContracts: [],
       policy: DEFAULT_WORKFLOW_POLICY,
@@ -583,7 +593,7 @@ describe('M018 universal durable disposition claims', () => {
         definitionId: 'wf-host-policy-script',
         version: 1,
         startIdempotencyKey: 'host-policy-script-disabled',
-        entryInputs: [],
+        inputs: [],
       },
     );
     expect(hostRunDisabled).toMatchObject({ ok: false });
@@ -694,12 +704,16 @@ describe('M018 universal durable disposition claims', () => {
         version: 1,
         name: definitionId,
         topology: {
-          kind: 'one_node_v1',
-          entryNodeId: 'entry',
+          kind: 'workflow',
+          inputs: contract
+            ? [{ name: 'request', semanticKind: 'request', entryNodeId: 'entry', inputRef: 'request' }]
+            : [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
           nodes: [{ nodeId: 'entry', role: 'worker', backend: 'grok' }],
+          edges: [],
         },
         entryContracts: contract
-          ? [{ entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'next_result' }]
+          ? [{ entryNodeId: 'entry', inputRef: 'request', expectedArtifactKind: 'workflow_input' }]
           : [],
         policy: DEFAULT_WORKFLOW_POLICY,
         ownerRootTaskId: root.id,
@@ -720,7 +734,7 @@ describe('M018 universal durable disposition claims', () => {
                 workspace_id, run_id, artifact_id, producer_node_id, logical_name,
                 revision, kind, payload_json, created_at
               ) VALUES ('ws', 'child-policy-source-run', 'child-policy-input', NULL,
-                        'request', 1, 'next_result', '{"value":"input"}', ?)`,
+                        'request', 1, 'workflow_input', '{"value":"input"}', ?)`,
         params: [root.createdAt],
       },
       {

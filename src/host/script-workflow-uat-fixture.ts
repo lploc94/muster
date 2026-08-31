@@ -119,6 +119,57 @@ function route(
   return routed.command;
 }
 
+function exitOutcome() {
+  return {
+    kind: 'exit',
+    next: { when: { exitCode: 0 } },
+    fail: { when: { exitCode: 'nonzero' } },
+  };
+}
+
+function scriptNode(nodeKey: string, file: string, args: string[] = []) {
+  return {
+    nodeKey,
+    script: { interpreter: 'node', file, args },
+    outcome: exitOutcome(),
+  };
+}
+
+function canonicalManifest(
+  name: string,
+  nodes: readonly Record<string, unknown>[],
+  edges: readonly Record<string, unknown>[] = [],
+  inputs: readonly Record<string, unknown>[] = [],
+  outputs: readonly Record<string, unknown>[] = [{ name: 'result', kind: 'result', from: 'run' }],
+): Record<string, unknown> {
+  return {
+    schema: 'muster.workflow/v2',
+    name,
+    description: `${name} description`,
+    inputs,
+    outputs,
+    nodes,
+    edges,
+  };
+}
+
+async function writeCanonicalPackage(
+  root: string,
+  packageName: string,
+  manifest: Record<string, unknown>,
+  assets: Record<string, string>,
+): Promise<string> {
+  const packageRoot = join(root, packageName);
+  await mkdir(packageRoot, { recursive: true });
+  await writeFile(join(packageRoot, 'workflow.json'), JSON.stringify(manifest), 'utf8');
+  await Promise.all(Object.entries(assets).map(async ([relative, content]) => {
+    const file = join(packageRoot, ...relative.split('/'));
+    await mkdir(join(file, '..'), { recursive: true });
+    await writeFile(file, content, 'utf8');
+  }));
+  return packageRoot;
+}
+
 async function invoke(
   deps: ScriptWorkflowUatDeps,
   credential: CredentialContext,
@@ -138,10 +189,13 @@ async function defineAndStart(
 ): Promise<{ definitionId: string; runId: string; entryTaskId: string }> {
   const definition = route('define_workflow', semantic, credential);
   assertQa(definition.kind === 'define_workflow', 'define route returned the wrong command');
-  assertQa('definitionId' in definition, 'inline define route returned no definition identity');
-  await invoke(deps, credential, 'define_workflow', definition);
+  const defined = await invoke(deps, credential, 'define_workflow', definition) as { definitionId?: unknown };
+  const definitionId = 'definitionId' in definition
+    ? definition.definitionId
+    : defined.definitionId;
+  assertQa(typeof definitionId === 'string', 'define route returned no definition identity');
   const start = route('start_workflow', {
-    workflow: `${definition.definitionId}@1`,
+    workflow: `${definitionId}@1`,
     goal,
   }, credential);
   assertQa(start.kind === 'start_workflow', 'start route returned the wrong command');
@@ -151,7 +205,7 @@ async function defineAndStart(
   };
   assertQa(typeof result.runId === 'string', 'start returned no runId');
   assertQa(typeof result.entryTaskId === 'string', 'start returned no entryTaskId');
-  return { definitionId: definition.definitionId, runId: result.runId, entryTaskId: result.entryTaskId };
+  return { definitionId, runId: result.runId, entryTaskId: result.entryTaskId };
 }
 
 /**
@@ -200,7 +254,7 @@ export async function runScriptWorkflowUatFixture(
    const workspaceCatalog = join(deps.workspaceFolder, '.muster', 'workflows');
    const globalCatalog = join(homedir(), '.muster', 'workflows');
    const globalBundle = join(globalCatalog, 'native-qa-bundle');
-   const globalBundleEntry = join(globalBundle, 'native-qa-bundle.md');
+   const globalBundleManifest = join(globalBundle, 'workflow.json');
    const globalBundleScript = join(globalBundle, 'scripts', 'native-global.ts');
   await Promise.all([
     mkdir(workspaceCatalog, { recursive: true }),
@@ -208,31 +262,31 @@ export async function runScriptWorkflowUatFixture(
     mkdir(join(globalBundle, 'scripts'), { recursive: true }),
     mkdir(join(deps.workspaceFolder, 'scripts'), { recursive: true }),
   ]);
-  const savedName = `Native QA Saved Workflow ${randomUUID()}`;
-  const workspaceSaved = join(workspaceCatalog, 'native-qa-saved.md');
-  const globalSaved = join(globalCatalog, 'native-qa-saved.md');
-  const invalidSaved = join(workspaceCatalog, 'native-qa-invalid.md');
-  const markdown = (description: string, body: string) => [
-    '---',
-    `name: ${savedName}`,
-    `description: ${description}`,
-    '---',
-    body,
-  ].join('\n');
-  await Promise.all([
-    writeFile(globalSaved, markdown('global native QA', 'Global native QA body'), 'utf8'),
-    writeFile(workspaceSaved, markdown('workspace native QA', 'Workspace native QA body'), 'utf8'),
-    writeFile(invalidSaved, 'invalid workflow without frontmatter', 'utf8'),
-    writeFile(globalBundleEntry, [
-      '---',
-      'name: Native global bundle',
-      'description: Global bundle package-root proof',
-      '---',
-      'Run the global package script.',
-    ].join('\n'), 'utf8'),
-    writeFile(globalBundleScript, [
-      'const result: string = "global-bundle";',
-      'process.stdout.write(result);',
+   const savedName = `Native QA Saved Workflow ${randomUUID()}`;
+   const workspaceSaved = join(workspaceCatalog, 'native-qa-saved');
+   const globalSaved = join(globalCatalog, 'native-qa-saved');
+   const invalidSaved = join(workspaceCatalog, 'native-qa-invalid');
+   const savedManifest = (description: string) => ({
+     ...canonicalManifest(
+       savedName,
+       [{ nodeKey: 'saved', taskType: 'review', instructions: { inline: 'Review the request.' } }],
+       [],
+       [],
+       [{ name: 'result', kind: 'result', from: 'saved' }],
+     ),
+     description,
+   });
+   await Promise.all([
+     writeCanonicalPackage(globalCatalog, 'native-qa-saved', savedManifest('global native QA'), {}),
+     writeCanonicalPackage(workspaceCatalog, 'native-qa-saved', savedManifest('workspace native QA'), {}),
+     mkdir(invalidSaved, { recursive: true }).then(() => writeFile(join(invalidSaved, 'workflow.json'), '{invalid json', 'utf8')),
+     writeFile(globalBundleManifest, JSON.stringify(canonicalManifest(
+       'Native global bundle',
+       [scriptNode('global', 'scripts/native-global.ts')],
+     )), 'utf8'),
+     writeFile(globalBundleScript, [
+       'const result: string = "global-bundle";',
+       'process.stdout.write(result);',
     ].join('\n'), 'utf8'),
     writeFile(join(deps.workspaceFolder, 'scripts', 'native-global.ts'),
       'process.stdout.write("workspace-shadow");', 'utf8'),
@@ -242,7 +296,7 @@ export async function runScriptWorkflowUatFixture(
       // would have passed without argv ever being exercised.
       "process.stdout.write('native-alpha\\n|' + process.argv[2]);",
       "process.stderr.write('native diagnostic');",
-      'process.exitCode = 3;',
+       'process.exitCode = 0;',
     ].join('\n'), 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-consume.js'), [
       "let input = '';",
@@ -274,8 +328,8 @@ export async function runScriptWorkflowUatFixture(
     assertQa(selected?.scope === 'workspace', 'workspace catalog did not shadow global');
     assertQa(selected.description === 'workspace native QA', 'workspace catalog metadata lost');
     assertQa(
-      listed.diagnostics?.some((entry) =>
-        entry.file === 'native-qa-invalid.md' && entry.code === 'invalid_workflow_file'),
+     listed.diagnostics?.some((entry) =>
+         entry.file === 'native-qa-invalid' && entry.code === 'invalid_workflow_file'),
       'invalid catalog file was not diagnosed',
     );
     assertQa(!JSON.stringify(listed).includes(deps.workspaceFolder), 'catalog list leaked a path');
@@ -290,10 +344,11 @@ export async function runScriptWorkflowUatFixture(
       credential,
       'get_predefined_workflow',
       { kind: 'get_predefined_workflow', workflowRef: selected.workflowRef },
-    ) as { body?: unknown; provenance?: unknown };
-    assertQa(loaded.body === 'Workspace native QA body', 'opaque catalog ref returned wrong body');
-    assertQa(loaded.provenance === 'user-authored-untrusted', 'catalog provenance was not explicit');
-    await writeFile(workspaceSaved, markdown('workspace native QA changed', 'Changed body'), 'utf8');
+     ) as { name?: unknown; description?: unknown; body?: unknown; provenance?: unknown };
+     assertQa(loaded.name === savedName, 'opaque catalog ref returned wrong metadata');
+     assertQa(loaded.description === 'workspace native QA', 'catalog metadata was not explicit');
+     assertQa(loaded.body === undefined && loaded.provenance === undefined, 'catalog returned package body');
+     await writeFile(join(workspaceSaved, 'workflow.json'), JSON.stringify(savedManifest('workspace native QA changed')), 'utf8');
     const stale = await deps.engine.handleToolCall(
       credential,
       'get_predefined_workflow',
@@ -301,31 +356,21 @@ export async function runScriptWorkflowUatFixture(
     );
     assertQa(!stale.ok && /not found or changed/.test(stale.error), 'stale catalog ref was accepted');
 
-    const dataflowDefinition = route('define_workflow', {
-      name: `Native script dataflow ${rootId}`,
-      nodes: [
-        {
-          nodeKey: 'produce',
-          script: {
-            interpreter: 'node',
-            file: 'native-produce.js',
-            // Shell metacharacters as a real argv entry: the producer echoes
-            // `process.argv[2]`, so the downstream assertion fails if the executor
-            // ever expands or re-quotes an argument.
-            args: ['a;$(literal)'],
-            onFailure: 'continue',
-          },
-        },
-        {
-          nodeKey: 'consume',
-          script: { interpreter: 'node', file: 'native-consume.js' },
-        },
-      ],
-      edges: [{ from: 'produce', to: 'consume', as: 'dep' }],
-    }, credential);
-    assertQa(dataflowDefinition.kind === 'define_workflow', 'dataflow definition route failed');
-    assertQa('definitionId' in dataflowDefinition, 'inline dataflow definition returned no identity');
-    await invoke(deps, credential, 'define_workflow', dataflowDefinition);
+     const dataflowDefinition = route('define_workflow', {
+       manifest: canonicalManifest(
+         `Native script dataflow ${rootId}`,
+         [
+           scriptNode('produce', 'native-produce.js', ['a;$(literal)']),
+           scriptNode('consume', 'native-consume.js'),
+         ],
+         [{ from: 'produce', to: 'consume', inputRef: 'dep' }],
+         [],
+         [{ name: 'result', kind: 'result', from: 'consume' }],
+       ),
+     }, credential);
+     assertQa(dataflowDefinition.kind === 'define_workflow', 'dataflow definition route failed');
+     assertQa('definitionId' in dataflowDefinition, 'inline dataflow definition returned no identity');
+     await invoke(deps, credential, 'define_workflow', dataflowDefinition);
     const dataflowStart = route('start_workflow', {
       workflow: `${dataflowDefinition.definitionId}@1`,
       goal: 'Native dataflow QA',
@@ -368,14 +413,9 @@ export async function runScriptWorkflowUatFixture(
       'continue dataflow did not succeed',
     );
 
-    const globalBundleRun = await defineAndStart(deps, credential, {
-      name: `Native global bundle execution ${rootId}`,
-      predefinedWorkflowRef: globalBundleEntryRef!.workflowRef,
-      nodes: [{
-        nodeKey: 'global',
-        script: { interpreter: 'node', file: 'scripts/native-global.ts' },
-      }],
-    }, 'Native global bundle QA');
+     const globalBundleRun = await defineAndStart(deps, credential, {
+       predefinedWorkflowRef: globalBundleEntryRef!.workflowRef,
+     }, 'Native global bundle QA');
     assertQa(
       await waitForRun(deps.repository, globalBundleRun.runId, rootId) === 'succeeded',
       'global bundle workflow did not succeed',
@@ -393,7 +433,7 @@ export async function runScriptWorkflowUatFixture(
       'const result: string = "changed-global-bundle";',
       'process.stdout.write(result);',
     ].join('\n'), 'utf8');
-    const staleGlobalBundleStart = route('start_workflow', {
+     const staleGlobalBundleStart = route('start_workflow', {
       workflow: `${globalBundleRun.definitionId}@1`,
       goal: 'Native changed package rejection',
     }, credential);
@@ -431,11 +471,11 @@ export async function runScriptWorkflowUatFixture(
       'producer stdout was not preserved exactly',
     );
     assertQa(
-      JSON.stringify(producerArtifact).includes('"exitCode":3'),
-      'continue exit metadata was not persisted',
+      JSON.stringify(producerArtifact).includes('"exitCode":0'),
+      'NEXT exit metadata was not persisted',
     );
     assertQa(
-      consumerArtifact.result === 'native-alpha\n|a;$(literal)|exit=3',
+      consumerArtifact.result === 'native-alpha\n|a;$(literal)|exit=0',
       'downstream stdin dataflow lost stdout or exit metadata',
     );
     assertQa(!JSON.stringify(artifacts).includes('native diagnostic'), 'stderr leaked into an artifact');
@@ -450,7 +490,7 @@ export async function runScriptWorkflowUatFixture(
     assertQa(
       producerTurns.some((entry) =>
         entry.executionResult?.stderr === 'native diagnostic' &&
-        entry.executionResult.exitCode === 3),
+        entry.executionResult.exitCode === 0),
       'stderr was not retained on the producing turn',
     );
     const sessionClaims = await deps.client.get<{ count: number }>(
@@ -466,13 +506,15 @@ export async function runScriptWorkflowUatFixture(
     const graph = await deps.repository.getWorkflowGraphForTask(dataflowResult.entryTaskId);
     assertQa(graph?.nodes.length === 2 && graph.edges.length === 1, 'script graph projection was incomplete');
 
-    const empty = await defineAndStart(deps, credential, {
-      name: `Native empty stdout ${rootId}`,
-      nodes: [{
-        nodeKey: 'empty',
-        script: { interpreter: 'node', file: 'native-empty.js' },
-      }],
-    }, 'Native empty stdout QA');
+     const empty = await defineAndStart(deps, credential, {
+       manifest: canonicalManifest(
+         `Native empty stdout ${rootId}`,
+         [scriptNode('empty', 'native-empty.js')],
+         [],
+         [],
+         [{ name: 'result', kind: 'result', from: 'empty' }],
+       ),
+     }, 'Native empty stdout QA');
     assertQa(await waitForRun(deps.repository, empty.runId, rootId) === 'succeeded', 'empty stdout failed');
     const emptyArtifact = await deps.client.get<{ payload_json: string }>(
       `SELECT payload_json FROM workflow_artifacts
@@ -484,17 +526,15 @@ export async function runScriptWorkflowUatFixture(
       'empty stdout was dropped from the artifact',
     );
 
-    const failed = await defineAndStart(deps, credential, {
-      name: `Native fail run ${rootId}`,
-      nodes: [{
-        nodeKey: 'fail',
-        script: {
-          interpreter: 'node',
-          file: 'native-fail.js',
-          onFailure: 'fail_run',
-        },
-      }],
-    }, 'Native fail_run QA');
+     const failed = await defineAndStart(deps, credential, {
+       manifest: canonicalManifest(
+         `Native fail run ${rootId}`,
+         [scriptNode('fail', 'native-fail.js')],
+         [],
+         [],
+         [{ name: 'result', kind: 'result', from: 'fail' }],
+       ),
+     }, 'Native fail QA');
     assertQa(await waitForRun(deps.repository, failed.runId, rootId) === 'failed', 'fail_run succeeded');
     assertQa((await deps.repository.listTurns(failed.entryTaskId)).length === 1, 'fail_run retried');
 

@@ -27,8 +27,8 @@ export const WORKFLOW_PACKAGE_HASH_LENGTH = 64;
 
 export type ScriptInterpreter = 'node' | 'python' | 'python3';
 
-export type WorkflowPackageKind = 'file' | 'bundle';
-export type WorkflowCatalogRootKind = 'canonical' | 'legacy' | 'custom';
+export type WorkflowPackageKind = 'bundle';
+export type WorkflowCatalogRootKind = 'canonical' | 'custom';
 
 /** Host-authored provenance for a predefined workflow package. */
 export interface WorkflowPackageSource {
@@ -36,9 +36,9 @@ export interface WorkflowPackageSource {
   scope: 'workspace' | 'global';
   packageKind: WorkflowPackageKind;
   catalogRootKind: WorkflowCatalogRootKind;
-  /** Relative to the selected catalog root; `.` for a flat workflow file. */
+  /** Direct-child package directory relative to the selected catalog root. */
   packagePath: string;
-  /** Relative to packagePath; flat workflows use the Markdown basename. */
+  /** The one authoritative manifest in the package. */
   entryFile: string;
   workflowRef: string;
   packageSha256: string;

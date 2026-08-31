@@ -6,10 +6,10 @@
 export const WORKFLOW_CATALOG_REQUEST_ID_MAX = 128;
 /** Predefined refs use `pwf_` plus 32 lowercase hex chars (36); this allows headroom. */
 export const WORKFLOW_CATALOG_REF_MAX = 64;
-/** Mirrors parsePredefinedWorkflowMarkdown's 200-character name bound. */
+/** Mirrors the canonical workflow manifest name bound. */
 export const WORKFLOW_CATALOG_NAME_MAX = 200;
-/** Mirrors parsePredefinedWorkflowMarkdown's 1,000-character description bound. */
-export const WORKFLOW_CATALOG_DESCRIPTION_MAX = 1_000;
+/** Mirrors the canonical workflow manifest description bound. */
+export const WORKFLOW_CATALOG_DESCRIPTION_MAX = 4_096;
 /** Per-payload wire budget; the host's 128-file limit is per scope across two scopes, and the route clamps and reports truncation. */
 export const WORKFLOW_CATALOG_WORKFLOWS_MAX = 128;
 /** Mirrors PREDEFINED_WORKFLOW_MAX_DIAGNOSTICS. */
@@ -26,7 +26,7 @@ export const WORKFLOW_CATALOG_REASONS = ['initial', 'reload'] as const;
 export type WorkflowCatalogReason = (typeof WORKFLOW_CATALOG_REASONS)[number];
 
 export type WorkflowCatalogWireScope = 'workspace' | 'global';
-export type WorkflowCatalogWirePackageKind = 'file' | 'bundle';
+export type WorkflowCatalogWirePackageKind = 'bundle';
 
 export interface WorkflowCatalogWireEntry {
   workflowRef: string;
@@ -67,7 +67,7 @@ export type ParsedRequestWorkflowCatalog =
 const ERROR_CODES = new Set<string>(WORKFLOW_CATALOG_ERROR_CODES);
 const REASONS = new Set<string>(WORKFLOW_CATALOG_REASONS);
 const SCOPES = new Set<string>(['workspace', 'global']);
-const PACKAGE_KINDS = new Set<string>(['file', 'bundle']);
+const PACKAGE_KINDS = new Set<string>(['bundle']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);

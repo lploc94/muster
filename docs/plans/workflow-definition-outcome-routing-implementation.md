@@ -105,7 +105,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `refactor(workflow-definition): adopt canonical manifest contract`
 
 ## Phase 2: Make workflow.json the Package Authority
-- Status: pending
+- Status: complete
 - Depends on: Phase 1
 - Goal: Discover saved workflows only as canonical `workflow.json` bundles and freeze every referenced instruction/script asset before definition persistence.
 - Current behavior: `src/host/predefined-workflows.ts` scans flat Markdown and Markdown-entry bundles under global/workspace canonical and singular fallback roots, derives package refs/digests, and freezes script provenance; Markdown body/frontmatter remains the saved workflow source.
@@ -129,9 +129,9 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
   - Remove Markdown/frontmatter topology compilation and legacy fallback code/tests/docs; retain Markdown parsing libraries only where used by unrelated product surfaces.
   - Keep catalog read-only: it discovers/describes packages but does not execute, persist, or expose prompt bodies.
 - Acceptance criteria:
-  - [ ] AC-1: Only safe canonical `workflow.json` bundles are listed/resolved from existing global/workspace roots - proven by `src/host/predefined-workflows.test.ts` and catalog route/wire tests.
-  - [ ] AC-2: Referenced prompt and script bytes are bounded, integrity-checked, fingerprinted, and frozen before definition persistence - proven by package mutation/CWD/symlink tests.
-  - [ ] AC-3: Flat/legacy Markdown workflows are no longer compiled or advertised - proven by explicit negative catalog and coordinator tests.
+  - [x] AC-1: Only safe canonical `workflow.json` bundles are listed/resolved from existing global/workspace roots - proven by `src/host/predefined-workflows.test.ts` and catalog route/wire tests.
+  - [x] AC-2: Referenced prompt and script bytes are bounded, integrity-checked, fingerprinted, and frozen before definition persistence - proven by package mutation/CWD/symlink tests.
+  - [x] AC-3: Flat/legacy Markdown workflows are no longer compiled or advertised - proven by explicit negative catalog and coordinator tests.
 - Focused verification:
   - `npx vitest run src/host/predefined-workflows.test.ts src/host/workflow-catalog-cache.test.ts src/host/workflow-catalog-route.test.ts src/shared/workflow-catalog-wire.test.ts src/task/coordinator-tools.test.ts src/task/script-workflow.test.ts`
 - Phase gates:
@@ -343,7 +343,7 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 | Phase | Status | Commit | Verification | Review |
 |---|---|---|---|---|
 | 1 | complete | this phase commit (`refactor(workflow-definition): adopt canonical manifest contract`) | Focused: 180/180; `npx tsc -p . --noEmit`; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 3 rounds; 5 findings fixed |
-| 2 | pending | N/A | pending | pending |
+| 2 | complete | this phase commit (`feat(workflow-packages): make workflow json authoritative`) | Focused: 164/164; script-workflow QA: 150/150; compile; source-boundary + fixtures passed; native VS Code 1.135.0 rerun remains truthfully pending after its UAT-only workspace setting update blocked before run creation | `codex-impl-review` APPROVE in 4 rounds; 9 findings fixed |
 | 3 | pending | N/A | pending | pending |
 | 4 | pending | N/A | pending | pending |
 | 5 | pending | N/A | pending | pending |

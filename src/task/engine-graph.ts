@@ -7,6 +7,7 @@ import { DEFAULT_ACP_EXECUTOR_ID } from '../backends/executor-registry';
 import {
   getPredefinedWorkflow,
   listPredefinedWorkflows,
+  resolvePredefinedWorkflowDefinition,
 } from '../host/predefined-workflows';
 import type { Backend, RunInput, RunOptions } from '../types';
 import { canBindTaskToBackend } from './backend-eligibility';
@@ -54,6 +55,7 @@ import type { GraphCommandKind, RepositoryCommand, TaskRepository } from './repo
 import { durableDispositionClaim } from './disposition-claim';
 import type {
   StartWorkflowEntryInput,
+  WorkflowEntryContract,
   WorkflowDefinition,
   WorkflowPolicy,
   WorkflowStartInput,
@@ -412,6 +414,13 @@ function workflowHostPolicyError(code: string, message: string): {
   error: string;
 } {
   return { ok: false, error: JSON.stringify({ code, message }) };
+}
+
+function predefinedWorkflowDefinitionId(rootId: string, workflowRef: string): string {
+  return `workflow-${createHash('sha256')
+    .update(rootId).update('\0')
+    .update(workflowRef)
+    .digest('hex').slice(0, 32)}`;
 }
 
 function resolvePublicWorkflowStartInputs(
@@ -2929,27 +2938,57 @@ export async function executeToolCommand(
     }
 
     case 'define_workflow': {
-      if ('predefinedWorkflowRef' in command) {
-        return workflowHostPolicyError(
-          'predefined_workflow_manifest_unavailable',
-          'saved workflow packages require a canonical workflow manifest',
-        );
-      }
       const caller = await deps.repository.getTask(ctx.callerTaskId);
       if (!caller || caller.lifecycle !== 'open') {
         return workflowHostPolicyError('caller_not_open', 'caller task is not open');
       }
-      const latest = command.version === undefined
-        ? await deps.repository.getLatestWorkflowDefinition(command.definitionId, ctx.rootId)
-        : undefined;
-      const initialVersion = command.version ?? latest?.version ?? 1;
+      let definitionId: string;
+      let version: number | undefined;
+      let name: string;
+      let topology: unknown;
+      let entryContracts: readonly WorkflowEntryContract[];
+      let policy: WorkflowPolicy;
+      let latest: WorkflowDefinition | undefined;
+      let explicitVersion: number | undefined;
+      if ('predefinedWorkflowRef' in command) {
+        const workspaceFolder = workflowCatalogFolder(deps, caller);
+        const resolved = await resolvePredefinedWorkflowDefinition(
+          {
+            workspaceFolder,
+            ...(deps.globalWorkflowFolder !== undefined
+              ? { globalWorkflowFolder: deps.globalWorkflowFolder }
+              : {}),
+          },
+          command.predefinedWorkflowRef,
+        );
+        if (!resolved.ok) return workflowHostPolicyError(resolved.code, resolved.reason);
+        definitionId = predefinedWorkflowDefinitionId(ctx.rootId, resolved.source.workflowRef);
+        latest = await deps.repository.getLatestWorkflowDefinition(definitionId, ctx.rootId);
+        version = latest?.version ?? 1;
+        name = resolved.name;
+        topology = resolved.topology;
+        entryContracts = resolved.entryContracts;
+        policy = deriveDefaultWorkflowPolicy(resolved.entryContracts);
+      } else {
+        definitionId = command.definitionId;
+        explicitVersion = command.version;
+        latest = command.version === undefined
+          ? await deps.repository.getLatestWorkflowDefinition(command.definitionId, ctx.rootId)
+          : undefined;
+        version = explicitVersion ?? latest?.version ?? 1;
+        name = command.name;
+        topology = command.topology;
+        entryContracts = command.entryContracts;
+        policy = command.policy ?? deriveDefaultWorkflowPolicy(command.entryContracts);
+      }
+      const initialVersion = version ?? 1;
       const validated = validateDefineWorkflow({
-        definitionId: command.definitionId,
+        definitionId,
         version: initialVersion,
-        name: command.name,
-        topology: command.topology,
-        entryContracts: command.entryContracts,
-        policy: command.policy ?? deriveDefaultWorkflowPolicy(command.entryContracts),
+        name,
+        topology,
+        entryContracts,
+        policy,
         scope: { kind: 'root', ownerRootTaskId: ctx.rootId },
         createdAt: now,
       });
@@ -2960,7 +2999,7 @@ export async function executeToolCommand(
       if (!frozen.ok) return frozen;
       let definition = frozen.definition;
       if (
-        command.version === undefined && latest &&
+        explicitVersion === undefined && latest &&
         fingerprintWorkflowDefinition(definition) !== fingerprintWorkflowDefinition(latest)
       ) {
         const next = validateDefineWorkflow({ ...definition, version: latest.version + 1 });

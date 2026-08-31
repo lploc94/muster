@@ -10,16 +10,24 @@ import {
   resolve,
 } from 'node:path';
 import { lstat, open, opendir, realpath, stat } from 'node:fs/promises';
-import type {
-  ScriptInterpreter,
-  WorkflowCatalogRootKind,
-  WorkflowPackageKind,
-  WorkflowPackageSource,
-  WorkflowScriptSource,
+import { decodeWorkflowManifest } from '../task/workflow-codec';
+import {
+  WORKFLOW_DESCRIPTION_MAX_LENGTH,
+  WORKFLOW_INSTRUCTIONS_MAX_LENGTH,
+  WORKFLOW_NAME_MAX_LENGTH,
+  WORKFLOW_PACKAGE_PATH_MAX_LENGTH,
+  WORKFLOW_SCHEMA,
+  isValidWorkflowScriptFile,
+  type ScriptInterpreter,
+  type WorkflowCatalogRootKind,
+  type WorkflowEntryContract,
+  type WorkflowPackageKind,
+  type WorkflowScriptSource,
+  type WorkflowTopology,
+  type WorkflowPackageSource,
 } from '../task/workflow-types';
 
 export const PREDEFINED_WORKFLOW_CATALOG_DIRECTORY = 'workflows';
-export const PREDEFINED_WORKFLOW_LEGACY_DIRECTORY = 'workflow';
 export const PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE = 128;
 export const PREDEFINED_WORKFLOW_MAX_FILE_BYTES = 256 * 1024;
 export const PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES = 1024 * 1024;
@@ -28,7 +36,6 @@ export const PREDEFINED_WORKFLOW_MAX_BUNDLE_DIRECTORIES = 256;
 export const PREDEFINED_WORKFLOW_MAX_BUNDLE_ENTRIES = 512;
 export const PREDEFINED_WORKFLOW_MAX_BUNDLE_DEPTH = 32;
 export const PREDEFINED_WORKFLOW_MAX_BUNDLE_BYTES = 8 * 1024 * 1024;
-export const PREDEFINED_WORKFLOW_MAX_BODY_CHARS = 120_000;
 export const PREDEFINED_WORKFLOW_MAX_DIAGNOSTICS = 32;
 
 export type PredefinedWorkflowScope = 'workspace' | 'global';
@@ -42,15 +49,12 @@ export interface PredefinedWorkflowSummary {
   packageKind: PredefinedWorkflowPackageKind;
 }
 
+export type PredefinedWorkflowDocument = PredefinedWorkflowSummary;
+
 export interface PredefinedWorkflowDiagnostic {
   file: string;
   code: string;
   message: string;
-}
-
-export interface PredefinedWorkflowDocument extends PredefinedWorkflowSummary {
-  body: string;
-  provenance: 'user-authored-untrusted';
 }
 
 export interface PredefinedWorkflowCatalogOptions {
@@ -64,19 +68,36 @@ export interface ResolvedPredefinedWorkflow {
   source: WorkflowPackageSource;
   /** Canonical package root, retained only inside the host resolution path. */
   packageRoot: string;
+  /** Normalized manifest retained inside the host resolution path. */
+  manifest: {
+    name: string;
+    topology: WorkflowTopology;
+    entryContracts: WorkflowEntryContract[];
+  };
 }
 
-interface CatalogEntry extends PredefinedWorkflowDocument {
+export type FrozenPredefinedWorkflowDefinition = {
+  name: string;
+  topology: WorkflowTopology;
+  entryContracts: WorkflowEntryContract[];
   source: WorkflowPackageSource;
   packageRoot: string;
+};
+
+export type PredefinedWorkflowDefinitionResolution =
+  | ({ ok: true } & FrozenPredefinedWorkflowDefinition)
+  | { ok: false; code: 'predefined_workflow_stale' | 'predefined_workflow_asset_invalid'; reason: string };
+
+interface CatalogEntry {
+  document: PredefinedWorkflowDocument;
+  source: WorkflowPackageSource;
   collisionKey: string;
 }
 
 interface CatalogCandidate {
   name: string;
-  packageKind: PredefinedWorkflowPackageKind;
   packageRoot: string;
-  entryFile?: string;
+  kind: 'directory' | 'symlink';
 }
 
 interface ScopeScan {
@@ -84,6 +105,23 @@ interface ScopeScan {
   entries: CatalogEntry[];
   diagnostics: PredefinedWorkflowDiagnostic[];
 }
+
+interface PackageFile {
+  relativePath: string;
+  content: Buffer;
+}
+
+interface CanonicalBundle {
+  files: PackageFile[];
+  manifestContent: Buffer;
+}
+
+interface CanonicalManifestMetadata {
+  name: string;
+  description: string;
+}
+
+const packageFiles = new WeakMap<ResolvedPredefinedWorkflow, readonly PackageFile[]>();
 
 class CatalogFileError extends Error {}
 
@@ -98,14 +136,6 @@ function boundedFileLabel(file: string): string {
 function boundedDiagnosticMessage(error: unknown): string {
   if (error instanceof CatalogFileError) return error.message.slice(0, 240);
   return 'unable to read workflow package';
-}
-
-function stripSymmetricQuotes(value: string): string {
-  if (value.length >= 2 && (
-    (value.startsWith('"') && value.endsWith('"')) ||
-    (value.startsWith("'") && value.endsWith("'"))
-  )) return value.slice(1, -1);
-  return value;
 }
 
 function digestBytes(content: Buffer): string {
@@ -131,16 +161,14 @@ async function pathHasNoSymlinkComponents(root: string, candidate: string): Prom
   return true;
 }
 
-function normalizedRelativePath(value: string): string | undefined {
-  if (
-    typeof value !== 'string' ||
-    value.length === 0 ||
-    /[\0\r\n]/.test(value)
-  ) return undefined;
+function normalizedRelativePath(value: string, allowDot = false): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || /[\0\r\n]/.test(value)) return undefined;
   const portable = value.replace(/\\/g, '/');
   if (portable.startsWith('/') || /^[A-Za-z]:/.test(portable)) return undefined;
   const parts = portable.split('/');
-  if (parts.some((part) => part === '..' || part === '' || /[\x00-\x1f\x7f]/.test(part))) return undefined;
+  if (parts.some((part) => part === '..' || part === '' || (!allowDot && part === '.') || /[\x00-\x1f\x7f]/.test(part))) {
+    return undefined;
+  }
   return parts.join('/');
 }
 
@@ -149,65 +177,17 @@ function sourceDescriptorValid(source: WorkflowPackageSource): boolean {
   const entryFile = normalizedRelativePath(source.entryFile);
   return source.kind === 'predefined' &&
     (source.scope === 'workspace' || source.scope === 'global') &&
-    (source.packageKind === 'file' || source.packageKind === 'bundle') &&
-    (source.catalogRootKind === 'canonical' || source.catalogRootKind === 'legacy' || source.catalogRootKind === 'custom') &&
-    (source.catalogRootKind !== 'custom' || (source.scope === 'global' && source.catalogRootKind === 'custom')) &&
-    typeof source.packagePath === 'string' && source.packagePath.length <= 1_024 &&
-    typeof source.entryFile === 'string' && source.entryFile.length <= 1_024 &&
+    source.packageKind === 'bundle' &&
+    (source.catalogRootKind === 'canonical' || source.catalogRootKind === 'custom') &&
+    (source.catalogRootKind !== 'custom' || source.scope === 'global') &&
+    typeof source.packagePath === 'string' && source.packagePath.length <= WORKFLOW_PACKAGE_PATH_MAX_LENGTH &&
+    typeof source.entryFile === 'string' && source.entryFile === 'workflow.json' &&
     packagePath !== undefined &&
-    entryFile !== undefined &&
-    !entryFile.includes('/') &&
-    (source.packageKind === 'file' ? source.packagePath === '.' : source.packagePath !== '.') &&
-    (source.packageKind === 'file' ? source.packagePath === '.' : !packagePath.includes('/')) &&
+    entryFile === 'workflow.json' &&
+    !source.packagePath.includes('/') &&
+    !source.packagePath.includes('\\') &&
     /^pwf_[a-f0-9]{32}$/.test(source.workflowRef) &&
     /^[a-f0-9]{64}$/.test(source.packageSha256);
-}
-
-export function parsePredefinedWorkflowMarkdown(
-  source: string,
-): { ok: true; name: string; description: string; body: string } | { ok: false; reason: string } {
-  const normalized = source.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
-  const lines = normalized.split('\n');
-  if (lines[0] !== '---') return { ok: false, reason: 'frontmatter must start on the first line' };
-  const close = lines.indexOf('---', 1);
-  if (close < 0) return { ok: false, reason: 'frontmatter closing delimiter is missing' };
-
-  const fields = new Map<string, string>();
-  for (const line of lines.slice(1, close)) {
-    if (!line.trim()) continue;
-    const colon = line.indexOf(':');
-    if (colon <= 0) return { ok: false, reason: 'frontmatter must use key: value lines' };
-    const key = line.slice(0, colon).trim();
-    if (key !== 'name' && key !== 'description') {
-      return { ok: false, reason: `unsupported frontmatter field: ${key || '(empty)'}` };
-    }
-    if (fields.has(key)) return { ok: false, reason: `duplicate frontmatter field: ${key}` };
-    const value = stripSymmetricQuotes(line.slice(colon + 1).trim());
-    if (!value || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/.test(value)) {
-      return { ok: false, reason: `invalid frontmatter value: ${key}` };
-    }
-    fields.set(key, value);
-  }
-  const name = fields.get('name');
-  const description = fields.get('description');
-  if (!name || name.length > 200) return { ok: false, reason: 'name is required and must be at most 200 characters' };
-  if (!description || description.length > 1_000) {
-    return { ok: false, reason: 'description is required and must be at most 1000 characters' };
-  }
-  const body = lines.slice(close + 1).join('\n').trim();
-  if (!body) return { ok: false, reason: 'workflow body is empty' };
-  if (body.length > PREDEFINED_WORKFLOW_MAX_BODY_CHARS) {
-    return { ok: false, reason: 'workflow body exceeds the catalog limit' };
-  }
-  return { ok: true, name, description, body };
-}
-
-async function directoryExists(folder: string): Promise<boolean> {
-  try {
-    return (await stat(folder)).isDirectory();
-  } catch {
-    return false;
-  }
 }
 
 async function readBoundedFile(file: string, maxBytes: number): Promise<Buffer> {
@@ -233,11 +213,6 @@ async function readBoundedFile(file: string, maxBytes: number): Promise<Buffer> 
   } finally {
     await handle?.close().catch(() => undefined);
   }
-}
-
-interface PackageFile {
-  relativePath: string;
-  content: Buffer;
 }
 
 async function readBundleFiles(root: string): Promise<PackageFile[]> {
@@ -305,49 +280,136 @@ async function readBundleFiles(root: string): Promise<PackageFile[]> {
 
 function packageDigest(files: readonly PackageFile[]): string {
   const hash = createHash('sha256');
+  hash.update('muster.workflow.package/v2\0', 'utf8');
+  const fileCount = Buffer.allocUnsafe(4);
+  fileCount.writeUInt32BE(files.length);
+  hash.update(fileCount);
+  const updateFramed = (value: Buffer): void => {
+    const length = Buffer.allocUnsafe(4);
+    length.writeUInt32BE(value.byteLength);
+    hash.update(length);
+    hash.update(value);
+  };
   for (const file of files) {
-    hash.update(file.relativePath, 'utf8');
-    hash.update('\0', 'utf8');
-    hash.update(file.content);
-    hash.update('\0', 'utf8');
+    updateFramed(Buffer.from(file.relativePath, 'utf8'));
+    updateFramed(file.content);
   }
   return hash.digest('hex');
 }
 
-async function bundleCandidate(
-  root: string,
-  directoryName: string,
-): Promise<{ entryFile: string; files: PackageFile[] }> {
-  const files = await readBundleFiles(root);
-  const markdown = files.filter((file) =>
-    file.relativePath.toLowerCase().endsWith('.md') && !file.relativePath.includes('/'));
-  const preferred = `${directoryName}.md`;
-  const entry = markdown.find((file) => file.relativePath === preferred) ??
-    (markdown.length === 1 ? markdown[0] : undefined);
-  if (!entry) {
-    throw new CatalogFileError(
-      markdown.length === 0
-        ? 'workflow bundle must contain an entry Markdown file'
-        : 'workflow bundle has more than one possible entry Markdown file',
-    );
-  }
-  return { entryFile: entry.relativePath, files };
-}
-
 function makeWorkflowRef(
   scope: PredefinedWorkflowScope,
-  packageKind: PredefinedWorkflowPackageKind,
   packagePath: string,
-  entryFile: string,
   packageSha256: string,
 ): string {
   return `pwf_${createHash('sha256')
     .update(scope).update('\0')
-    .update(packageKind).update('\0')
+    .update('bundle').update('\0')
     .update(packagePath).update('\0')
-    .update(entryFile).update('\0')
+    .update('workflow.json').update('\0')
     .update(packageSha256)
     .digest('hex').slice(0, 32)}`;
+}
+
+function parseCanonicalJson(content: Buffer): Record<string, unknown> {
+  if (content.byteLength > PREDEFINED_WORKFLOW_MAX_FILE_BYTES) {
+    throw new CatalogFileError('workflow manifest exceeds the package size limit');
+  }
+  const text = content.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(content)) {
+    throw new CatalogFileError('workflow.json is not valid UTF-8');
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch {
+    throw new CatalogFileError('workflow.json is malformed JSON');
+  }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw new CatalogFileError('workflow.json must contain an object');
+  }
+  return raw as Record<string, unknown>;
+}
+
+function parseCanonicalManifestMetadata(content: Buffer): CanonicalManifestMetadata {
+  const raw = parseCanonicalJson(content);
+  const allowed = new Set(['schema', 'name', 'description', 'inputs', 'outputs', 'nodes', 'edges']);
+  if (Object.keys(raw).some((key) => !allowed.has(key))) {
+    throw new CatalogFileError('invalid workflow manifest metadata');
+  }
+  if (raw.schema !== WORKFLOW_SCHEMA) throw new CatalogFileError('unsupported workflow schema');
+  if (
+    typeof raw.name !== 'string' || raw.name.length === 0 ||
+    raw.name.length > WORKFLOW_NAME_MAX_LENGTH || raw.name.includes('\0')
+  ) {
+    throw new CatalogFileError('invalid workflow name');
+  }
+  if (
+    raw.description !== undefined &&
+    (
+      typeof raw.description !== 'string' || raw.description.length === 0 ||
+      raw.description.length > WORKFLOW_DESCRIPTION_MAX_LENGTH || raw.description.includes('\0')
+    )
+  ) throw new CatalogFileError('invalid workflow description');
+  if (!Array.isArray(raw.inputs) || !Array.isArray(raw.outputs) || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
+    throw new CatalogFileError('workflow manifest arrays are required');
+  }
+  return {
+    name: raw.name,
+    description: typeof raw.description === 'string' ? raw.description : '',
+  };
+}
+
+function parseCanonicalManifest(content: Buffer): ResolvedPredefinedWorkflow['manifest'] {
+  const raw = parseCanonicalJson(content);
+  const decoded = decodeWorkflowManifest(raw, 'saved');
+  if (!decoded.ok) throw new CatalogFileError(`invalid workflow manifest: ${decoded.reason}`);
+  return {
+    name: decoded.name,
+    topology: decoded.topology,
+    entryContracts: decoded.entryContracts,
+  };
+}
+
+async function readCanonicalBundle(root: string): Promise<CanonicalBundle> {
+  const info = await lstat(root).catch(() => undefined);
+  if (!info?.isDirectory() || info.isSymbolicLink()) {
+    throw new CatalogFileError('workflow package must be a regular directory');
+  }
+  const files = await readBundleFiles(root);
+  const manifests = files.filter((file) =>
+    file.relativePath.toLowerCase().split('/').at(-1) === 'workflow.json');
+  const authoritative = files.find((file) => file.relativePath === 'workflow.json');
+  if (manifests.length !== 1 || !authoritative) {
+    throw new CatalogFileError(
+      manifests.length === 0
+        ? 'workflow bundle must contain one authoritative workflow.json'
+        : 'workflow bundle must contain exactly one authoritative workflow.json',
+    );
+  }
+  return { files, manifestContent: authoritative.content };
+}
+
+function makeResolvedPredefinedWorkflow(input: {
+  source: WorkflowPackageSource;
+  packageRoot: string;
+  manifest: ResolvedPredefinedWorkflow['manifest'];
+  files: readonly PackageFile[];
+}): ResolvedPredefinedWorkflow {
+  const resolved: ResolvedPredefinedWorkflow = {
+    document: {
+      workflowRef: input.source.workflowRef,
+      name: input.manifest.name,
+      description: input.manifest.topology.description ?? '',
+      scope: input.source.scope,
+      packageKind: 'bundle',
+    },
+    source: input.source,
+    packageRoot: input.packageRoot,
+    manifest: input.manifest,
+  };
+  packageFiles.set(resolved, input.files);
+  return resolved;
 }
 
 async function scanScope(
@@ -355,7 +417,20 @@ async function scanScope(
   scope: PredefinedWorkflowScope,
   catalogRootKind: WorkflowCatalogRootKind,
 ): Promise<ScopeScan> {
-  if (!(await directoryExists(folder))) return { present: false, entries: [], diagnostics: [] };
+  const rootInfo = await lstat(folder).catch(() => undefined);
+  if (!rootInfo) return { present: false, entries: [], diagnostics: [] };
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    return {
+      present: true,
+      entries: [],
+      diagnostics: [{
+        file: '(scope)',
+        code: 'invalid_catalog_root',
+        message: `unable to read ${scope} workflow catalog`,
+      }],
+    };
+  }
+
   const diagnostics: PredefinedWorkflowDiagnostic[] = [];
   const candidates: CatalogCandidate[] = [];
   let truncated = false;
@@ -375,28 +450,17 @@ async function scanScope(
   }
   try {
     for await (const entry of directory) {
-      let candidate: CatalogCandidate | undefined;
-      if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
-        candidate = {
-          name: entry.name,
-          packageKind: 'file',
-          packageRoot: folder,
-          entryFile: entry.name,
-        };
-      } else if (entry.isDirectory()) {
-        candidate = {
-          name: entry.name,
-          packageKind: 'bundle',
-          packageRoot: join(folder, entry.name),
-        };
-      }
-      if (candidate) {
-        candidates.push(candidate);
-        candidates.sort((left, right) => compareBytes(left.name, right.name));
-        if (candidates.length > PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE) {
-          candidates.pop();
-          truncated = true;
-        }
+      const kind = entry.isSymbolicLink()
+        ? 'symlink'
+        : entry.isDirectory()
+          ? 'directory'
+          : undefined;
+      if (!kind) continue;
+      candidates.push({ name: entry.name, packageRoot: join(folder, entry.name), kind });
+      candidates.sort((left, right) => compareBytes(left.name, right.name));
+      if (candidates.length > PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE) {
+        candidates.pop();
+        truncated = true;
       }
     }
   } finally {
@@ -406,7 +470,7 @@ async function scanScope(
     diagnostics.push({
       file: '(scope)',
       code: 'scope_truncated',
-      message: `more than ${PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE} workflow entries in ${scope} scope; lexicographically later entries ignored`,
+      message: `more than ${PREDEFINED_WORKFLOW_MAX_FILES_PER_SCOPE} workflow packages in ${scope} scope; lexicographically later entries ignored`,
     });
   }
   candidates.sort((left, right) => compareBytes(left.name, right.name));
@@ -414,53 +478,42 @@ async function scanScope(
   const entries: CatalogEntry[] = [];
   for (const candidate of candidates) {
     try {
-      let entryFile: string;
-      let entryContent: Buffer;
-      let files: PackageFile[];
-      if (candidate.packageKind === 'file') {
-        entryFile = candidate.entryFile!;
-        entryContent = await readBoundedFile(join(candidate.packageRoot, entryFile), PREDEFINED_WORKFLOW_MAX_FILE_BYTES);
-        files = [{ relativePath: entryFile, content: entryContent }];
-      } else {
-        const bundle = await bundleCandidate(candidate.packageRoot, candidate.name);
-        entryFile = bundle.entryFile;
-        files = bundle.files;
-        entryContent = files.find((file) => file.relativePath === entryFile)!.content;
+      if (
+        candidate.kind !== 'directory' ||
+        !candidate.name ||
+        candidate.name.length > WORKFLOW_PACKAGE_PATH_MAX_LENGTH ||
+        !normalizedRelativePath(candidate.name)
+      ) {
+        throw new CatalogFileError('workflow package name is unsafe');
       }
-      const parsed = parsePredefinedWorkflowMarkdown(entryContent.toString('utf8'));
-      if (!parsed.ok) throw new CatalogFileError(parsed.reason);
-      const packagePath = candidate.packageKind === 'file' ? '.' : candidate.name;
-      const packageSha256 = packageDigest(files);
-      const workflowRef = makeWorkflowRef(
-        scope,
-        candidate.packageKind,
-        packagePath,
-        entryFile,
-        packageSha256,
-      );
+      const bundle = await readCanonicalBundle(candidate.packageRoot);
+      const metadata = parseCanonicalManifestMetadata(bundle.manifestContent);
+      const packagePath = candidate.name;
+      const packageSha256 = packageDigest(bundle.files);
+      const workflowRef = makeWorkflowRef(scope, packagePath, packageSha256);
       const source: WorkflowPackageSource = {
         kind: 'predefined',
         scope,
-        packageKind: candidate.packageKind,
+        packageKind: 'bundle',
         catalogRootKind,
         packagePath,
-        entryFile,
+        entryFile: 'workflow.json',
         workflowRef,
         packageSha256,
       };
       if (!sourceDescriptorValid(source)) throw new CatalogFileError('invalid workflow package identity');
-      entries.push({
-        workflowRef,
-        name: parsed.name,
-        description: parsed.description,
-        scope,
-        packageKind: candidate.packageKind,
-        body: parsed.body,
-        provenance: 'user-authored-untrusted',
+      const entry: CatalogEntry = {
+        document: {
+          workflowRef,
+          name: metadata.name,
+          description: metadata.description,
+          scope,
+          packageKind: 'bundle',
+        },
         source,
-        packageRoot: candidate.packageRoot,
-        collisionKey: parsed.name.trim().toLowerCase(),
-      });
+        collisionKey: metadata.name.trim().toLowerCase(),
+      };
+      entries.push(entry);
     } catch (error) {
       if (diagnostics.length < PREDEFINED_WORKFLOW_MAX_DIAGNOSTICS) {
         diagnostics.push({
@@ -478,7 +531,7 @@ async function scanScope(
       unique.set(entry.collisionKey, entry);
     } else if (diagnostics.length < PREDEFINED_WORKFLOW_MAX_DIAGNOSTICS) {
       diagnostics.push({
-        file: boundedFileLabel(entry.source.entryFile),
+        file: boundedFileLabel(entry.source.packagePath),
         code: 'duplicate_workflow_name',
         message: `duplicate workflow name in ${scope} scope; lexicographically first entry wins`,
       });
@@ -495,15 +548,9 @@ async function selectedRoot(
     return { folder: options.globalWorkflowFolder, kind: 'custom' };
   }
   const base = scope === 'global' ? homedir() : options.workspaceFolder;
-  const canonical = scope === 'global'
-    ? join(base, '.muster', PREDEFINED_WORKFLOW_CATALOG_DIRECTORY)
-    : join(base, '.muster', PREDEFINED_WORKFLOW_CATALOG_DIRECTORY);
-  if (await directoryExists(canonical)) return { folder: canonical, kind: 'canonical' };
   return {
-    folder: scope === 'global'
-      ? join(base, '.muster', PREDEFINED_WORKFLOW_LEGACY_DIRECTORY)
-      : join(base, '.muster', PREDEFINED_WORKFLOW_LEGACY_DIRECTORY),
-    kind: 'legacy',
+    folder: join(base, '.muster', PREDEFINED_WORKFLOW_CATALOG_DIRECTORY),
+    kind: 'canonical',
   };
 }
 
@@ -528,9 +575,9 @@ async function scanCatalog(options: PredefinedWorkflowCatalogOptions): Promise<{
   for (const entry of workspace.entries) selected.set(entry.collisionKey, entry);
   return {
     entries: [...selected.values()].sort((left, right) =>
-      compareBytes(left.name, right.name) ||
-      compareBytes(left.scope, right.scope) ||
-      compareBytes(left.source.entryFile, right.source.entryFile)),
+      compareBytes(left.document.name, right.document.name) ||
+      compareBytes(left.source.scope, right.source.scope) ||
+      compareBytes(left.source.packagePath, right.source.packagePath)),
     diagnostics,
   };
 }
@@ -541,9 +588,7 @@ export async function listPredefinedWorkflows(options: PredefinedWorkflowCatalog
 }> {
   const catalog = await scanCatalog(options);
   return {
-    workflows: catalog.entries.map(({ workflowRef, name, description, scope, packageKind }) => ({
-      workflowRef, name, description, scope, packageKind,
-    })),
+    workflows: catalog.entries.map(({ document }) => ({ ...document })),
     diagnostics: catalog.diagnostics,
   };
 }
@@ -554,14 +599,8 @@ export async function resolvePredefinedWorkflow(
 ): Promise<ResolvedPredefinedWorkflow | undefined> {
   if (!/^pwf_[a-f0-9]{32}$/.test(ref)) return undefined;
   const catalog = await scanCatalog(options);
-  const entry = catalog.entries.find((candidate) => candidate.workflowRef === ref);
-  if (!entry) return undefined;
-  const { source, packageRoot, workflowRef, name, description, scope, packageKind, body, provenance } = entry;
-  return {
-    document: { workflowRef, name, description, scope, packageKind, body, provenance },
-    source,
-    packageRoot,
-  };
+  const entry = catalog.entries.find((candidate) => candidate.source.workflowRef === ref);
+  return entry ? resolvePredefinedWorkflowSource(options, entry.source) : undefined;
 }
 
 function catalogRootForSource(
@@ -572,13 +611,7 @@ function catalogRootForSource(
     return source.scope === 'global' ? options.globalWorkflowFolder : undefined;
   }
   const base = source.scope === 'global' ? homedir() : options.workspaceFolder;
-  return join(
-    base,
-    '.muster',
-    source.catalogRootKind === 'canonical'
-      ? PREDEFINED_WORKFLOW_CATALOG_DIRECTORY
-      : PREDEFINED_WORKFLOW_LEGACY_DIRECTORY,
-  );
+  return join(base, '.muster', PREDEFINED_WORKFLOW_CATALOG_DIRECTORY);
 }
 
 /** Resolve a persisted package source without consulting current shadowing or catalog truncation. */
@@ -593,57 +626,23 @@ export async function resolvePredefinedWorkflowSource(
     const rootInfo = await lstat(catalogRoot);
     if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return undefined;
     const root = await realpath(catalogRoot);
-    const packageRoot = source.packageKind === 'file'
-      ? root
-      : resolve(root, source.packagePath);
-    if (!isWithin(root, packageRoot) || !(await pathHasNoSymlinkComponents(root, packageRoot))) {
-      return undefined;
-    }
-    if (source.packageKind === 'bundle') {
-      const packageInfo = await lstat(packageRoot);
-      if (!packageInfo.isDirectory() || packageInfo.isSymbolicLink()) return undefined;
-    }
-
-    let files: PackageFile[];
-    let entryContent: Buffer;
-    if (source.packageKind === 'file') {
-      const entryPath = resolve(root, source.entryFile);
-      if (!isWithin(root, entryPath) || !(await pathHasNoSymlinkComponents(root, entryPath))) return undefined;
-      entryContent = await readBoundedFile(entryPath, PREDEFINED_WORKFLOW_MAX_FILE_BYTES);
-      files = [{ relativePath: source.entryFile, content: entryContent }];
-    } else {
-      const bundle = await bundleCandidate(packageRoot, source.packagePath);
-      if (bundle.entryFile !== source.entryFile) return undefined;
-      files = bundle.files;
-      const entry = files.find((file) => file.relativePath === source.entryFile);
-      if (!entry) return undefined;
-      entryContent = entry.content;
-    }
-
-    const packageSha256 = packageDigest(files);
-    const workflowRef = makeWorkflowRef(
-      source.scope,
-      source.packageKind,
-      source.packagePath,
-      source.entryFile,
-      packageSha256,
-    );
+    const packageRoot = resolve(root, source.packagePath);
+    if (
+      !isWithin(root, packageRoot) ||
+      relative(root, packageRoot).split(/[\\/]/).length !== 1 ||
+      !(await pathHasNoSymlinkComponents(root, packageRoot))
+    ) return undefined;
+    const bundle = await readCanonicalBundle(packageRoot);
+    const packageSha256 = packageDigest(bundle.files);
+    const workflowRef = makeWorkflowRef(source.scope, source.packagePath, packageSha256);
     if (packageSha256 !== source.packageSha256 || workflowRef !== source.workflowRef) return undefined;
-    const parsed = parsePredefinedWorkflowMarkdown(entryContent.toString('utf8'));
-    if (!parsed.ok) return undefined;
-    return {
-      document: {
-        workflowRef: source.workflowRef,
-        name: parsed.name,
-        description: parsed.description,
-        scope: source.scope,
-        packageKind: source.packageKind,
-        body: parsed.body,
-        provenance: 'user-authored-untrusted',
-      },
+    const manifest = parseCanonicalManifest(bundle.manifestContent);
+    return makeResolvedPredefinedWorkflow({
       source,
       packageRoot,
-    };
+      manifest,
+      files: bundle.files,
+    });
   } catch {
     return undefined;
   }
@@ -653,7 +652,122 @@ export async function getPredefinedWorkflow(
   options: PredefinedWorkflowCatalogOptions,
   ref: string,
 ): Promise<PredefinedWorkflowDocument | undefined> {
-  return (await resolvePredefinedWorkflow(options, ref))?.document;
+  if (!/^pwf_[a-f0-9]{32}$/.test(ref)) return undefined;
+  const catalog = await scanCatalog(options);
+  const entry = catalog.entries.find((candidate) => candidate.source.workflowRef === ref);
+  return entry ? { ...entry.document } : undefined;
+}
+
+function utf8Asset(
+  content: Buffer,
+  file: string,
+  kind: 'instruction' | 'script',
+  allowEmpty = false,
+): string {
+  const text = content.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(content)) {
+    throw new CatalogFileError(`predefined workflow ${kind} is not valid UTF-8: ${file}`);
+  }
+  if (!allowEmpty && content.byteLength === 0) {
+    throw new CatalogFileError(`predefined workflow ${kind} is empty: ${file}`);
+  }
+  return text;
+}
+
+export async function freezePredefinedWorkflowDefinition(
+  resolved: ResolvedPredefinedWorkflow,
+): Promise<
+  | { ok: true; name: string; topology: WorkflowTopology; entryContracts: WorkflowEntryContract[] }
+  | { ok: false; reason: string }
+> {
+  try {
+    const files = packageFiles.get(resolved);
+    if (!files) return { ok: false, reason: 'predefined workflow package is unavailable' };
+    if (packageDigest(files) !== resolved.source.packageSha256) {
+      return { ok: false, reason: 'predefined workflow package changed after resolution' };
+    }
+    const byPath = new Map(files.map((file) => [file.relativePath, file.content] as const));
+    const nodes = resolved.manifest.topology.nodes.map((node) => {
+      let instructions = node.instructions;
+      if (instructions?.kind === 'file') {
+        const normalized = normalizedRelativePath(instructions.file);
+        const content = normalized ? byPath.get(normalized) : undefined;
+        if (!content) throw new CatalogFileError(`predefined workflow asset is missing: ${instructions.file}`);
+        const text = utf8Asset(content, instructions.file, 'instruction');
+        if (
+          content.byteLength > PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES ||
+          text.length > WORKFLOW_INSTRUCTIONS_MAX_LENGTH
+        ) throw new CatalogFileError(`predefined workflow instruction exceeds the package limit: ${instructions.file}`);
+        instructions = {
+          kind: 'file',
+          file: instructions.file,
+          content: text,
+          sha256: digestBytes(content),
+        };
+      }
+
+      let execution = node.execution;
+      if (execution?.kind === 'script') {
+        const normalized = normalizedRelativePath(execution.file);
+        const content = normalized ? byPath.get(normalized) : undefined;
+        if (!content) throw new CatalogFileError(`predefined workflow asset is missing: ${execution.file}`);
+        if (!isValidWorkflowScriptFile(execution.file, execution.interpreter)) {
+          throw new CatalogFileError(`predefined workflow script is invalid: ${execution.file}`);
+        }
+        utf8Asset(content, execution.file, 'script', true);
+        if (content.byteLength > PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES) {
+          throw new CatalogFileError(`predefined workflow script exceeds the package limit: ${execution.file}`);
+        }
+        execution = {
+          ...execution,
+          source: {
+            ...resolved.source,
+            scriptSha256: digestBytes(content),
+          } satisfies WorkflowScriptSource,
+        };
+      }
+      return {
+        ...node,
+        ...(instructions ? { instructions } : {}),
+        ...(execution ? { execution } : {}),
+      };
+    });
+    return {
+      ok: true,
+      name: resolved.manifest.name,
+      topology: { ...resolved.manifest.topology, nodes },
+      entryContracts: resolved.manifest.entryContracts.map((contract) => ({ ...contract })),
+    };
+  } catch (error) {
+    return { ok: false, reason: boundedDiagnosticMessage(error) };
+  }
+}
+
+/** Resolve, revalidate, and freeze one package immediately before persistence. */
+export async function resolvePredefinedWorkflowDefinition(
+  options: PredefinedWorkflowCatalogOptions,
+  ref: string,
+): Promise<PredefinedWorkflowDefinitionResolution> {
+  const listed = await resolvePredefinedWorkflow(options, ref);
+  if (!listed) {
+    return {
+      ok: false,
+      code: 'predefined_workflow_stale',
+      reason: 'predefined workflow is not found or changed; list the catalog again',
+    };
+  }
+  const frozen = await freezePredefinedWorkflowDefinition(listed);
+  if (!frozen.ok) {
+    return { ok: false, code: 'predefined_workflow_asset_invalid', reason: frozen.reason };
+  }
+  return {
+    ok: true,
+    name: frozen.name,
+    topology: frozen.topology,
+    entryContracts: frozen.entryContracts,
+    source: listed.source,
+    packageRoot: listed.packageRoot,
+  };
 }
 
 export async function resolvePredefinedWorkflowScript(
@@ -662,7 +776,7 @@ export async function resolvePredefinedWorkflowScript(
   interpreter: ScriptInterpreter,
 ): Promise<WorkflowScriptSource | undefined> {
   const normalized = normalizedRelativePath(file);
-  if (!normalized) return undefined;
+  if (!normalized || !isValidWorkflowScriptFile(normalized, interpreter)) return undefined;
   const packageInfo = await lstat(resolved.packageRoot).catch(() => undefined);
   if (!packageInfo?.isDirectory() || packageInfo.isSymbolicLink()) return undefined;
   const packageRoot = await realpath(resolved.packageRoot).catch(() => undefined);

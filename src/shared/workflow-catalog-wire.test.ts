@@ -113,6 +113,12 @@ describe('parseWorkflowCatalogResult', () => {
     }))).toBeNull();
   });
 
+  it('rejects the removed flat-file package kind', () => {
+    expect(parseWorkflowCatalogResult(result({
+      catalog: { reason: 'initial', workflows: [{ ...entry, packageKind: 'file' }], diagnostics: [] },
+    }))).toBeNull();
+  });
+
   it('rejects an extra key on an entry', () => {
     expect(parseWorkflowCatalogResult(result({
       catalog: {
@@ -231,6 +237,17 @@ describe('parseWorkflowCatalogResult', () => {
         diagnostics: [],
       },
     }))).toBeNull();
+  });
+
+  it('accepts a canonical description at the manifest bound', () => {
+    expect(WORKFLOW_CATALOG_DESCRIPTION_MAX).toBe(4_096);
+    expect(parseWorkflowCatalogResult(result({
+      catalog: {
+        reason: 'initial',
+        workflows: [{ ...entry, description: 'd'.repeat(WORKFLOW_CATALOG_DESCRIPTION_MAX) }],
+        diagnostics: [],
+      },
+    }))).not.toBeNull();
   });
 
   it('rejects an empty workflowRef', () => {

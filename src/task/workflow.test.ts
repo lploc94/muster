@@ -329,6 +329,23 @@ describe('canonical workflow manifest contract', () => {
     expectInvalidManifest(prev, /prev|outcome/i);
   });
 
+  it('rejects NUL in canonical workflow names and descriptions', () => {
+    const unsafeName = clone(oneNodeManifest());
+    unsafeName.name = 'unsafe\0name';
+    expectInvalidManifest(unsafeName, /name/i);
+
+    const unsafeDescription = clone(oneNodeManifest());
+    unsafeDescription.description = 'unsafe\0description';
+    expectInvalidManifest(unsafeDescription, /description/i);
+
+    const definition = definitionFromManifest(oneNodeManifest());
+    expect(validateDefineWorkflow({ ...definition, name: 'unsafe\0name' })).toMatchObject({ ok: false });
+    expect(validateDefineWorkflow({
+      ...definition,
+      topology: { ...definition.topology, description: 'unsafe\0description' },
+    })).toMatchObject({ ok: false });
+  });
+
   it('rejects removed label, edge as, script onFailure, and legacy topology fields', () => {
     const label = clone(oneNodeManifest());
     Object.assign(label.nodes[0]!, { label: 'legacy objective' });

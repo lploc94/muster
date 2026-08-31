@@ -5,7 +5,7 @@ function snapshot(name: string): WorkflowCatalogSnapshot {
   return {
     workflows: [{
       workflowRef: `ref-${name}`, name, description: '',
-      scope: 'workspace', packageKind: 'file',
+      scope: 'workspace', packageKind: 'bundle',
     }],
     diagnostics: [],
   };

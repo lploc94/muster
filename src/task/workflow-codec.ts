@@ -106,6 +106,10 @@ function isNonEmptyString(value: unknown, max: number): value is string {
   return typeof value === 'string' && value.length > 0 && value.length <= max;
 }
 
+function isNonEmptyMetadataString(value: unknown, max: number): value is string {
+  return isNonEmptyString(value, max) && !value.includes('\0');
+}
+
 function isStableId(value: unknown): value is string {
   return isNonEmptyString(value, MAX_ID_LEN) && STABLE_ID_RE.test(value);
 }
@@ -125,7 +129,7 @@ function isSafeRelativePath(value: string, allowDot = false): boolean {
   return !portable.startsWith('/') &&
     !/^[A-Za-z]:/.test(portable) &&
     !/[\x00-\x1f\x7f]/.test(portable) &&
-    !portable.split('/').some((part) => part === '' || part === '..');
+    !portable.split('/').some((part) => part === '' || part === '..' || (!allowDot && part === '.'));
 }
 
 function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSource | undefined {
@@ -137,8 +141,8 @@ function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSource | undefi
   if (
     raw.kind !== 'predefined' ||
     (raw.scope !== 'workspace' && raw.scope !== 'global') ||
-    (raw.packageKind !== 'file' && raw.packageKind !== 'bundle') ||
-    (raw.catalogRootKind !== 'canonical' && raw.catalogRootKind !== 'legacy' && raw.catalogRootKind !== 'custom') ||
+    raw.packageKind !== 'bundle' ||
+    (raw.catalogRootKind !== 'canonical' && raw.catalogRootKind !== 'custom') ||
     !isNonEmptyString(raw.packagePath, WORKFLOW_PACKAGE_PATH_MAX_LENGTH) ||
     !isNonEmptyString(raw.entryFile, WORKFLOW_SCRIPT_FILE_MAX_LENGTH) ||
     !isNonEmptyString(raw.workflowRef, 64) ||
@@ -146,9 +150,11 @@ function decodeWorkflowScriptSource(raw: unknown): WorkflowScriptSource | undefi
     !isNonEmptyString(raw.scriptSha256, WORKFLOW_PACKAGE_HASH_LENGTH)
   ) return undefined;
   if (
-    !isSafeRelativePath(raw.packagePath, true) ||
-    !isSafeRelativePath(raw.entryFile) ||
-    (raw.packageKind === 'file' ? raw.packagePath !== '.' : raw.packagePath === '.') ||
+    !isSafeRelativePath(raw.packagePath) ||
+    raw.packagePath.includes('/') ||
+    raw.packagePath.includes('\\') ||
+    raw.entryFile !== 'workflow.json' ||
+    raw.catalogRootKind === 'custom' && raw.scope !== 'global' ||
     !/^pwf_[a-f0-9]{32}$/.test(raw.workflowRef) ||
     !/^[a-f0-9]{64}$/.test(raw.packageSha256) ||
     !/^[a-f0-9]{64}$/.test(raw.scriptSha256)
@@ -635,7 +641,7 @@ export function decodeTopology(raw: unknown): TopologyDecodeResult {
   }
   if (
     raw.description !== undefined &&
-    !isNonEmptyString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
+    !isNonEmptyMetadataString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
   ) return { ok: false, reason: 'invalid workflow description' };
   if (!Array.isArray(raw.nodes) || !Array.isArray(raw.edges) || !Array.isArray(raw.inputs) || !Array.isArray(raw.outputs)) {
     return { ok: false, reason: 'workflow topology arrays are required' };
@@ -731,10 +737,10 @@ export function decodeWorkflowManifest(
     'schema', 'name', 'description', 'inputs', 'outputs', 'nodes', 'edges',
   ])) return { ok: false, reason: 'unknown workflow manifest field' };
   if (raw.schema !== WORKFLOW_SCHEMA) return { ok: false, reason: 'unsupported workflow schema' };
-  if (!isNonEmptyString(raw.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
+  if (!isNonEmptyMetadataString(raw.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
   if (
     raw.description !== undefined &&
-    !isNonEmptyString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
+    !isNonEmptyMetadataString(raw.description, WORKFLOW_DESCRIPTION_MAX_LENGTH)
   ) return { ok: false, reason: 'invalid description' };
   if (!Array.isArray(raw.nodes) || !Array.isArray(raw.edges) || !Array.isArray(raw.inputs) || !Array.isArray(raw.outputs)) {
     return { ok: false, reason: 'manifest inputs, outputs, nodes, and edges are required arrays' };
@@ -1081,7 +1087,7 @@ function decodeEntryContracts(
 export function decodeDefineWorkflowInput(input: DefineWorkflowInput): DefinitionDecodeResult {
   if (!isStableId(input.definitionId)) return { ok: false, reason: 'invalid definitionId' };
   if (!Number.isInteger(input.version) || input.version < 1) return { ok: false, reason: 'invalid version' };
-  if (!isNonEmptyString(input.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
+  if (!isNonEmptyMetadataString(input.name, WORKFLOW_NAME_MAX_LENGTH)) return { ok: false, reason: 'invalid name' };
   if (
     !isNonEmptyString(input.createdAt, 64) ||
     !Number.isFinite(Date.parse(input.createdAt)) ||
