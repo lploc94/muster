@@ -12,7 +12,6 @@ function repositoryFor(graph: WorkflowGraphProjection | undefined): Pick<TaskRep
 describe('buildWorkflowGraphView', () => {
   it('adapts the bounded host-only graph for a graph viewer and derives reused edges', async () => {
     const repository = repositoryFor({
-      runId: 'run-1',
       runStatus: 'running',
       nodes: [
         {
@@ -31,12 +30,12 @@ describe('buildWorkflowGraphView', () => {
         },
       ],
       gates: [{
-        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        consumerNodeId: 'live-consumer', status: 'satisfied',
         required: 1, satisfied: 1,
         inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
       }],
       activeGate: {
-        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        consumerNodeId: 'live-consumer', status: 'satisfied',
         required: 1, satisfied: 1,
         inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
       },
@@ -46,13 +45,12 @@ describe('buildWorkflowGraphView', () => {
         frontierNodeIds: ['live-consumer'], activeNodeIds: ['live-consumer'],
       },
       feedbackRounds: [],
-      childRuns: [{ runId: 'child-1', status: 'running' }],
+      childRuns: [{ status: 'running' }],
       reuse: { nodeCount: 1, edgeCount: 1 },
       diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
     });
 
     await expect(buildWorkflowGraphView(repository, 'task-1')).resolves.toEqual({
-      runId: 'run-1',
       runStatus: 'running',
       nodes: [
         {
@@ -74,12 +72,12 @@ describe('buildWorkflowGraphView', () => {
         },
       ],
       gates: [{
-        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        consumerNodeId: 'live-consumer', status: 'satisfied',
         required: 1, satisfied: 1,
         inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
       }],
       activeGate: {
-        gateId: 'gate-1', consumerNodeId: 'live-consumer', status: 'satisfied',
+        consumerNodeId: 'live-consumer', status: 'satisfied',
         required: 1, satisfied: 1,
         inputs: [{ inputRef: 'source', producerNodeId: 'reused-producer', state: 'supplied_reused' }],
       },
@@ -89,7 +87,7 @@ describe('buildWorkflowGraphView', () => {
         frontierNodeIds: ['live-consumer'], activeNodeIds: ['live-consumer'],
       },
       feedbackRounds: [],
-      childRuns: [{ runId: 'child-1', status: 'running' }],
+      childRuns: [{ status: 'running' }],
       reuse: { nodeCount: 1, edgeCount: 1 },
       diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
     });

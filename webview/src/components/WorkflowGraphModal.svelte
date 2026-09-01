@@ -86,16 +86,16 @@
   class="workflow-modal"
   role="dialog"
   aria-modal="true"
-  aria-label={graph ? `Workflow graph for run ${graph.runId}` : 'Workflow graph'}
+  aria-label="Workflow graph"
   data-testid="workflow-graph-modal"
   tabindex="-1"
 >
   <header class="workflow-modal__header">
     <div class="workflow-modal__head">
       <div class="workflow-modal__eyebrow">Workflow</div>
-      <div class="workflow-modal__title" title={graph?.runId ?? 'Loading…'}>
+      <div class="workflow-modal__title">
         {#if graph}
-          Run {view?.runId}
+          Workflow graph
         {:else if request}
           Loading workflow…
         {:else}
@@ -201,8 +201,8 @@
         <div class="workflow-modal__section">
           <div class="workflow-modal__section-title">Dependency gates — {view.gates.length}</div>
           <div class="workflow-modal__gates">
-            {#each view.gates as gate (gate.id)}
-              <div class="workflow-modal__gate" data-gate-id={gate.id} data-consumer-node-id={gate.consumerNodeId}>
+            {#each view.gates as gate (gate.consumerNodeId)}
+              <div class="workflow-modal__gate" data-consumer-node-id={gate.consumerNodeId}>
                 <div class="workflow-modal__summary-line">
                   <strong>{gate.consumerNodeId}</strong>
                   <span>{gate.statusLabel} · {gate.progressLabel}</span>
@@ -226,7 +226,7 @@
         <div class="workflow-modal__section">
           <div class="workflow-modal__section-title">Feedback rounds</div>
           <ul class="workflow-modal__plain-list">
-            {#each view.feedbackRounds as r (r.id)}
+            {#each view.feedbackRounds as r}
               <li><span>{r.statusLabel} from {r.requesterNodeId}</span> <span>{r.progressLabel}</span></li>
             {/each}
           </ul>
@@ -237,8 +237,8 @@
         <div class="workflow-modal__section">
           <div class="workflow-modal__section-title">Child runs</div>
           <ul class="workflow-modal__plain-list">
-            {#each view.childRuns as c (c.id)}
-              <li data-child-run-id={c.id}><span>{c.id}</span> <span>{c.statusLabel}</span></li>
+            {#each view.childRuns as c}
+              <li><span>{c.label}</span> <span>{c.statusLabel}</span></li>
             {/each}
           </ul>
         </div>

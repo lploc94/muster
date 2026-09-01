@@ -860,7 +860,7 @@ describe('M018 S07 bounded workflow status projection', () => {
 
       const graph = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
       expect(graph).toMatchObject({
-        runId: data.runId,
+        runStatus: 'running',
         nodes: expect.arrayContaining([
           {
             nodeId: 'p1', workflowNodeStatus: 'active', executionActivity: 'queued',
@@ -894,7 +894,7 @@ describe('M018 S07 bounded workflow status projection', () => {
             ]),
           }),
         ]),
-        activeGate: expect.objectContaining({ gateId: p1.gateId, status: 'satisfied' }),
+        activeGate: expect.objectContaining({ consumerNodeId: 'p1', status: 'satisfied' }),
         progress: {
           total: 3, completed: 0, queued: 2, executing: 0, waiting: 0,
           blocked: 1, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
@@ -1076,13 +1076,13 @@ describe('M018 S07 bounded workflow status projection', () => {
       })).resolves.toMatchObject({ changed: true });
       const terminalMatrix = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
       expect(terminalMatrix?.nodes.map((node) => [node.nodeId, node.displayState])).toEqual([
-        ['consumer', 'not_started'],
+        ['consumer', 'failed'],
         ['p1', 'failed'],
         ['p2', 'completed'],
       ]);
       expect(terminalMatrix?.progress).toMatchObject({
         total: 3, completed: 1, queued: 0, executing: 0, waiting: 0,
-        blocked: 0, notStarted: 1, failed: 1, cancelled: 0, skipped: 0,
+        blocked: 0, notStarted: 0, failed: 2, cancelled: 0, skipped: 0,
       });
       await ctx.client.run(
         `UPDATE workflow_runs
@@ -1092,9 +1092,7 @@ describe('M018 S07 bounded workflow status projection', () => {
       );
       const terminalInspection = await ctx.repository.inspectWorkflowRun(data.runId, p1.taskId);
       expect(terminalInspection?.runStatus).toBe('failed');
-      expect(terminalInspection?.diagnostics).toContainEqual({
-        code: 'terminal_run_has_live_node',
-      });
+      expect(terminalInspection?.diagnostics).toEqual([]);
     } finally {
       await ctx.close();
     }

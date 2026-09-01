@@ -892,7 +892,6 @@
             taskId: msg.taskId,
             ok: msg.ok,
             code: msg.ok ? undefined : msg.code,
-            graphRunId: msg.ok ? msg.graph.runId : undefined,
           });
           workflowGraphStore.handleResult(msg as any, tasks.focusedTaskId);
           break;

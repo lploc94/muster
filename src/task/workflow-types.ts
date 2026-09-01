@@ -602,6 +602,9 @@ export interface WorkflowGraphEdgeProjection {
   contributionState: WorkflowGateInputState;
 }
 
+/** Dependency-gate display state without the durable gate-row identity. */
+export type WorkflowGraphGateProjection = Omit<WorkflowGateStatusProjection, 'gateId'>;
+
 export interface WorkflowGraphProgressProjection {
   total: number;
   completed: number;
@@ -619,12 +622,10 @@ export interface WorkflowGraphProgressProjection {
 
 /** Direct nested workflow run visible from a host graph read. */
 export interface WorkflowGraphChildRunProjection {
-  runId: string;
   status: WorkflowRunStatus;
 }
 
 export interface WorkflowGraphFeedbackRoundProjection {
-  roundId: string;
   requesterNodeId: string;
   status: 'open' | 'satisfied';
   joinMode: 'all';
@@ -644,12 +645,11 @@ export interface WorkflowGraphReuseProjection {
  * durable node topology but never prompts, artifact bodies, secrets, or paths.
  */
 export interface WorkflowGraphProjection {
-  runId: string;
   runStatus: WorkflowRunStatus;
   nodes: readonly WorkflowGraphNodeProjection[];
   edges: readonly WorkflowGraphEdgeProjection[];
-  gates: readonly WorkflowGateStatusProjection[];
-  activeGate?: WorkflowGateStatusProjection;
+  gates: readonly WorkflowGraphGateProjection[];
+  activeGate?: WorkflowGraphGateProjection;
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   childRuns: readonly WorkflowGraphChildRunProjection[];

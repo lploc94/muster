@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   DEFAULT_WORKFLOW_POLICY,
   WORKFLOW_RUN_BUDGET_BOUNDS,
@@ -29,6 +29,7 @@ import {
   deriveWorkflowStartResumeMessageId,
   deriveWorkflowStartResumeTurnId,
   entryNodeIds,
+  fingerprintChildInvocation,
   fingerprintDefinition,
   formatWorkflowEntryAggregate,
   maximumWorkflowEntryAggregateBytes,
@@ -797,6 +798,49 @@ describe('canonical workflow manifest contract', () => {
 });
 
 describe('workflow runtime identities and bounded status helpers', () => {
+  it('fingerprints child bindings by canonical UTF-8 order, independent of host collation', () => {
+    const input = {
+      callerScopeId: 'wfr_parent',
+      childDefinitionId: 'wf-child',
+      childDefinitionVersion: 1,
+      childIdempotencyKey: 'child-key',
+      entryBindings: [
+        {
+          name: 'request',
+          fromInputRef: 'request-source',
+          sourceArtifactRunId: 'wfr_source_request',
+          sourceArtifactId: 'wfa_request',
+          sourceArtifactRevision: 1,
+        },
+        {
+          name: 'context',
+          fromInputRef: 'context-source',
+          sourceArtifactRunId: 'wfr_source_context',
+          sourceArtifactId: 'wfa_context',
+          sourceArtifactRevision: 2,
+        },
+      ],
+      effectivePolicy: DEFAULT_WORKFLOW_POLICY,
+    };
+    const canonical = fingerprintChildInvocation(input);
+    expect(fingerprintChildInvocation({
+      ...input,
+      entryBindings: [...input.entryBindings].reverse(),
+    })).toBe(canonical);
+
+    const originalLocaleCompare = String.prototype.localeCompare;
+    const localeCompare = vi.spyOn(String.prototype, 'localeCompare').mockImplementation(
+      function (this: string, other: string): number {
+        return -originalLocaleCompare.call(this, other);
+      },
+    );
+    try {
+      expect(fingerprintChildInvocation(input)).toBe(canonical);
+    } finally {
+      localeCompare.mockRestore();
+    }
+  });
+
   it('derives deterministic multi-entry start identities', () => {
     const definition = definitionFromManifest(fanInManifest());
     const entries = entryNodeIds(definition.topology);

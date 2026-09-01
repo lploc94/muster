@@ -21,6 +21,7 @@ import {
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
   formatWorkflowEntryAggregate,
+  fingerprintChildInvocation,
   fingerprintWorkflowDefinition,
   startWorkflowConflict,
   startWorkflowCreated,
@@ -3649,28 +3650,29 @@ export class SqliteTaskRepository implements TaskRepository {
     const reusedNodeIds = new Set(
       nodes.filter((node) => node.workflowNodeStatus === 'reused').map((node) => node.nodeId),
     );
+    const graphGates = gateRead.gates.map(({ gateId: _gateId, ...gate }) => gate);
     const activeGate = gateRead.gates.find(
       (gate) => gate.status === 'open' || gate.status === 'satisfied',
     );
     const progress = workflowGraphProgressProjection(nodes);
 
     return {
-      runId: run.run_id,
       runStatus: run.status,
       nodes,
       edges,
-      gates: gateRead.gates,
-      ...(activeGate ? { activeGate } : {}),
+      gates: graphGates,
+      ...(activeGate
+        ? { activeGate: (({ gateId: _gateId, ...gate }) => gate)(activeGate) }
+        : {}),
       progress,
       feedbackRounds: roundRows.slice(0, 32).map((round) => ({
-        roundId: round.round_id,
         requesterNodeId: round.requester_node_id,
         status: round.status,
         joinMode: round.join_mode,
         required: Number(round.required) || 0,
         responded: Number(round.responded) || 0,
       })),
-      childRuns: childRows.slice(0, 64).map((child) => ({ runId: child.run_id, status: child.status })),
+      childRuns: childRows.slice(0, 64).map((child) => ({ status: child.status })),
       reuse: {
         nodeCount: reusedNodeIds.size,
         edgeCount: edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId)).length,
@@ -5664,13 +5666,23 @@ export class SqliteTaskRepository implements TaskRepository {
       turnStatement(this.workspaceId, command.turn, false),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
       ...(authority.kind === 'valid'
-        ? [workflowActivationRetryStatement(
-            this.workspaceId,
-            authority,
-            sourceTurnId,
-            command.turn.id,
-            command.turn.createdAt,
-          )]
+        ? [
+            workflowDecisionRepairRetryStatement(
+              this.workspaceId,
+              authority.runId,
+              authority.activationId,
+              sourceTurnId,
+              command.turn.id,
+              command.turn.createdAt,
+            ),
+            workflowActivationRetryStatement(
+              this.workspaceId,
+              authority,
+              sourceTurnId,
+              command.turn.id,
+              command.turn.createdAt,
+            ),
+          ]
         : []),
     ];
     const results = await this.writeIfFirstChanged(
@@ -7154,6 +7166,13 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const { identities, fingerprint } = validated;
+    const durableCallerTask = validated.callerTaskId
+      ? await this.getTask(validated.callerTaskId)
+      : undefined;
+    if (validated.callerTaskId && !durableCallerTask) {
+      return invalidStart('invalid identity');
+    }
+    const executionCwd = durableCallerTask?.cwd;
     const resolvedInputByKey = new Map<string, {
       value: string;
       semanticKind: string;
@@ -7576,6 +7595,7 @@ export class SqliteTaskRepository implements TaskRepository {
           maxAutomaticRetries: 1,
           runTimeoutOverrideMs: validated.policy.runTimeoutMs,
         },
+        ...(executionCwd !== undefined ? { cwd: executionCwd } : {}),
         revision: 0,
         createdAt: validated.createdAt,
         updatedAt: validated.createdAt,
@@ -7609,6 +7629,7 @@ export class SqliteTaskRepository implements TaskRepository {
           maxAutomaticRetries: 1,
           runTimeoutOverrideMs: validated.policy.runTimeoutMs,
         },
+        ...(executionCwd !== undefined ? { cwd: executionCwd } : {}),
         workflowShell: { runId: identities.runId, nodeId, gateId },
         revision: 0,
         createdAt: validated.createdAt,
@@ -8814,13 +8835,23 @@ export class SqliteTaskRepository implements TaskRepository {
       ...(decision.mode === 'repair' && !budget.exhausted
         ? []
         : workflowRetry && !budget.exhausted
-        ? [workflowActivationRetryStatement(
-            this.workspaceId,
-            workflowRetry.authority,
-            command.turn.id,
-            workflowRetry.turn.id,
-            command.turn.finishedAt ?? new Date().toISOString(),
-          )]
+        ? [
+            workflowDecisionRepairRetryStatement(
+              this.workspaceId,
+              workflowRetry.authority.runId,
+              workflowRetry.authority.activationId,
+              command.turn.id,
+              workflowRetry.turn.id,
+              command.turn.finishedAt ?? new Date().toISOString(),
+            ),
+            workflowActivationRetryStatement(
+              this.workspaceId,
+              workflowRetry.authority,
+              command.turn.id,
+              workflowRetry.turn.id,
+              command.turn.finishedAt ?? new Date().toISOString(),
+            ),
+          ]
         : [workflowActivationSettlementStatement(
             this.workspaceId,
             command.turn.id,
@@ -11186,6 +11217,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
     const callerNode = await this.lookupWorkflowNodeForTask(command.task.id);
+    const durableCallerTask = callerNode ? await this.getTask(command.task.id) : undefined;
     const callerRun = callerNode ? await this.db.get<{
       definition_id: string;
       definition_version: number;
@@ -11202,7 +11234,13 @@ export class SqliteTaskRepository implements TaskRepository {
         WHERE workspace_id = ? AND run_id = ?`,
       [this.workspaceId, callerNode.runId],
     ) : undefined;
-    if (!callerNode || !callerRun || typeof callerRun.owner_root_task_id !== 'string') return empty;
+    if (
+      !callerNode ||
+      !durableCallerTask ||
+      !callerRun ||
+      typeof callerRun.owner_root_task_id !== 'string'
+    ) return empty;
+    const childExecutionCwd = durableCallerTask.cwd;
     const callerAuthority = await this.db.get<{ is_terminal: number }>(
       `SELECT EXISTS (
                 SELECT 1 FROM workflow_definition_outputs output
@@ -11529,7 +11567,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const childDeadlineAt = new Date(
       childCreatedAtMs + childEffectivePolicy.runTimeoutMs,
     ).toISOString();
-    const invocationFingerprint = childInvocationFingerprint({
+    const invocationFingerprint = fingerprintChildInvocation({
       callerScopeId,
       childDefinitionId: disposition.childDefinitionId,
       childDefinitionVersion: disposition.childDefinitionVersion,
@@ -11708,6 +11746,7 @@ export class SqliteTaskRepository implements TaskRepository {
           maxAutomaticRetries: 1,
           runTimeoutOverrideMs: childEffectivePolicy.runTimeoutMs,
         },
+        ...(childExecutionCwd !== undefined ? { cwd: childExecutionCwd } : {}),
         revision: 0,
         createdAt: finishedAt,
         updatedAt: finishedAt,
@@ -11814,6 +11853,7 @@ export class SqliteTaskRepository implements TaskRepository {
           maxAutomaticRetries: 1,
           runTimeoutOverrideMs: childEffectivePolicy.runTimeoutMs,
         },
+        ...(childExecutionCwd !== undefined ? { cwd: childExecutionCwd } : {}),
         workflowShell: { runId: childRunId, nodeId: nodeGate.nodeId, gateId: nodeGate.gateId },
         revision: 0,
         createdAt: finishedAt,
@@ -12904,13 +12944,29 @@ export class SqliteTaskRepository implements TaskRepository {
                        WHERE task_turn.workspace_id = source_turn.workspace_id
                          AND task_turn.task_id = source_turn.task_id) < run.max_turns_per_task
                 AND run.workflow_turns_reserved < run.max_workflow_turns
-               AND NOT EXISTS (
-                 SELECT 1 FROM turns competing
-                  WHERE competing.workspace_id = source_turn.workspace_id
-                    AND competing.task_id = source_turn.task_id
-                    AND competing.status IN ('queued', 'running', 'waiting_user')
-               )
-            ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+                AND NOT EXISTS (
+                  SELECT 1 FROM turns competing
+                   WHERE competing.workspace_id = source_turn.workspace_id
+                     AND competing.task_id = source_turn.task_id
+                     AND competing.status IN ('queued', 'running', 'waiting_user')
+                )
+                AND NOT EXISTS (
+                  SELECT 1 FROM workflow_decision_repairs repair
+                   WHERE repair.workspace_id = activation.workspace_id
+                     AND repair.run_id = activation.run_id
+                     AND repair.activation_id = activation.activation_id
+                     AND repair.status = 'open'
+                     AND NOT (
+                       (repair.attempts_used = 0
+                        AND repair.next_repair_turn_id IS NULL
+                        AND (repair.last_attempt_turn_id IS NULL
+                             OR repair.last_attempt_turn_id = source_turn.id))
+                       OR
+                       (repair.attempts_used IN (1, 2)
+                        AND repair.next_repair_turn_id = source_turn.id)
+                     )
+                )
+             ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
       params: [
         this.workspaceId,
         ledgerKey,
@@ -12942,6 +12998,14 @@ export class SqliteTaskRepository implements TaskRepository {
           turnStatement(this.workspaceId, turn, false),
           ...turn.inputs.map((input, ordering) =>
             turnInputStatement(this.workspaceId, turn.id, ordering, input)),
+          workflowDecisionRepairRetryStatement(
+            this.workspaceId,
+            command.runId,
+            command.activationId,
+            command.failedTurnId,
+            turn.id,
+            command.createdAt,
+          ),
           {
             sql: `UPDATE workflow_activations
                      SET status = 'queued', execution_turn_id = ?, updated_at = ?
@@ -13244,6 +13308,20 @@ export class SqliteTaskRepository implements TaskRepository {
                WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
                  AND status IN ('queued', 'running', 'failed', 'interrupted')`,
         params: [terminalStatus, input.at, this.workspaceId, ...runIds],
+      },
+      {
+        sql: `UPDATE workflow_nodes SET status = ?
+               WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND status IN ('active', 'pending')`,
+        params: [terminalStatus, this.workspaceId, ...runIds],
+      },
+      {
+        sql: `UPDATE workflow_decision_repairs
+                 SET status = 'exhausted', attempts_used = 3,
+                     next_repair_turn_id = NULL, updated_at = ?
+               WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND status = 'open'`,
+        params: [input.at, this.workspaceId, ...runIds],
       },
       {
         sql: `UPDATE workflow_continuations
@@ -13973,39 +14051,6 @@ function sumWorkflowTurnReservations(
   return totals;
 }
 
-function childInvocationFingerprint(input: {
-  callerScopeId: string;
-  childDefinitionId: string;
-  childDefinitionVersion: number;
-  childIdempotencyKey: string;
-  entryBindings: readonly {
-    name: string;
-    fromInputRef: string;
-    sourceArtifactRunId: string;
-    sourceArtifactId: string;
-    sourceArtifactRevision: number;
-  }[];
-  effectivePolicy: WorkflowPolicy;
-}): string {
-  const entryBindings = input.entryBindings
-    .map((binding) => ({
-      name: binding.name,
-      fromInputRef: binding.fromInputRef,
-      sourceArtifactRunId: binding.sourceArtifactRunId,
-      sourceArtifactId: binding.sourceArtifactId,
-      sourceArtifactRevision: binding.sourceArtifactRevision,
-    }))
-    .sort((left, right) => left.name.localeCompare(right.name));
-  return stableId('wfif', JSON.stringify({
-    callerScopeId: input.callerScopeId,
-    childDefinitionId: input.childDefinitionId,
-    childDefinitionVersion: input.childDefinitionVersion,
-    childIdempotencyKey: input.childIdempotencyKey,
-    entryBindings,
-    effectivePolicy: input.effectivePolicy,
-  }));
-}
-
 function encodePayload(value: Record<string, unknown>): string {
   return JSON.stringify({ payloadVersion: 1, ...value });
 }
@@ -14276,6 +14321,22 @@ function guardedWorkflowRetryTaskUpdateStatement(
            AND run.definition_id = ?
            AND run.definition_version = ?
            AND definition.fingerprint = ?
+           AND NOT EXISTS (
+             SELECT 1 FROM workflow_decision_repairs repair
+              WHERE repair.workspace_id = activation.workspace_id
+                AND repair.run_id = activation.run_id
+                AND repair.activation_id = activation.activation_id
+                AND repair.status = 'open'
+                AND NOT (
+                  (repair.attempts_used = 0
+                   AND repair.next_repair_turn_id IS NULL
+                   AND (repair.last_attempt_turn_id IS NULL
+                        OR repair.last_attempt_turn_id = source_turn.id))
+                  OR
+                  (repair.attempts_used IN (1, 2)
+                   AND repair.next_repair_turn_id = source_turn.id)
+                )
+           )
            AND NOT EXISTS (
               SELECT 1 FROM turns competing
                WHERE competing.workspace_id = tasks.workspace_id
@@ -14707,6 +14768,48 @@ function workflowActivationRetryStatement(
   };
 }
 
+/** Keep an open decision-repair attempt bound to the execution turn that owns it. */
+function workflowDecisionRepairRetryStatement(
+  workspaceId: string,
+  runId: string,
+  activationId: string,
+  sourceTurnId: string,
+  retryTurnId: string,
+  at: string,
+): SqlStatement {
+  return {
+    sql: `UPDATE workflow_decision_repairs
+             SET last_attempt_turn_id = CASE
+                   WHEN attempts_used = 0 THEN ?
+                   ELSE last_attempt_turn_id
+                 END,
+                 next_repair_turn_id = CASE
+                   WHEN attempts_used IN (1, 2) THEN ?
+                   ELSE NULL
+                 END,
+                 updated_at = ?
+           WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+             AND status = 'open'
+             AND (
+               (attempts_used = 0
+                AND next_repair_turn_id IS NULL
+                AND (last_attempt_turn_id IS NULL OR last_attempt_turn_id = ?))
+               OR
+               (attempts_used IN (1, 2) AND next_repair_turn_id = ?)
+             )`,
+    params: [
+      retryTurnId,
+      retryTurnId,
+      at,
+      workspaceId,
+      runId,
+      activationId,
+      sourceTurnId,
+      sourceTurnId,
+    ],
+  };
+}
+
 function workflowActivationRunningStatement(
   workspaceId: string,
   turnId: string,
@@ -14939,9 +15042,25 @@ function guardedSettleTurnStatement(
          AND node.task_id = turns.task_id
          AND run.status = 'running'
          AND (run.deadline_at IS NULL OR run.deadline_at > ?)
-         AND run.definition_id = ?
-         AND run.definition_version = ?
-         AND definition.fingerprint = ?
+          AND run.definition_id = ?
+          AND run.definition_version = ?
+          AND definition.fingerprint = ?
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_decision_repairs repair
+             WHERE repair.workspace_id = activation.workspace_id
+               AND repair.run_id = activation.run_id
+               AND repair.activation_id = activation.activation_id
+               AND repair.status = 'open'
+               AND NOT (
+                 (repair.attempts_used = 0
+                  AND repair.next_repair_turn_id IS NULL
+                  AND (repair.last_attempt_turn_id IS NULL
+                       OR repair.last_attempt_turn_id = turns.id))
+                 OR
+                 (repair.attempts_used IN (1, 2)
+                  AND repair.next_repair_turn_id = turns.id)
+               )
+          )
     )`);
     stateParams.push(
       authority.runId,

@@ -205,6 +205,12 @@ export type RunInput =
       stdin?: string;
     };
 
+/** Host-owned, disposable package tree containing only coherently verified bytes. */
+export interface VerifiedScriptPackageSnapshot {
+  scriptRoot: string;
+  dispose: () => void | Promise<void>;
+}
+
 export interface RunOptions {
   input: RunInput;
   resumeId?: string;
@@ -241,8 +247,8 @@ export interface RunOptions {
     scriptRoot?: string;
     /** Integrity digest captured when a predefined package was compiled. */
     expectedScriptSha256?: string;
-    /** Revalidate the complete predefined package and selected script immediately before spawn. */
-    verifyPackageIntegrity?: () => void | Promise<void>;
+    /** Revalidate and snapshot the complete predefined package immediately before spawn. */
+    verifyPackageIntegrity?: () => VerifiedScriptPackageSnapshot | Promise<VerifiedScriptPackageSnapshot>;
   };
   /**
    * M017-S06: optional bounded pre-dispatch MCP setup/recovery controller.

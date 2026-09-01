@@ -330,153 +330,176 @@ export class ScriptBackend implements Backend {
       return;
     }
 
-    // This is the final asynchronous package/script verification before the
-    // authorization and cancellation fences immediately preceding spawn.
-    if (policy.verifyPackageIntegrity) {
-      try {
-        await policy.verifyPackageIntegrity();
-      } catch (error) {
+    let executionSnapshot: Awaited<ReturnType<NonNullable<typeof policy.verifyPackageIntegrity>>> | undefined;
+    try {
+      // This is the final asynchronous package verification. It returns a private
+      // package-shaped tree built from the exact bytes that passed provenance checks,
+      // so spawn never reopens the mutable catalog pathname.
+      if (policy.verifyPackageIntegrity) {
+        try {
+          const candidate = await policy.verifyPackageIntegrity();
+          if (
+            !candidate ||
+            typeof candidate.scriptRoot !== 'string' ||
+            candidate.scriptRoot.length === 0 ||
+            typeof candidate.dispose !== 'function'
+          ) throw new Error('predefined workflow package snapshot is unavailable');
+          executionSnapshot = candidate;
+          script = await resolveScriptPath(candidate.scriptRoot, options.input.file, options.input.interpreter);
+          if (
+            policy.expectedScriptSha256 !== undefined &&
+            await sha256File(script) !== policy.expectedScriptSha256
+          ) throw new Error('predefined workflow script changed after definition');
+        } catch (error) {
+          yield {
+            type: 'error',
+            message: error instanceof Error ? error.message : 'script package integrity validation failed',
+            meta: { code: 'package_integrity_mismatch' },
+          };
+          return;
+        }
+      }
+      if (!policy.authorize()) {
+        yield { type: 'error', message: 'local script execution is not authorized', meta: { code: 'host_run_denied' } };
+        return;
+      }
+      if (options.signal?.aborted) {
+        yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
+        return;
+      }
+
+      const maxStdoutBytes = Math.max(1, policy.maxStdoutBytes || DEFAULT_STDOUT_BYTES);
+      const maxStderrBytes = Math.max(1, policy.maxStderrBytes ?? DEFAULT_STDERR_BYTES);
+      const timeoutMs = Math.max(1, policy.timeoutMs || DEFAULT_TIMEOUT_MS);
+      const isTypeScript = ['.ts', '.cts', '.mts'].includes(extname(script).toLowerCase());
+      const child = spawn(program, [
+        ...(isTypeScript ? ['--experimental-strip-types'] : []),
+        script,
+        ...options.input.args,
+      ], {
+        cwd,
+        shell: false,
+        windowsHide: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: safeChildEnvironment(),
+        // Own process group on POSIX so termination reaches descendants too.
+        detached: process.platform !== 'win32',
+      });
+
+      let stdoutBytes = 0;
+      const stdoutChunks: Buffer[] = [];
+      let stderrTail: Buffer = Buffer.alloc(0);
+      let outputExceeded = false;
+      let timedOut = false;
+      let cancelled = false;
+
+      // Escalating, deadline-bounded termination. A script may trap SIGTERM and never
+      // exit, so the forced signal follows a grace period and the awaited settle carries
+      // its own ceiling: cancel, timeout and overflow can never hang on a stubborn child.
+      let forceTimer: NodeJS.Timeout | undefined;
+      let deadlineTimer: NodeJS.Timeout | undefined;
+      let armDeadline = (): void => undefined;
+      const abandoned = new Promise<{ kind: 'abandoned' }>((done) => {
+        armDeadline = () => {
+          if (deadlineTimer !== undefined) return;
+          deadlineTimer = setTimeout(() => done({ kind: 'abandoned' }), TERMINATION_DEADLINE_MS);
+          deadlineTimer.unref?.();
+        };
+      });
+      const terminate = () => {
+        killProcessTree(child, false);
+        if (forceTimer === undefined) {
+          forceTimer = setTimeout(() => killProcessTree(child, true), KILL_GRACE_MS);
+          forceTimer.unref?.();
+        }
+        armDeadline();
+      };
+
+      child.stdout.on('data', (value: Buffer | string) => {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stdoutBytes += chunk.length;
+        if (stdoutBytes > maxStdoutBytes) {
+          outputExceeded = true;
+          terminate();
+          return;
+        }
+        stdoutChunks.push(chunk);
+      });
+      child.stderr.on('data', (value: Buffer | string) => {
+        const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+        stderrTail = appendTail(stderrTail, chunk, maxStderrBytes);
+      });
+
+      const abort = () => {
+        cancelled = true;
+        terminate();
+      };
+      options.signal?.addEventListener('abort', abort, { once: true });
+      const timer = setTimeout(() => {
+        timedOut = true;
+        terminate();
+      }, timeoutMs);
+      const terminalPromise = new Promise<
+        | { kind: 'close'; code: number | null }
+        | { kind: 'error'; message: string }
+      >((done) => {
+        child.once('error', () => done({ kind: 'error', message: 'failed to spawn script interpreter' }));
+        child.once('close', (code) => done({ kind: 'close', code }));
+      });
+      // A script may close stdin before consuming the bounded workflow payload.
+      // Ignore that pipe error and let the process terminal event decide outcome.
+      child.stdin.on('error', () => undefined);
+      child.stdin.end(stdin, 'utf8');
+
+      const terminal = await Promise.race([terminalPromise, abandoned]);
+      clearTimeout(timer);
+      clearTimeout(forceTimer);
+      clearTimeout(deadlineTimer);
+      options.signal?.removeEventListener('abort', abort);
+
+      if (cancelled || options.signal?.aborted) {
+        yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
+        return;
+      }
+      if (timedOut) {
+        yield { type: 'error', message: 'script execution timed out', meta: { code: 'script_timeout' } };
+        return;
+      }
+      if (outputExceeded) {
+        yield { type: 'error', message: 'script stdout exceeds workflow artifact limit', meta: { code: 'stdout_limit' } };
+        return;
+      }
+      if (terminal.kind === 'abandoned') {
         yield {
           type: 'error',
-          message: error instanceof Error ? error.message : 'script package integrity validation failed',
-          meta: { code: 'package_integrity_mismatch' },
+          message: 'script process did not exit after termination',
+          meta: { code: 'termination_timeout' },
         };
         return;
       }
-    }
-    if (!policy.authorize()) {
-      yield { type: 'error', message: 'local script execution is not authorized', meta: { code: 'host_run_denied' } };
-      return;
-    }
-    if (options.signal?.aborted) {
-      yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
-      return;
-    }
-
-    const maxStdoutBytes = Math.max(1, policy.maxStdoutBytes || DEFAULT_STDOUT_BYTES);
-    const maxStderrBytes = Math.max(1, policy.maxStderrBytes ?? DEFAULT_STDERR_BYTES);
-    const timeoutMs = Math.max(1, policy.timeoutMs || DEFAULT_TIMEOUT_MS);
-    const isTypeScript = ['.ts', '.cts', '.mts'].includes(extname(script).toLowerCase());
-    const child = spawn(program, [
-      ...(isTypeScript ? ['--experimental-strip-types'] : []),
-      script,
-      ...options.input.args,
-    ], {
-      cwd,
-      shell: false,
-      windowsHide: true,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: safeChildEnvironment(),
-      // Own process group on POSIX so termination reaches descendants too.
-      detached: process.platform !== 'win32',
-    });
-
-    let stdoutBytes = 0;
-    const stdoutChunks: Buffer[] = [];
-    let stderrTail: Buffer = Buffer.alloc(0);
-    let outputExceeded = false;
-    let timedOut = false;
-    let cancelled = false;
-
-    // Escalating, deadline-bounded termination. A script may trap SIGTERM and never
-    // exit, so the forced signal follows a grace period and the awaited settle carries
-    // its own ceiling: cancel, timeout and overflow can never hang on a stubborn child.
-    let forceTimer: NodeJS.Timeout | undefined;
-    let deadlineTimer: NodeJS.Timeout | undefined;
-    let armDeadline = (): void => undefined;
-    const abandoned = new Promise<{ kind: 'abandoned' }>((done) => {
-      armDeadline = () => {
-        if (deadlineTimer !== undefined) return;
-        deadlineTimer = setTimeout(() => done({ kind: 'abandoned' }), TERMINATION_DEADLINE_MS);
-        deadlineTimer.unref?.();
-      };
-    });
-    const terminate = () => {
-      killProcessTree(child, false);
-      if (forceTimer === undefined) {
-        forceTimer = setTimeout(() => killProcessTree(child, true), KILL_GRACE_MS);
-        forceTimer.unref?.();
-      }
-      armDeadline();
-    };
-
-    child.stdout.on('data', (value: Buffer | string) => {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      stdoutBytes += chunk.length;
-      if (stdoutBytes > maxStdoutBytes) {
-        outputExceeded = true;
-        terminate();
+      if (terminal.kind === 'error' || terminal.code === null) {
+        yield {
+          type: 'error',
+          message: terminal.kind === 'error' ? terminal.message : 'script process ended without an exit code',
+          meta: { code: 'spawn_failed' },
+        };
         return;
       }
-      stdoutChunks.push(chunk);
-    });
-    child.stderr.on('data', (value: Buffer | string) => {
-      const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
-      stderrTail = appendTail(stderrTail, chunk, maxStderrBytes);
-    });
 
-    const abort = () => {
-      cancelled = true;
-      terminate();
-    };
-    options.signal?.addEventListener('abort', abort, { once: true });
-    const timer = setTimeout(() => {
-      timedOut = true;
-      terminate();
-    }, timeoutMs);
-    const terminalPromise = new Promise<
-      | { kind: 'close'; code: number | null }
-      | { kind: 'error'; message: string }
-    >((done) => {
-      child.once('error', () => done({ kind: 'error', message: 'failed to spawn script interpreter' }));
-      child.once('close', (code) => done({ kind: 'close', code }));
-    });
-    // A script may close stdin before consuming the bounded workflow payload.
-    // Ignore that pipe error and let the process terminal event decide outcome.
-    child.stdin.on('error', () => undefined);
-    child.stdin.end(stdin, 'utf8');
-
-    const terminal = await Promise.race([terminalPromise, abandoned]);
-    clearTimeout(timer);
-    clearTimeout(forceTimer);
-    clearTimeout(deadlineTimer);
-    options.signal?.removeEventListener('abort', abort);
-
-    if (cancelled || options.signal?.aborted) {
-      yield { type: 'error', message: 'script execution cancelled', isCancellation: true };
-      return;
-    }
-    if (timedOut) {
-      yield { type: 'error', message: 'script execution timed out', meta: { code: 'script_timeout' } };
-      return;
-    }
-    if (outputExceeded) {
-      yield { type: 'error', message: 'script stdout exceeds workflow artifact limit', meta: { code: 'stdout_limit' } };
-      return;
-    }
-    if (terminal.kind === 'abandoned') {
       yield {
-        type: 'error',
-        message: 'script process did not exit after termination',
-        meta: { code: 'termination_timeout' },
+        type: 'processCompleted',
+        stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+        stderr: stderrTail.toString('utf8'),
+        exitCode: terminal.code,
       };
-      return;
+      yield { type: 'turnCompleted', meta: { executorKind: 'script', exitCode: terminal.code } };
+    } finally {
+      try {
+        await executionSnapshot?.dispose();
+      } catch {
+        // The child has already reached a terminal state; cleanup must not
+        // rewrite its durable execution outcome.
+      }
     }
-    if (terminal.kind === 'error' || terminal.code === null) {
-      yield {
-        type: 'error',
-        message: terminal.kind === 'error' ? terminal.message : 'script process ended without an exit code',
-        meta: { code: 'spawn_failed' },
-      };
-      return;
-    }
-
-    yield {
-      type: 'processCompleted',
-      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
-      stderr: stderrTail.toString('utf8'),
-      exitCode: terminal.code,
-    };
-    yield { type: 'turnCompleted', meta: { executorKind: 'script', exitCode: terminal.code } };
   }
 }

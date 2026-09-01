@@ -1,10 +1,19 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import type { NormalizedEvent, RunOptions } from '../types';
+import type { NormalizedEvent, RunOptions, VerifiedScriptPackageSnapshot } from '../types';
 import { ScriptBackend } from './script';
 
 const dirs: string[] = [];
@@ -35,6 +44,19 @@ async function collect(runOptions: RunOptions): Promise<NormalizedEvent[]> {
   const events: NormalizedEvent[] = [];
   for await (const event of new ScriptBackend().run(runOptions)) events.push(event);
   return events;
+}
+
+function snapshotPackage(root: string, files: readonly string[]): VerifiedScriptPackageSnapshot {
+  const snapshotRoot = workspace();
+  for (const file of files) {
+    const target = join(snapshotRoot, ...file.split('/'));
+    mkdirSync(join(target, '..'), { recursive: true });
+    writeFileSync(target, readFileSync(join(root, ...file.split('/'))));
+  }
+  return {
+    scriptRoot: snapshotRoot,
+    dispose: async () => rmSync(snapshotRoot, { recursive: true, force: true }),
+  };
 }
 
 afterEach(() => {
@@ -128,6 +150,45 @@ describe('ScriptBackend', () => {
     ]);
   });
 
+  it('executes only the immutable verified package snapshot and removes it after termination', async () => {
+    const cwd = workspace();
+    const packageRoot = join(cwd, 'mutable-package');
+    mkdirSync(join(packageRoot, 'scripts'), { recursive: true });
+    const scriptSource = [
+      "const helper = require('./helper.cjs');",
+      "process.stdout.write(helper + '|' + process.cwd());",
+    ].join('\n');
+    writeFileSync(join(packageRoot, 'scripts', 'run.cjs'), scriptSource);
+    writeFileSync(join(packageRoot, 'scripts', 'helper.cjs'), "module.exports = 'verified';");
+    let snapshotRoot: string | undefined;
+    const runOptions = options(cwd, 'scripts/run.cjs', {
+      localExecution: {
+        ...options(cwd, 'scripts/run.cjs').localExecution!,
+        scriptRoot: packageRoot,
+        expectedScriptSha256: createHash('sha256').update(scriptSource).digest('hex'),
+        verifyPackageIntegrity: async () => {
+          const snapshot = snapshotPackage(packageRoot, ['scripts/run.cjs', 'scripts/helper.cjs']);
+          snapshotRoot = snapshot.scriptRoot;
+          writeFileSync(join(packageRoot, 'scripts', 'run.cjs'), 'process.stdout.write("swapped-script")');
+          writeFileSync(join(packageRoot, 'scripts', 'helper.cjs'), "module.exports = 'swapped-helper';");
+          return snapshot;
+        },
+      },
+    });
+
+    await expect(collect(runOptions)).resolves.toEqual([
+      {
+        type: 'processCompleted',
+        stdout: `verified|${realpathSync(cwd)}`,
+        stderr: '',
+        exitCode: 0,
+      },
+      { type: 'turnCompleted', meta: { executorKind: 'script', exitCode: 0 } },
+    ]);
+    expect(snapshotRoot).toBeDefined();
+    expect(existsSync(snapshotRoot!)).toBe(false);
+  });
+
   it('rechecks authorization and cancellation after asynchronous package verification', async () => {
     const cwd = workspace();
     writeFileSync(join(cwd, 'late.js'), 'process.stdout.write("must-not-run");');
@@ -141,8 +202,10 @@ describe('ScriptBackend', () => {
         ...options(cwd, 'late.js').localExecution!,
         authorize: () => authorized,
         verifyPackageIntegrity: async () => {
+          const snapshot = snapshotPackage(cwd, ['late.js']);
           authorized = false;
           await Promise.resolve();
+          return snapshot;
         },
       },
     });
@@ -156,8 +219,10 @@ describe('ScriptBackend', () => {
       localExecution: {
         ...options(cwd, 'late.js').localExecution!,
         verifyPackageIntegrity: async () => {
+          const snapshot = snapshotPackage(cwd, ['late.js']);
           controller.abort();
           await Promise.resolve();
+          return snapshot;
         },
       },
     });

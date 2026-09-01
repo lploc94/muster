@@ -11286,7 +11286,6 @@ test.describe('M019 S05 Assembled First Run', () => {
     ) as { requestId: string; taskId: string };
 
     const graphPayload = {
-        runId: 'run-m024-s05',
         runStatus: 'running',
         nodes: [
           { nodeId: 'node-1', title: 'Prior result', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
@@ -11306,12 +11305,12 @@ test.describe('M019 S05 Assembled First Run', () => {
           { fromNodeId: 'node-4', toNodeId: 'node-5', inputRef: 'pending_four', contributionState: 'pending', reused: false },
         ],
         gates: [
-          { gateId: 'gate-node-1', consumerNodeId: 'node-1', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
-          { gateId: 'gate-node-2', consumerNodeId: 'node-2', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
-          { gateId: 'gate-node-3', consumerNodeId: 'node-3', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
-          { gateId: 'gate-node-4', consumerNodeId: 'node-4', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { consumerNodeId: 'node-1', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { consumerNodeId: 'node-2', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { consumerNodeId: 'node-3', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
+          { consumerNodeId: 'node-4', status: 'consumed', satisfied: 1, required: 1, inputs: [{ inputRef: 'entry', producerNodeId: 'engine_start', state: 'supplied_live' }] },
           {
-            gateId: 'gate-m024-s05', consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
+            consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
             inputs: [
               { inputRef: 'reuse_result', producerNodeId: 'node-1', state: 'supplied_reused' },
               { inputRef: 'live_result', producerNodeId: 'node-2', state: 'supplied_live' },
@@ -11321,7 +11320,7 @@ test.describe('M019 S05 Assembled First Run', () => {
           },
         ],
         activeGate: {
-          gateId: 'gate-m024-s05', consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
+          consumerNodeId: 'node-5', status: 'open', satisfied: 2, required: 4,
           inputs: [
             { inputRef: 'reuse_result', producerNodeId: 'node-1', state: 'supplied_reused' },
             { inputRef: 'live_result', producerNodeId: 'node-2', state: 'supplied_live' },
@@ -11335,9 +11334,9 @@ test.describe('M019 S05 Assembled First Run', () => {
           frontierNodeIds: ['node-3', 'node-4', 'node-5'], activeNodeIds: ['node-3', 'node-4'],
         },
         feedbackRounds: [
-          { roundId: 'feedback-m024-s05', requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
+          { requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
         ],
-        childRuns: [{ runId: 'child-run-m024-s05', status: 'running' }],
+        childRuns: [{ status: 'running' }],
         reuse: { nodeCount: 1, edgeCount: 1 },
         diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
     };
@@ -11366,10 +11365,10 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(canvas.locator('[data-node-id="node-3"]')).toHaveAttribute('aria-label', /Route correction.*Correcting workflow route.*attempt 2 of 3/);
     await expect(modal.getByTestId('workflow-progress-summary')).toContainText('2 of 5 completed · 2 executing · 1 blocked');
     await expect(modal.getByTestId('workflow-frontier-summary')).toContainText('Frontier: node-3, node-4, node-5');
-    await expect(modal.locator('[data-gate-id]')).toHaveCount(5);
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('node-5');
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"]')).toContainText('2 of 4 required inputs supplied');
-    await expect(modal.locator('[data-gate-id="gate-m024-s05"] [data-input-ref="pending_three"]')).toContainText('Pending');
+    await expect(modal.locator('[data-consumer-node-id]')).toHaveCount(5);
+    await expect(modal.locator('[data-consumer-node-id="node-5"]')).toContainText('node-5');
+    await expect(modal.locator('[data-consumer-node-id="node-5"]')).toContainText('2 of 4 required inputs supplied');
+    await expect(modal.locator('[data-consumer-node-id="node-5"] [data-input-ref="pending_three"]')).toContainText('Pending');
     await modal.getByRole('button', { name: 'Reset view' }).click();
     await expect(modal.locator('.workflow-modal__scale')).toHaveText('100%');
     await modal.getByRole('button', { name: 'Zoom in' }).click();
@@ -11419,7 +11418,8 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(canvasBox!.y + canvasBox!.height).toBeLessThanOrEqual(wrapBox!.y + wrapBox!.height + 1);
     await expect(modal).toContainText('Feedback rounds');
     await expect(modal).toContainText('1 of 2 responses received');
-    await expect(modal.locator('[data-child-run-id="child-run-m024-s05"]')).toContainText('Running');
+    await expect(modal.getByText('Child workflow 1')).toBeVisible();
+    await expect(modal.getByText('Child workflow 1').locator('..')).toContainText('Running');
     await expect(modal.getByRole('status')).toContainText('Workflow graph may be incomplete');
     await expect(modal).toContainText('Workflow nodes were truncated');
     await modal.getByRole('button', { name: 'Close workflow graph' }).click();

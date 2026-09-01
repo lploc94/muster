@@ -22,7 +22,7 @@ import {
 
 /** Bounded projection of a rendered graph — aggregate shape, never identifiers. */
 export type WorkflowGraphProbeGraphObservation = {
-  hasRunId: boolean;
+  runStatus: string;
   nodeCount: number;
   edgeCount: number;
   /** Nodes/edges individually flagged reused on the wire. */
@@ -78,7 +78,7 @@ type Pending = {
 function summarizeGraph(graph: WorkflowGraphWireGraph): WorkflowGraphProbeGraphObservation {
   const statuses = [...new Set(graph.nodes.map((node) => node.workflowNodeStatus))].sort();
   return {
-    hasRunId: typeof graph.runId === 'string' && graph.runId.length > 0,
+    runStatus: graph.runStatus,
     nodeCount: graph.nodes.length,
     edgeCount: graph.edges.length,
     reusedNodeCount: graph.nodes.filter((node) => node.reused).length,

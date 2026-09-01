@@ -34,12 +34,11 @@
 <section
   class="workflow-graph-panel"
   data-testid="workflow-graph-panel"
-  aria-label="Workflow graph for run {view.runId}"
+  aria-label="Workflow graph"
 >
   <header class="workflow-graph-panel__header">
     <div>
-      <div class="workflow-graph-panel__eyebrow">Workflow run</div>
-      <div class="workflow-graph-panel__run-id">{view.runId}</div>
+      <div class="workflow-graph-panel__eyebrow">Workflow graph</div>
     </div>
     <div class="workflow-graph-panel__reuse" aria-label="Reuse density">
       {view.reuseSummary.label}
@@ -87,7 +86,7 @@
   </div>
 
   {#if view.activeGate}
-    <div class="workflow-graph-panel__section" data-gate-id={view.activeGate.id}>
+    <div class="workflow-graph-panel__section" data-consumer-node-id={view.activeGate.consumerNodeId}>
       <div class="workflow-graph-panel__section-title">Active gate</div>
       <div class="workflow-graph-panel__summary-line">
         <span>{view.activeGate.statusLabel}</span>
@@ -100,7 +99,7 @@
     <div class="workflow-graph-panel__section">
       <div class="workflow-graph-panel__section-title">Feedback rounds</div>
       <ul class="workflow-graph-panel__plain-list">
-        {#each view.feedbackRounds as round (round.id)}
+        {#each view.feedbackRounds as round}
           <li>
             <span>{round.statusLabel} from {round.requesterNodeId}</span>
             <span>{round.progressLabel}</span>
@@ -114,9 +113,9 @@
     <div class="workflow-graph-panel__section">
       <div class="workflow-graph-panel__section-title">Child runs</div>
       <ul class="workflow-graph-panel__plain-list">
-        {#each view.childRuns as childRun (childRun.id)}
-          <li data-child-run-id={childRun.id}>
-            <span>{childRun.id}</span>
+        {#each view.childRuns as childRun}
+          <li>
+            <span>{childRun.label}</span>
             <span class="workflow-graph-panel__status">{childRun.statusLabel}</span>
           </li>
         {/each}
@@ -180,15 +179,6 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.06em;
-  }
-
-  .workflow-graph-panel__run-id {
-    margin-top: 2px;
-    font-family: var(--vscode-editor-font-family, ui-monospace, monospace);
-    font-size: 12px;
-    font-weight: 600;
-    color: var(--vscode-foreground, #cccccc);
-    overflow-wrap: anywhere;
   }
 
   .workflow-graph-panel__reuse {

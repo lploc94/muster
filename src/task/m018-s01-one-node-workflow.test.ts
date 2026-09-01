@@ -89,6 +89,144 @@ async function missingWorkflowDecisionSettlement(
   };
 }
 
+type StrictDecisionRepairFixture = {
+  runId: string;
+  entryTaskId: string;
+  activationTurnId: string;
+  activationId: string;
+  correctionTurnId: string;
+};
+
+async function startStrictDecisionRepair(
+  repository: SqliteTaskRepository,
+  client: DbClient,
+  suffix: string,
+  createdAt: string,
+): Promise<StrictDecisionRepairFixture> {
+  const definitionId = `wf-decision-rebind-${suffix}`;
+  await expect(repository.execute({
+    kind: 'defineWorkflowVersion',
+    workspaceId: 'ws',
+    definitionId,
+    version: 1,
+    name: `decision-rebind-${suffix}`,
+    topology: {
+      ...TOPOLOGY,
+      nodes: [{
+        ...TOPOLOGY.nodes[0]!,
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The result is complete.' },
+        },
+      }],
+    },
+    createdAt,
+  })).resolves.toMatchObject({ ok: true, changed: true });
+  const started = await repository.execute({
+    kind: 'startWorkflowRun',
+    workspaceId: 'ws',
+    definitionId,
+    version: 1,
+    startIdempotencyKey: `decision-rebind-${suffix}`,
+    createdAt,
+    backend: 'grok',
+  });
+  const payload = started.operation!.result.data as {
+    runId: string;
+    entryTaskId: string;
+    activationTurnId: string;
+  };
+  const activation = await client.get<{ activation_id: string }>(
+    `SELECT activation_id FROM workflow_activations
+      WHERE workspace_id = ? AND run_id = ?`,
+    ['ws', payload.runId],
+  );
+  const activationId = activation!.activation_id;
+  const correctionTurnId = deriveWorkflowDecisionRepairTurnId(activationId, 2);
+  await expect(missingWorkflowDecisionSettlement(
+    repository,
+    client,
+    payload.entryTaskId,
+    payload.activationTurnId,
+    new Date(Date.parse(createdAt) + 1_000).toISOString(),
+  )).resolves.toMatchObject({ result: { changed: true } });
+  await expect(repository.getTurn(correctionTurnId)).resolves.toMatchObject({ status: 'queued' });
+  return { ...payload, activationId, correctionTurnId };
+}
+
+async function failDecisionCorrectionTurn(
+  repository: SqliteTaskRepository,
+  client: DbClient,
+  taskId: string,
+  turnId: string,
+  at: string,
+  retry?: import('./types').TaskTurn,
+): Promise<void> {
+  await client.run(
+    `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL
+      WHERE workspace_id = ? AND id = ?`,
+    [at, 'ws', turnId],
+  );
+  const task = await repository.getTask(taskId);
+  const turn = await repository.getTurn(turnId);
+  await expect(repository.execute({
+    kind: 'settleTurnAndApplyEffects',
+    workspaceId: 'ws',
+    expectedTaskRevision: task!.revision,
+    task: { ...task!, revision: task!.revision + 1, updatedAt: at },
+    turn: {
+      ...turn!,
+      status: 'failed',
+      failureClass: 'safe_to_retry',
+      dispatchPhase: 'terminal_received',
+      error: 'transient correction failure',
+      finishedAt: at,
+    },
+    expectedStatuses: ['running'],
+    relatedTurns: retry ? [retry] : [],
+    messages: [],
+  })).resolves.toMatchObject({ ok: true, changed: true });
+}
+
+async function settleCorrectedDecision(
+  repository: SqliteTaskRepository,
+  taskId: string,
+  turnId: string,
+  startedAt: string,
+  finishedAt: string,
+): Promise<void> {
+  await expect(repository.execute({
+    kind: 'claimTurn',
+    workspaceId: 'ws',
+    turnId,
+    startedAt,
+    rootTaskId: taskId,
+    maxConcurrentTurns: 10,
+    maxConcurrentPerRoot: 10,
+    maxConcurrentPerBackend: 10,
+    resourceKeys: [],
+  })).resolves.toMatchObject({ ok: true, changed: true });
+  const task = await repository.getTask(taskId);
+  const turn = await repository.getTurn(turnId);
+  const disposition = {
+    kind: 'workflow_next' as const,
+    change: 'updated' as const,
+    result: 'corrected result',
+  };
+  await stageDispositionForSettlement(repository, turn!, disposition);
+  await expect(repository.execute({
+    kind: 'settleTurnAndApplyEffects',
+    workspaceId: 'ws',
+    expectedTaskRevision: task!.revision,
+    task: { ...task!, revision: task!.revision + 1, updatedAt: finishedAt },
+    turn: { ...turn!, status: 'succeeded', disposition, finishedAt },
+    expectedStatuses: ['running'],
+    relatedTurns: [],
+    messages: [],
+  })).resolves.toMatchObject({ ok: true, changed: true });
+}
+
 describe('M018 S01 one-node workflow activation', () => {
   it('domain validates start input and derives stable activation identities', () => {
     const def = makeOneNodeDefinition();
@@ -821,6 +959,296 @@ describe('M018 S01 one-node workflow activation', () => {
       fs.rmSync(ctx.dir, { recursive: true, force: true });
     }
   }, 30_000);
+
+  it('rebinds an open decision repair to a manual retry of its failed correction turn', async () => {
+    const ctx = await openRepo('decision-repair-manual-retry');
+    try {
+      const createdAt = '2026-07-19T04:00:00.000Z';
+      const fixture = await startStrictDecisionRepair(
+        ctx.repository,
+        ctx.client,
+        'manual-retry',
+        createdAt,
+      );
+      await failDecisionCorrectionTurn(
+        ctx.repository,
+        ctx.client,
+        fixture.entryTaskId,
+        fixture.correctionTurnId,
+        '2026-07-19T04:00:02.000Z',
+      );
+      const failed = await ctx.repository.getTurn(fixture.correctionTurnId);
+      const task = await ctx.repository.getTask(fixture.entryTaskId);
+      const retryTurnId = `${fixture.correctionTurnId}-operational-retry`;
+      const retry = {
+        id: retryTurnId,
+        taskId: fixture.entryTaskId,
+        sequence: failed!.sequence + 1,
+        trigger: 'retry' as const,
+        status: 'queued' as const,
+        retryOf: fixture.correctionTurnId,
+        inputs: [...failed!.inputs],
+        executionEpoch: failed!.executionEpoch,
+        runtimeEpoch: failed!.runtimeEpoch,
+        ...(failed!.workflowInstructions !== undefined
+          ? { workflowInstructions: failed!.workflowInstructions }
+          : {}),
+        createdAt: '2026-07-19T04:00:03.000Z',
+      };
+      await expect(ctx.repository.execute({
+        kind: 'retryTurn',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        maxTurnsPerTask: 10,
+        task: task!,
+        turn: retry,
+        reuseOriginalInputs: true,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 1,
+        next_repair_turn_id: retryTurnId,
+      });
+
+      await settleCorrectedDecision(
+        ctx.repository,
+        fixture.entryTaskId,
+        retryTurnId,
+        '2026-07-19T04:00:04.000Z',
+        '2026-07-19T04:00:05.000Z',
+      );
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({ status: 'decided', attempts_used: 2, next_repair_turn_id: null });
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('rebinds an open decision repair to an automatic retry of its failed correction turn', async () => {
+    const ctx = await openRepo('decision-repair-automatic-retry');
+    try {
+      const fixture = await startStrictDecisionRepair(
+        ctx.repository,
+        ctx.client,
+        'automatic-retry',
+        '2026-07-19T04:30:00.000Z',
+      );
+      const correction = await ctx.repository.getTurn(fixture.correctionTurnId);
+      const retryTurnId = `${fixture.correctionTurnId}-automatic-retry`;
+      const retry = {
+        id: retryTurnId,
+        taskId: fixture.entryTaskId,
+        sequence: correction!.sequence + 1,
+        trigger: 'retry' as const,
+        status: 'queued' as const,
+        retryOf: fixture.correctionTurnId,
+        inputs: [...correction!.inputs],
+        executionEpoch: correction!.executionEpoch,
+        runtimeEpoch: correction!.runtimeEpoch,
+        ...(correction!.workflowInstructions !== undefined
+          ? { workflowInstructions: correction!.workflowInstructions }
+          : {}),
+        createdAt: '2026-07-19T04:30:02.000Z',
+      };
+      await failDecisionCorrectionTurn(
+        ctx.repository,
+        ctx.client,
+        fixture.entryTaskId,
+        fixture.correctionTurnId,
+        '2026-07-19T04:30:02.000Z',
+        retry,
+      );
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 1,
+        next_repair_turn_id: retryTurnId,
+      });
+
+      await settleCorrectedDecision(
+        ctx.repository,
+        fixture.entryTaskId,
+        retryTurnId,
+        '2026-07-19T04:30:03.000Z',
+        '2026-07-19T04:30:04.000Z',
+      );
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({ status: 'decided', attempts_used: 2, next_repair_turn_id: null });
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('rebinds an open decision repair to a recovered correction turn after reload', async () => {
+    const ctx = await openRepo('decision-repair-recovery-reload');
+    const clients = [ctx.client];
+    let repository = ctx.repository;
+    let client = ctx.client;
+    try {
+      const fixture = await startStrictDecisionRepair(
+        repository,
+        client,
+        'recovery-reload',
+        '2026-07-19T05:00:00.000Z',
+      );
+      await failDecisionCorrectionTurn(
+        repository,
+        client,
+        fixture.entryTaskId,
+        fixture.correctionTurnId,
+        '2026-07-19T05:00:02.000Z',
+      );
+      await client.close();
+      client = new DbClient({
+        workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+        execArgv: ['--import', 'tsx'],
+      });
+      clients.push(client);
+      await client.open(ctx.dbPath);
+      repository = new SqliteTaskRepository(client, 'ws');
+
+      const recovered = await repository.execute({
+        kind: 'recoverWorkflowActivation',
+        workspaceId: 'ws',
+        runId: fixture.runId,
+        activationId: fixture.activationId,
+        failedTurnId: fixture.correctionTurnId,
+        recoveryOperationId: 'decision-repair-recovery-reload',
+        fingerprint: 'decision-repair-recovery-reload-v1',
+        instruction: 'Resume the interrupted correction attempt.',
+        expectedActivationStatus: 'failed',
+        createdAt: '2026-07-19T05:00:03.000Z',
+      });
+      expect(recovered).toMatchObject({ ok: true, changed: true });
+      const recoveredTurnId = (recovered.operation!.result as {
+        ok: true;
+        data: { turnId: string };
+      }).data.turnId;
+      await expect(client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 1,
+        next_repair_turn_id: recoveredTurnId,
+      });
+
+      await settleCorrectedDecision(
+        repository,
+        fixture.entryTaskId,
+        recoveredTurnId,
+        '2026-07-19T05:00:04.000Z',
+        '2026-07-19T05:00:05.000Z',
+      );
+      await expect(client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({ status: 'decided', attempts_used: 2, next_repair_turn_id: null });
+    } finally {
+      await Promise.all(clients.map((candidate) => candidate.close().catch(() => undefined)));
+      fs.rmSync(ctx.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('closes active and pending nodes plus an open repair when a run times out', async () => {
+    const ctx = await openRepo('decision-repair-timeout-closure');
+    try {
+      const createdAt = '2026-07-19T06:00:00.000Z';
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-timeout-closure',
+        version: 1,
+        name: 'decision-repair-timeout-closure',
+        topology: {
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'sink' }],
+          nodes: [{
+            nodeId: 'decision',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is complete.' },
+            },
+          }, { nodeId: 'sink' }],
+          edges: [{ fromNodeId: 'decision', toNodeId: 'sink', inputRef: 'decision_result' }],
+        },
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-decision-repair-timeout-closure',
+        version: 1,
+        startIdempotencyKey: 'decision-repair-timeout-closure',
+        createdAt,
+        backend: 'grok',
+      });
+      const payload = started.operation!.result.data as {
+        runId: string;
+        entryTaskId: string;
+        activationTurnId: string;
+      };
+      await expect(missingWorkflowDecisionSettlement(
+        ctx.repository,
+        ctx.client,
+        payload.entryTaskId,
+        payload.activationTurnId,
+        '2026-07-19T06:00:01.000Z',
+      )).resolves.toMatchObject({ result: { changed: true } });
+      await ctx.client.run(
+        `UPDATE workflow_runs SET deadline_at = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['2026-07-19T06:00:02.000Z', 'ws', payload.runId],
+      );
+
+      await expect(ctx.repository.execute({
+        kind: 'reapWorkflowTimeouts',
+        workspaceId: 'ws',
+        now: '2026-07-19T06:00:03.000Z',
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(ctx.client.all(
+        `SELECT node_id, status FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+        ['ws', payload.runId],
+      )).resolves.toEqual([
+        { node_id: 'decision', status: 'failed' },
+        { node_id: 'sink', status: 'failed' },
+      ]);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, next_repair_turn_id
+          FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toEqual({
+        status: 'exhausted',
+        attempts_used: 3,
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'run_timeout' });
+    } finally {
+      await ctx.close();
+    }
+  });
 
   it('uses the existing workflow budget closure instead of over-admitting a repair turn', async () => {
     const ctx = await openRepo('decision-repair-budget');

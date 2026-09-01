@@ -815,16 +815,21 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       );
       expect(late.ok).toBe(true);
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
-      // Consumer must not have been activated after closure; shell remains pending.
+      // Consumer must not have been activated after closure; its materialized shell
+      // is terminalized with the rest of the failed run and still has no turn.
       const consumerNode = await opened.client.get<{ task_id: string | null; status: string }>(
         `SELECT task_id, status FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
         ['ws', data.runId, 'consumer'],
       );
       expect(consumerNode?.task_id).toEqual(expect.any(String));
-      expect(consumerNode?.status).toBe('pending');
+      expect(consumerNode?.status).toBe('failed');
       const shellTask = await opened.repository.getTask(consumerNode!.task_id!);
-      expect(shellTask?.workflowShell).toBeTruthy();
+      expect(shellTask).toMatchObject({
+        lifecycle: 'failed',
+        workflowShell: expect.any(Object),
+        lifecycleAuthority: { kind: 'workflow', runId: data.runId },
+      });
       expect(await opened.repository.listTurns(consumerNode!.task_id!)).toHaveLength(0);
     } finally {
       await opened.close();

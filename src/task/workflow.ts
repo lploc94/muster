@@ -7,6 +7,7 @@
 import { createHash } from 'node:crypto';
 import { formatWorkflowAgentOutcomeContract } from './brief';
 import { TASK_ERROR_MAX_BYTES } from './content-limits';
+import { compareBinary } from './transcript-order';
 import {
   decodeDefineWorkflowInput,
   decodeWorkflowManifest,
@@ -304,6 +305,44 @@ export function startWorkflowLedgerKey(
 export function stableId(prefix: string, material: string): string {
   const digest = createHash('sha256').update(material, 'utf8').digest('hex').slice(0, 24);
   return `${prefix}_${digest}`;
+}
+
+/**
+ * Canonical durable identity for one validated child invocation. Binding names
+ * are unique by contract and ordered with SQLite-compatible UTF-8 byte collation,
+ * never host locale/ICU rules.
+ */
+export function fingerprintChildInvocation(input: {
+  callerScopeId: string;
+  childDefinitionId: string;
+  childDefinitionVersion: number;
+  childIdempotencyKey: string;
+  entryBindings: readonly {
+    name: string;
+    fromInputRef: string;
+    sourceArtifactRunId: string;
+    sourceArtifactId: string;
+    sourceArtifactRevision: number;
+  }[];
+  effectivePolicy: WorkflowPolicy;
+}): string {
+  const entryBindings = input.entryBindings
+    .map((binding) => ({
+      name: binding.name,
+      fromInputRef: binding.fromInputRef,
+      sourceArtifactRunId: binding.sourceArtifactRunId,
+      sourceArtifactId: binding.sourceArtifactId,
+      sourceArtifactRevision: binding.sourceArtifactRevision,
+    }))
+    .sort((left, right) => compareBinary(left.name, right.name));
+  return stableId('wfif', JSON.stringify({
+    callerScopeId: input.callerScopeId,
+    childDefinitionId: input.childDefinitionId,
+    childDefinitionVersion: input.childDefinitionVersion,
+    childIdempotencyKey: input.childIdempotencyKey,
+    entryBindings,
+    effectivePolicy: input.effectivePolicy,
+  }));
 }
 
 /**

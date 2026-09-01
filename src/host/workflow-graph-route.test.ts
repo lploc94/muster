@@ -8,7 +8,6 @@ function deps(overrides?: Partial<WorkflowGraphRouteDeps>): WorkflowGraphRouteDe
   return {
     getFocused: () => ({ taskId: 'task-1', generation: 1 }),
     buildWorkflowGraph: async () => ({
-      runId: 'run-1',
       runStatus: 'running',
       nodes: [{
         nodeId: 'node-1', title: 'Review route', workflowNodeStatus: 'active', executionActivity: 'executing',
@@ -114,7 +113,7 @@ describe('routeRequestWorkflowGraph', () => {
       { type: 'requestWorkflowGraph', requestId: 'request-1', taskId: 'task-1' },
       deps({
         buildWorkflowGraph: async () => ({
-          runId: 'run-1', runStatus: 'running', nodes: [], edges: [], gates: [],
+          runStatus: 'running', nodes: [], edges: [], gates: [],
           progress: {
             total: 0, completed: 0, queued: 0, executing: 0, waiting: 0,
             blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
@@ -154,7 +153,6 @@ describe('routeRequestWorkflowGraph', () => {
         taskId: 'task-1',
         ok: true,
         graph: {
-          runId: 'run-1',
           runStatus: 'running',
           nodes: [{
             nodeId: 'node-1', title: 'Review route', workflowNodeStatus: 'active', executionActivity: 'executing',

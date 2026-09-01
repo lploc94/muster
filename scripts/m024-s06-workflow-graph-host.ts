@@ -112,7 +112,7 @@ export async function run(): Promise<void> {
   assert.equal(observation.ok, true, `graph result failed with code=${observation.code ?? 'none'}`);
   const graph = observation.graph;
   assert.ok(graph, 'ok result carried no graph observation');
-  assert.equal(graph.hasRunId, true, 'graph carried no runId');
+  assert.equal(graph.runStatus, 'running', 'graph carried no running status');
   assert.equal(graph.nodeCount, EXPECTED_NODE_COUNT, `graph exposed ${graph.nodeCount} nodes`);
   assert.equal(
     graph.reusedNodeCount,

@@ -95,7 +95,7 @@ export function validateWorkflowGraphEvidence(evidence, options = {}) {
       failures.push('roundTrip.correlated must be true for PASS');
     }
     if (round.resultOk !== true) failures.push('roundTrip.resultOk must be true for PASS');
-    if (round.hasRunId !== true) failures.push('roundTrip.hasRunId must be true for PASS');
+    if (round.runStatus !== 'running') failures.push('roundTrip.runStatus must be running for PASS');
     for (const field of [
       'nodeCount',
       'edgeCount',
@@ -206,7 +206,7 @@ export function assembleWorkflowGraphEvidence(result, generatedAt = new Date().t
     roundTrip: {
       correlated: true,
       resultOk: true,
-      hasRunId: graph.hasRunId === true,
+      runStatus: graph.runStatus,
       nodeCount: graph.nodeCount,
       edgeCount: graph.edgeCount,
       reusedNodeCount: graph.reusedNodeCount,

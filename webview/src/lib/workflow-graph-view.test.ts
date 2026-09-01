@@ -12,7 +12,6 @@ function graph(
   overrides: Partial<WorkflowGraphWireGraph> = {},
 ): WorkflowGraphWireGraph {
   return {
-    runId: "run-parent",
     runStatus: "running",
     nodes: [
       { nodeId: "one", workflowNodeStatus: "reused", executionActivity: "none", displayState: "reused", progressBucket: "completed", reused: true },
@@ -46,7 +45,7 @@ function graph(
       },
     ],
     gates: [{
-      gateId: "gate-five", consumerNodeId: "five", status: "open",
+      consumerNodeId: "five", status: "open",
       satisfied: 3, required: 4,
       inputs: [
         { inputRef: "one", producerNodeId: "one", state: "supplied_reused" },
@@ -56,7 +55,6 @@ function graph(
       ],
     }],
     activeGate: {
-      gateId: "gate-five",
       consumerNodeId: "five",
       status: "open",
       satisfied: 3,
@@ -75,7 +73,6 @@ function graph(
     },
     feedbackRounds: [
       {
-        roundId: "feedback-1",
         requesterNodeId: "five",
         status: "open",
         joinMode: "all",
@@ -83,7 +80,7 @@ function graph(
         required: 2,
       },
     ],
-    childRuns: [{ runId: "run-child", status: "running" }],
+    childRuns: [{ status: "running" }],
     reuse: { nodeCount: 4, edgeCount: 4 },
     diagnostics: [
       { code: "workflow_graph_topology_undecodable" },
@@ -97,7 +94,6 @@ function graph(
 
 function operationalGraph(): WorkflowGraphWireGraph {
   return {
-    runId: "run-operational",
     runStatus: "running",
     nodes: [
       { nodeId: "a", workflowNodeStatus: "succeeded", executionActivity: "completed", displayState: "completed", progressBucket: "completed", reused: false },
@@ -112,23 +108,23 @@ function operationalGraph(): WorkflowGraphWireGraph {
       { fromNodeId: "c", toNodeId: "e", inputRef: "from_c", contributionState: "blocking", reused: false },
     ],
     gates: [
-      { gateId: "gate-a", consumerNodeId: "a", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
-      { gateId: "gate-b", consumerNodeId: "b", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
-      { gateId: "gate-d", consumerNodeId: "d", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      { consumerNodeId: "a", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      { consumerNodeId: "b", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
+      { consumerNodeId: "d", status: "consumed", satisfied: 1, required: 1, inputs: [{ inputRef: "entry", producerNodeId: "engine_start", state: "supplied_live" }] },
       {
-        gateId: "gate-c", consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
+        consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
         inputs: [
           { inputRef: "from_a", producerNodeId: "a", state: "supplied_live" },
           { inputRef: "from_b", producerNodeId: "b", state: "pending" },
         ],
       },
       {
-        gateId: "gate-e", consumerNodeId: "e", status: "open", satisfied: 0, required: 1,
+        consumerNodeId: "e", status: "open", satisfied: 0, required: 1,
         inputs: [{ inputRef: "from_c", producerNodeId: "c", state: "blocking" }],
       },
     ],
     activeGate: {
-      gateId: "gate-c", consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
+      consumerNodeId: "c", status: "open", satisfied: 1, required: 2,
       inputs: [
         { inputRef: "from_a", producerNodeId: "a", state: "supplied_live" },
         { inputRef: "from_b", producerNodeId: "b", state: "pending" },
@@ -166,7 +162,6 @@ describe("buildWorkflowGraphPanelView", () => {
   it("reduces a five-node reuse closure into stable operator-facing panel data", () => {
     const view = buildWorkflowGraphPanelView(graph());
 
-    expect(view.runId).toBe("run-parent");
     expect(view.nodes).toEqual([
       {
         id: "one",
@@ -211,7 +206,6 @@ describe("buildWorkflowGraphPanelView", () => {
     ]);
     expect(view.activeNodeId).toBe("five");
     expect(view.activeGate).toEqual({
-      id: "gate-five",
       consumerNodeId: "five",
       status: "open",
       statusLabel: "Open",
@@ -228,7 +222,6 @@ describe("buildWorkflowGraphPanelView", () => {
     });
     expect(view.feedbackRounds).toEqual([
       {
-        id: "feedback-1",
         requesterNodeId: "five",
         status: "open",
         statusLabel: "Open",
@@ -239,7 +232,7 @@ describe("buildWorkflowGraphPanelView", () => {
       },
     ]);
     expect(view.childRuns).toEqual([
-      { id: "run-child", status: "running", statusLabel: "Running" },
+      { label: "Child workflow 1", status: "running", statusLabel: "Running" },
     ]);
     expect(view.reuseSummary).toEqual({
       nodeCount: 4,
@@ -308,7 +301,6 @@ describe("buildWorkflowGraphPanelView", () => {
     ]);
     expect(view.gates).toHaveLength(5);
     expect(view.gates.find((gate) => gate.consumerNodeId === "c")).toEqual({
-      id: "gate-c",
       consumerNodeId: "c",
       status: "open",
       statusLabel: "Open",
@@ -377,7 +369,7 @@ describe("buildWorkflowGraphPanelView", () => {
       frontierNodeIds: ["feedback", "repair", "executing"], activeNodeIds: ["executing"],
     };
     mixed.feedbackRounds = [{
-      roundId: "round-open", requesterNodeId: "feedback", status: "open", joinMode: "all",
+      requesterNodeId: "feedback", status: "open", joinMode: "all",
       required: 2, responded: 1,
     }];
     mixed.reuse = { nodeCount: 0, edgeCount: 0 };

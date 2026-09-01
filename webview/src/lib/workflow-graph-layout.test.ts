@@ -12,7 +12,6 @@ import {
 function chainGraph(count: number): WorkflowGraphWireGraph {
   const nodeIds = Array.from({ length: count }, (_, index) => `node-${index}`);
   return {
-    runId: `run-${count}`,
     runStatus: 'running',
     nodes: nodeIds.map((nodeId) => ({
       nodeId,
@@ -98,7 +97,6 @@ describe('workflow graph layout and fit', () => {
     refreshed.nodes[0]!.displayState = 'completed';
     refreshed.nodes[0]!.workflowNodeStatus = 'succeeded';
     const changed = chainGraph(3);
-    changed.runId = original.runId;
 
     expect(workflowGraphTopologyKey(refreshed)).toBe(workflowGraphTopologyKey(original));
     expect(workflowGraphTopologyKey(changed)).not.toBe(workflowGraphTopologyKey(original));

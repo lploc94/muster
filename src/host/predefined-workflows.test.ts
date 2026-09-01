@@ -1,8 +1,9 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  createPredefinedWorkflowExecutionSnapshot,
   freezePredefinedWorkflowDefinition,
   getPredefinedWorkflow,
   listPredefinedWorkflows,
@@ -13,6 +14,7 @@ import {
   PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES,
   PREDEFINED_WORKFLOW_MAX_BUNDLE_FILES,
   resolvePredefinedWorkflow,
+  resolvePredefinedWorkflowDefinition,
   resolvePredefinedWorkflowScript,
   resolvePredefinedWorkflowSource,
 } from './predefined-workflows';
@@ -319,6 +321,107 @@ describe('predefined workflow catalog', () => {
 
     rmSync(join(packageRoot, 'scripts', 'check.js'));
     await expect(resolvePredefinedWorkflow(options, listed.workflows[0]!.workflowRef)).resolves.toBeUndefined();
+  });
+
+  it('returns bounded asset diagnostics without echoing manifest-declared paths', async () => {
+    const workspace = temp('asset-diagnostic-workspace');
+    const global = temp('asset-diagnostic-global');
+    const root = workspaceRoot(workspace);
+    const instructionCanary = 'prompts/PRIVATE_INSTRUCTION_PATH_CANARY.md';
+    const scriptCanary = 'scripts/PRIVATE_SCRIPT_PATH_CANARY.js';
+    writePackage(
+      root,
+      'missing-instruction',
+      manifest('Missing instruction', 'missing instruction package', {
+        nodes: [{
+          nodeKey: 'check',
+          taskType: 'review',
+          instructions: { file: instructionCanary },
+        }],
+      }),
+      {},
+    );
+    writePackage(
+      root,
+      'missing-script',
+      manifest('Missing script', 'missing script package', {
+        nodes: [{
+          nodeKey: 'check',
+          script: { interpreter: 'node', file: scriptCanary, args: [] },
+          outcome: {
+            kind: 'exit',
+            next: { when: { exitCode: 0 } },
+            fail: { when: { exitCode: 'nonzero' } },
+          },
+        }],
+      }),
+      {},
+    );
+    const options = { workspaceFolder: workspace, globalWorkflowFolder: global };
+    const listed = await listPredefinedWorkflows(options);
+    expect(listed.workflows).toHaveLength(2);
+
+    for (const workflow of listed.workflows) {
+      const result = await resolvePredefinedWorkflowDefinition(options, workflow.workflowRef);
+      expect(result).toMatchObject({ ok: false, code: 'predefined_workflow_asset_invalid' });
+      if (result.ok) continue;
+      expect(result.reason).toMatch(/^predefined workflow (instruction|script) asset is missing$/);
+      expect(result.reason).not.toContain(instructionCanary);
+      expect(result.reason).not.toContain(scriptCanary);
+      expect(result.reason.length).toBeLessThanOrEqual(240);
+    }
+  });
+
+  it('materializes a disposable package-shaped snapshot from coherently verified bytes', async () => {
+    const workspace = temp('execution-snapshot-workspace');
+    const global = temp('execution-snapshot-global');
+    const root = workspaceRoot(workspace);
+    const scriptSource = "const helper = require('./helper.cjs'); process.stdout.write(helper);";
+    const packageRoot = writePackage(
+      root,
+      'execution-snapshot',
+      manifest('Execution snapshot', 'execution snapshot package', {
+        nodes: [{
+          nodeKey: 'check',
+          script: { interpreter: 'node', file: 'scripts/check.cjs', args: [] },
+          outcome: {
+            kind: 'exit',
+            next: { when: { exitCode: 0 } },
+            fail: { when: { exitCode: 'nonzero' } },
+          },
+        }],
+      }),
+      {
+        'scripts/check.cjs': scriptSource,
+        'scripts/helper.cjs': "module.exports = 'verified';",
+      },
+    );
+    const options = { workspaceFolder: workspace, globalWorkflowFolder: global };
+    const listed = await listPredefinedWorkflows(options);
+    const resolved = await resolvePredefinedWorkflow(options, listed.workflows[0]!.workflowRef);
+    expect(resolved).toBeDefined();
+    const script = await resolvePredefinedWorkflowScript(resolved!, 'scripts/check.cjs', 'node');
+    expect(script).toBeDefined();
+
+    const snapshot = await createPredefinedWorkflowExecutionSnapshot(
+      resolved!,
+      'scripts/check.cjs',
+      'node',
+      script!.scriptSha256,
+    );
+    expect(snapshot).toBeDefined();
+    expect(snapshot!.scriptRoot).not.toBe(packageRoot);
+
+    writeFileSync(join(packageRoot, 'scripts', 'check.cjs'), 'process.stdout.write("swapped")');
+    writeFileSync(join(packageRoot, 'scripts', 'helper.cjs'), "module.exports = 'swapped';");
+    expect(readFileSync(join(snapshot!.scriptRoot, 'scripts', 'check.cjs'), 'utf8')).toBe(scriptSource);
+    expect(readFileSync(join(snapshot!.scriptRoot, 'scripts', 'helper.cjs'), 'utf8')).toBe(
+      "module.exports = 'verified';",
+    );
+    expect(readFileSync(join(snapshot!.scriptRoot, 'workflow.json'), 'utf8')).toContain('Execution snapshot');
+
+    await snapshot!.dispose();
+    expect(existsSync(snapshot!.scriptRoot)).toBe(false);
   });
 
   it('allows an empty package-local script', async () => {

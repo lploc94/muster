@@ -76,7 +76,6 @@ export interface WorkflowGraphWireGateInput {
   state: WorkflowGraphWireInputState;
 }
 export interface WorkflowGraphWireGate {
-  gateId: string;
   consumerNodeId: string;
   status: WorkflowGraphWireGateStatus;
   satisfied: number;
@@ -98,16 +97,14 @@ export interface WorkflowGraphWireProgress {
   activeNodeIds: string[];
 }
 export interface WorkflowGraphWireFeedbackRound {
-  roundId: string;
   requesterNodeId: string;
   status: 'open' | 'satisfied';
   joinMode: 'all';
   required: number;
   responded: number;
 }
-export interface WorkflowGraphWireChildRun { runId: string; status: WorkflowGraphWireRunStatus; }
+export interface WorkflowGraphWireChildRun { status: WorkflowGraphWireRunStatus; }
 export interface WorkflowGraphWireGraph {
-  runId: string;
   runStatus: WorkflowGraphWireRunStatus;
   nodes: WorkflowGraphWireNode[];
   edges: WorkflowGraphWireEdge[];
@@ -358,13 +355,13 @@ function parseGateInput(raw: unknown): WorkflowGraphWireGateInput | null {
   return { inputRef: raw.inputRef, producerNodeId: raw.producerNodeId, state: raw.state as WorkflowGraphWireInputState };
 }
 function parseGate(raw: unknown): WorkflowGraphWireGate | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['gateId', 'consumerNodeId', 'status', 'satisfied', 'required', 'inputs']) || !isBoundedString(raw.gateId) || !isBoundedString(raw.consumerNodeId) || typeof raw.status !== 'string' || !GATE_STATUSES.has(raw.status) || !isCount(raw.satisfied) || !isCount(raw.required) || raw.satisfied > raw.required) return null;
+  if (!isRecord(raw) || !hasExactKeys(raw, ['consumerNodeId', 'status', 'satisfied', 'required', 'inputs']) || !isBoundedString(raw.consumerNodeId) || typeof raw.status !== 'string' || !GATE_STATUSES.has(raw.status) || !isCount(raw.satisfied) || !isCount(raw.required) || raw.satisfied > raw.required) return null;
   const inputs = parseList(raw.inputs, WORKFLOW_GRAPH_GATE_INPUTS_MAX, parseGateInput);
   const inputRefs = inputs ? new Set(inputs.map((input) => input.inputRef)) : undefined;
   if (!inputs || inputRefs?.size !== inputs.length || inputs.length !== raw.required || inputs.filter((input) => input.state === 'supplied_live' || input.state === 'supplied_reused').length !== raw.satisfied) return null;
   if ((raw.status === 'satisfied' || raw.status === 'consumed') && raw.satisfied !== raw.required) return null;
   if (raw.status === 'open' && raw.satisfied >= raw.required) return null;
-  return { gateId: raw.gateId, consumerNodeId: raw.consumerNodeId, status: raw.status as WorkflowGraphWireGateStatus, satisfied: raw.satisfied, required: raw.required, inputs };
+  return { consumerNodeId: raw.consumerNodeId, status: raw.status as WorkflowGraphWireGateStatus, satisfied: raw.satisfied, required: raw.required, inputs };
 }
 function parseProgress(raw: unknown, nodeCount: number): WorkflowGraphWireProgress | null {
   if (!isRecord(raw) || !hasExactKeys(raw, [
@@ -394,14 +391,14 @@ function parseProgress(raw: unknown, nodeCount: number): WorkflowGraphWireProgre
   };
 }
 function parseFeedbackRound(raw: unknown): WorkflowGraphWireFeedbackRound | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['roundId', 'requesterNodeId', 'status', 'joinMode', 'required', 'responded']) || !isBoundedString(raw.roundId) || !isBoundedString(raw.requesterNodeId) || typeof raw.status !== 'string' || !FEEDBACK_ROUND_STATUSES.has(raw.status) || typeof raw.joinMode !== 'string' || !FEEDBACK_JOIN_MODES.has(raw.joinMode) || !isCount(raw.required) || raw.required > WORKFLOW_GRAPH_NODES_MAX || !isCount(raw.responded) || raw.responded > raw.required) return null;
+  if (!isRecord(raw) || !hasExactKeys(raw, ['requesterNodeId', 'status', 'joinMode', 'required', 'responded']) || !isBoundedString(raw.requesterNodeId) || typeof raw.status !== 'string' || !FEEDBACK_ROUND_STATUSES.has(raw.status) || typeof raw.joinMode !== 'string' || !FEEDBACK_JOIN_MODES.has(raw.joinMode) || !isCount(raw.required) || raw.required > WORKFLOW_GRAPH_NODES_MAX || !isCount(raw.responded) || raw.responded > raw.required) return null;
   if (raw.status === 'satisfied' && raw.responded !== raw.required) return null;
   if (raw.status === 'open' && raw.responded >= raw.required) return null;
-  return { roundId: raw.roundId, requesterNodeId: raw.requesterNodeId, status: raw.status as WorkflowGraphWireFeedbackRound['status'], joinMode: raw.joinMode as WorkflowGraphWireFeedbackRound['joinMode'], required: raw.required, responded: raw.responded };
+  return { requesterNodeId: raw.requesterNodeId, status: raw.status as WorkflowGraphWireFeedbackRound['status'], joinMode: raw.joinMode as WorkflowGraphWireFeedbackRound['joinMode'], required: raw.required, responded: raw.responded };
 }
 function parseChildRun(raw: unknown): WorkflowGraphWireChildRun | null {
-  if (!isRecord(raw) || !hasExactKeys(raw, ['runId', 'status']) || !isBoundedString(raw.runId) || typeof raw.status !== 'string' || !RUN_STATUSES.has(raw.status)) return null;
-  return { runId: raw.runId, status: raw.status as WorkflowGraphWireRunStatus };
+  if (!isRecord(raw) || !hasExactKeys(raw, ['status']) || typeof raw.status !== 'string' || !RUN_STATUSES.has(raw.status)) return null;
+  return { status: raw.status as WorkflowGraphWireRunStatus };
 }
 function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | null {
   if (!isRecord(raw) || !hasExactKeys(raw, ['code']) || typeof raw.code !== 'string' || !DIAGNOSTIC_CODES.has(raw.code)) return null;
@@ -409,8 +406,8 @@ function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | 
 }
 function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
   if (!isRecord(raw)) return null;
-  const baseKeys = ['runId', 'runStatus', 'nodes', 'edges', 'gates', 'progress', 'feedbackRounds', 'childRuns', 'reuse', 'diagnostics'];
-  if (!hasExactKeys(raw, 'activeGate' in raw ? [...baseKeys, 'activeGate'] : baseKeys) || !isBoundedString(raw.runId) || typeof raw.runStatus !== 'string' || !RUN_STATUSES.has(raw.runStatus)) return null;
+  const baseKeys = ['runStatus', 'nodes', 'edges', 'gates', 'progress', 'feedbackRounds', 'childRuns', 'reuse', 'diagnostics'];
+  if (!hasExactKeys(raw, 'activeGate' in raw ? [...baseKeys, 'activeGate'] : baseKeys) || typeof raw.runStatus !== 'string' || !RUN_STATUSES.has(raw.runStatus)) return null;
   const nodes = parseList(raw.nodes, WORKFLOW_GRAPH_NODES_MAX, parseNode);
   const edges = parseList(raw.edges, WORKFLOW_GRAPH_EDGES_MAX, parseEdge);
   const gates = parseList(raw.gates, WORKFLOW_GRAPH_GATES_MAX, parseGate);
@@ -421,18 +418,12 @@ function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
   const progress = parseProgress(raw.progress, nodes.length);
   if (!progress) return null;
   const nodeIds = new Set(nodes.map((node) => node.nodeId));
-  const gateIds = new Set(gates.map((gate) => gate.gateId));
   const gateConsumers = new Set(gates.map((gate) => gate.consumerNodeId));
   const edgeKeys = new Set(edges.map((edge) => `${edge.toNodeId}\0${edge.inputRef}`));
-  const feedbackRoundIds = new Set(feedbackRounds.map((round) => round.roundId));
-  const childRunIds = new Set(childRuns.map((run) => run.runId));
   if (
     nodeIds.size !== nodes.length
-    || gateIds.size !== gates.length
     || gateConsumers.size !== gates.length
     || edgeKeys.size !== edges.length
-    || feedbackRoundIds.size !== feedbackRounds.length
-    || childRunIds.size !== childRuns.length
     || nodes.some((node) => !validNodeTuple(node, raw.runStatus as WorkflowGraphWireRunStatus))
     || gates.some((gate) => !nodeIds.has(gate.consumerNodeId))
     || edges.some((edge) => !nodeIds.has(edge.fromNodeId) || !nodeIds.has(edge.toNodeId))
@@ -504,7 +495,7 @@ function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
   const activeGate = raw.activeGate === undefined ? undefined : parseGate(raw.activeGate);
   if ('activeGate' in raw && !activeGate) return null;
   if (activeGate) {
-    const matchingGate = gates.find((gate) => gate.gateId === activeGate.gateId);
+    const matchingGate = gates.find((gate) => gate.consumerNodeId === activeGate.consumerNodeId);
     if (!matchingGate || JSON.stringify(matchingGate) !== JSON.stringify(activeGate)) return null;
   }
   if (nodes.some((node) => node.reused !== (node.workflowNodeStatus === 'reused'))) return null;
@@ -514,7 +505,7 @@ function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
     || raw.reuse.edgeCount !== edges.filter((edge) => edge.reused).length
     || edges.some((edge) => edge.reused !== reusedNodeIds.has(edge.fromNodeId))
   ) return null;
-  return { runId: raw.runId, runStatus: raw.runStatus as WorkflowGraphWireRunStatus, nodes, edges, gates, ...(activeGate ? { activeGate } : {}), progress, feedbackRounds, childRuns, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, diagnostics };
+  return { runStatus: raw.runStatus as WorkflowGraphWireRunStatus, nodes, edges, gates, ...(activeGate ? { activeGate } : {}), progress, feedbackRounds, childRuns, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, diagnostics };
 }
 
 /** Fail-closed host→webview parser: any malformed or extra field rejects the whole result. */

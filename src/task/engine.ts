@@ -4,7 +4,7 @@ import { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
 import type { McpReadinessSupervisor } from '../bridge/mcp-readiness';
 import {
-  resolvePredefinedWorkflowScript,
+  createPredefinedWorkflowExecutionSnapshot,
   resolvePredefinedWorkflowSource,
   type PredefinedWorkflowCatalogOptions,
 } from '../host/predefined-workflows';
@@ -4785,14 +4785,16 @@ export class TaskEngine {
                       if (!current) {
                         throw new Error('predefined workflow package changed after definition');
                       }
-                      const currentScript = await resolvePredefinedWorkflowScript(
+                      const snapshot = await createPredefinedWorkflowExecutionSnapshot(
                         current,
                         scriptExecution.file,
                         scriptExecution.interpreter,
+                        scriptExecution.source!.scriptSha256,
                       );
-                      if (!currentScript || currentScript.scriptSha256 !== scriptExecution.source!.scriptSha256) {
+                      if (!snapshot) {
                         throw new Error('predefined workflow script changed after definition');
                       }
+                      return snapshot;
                     },
                   }
                 : {}),

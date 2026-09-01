@@ -10,7 +10,6 @@ const REQUEST_ID = 'workflow-graph-1-1700000000000';
 
 function graph(overrides: Partial<WorkflowGraphWireGraph> = {}): WorkflowGraphWireGraph {
   return {
-    runId: 'wfr-1',
     runStatus: 'running',
     nodes: [
       { nodeId: 'one', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
@@ -23,8 +22,8 @@ function graph(overrides: Partial<WorkflowGraphWireGraph> = {}): WorkflowGraphWi
       { fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result', contributionState: 'supplied_live', reused: false },
     ],
     gates: [
-      { gateId: 'gate-two', consumerNodeId: 'two', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'one_result', producerNodeId: 'one', state: 'supplied_reused' }] },
-      { gateId: 'gate-five', consumerNodeId: 'five', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'four_result', producerNodeId: 'four', state: 'supplied_live' }] },
+      { consumerNodeId: 'two', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'one_result', producerNodeId: 'one', state: 'supplied_reused' }] },
+      { consumerNodeId: 'five', status: 'satisfied', satisfied: 1, required: 1, inputs: [{ inputRef: 'four_result', producerNodeId: 'four', state: 'supplied_live' }] },
     ],
     progress: {
       total: 4, completed: 3, queued: 1, executing: 0, waiting: 0,
@@ -72,7 +71,7 @@ describe('workflow graph probe coordinator', () => {
       taskId: TASK_ID,
       ok: true,
       graph: {
-        hasRunId: true,
+        runStatus: 'running',
         nodeCount: 4,
         edgeCount: 2,
         reusedNodeCount: 2,
@@ -136,7 +135,7 @@ describe('workflow graph probe coordinator', () => {
         code: 'not_workflow_task',
       }),
     ).toBe(false);
-    expect(coordinator.noteResult(okResult({ graph: { runId: 'wfr-1' } }))).toBe(false);
+    expect(coordinator.noteResult(okResult({ graph: { runStatus: 'running' } }))).toBe(false);
     // Extra field: fail-closed parser rejects the whole payload.
     expect(coordinator.noteResult(okResult({ extra: true }))).toBe(false);
     expect(coordinator.noteResult(okResult())).toBe(true);

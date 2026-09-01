@@ -93,7 +93,7 @@ describe('M024 S04 workflow graph projection', () => {
       };
 
       await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toMatchObject({
-        runId: expect.any(String),
+        runStatus: 'running',
       });
       expect(graphNodeReads).toBe(2);
 
@@ -364,6 +364,10 @@ describe('M024 S04 workflow graph projection', () => {
         requesterNodeId: 'feedback', status: 'open', joinMode: 'all',
       })]);
       expect(graph?.progress).toMatchObject({ completed: 1, queued: 1, executing: 1, waiting: 1 });
+      expect(graph).not.toHaveProperty('runId');
+      expect(graph?.gates.every((gate) => !('gateId' in gate))).toBe(true);
+      expect(graph?.activeGate).not.toHaveProperty('gateId');
+      expect(graph?.feedbackRounds.every((round) => !('roundId' in round))).toBe(true);
 
       const hostGraph = await buildWorkflowGraphView(repository, repair.taskId);
       const outcome = await routeRequestWorkflowGraph(
@@ -502,7 +506,6 @@ describe('M024 S04 workflow graph projection', () => {
 
       const graph = await repository.getWorkflowGraphForTask(five!.task_id);
       expect(graph).toEqual({
-        runId: consumer.runId,
         runStatus: 'running',
         nodes: [
           {
@@ -559,11 +562,14 @@ describe('M024 S04 workflow graph projection', () => {
           frontierNodeIds: ['five', 'four', 'one', 'three', 'two'], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: expect.arrayContaining([{ runId: 'child-run-001', status: 'running' }]),
+        childRuns: expect.arrayContaining([{ status: 'running' }]),
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
       });
       expect(JSON.stringify(graph)).not.toMatch(/payload_json|body_json|prompt|\/tmp\/|api[_-]?key|secret/i);
+      expect(JSON.stringify(graph)).not.toContain(consumer.runId);
+      expect(JSON.stringify(graph)).not.toContain('child-run-001');
+      expect(graph?.gates.every((gate) => !('gateId' in gate))).toBe(true);
       await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toEqual(graph);
       const hostGraph = await buildWorkflowGraphView(repository, five!.task_id);
       const outcome = await routeRequestWorkflowGraph(
@@ -581,7 +587,7 @@ describe('M024 S04 workflow graph projection', () => {
       expect(panel.nodes.find((node) => node.id === 'five')?.title).toBe('Step five');
       expect(panel.activeGate).toMatchObject({ satisfied: 0, required: 1 });
       expect(panel.childRuns).toHaveLength(64);
-      expect(panel.childRuns[0]).toEqual({ id: 'child-run-001', status: 'running', statusLabel: 'Running' });
+      expect(panel.childRuns[0]).toEqual({ label: 'Child workflow 1', status: 'running', statusLabel: 'Running' });
       expect(panel.reuseSummary).toMatchObject({ nodeCount: 0, edgeCount: 0 });
       expect(panel.degradedRead.diagnostics).toEqual(['Child workflow runs were truncated']);
 

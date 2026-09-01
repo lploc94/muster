@@ -2678,7 +2678,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
             requestId: raw.requestId,
             taskId,
             found: Boolean(graph),
-            runId: graph?.runId,
+            runStatus: graph?.runStatus,
             nodeCount: graph?.nodes.length,
             edgeCount: graph?.edges.length,
           });
@@ -2703,7 +2703,7 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
         ? {
             ok: outcome.message.ok,
             code: outcome.message.ok ? undefined : outcome.message.code,
-            runId: outcome.message.ok ? outcome.message.graph.runId : undefined,
+            runStatus: outcome.message.ok ? outcome.message.graph.runStatus : undefined,
           }
         : {}),
     });

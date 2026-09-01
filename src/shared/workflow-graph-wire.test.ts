@@ -13,7 +13,6 @@ const valid: WorkflowGraphResult = {
   taskId: 'task-1',
   ok: true,
   graph: {
-    runId: 'run-1',
     runStatus: 'running',
     nodes: [
       {
@@ -32,7 +31,7 @@ const valid: WorkflowGraphResult = {
       contributionState: 'supplied_reused', reused: true,
     }],
     gates: [{
-      gateId: 'gate-implement', consumerNodeId: 'implement', status: 'open',
+      consumerNodeId: 'implement', status: 'open',
       satisfied: 1, required: 2,
       inputs: [
         { inputRef: 'plan', producerNodeId: 'plan', state: 'supplied_reused' },
@@ -40,7 +39,7 @@ const valid: WorkflowGraphResult = {
       ],
     }],
     activeGate: {
-      gateId: 'gate-implement', consumerNodeId: 'implement', status: 'open',
+      consumerNodeId: 'implement', status: 'open',
       satisfied: 1, required: 2,
       inputs: [
         { inputRef: 'plan', producerNodeId: 'plan', state: 'supplied_reused' },
@@ -54,7 +53,6 @@ const valid: WorkflowGraphResult = {
     },
     feedbackRounds: [
       {
-        roundId: 'feedback-1',
         requesterNodeId: 'plan',
         status: 'open',
         joinMode: 'all',
@@ -62,7 +60,7 @@ const valid: WorkflowGraphResult = {
         responded: 1,
       },
     ],
-    childRuns: [{ runId: 'run-child-1', status: 'running' }],
+    childRuns: [{ status: 'running' }],
     reuse: { nodeCount: 1, edgeCount: 1 },
     diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
   },
@@ -106,7 +104,6 @@ describe('workflow graph wire contract', () => {
       taskId: 'decision-task',
       ok: true,
       graph: {
-        runId: 'decision-run',
         runStatus: 'running',
         nodes: [{
           nodeId: 'repair',
@@ -310,6 +307,30 @@ describe('workflow graph wire contract', () => {
     ).toBeNull();
   });
 
+  it('rejects every durable orchestration identity at the webview boundary', () => {
+    for (const graph of [
+      { ...valid.graph, runId: 'wfr_private' },
+      {
+        ...valid.graph,
+        gates: [{ ...valid.graph.gates[0], gateId: 'wfg_private' }],
+      },
+      {
+        ...valid.graph,
+        activeGate: { ...valid.graph.activeGate!, gateId: 'wfg_private' },
+      },
+      {
+        ...valid.graph,
+        feedbackRounds: [{ ...valid.graph.feedbackRounds[0], roundId: 'wfbr_private' }],
+      },
+      {
+        ...valid.graph,
+        childRuns: [{ ...valid.graph.childRuns[0], runId: 'wfr_child_private' }],
+      },
+    ]) {
+      expect(parseWorkflowGraphResult({ ...valid, graph })).toBeNull();
+    }
+  });
+
   it('rejects over-bound gate and input collections', () => {
     const { activeGate: _activeGate, ...graphWithoutActiveGate } = valid.graph;
     expect(
@@ -342,7 +363,6 @@ describe('workflow graph wire contract', () => {
           ...graphWithoutActiveGate,
           edges: [],
           gates: Array.from({ length: 65 }, (_, index) => ({
-            gateId: `gate-${index}`,
             consumerNodeId: 'implement',
             status: 'consumed',
             satisfied: 0,
@@ -360,7 +380,6 @@ describe('workflow graph wire contract', () => {
           ...graphWithoutActiveGate,
           edges: [],
           gates: [{
-            gateId: 'gate-65-inputs',
             consumerNodeId: 'implement',
             status: 'open',
             satisfied: 0,
@@ -514,11 +533,10 @@ describe('workflow graph wire contract', () => {
       ...valid,
       graph: {
         ...valid.graph,
-        gates: [
-          valid.graph.gates[0],
-          {
-            gateId: 'gate-implement-duplicate-consumer',
-            consumerNodeId: 'implement',
+          gates: [
+            valid.graph.gates[0],
+            {
+              consumerNodeId: 'implement',
             status: 'open',
             satisfied: 0,
             required: 1,
@@ -558,7 +576,6 @@ describe('workflow graph wire contract', () => {
       taskId: 'task-engine-start-node',
       ok: true,
       graph: {
-        runId: 'run-engine-start-node',
         runStatus: 'running',
         nodes: [
           {
@@ -575,7 +592,7 @@ describe('workflow graph wire contract', () => {
           contributionState: 'supplied_reused', reused: true,
         }],
         gates: [{
-          gateId: 'gate-consumer', consumerNodeId: 'consumer', status: 'satisfied',
+          consumerNodeId: 'consumer', status: 'satisfied',
           satisfied: 1, required: 1,
           inputs: [{ inputRef: 'source', producerNodeId: 'engine_start', state: 'supplied_reused' }],
         }],
@@ -694,14 +711,14 @@ describe('workflow graph wire contract', () => {
         ...valid.graph,
         feedbackRounds: [valid.graph.feedbackRounds[0], valid.graph.feedbackRounds[0]],
       },
-    })).toBeNull();
+    })).not.toBeNull();
     expect(parseWorkflowGraphResult({
       ...valid,
       graph: {
         ...valid.graph,
         childRuns: [valid.graph.childRuns[0], valid.graph.childRuns[0]],
       },
-    })).toBeNull();
+    })).not.toBeNull();
     expect(parseWorkflowGraphResult({
       ...valid,
       graph: {
@@ -735,7 +752,6 @@ describe('workflow graph wire contract', () => {
       reused: false,
     }));
     const gates = nodeIds.map((consumerNodeId, gateIndex) => ({
-      gateId: `gate-${gateIndex}`,
       consumerNodeId,
       status: 'open' as const,
       satisfied: 0,
@@ -752,7 +768,6 @@ describe('workflow graph wire contract', () => {
       taskId: 'task-max-gates',
       ok: true,
       graph: {
-        runId: 'run-max-gates',
         runStatus: 'running',
         nodes,
         edges: [],
@@ -792,7 +807,6 @@ describe('workflow graph wire contract', () => {
       reused: false,
     })));
     const gates = nodeIds.map((consumerNodeId, index) => ({
-      gateId: `bounded-gate-${index}`,
       consumerNodeId,
       status: 'open' as const,
       satisfied: 0,
@@ -805,7 +819,6 @@ describe('workflow graph wire contract', () => {
     }));
     const boundedGraph = {
       ...graphWithoutActiveGate,
-      runId: 'run-boundaries',
       nodes,
       edges,
       gates,
@@ -854,7 +867,6 @@ describe('workflow graph wire contract', () => {
       graph: {
         ...valid.graph,
         feedbackRounds: Array.from({ length: 33 }, (_, index) => ({
-          roundId: `feedback-${index}`,
           requesterNodeId: 'plan',
           status: 'open',
           joinMode: 'all',
@@ -867,8 +879,7 @@ describe('workflow graph wire contract', () => {
       ...valid,
       graph: {
         ...valid.graph,
-        childRuns: Array.from({ length: 65 }, (_, index) => ({
-          runId: `child-${index}`,
+        childRuns: Array.from({ length: 65 }, () => ({
           status: 'running',
         })),
       },

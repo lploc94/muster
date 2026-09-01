@@ -111,7 +111,33 @@ describe('start_workflow entry input artifact reuse', () => {
     });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES (?,?,?,?,?)`,
+        ['ws', 'm024-s02-unresolved', 'M024 S02 unresolved input',
+          '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z'],
+      );
       const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'createTask',
+        workspaceId: 'ws',
+        task: {
+          id: 'root-1', role: 'coordinator', lifecycle: 'open', releaseState: 'released',
+          goal: 'test unresolved workflow input', parentId: null, prerequisites: [],
+          backend: 'grok', cwd: dir, capabilities: [],
+          executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 }, revision: 0,
+          createdAt: '2026-08-01T00:00:00.000Z', updatedAt: '2026-08-01T00:00:00.000Z',
+          releasedAt: '2026-08-01T00:00:00.000Z',
+        },
+      });
+      await repository.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: {
+          id: 'turn-1', taskId: 'root-1', sequence: 1, status: 'running', trigger: 'user',
+          inputs: [], createdAt: '2026-08-01T00:00:00.000Z', startedAt: '2026-08-01T00:00:00.000Z',
+        },
+      });
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
         name: 'consumer', topology: {
@@ -130,7 +156,7 @@ describe('start_workflow entry input artifact reuse', () => {
         kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-consumer', version: 1,
         startIdempotencyKey: 'unresolved-reference', createdAt: '2026-08-01T00:00:00.000Z',
         inputs: [{ name: 'request', fromRun: 'missing-run', output: 'verifiedPlan' }],
-        ownerRootTaskId: 'root-1', callerTaskId: 'caller-1', callerTurnId: 'turn-1',
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'turn-1',
       })).resolves.toMatchObject({
         ok: false, conflict: true, reason: 'workflow input reference unresolved',
       });

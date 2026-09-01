@@ -1,15 +1,17 @@
 import { createHash } from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import {
   basename,
+  dirname,
   extname,
   isAbsolute,
   join,
   relative,
   resolve,
 } from 'node:path';
-import { lstat, open, opendir, realpath, stat } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, open, opendir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import type { VerifiedScriptPackageSnapshot } from '../types';
 import { decodeWorkflowManifest } from '../task/workflow-codec';
 import {
   WORKFLOW_DESCRIPTION_MAX_LENGTH,
@@ -660,16 +662,15 @@ export async function getPredefinedWorkflow(
 
 function utf8Asset(
   content: Buffer,
-  file: string,
   kind: 'instruction' | 'script',
   allowEmpty = false,
 ): string {
   const text = content.toString('utf8');
   if (!Buffer.from(text, 'utf8').equals(content)) {
-    throw new CatalogFileError(`predefined workflow ${kind} is not valid UTF-8: ${file}`);
+    throw new CatalogFileError(`predefined workflow ${kind} is not valid UTF-8`);
   }
   if (!allowEmpty && content.byteLength === 0) {
-    throw new CatalogFileError(`predefined workflow ${kind} is empty: ${file}`);
+    throw new CatalogFileError(`predefined workflow ${kind} is empty`);
   }
   return text;
 }
@@ -692,12 +693,12 @@ export async function freezePredefinedWorkflowDefinition(
       if (instructions?.kind === 'file') {
         const normalized = normalizedRelativePath(instructions.file);
         const content = normalized ? byPath.get(normalized) : undefined;
-        if (!content) throw new CatalogFileError(`predefined workflow asset is missing: ${instructions.file}`);
-        const text = utf8Asset(content, instructions.file, 'instruction');
+        if (!content) throw new CatalogFileError('predefined workflow instruction asset is missing');
+        const text = utf8Asset(content, 'instruction');
         if (
           content.byteLength > PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES ||
           text.length > WORKFLOW_INSTRUCTIONS_MAX_LENGTH
-        ) throw new CatalogFileError(`predefined workflow instruction exceeds the package limit: ${instructions.file}`);
+        ) throw new CatalogFileError('predefined workflow instruction exceeds the package limit');
         instructions = {
           kind: 'file',
           file: instructions.file,
@@ -710,13 +711,13 @@ export async function freezePredefinedWorkflowDefinition(
       if (execution?.kind === 'script') {
         const normalized = normalizedRelativePath(execution.file);
         const content = normalized ? byPath.get(normalized) : undefined;
-        if (!content) throw new CatalogFileError(`predefined workflow asset is missing: ${execution.file}`);
+        if (!content) throw new CatalogFileError('predefined workflow script asset is missing');
         if (!isValidWorkflowScriptFile(execution.file, execution.interpreter)) {
-          throw new CatalogFileError(`predefined workflow script is invalid: ${execution.file}`);
+          throw new CatalogFileError('predefined workflow script is invalid');
         }
-        utf8Asset(content, execution.file, 'script', true);
+        utf8Asset(content, 'script', true);
         if (content.byteLength > PREDEFINED_WORKFLOW_MAX_BUNDLE_FILE_BYTES) {
-          throw new CatalogFileError(`predefined workflow script exceeds the package limit: ${execution.file}`);
+          throw new CatalogFileError('predefined workflow script exceeds the package limit');
         }
         execution = {
           ...execution,
@@ -799,4 +800,53 @@ export async function resolvePredefinedWorkflowScript(
     ...resolved.source,
     scriptSha256: digestBytes(content),
   };
+}
+
+/**
+ * Materialize the package bytes captured by one successful provenance scan.
+ * The private temporary tree preserves package-relative imports while keeping
+ * execution independent from the mutable catalog pathname.
+ */
+export async function createPredefinedWorkflowExecutionSnapshot(
+  resolved: ResolvedPredefinedWorkflow,
+  file: string,
+  interpreter: ScriptInterpreter,
+  expectedScriptSha256: string,
+): Promise<VerifiedScriptPackageSnapshot | undefined> {
+  const normalized = normalizedRelativePath(file);
+  const files = packageFiles.get(resolved);
+  if (
+    !normalized ||
+    !isValidWorkflowScriptFile(normalized, interpreter) ||
+    !files ||
+    packageDigest(files) !== resolved.source.packageSha256
+  ) return undefined;
+  const selected = files.find((entry) => entry.relativePath === normalized);
+  if (!selected || digestBytes(selected.content) !== expectedScriptSha256) return undefined;
+
+  let snapshotRoot: string | undefined;
+  try {
+    snapshotRoot = await mkdtemp(join(tmpdir(), 'muster-workflow-execution-'));
+    for (const entry of files) {
+      const relativePath = normalizedRelativePath(entry.relativePath);
+      if (!relativePath) throw new Error('invalid captured package path');
+      const target = resolve(snapshotRoot, relativePath);
+      if (!isWithin(snapshotRoot, target)) throw new Error('captured package path escapes snapshot');
+      await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+      await writeFile(target, entry.content, { flag: 'wx', mode: 0o600 });
+    }
+    const disposableRoot = snapshotRoot;
+    let disposed = false;
+    return {
+      scriptRoot: disposableRoot,
+      dispose: async () => {
+        if (disposed) return;
+        await rm(disposableRoot, { recursive: true, force: true });
+        disposed = true;
+      },
+    };
+  } catch {
+    if (snapshotRoot) await rm(snapshotRoot, { recursive: true, force: true }).catch(() => undefined);
+    return undefined;
+  }
 }

@@ -19,7 +19,7 @@ const GENERATED_AT = '2026-08-02T00:00:00.000Z';
 
 function graph(overrides = {}) {
   return {
-    hasRunId: true,
+    runStatus: 'running',
     nodeCount: 5,
     edgeCount: 4,
     reusedNodeCount: 4,
@@ -196,9 +196,9 @@ test('validator rejects unknown diagnostics and malformed counts', () => {
       failure.includes('reusedEdgeCount'),
     ),
   );
-  const withoutRunId = { ...base, roundTrip: { ...base.roundTrip, hasRunId: false } };
+  const withoutRunningStatus = { ...base, roundTrip: { ...base.roundTrip, runStatus: 'failed' } };
   assert.ok(
-    validateWorkflowGraphEvidence(withoutRunId).some((failure) => failure.includes('hasRunId')),
+    validateWorkflowGraphEvidence(withoutRunningStatus).some((failure) => failure.includes('runStatus')),
   );
 });
 

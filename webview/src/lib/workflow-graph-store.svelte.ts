@@ -146,7 +146,6 @@ export class WorkflowGraphStore {
       taskId: msg.taskId,
       ok: msg.ok,
       code: msg.code,
-      graphRunId: msg.graph?.runId,
       expectedRequestId,
       focusedTaskId,
     });

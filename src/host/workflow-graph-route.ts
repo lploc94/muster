@@ -52,7 +52,6 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
   }
 
   return {
-    runId: graph.runId,
     runStatus: graph.runStatus,
     nodes: graph.nodes.map((node) => ({
       nodeId: node.nodeId,
@@ -74,7 +73,6 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
       reused: edge.reused,
     })),
     gates: graph.gates.map((gate) => ({
-      gateId: gate.gateId,
       consumerNodeId: gate.consumerNodeId,
       status: gate.status,
       satisfied: gate.satisfied,
@@ -84,7 +82,6 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
     ...(graph.activeGate
       ? {
           activeGate: {
-            gateId: graph.activeGate.gateId,
             consumerNodeId: graph.activeGate.consumerNodeId,
             status: graph.activeGate.status,
             satisfied: graph.activeGate.satisfied,
@@ -99,14 +96,13 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
       activeNodeIds: [...graph.progress.activeNodeIds],
     },
     feedbackRounds: graph.feedbackRounds.map((round) => ({
-      roundId: round.roundId,
       requesterNodeId: round.requesterNodeId,
       status: round.status,
       joinMode: round.joinMode,
       required: round.required,
       responded: round.responded,
     })),
-    childRuns: graph.childRuns.map((run) => ({ runId: run.runId, status: run.status })),
+    childRuns: graph.childRuns.map((run) => ({ status: run.status })),
     reuse: { nodeCount: graph.reuse.nodeCount, edgeCount: graph.reuse.edgeCount },
     diagnostics,
   };

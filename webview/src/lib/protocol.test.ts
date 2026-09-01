@@ -2410,7 +2410,6 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
         taskId: 'task-1',
         ok: true,
         graph: {
-          runId: 'run-1',
           runStatus: 'running',
           nodes: [{
             nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'queued',
@@ -2449,7 +2448,7 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
         requestId: 'request-1',
         taskId: 'task-1',
         ok: true,
-        graph: { runId: 'run-1', nodes: 'not-an-array' },
+        graph: { runStatus: 'running', nodes: 'not-an-array' },
       }),
     ).toBe(false);
   });

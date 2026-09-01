@@ -155,6 +155,10 @@ Frozen instruction bytes are persisted as node task content. Normal entry,
 dependency, child, retry, and reload paths use those bytes and never reread a
 mutable prompt file.
 
+Child invocation fingerprints canonically order public binding names by their
+UTF-8 bytes. Replay identity is therefore independent of the host locale and
+ICU version; it never uses locale-sensitive collation.
+
 An agent node may omit `outcome` and keep final-assistant-message implicit NEXT.
 When an agent outcome is present, the host renders its declared NEXT/PREV/FAIL
 contract and authorizes every attempted disposition against the frozen node
@@ -179,10 +183,15 @@ process cwd = active workspace or task cwd
 ```
 
 Before spawn, the runtime resolves the package from frozen provenance, verifies
-the current script bytes against the frozen digest, requires a regular
-interpreter-compatible file, and launches with `shell: false` and literal argv.
-A changed script cannot execute through an existing definition. Runtime script
-verification does not reload or reinterpret `workflow.json` or prompt files.
+the current script bytes against the frozen digest, and materializes the
+coherently verified package bytes into an isolated package-shaped execution
+snapshot. It requires a regular interpreter-compatible file in that snapshot,
+launches it with `shell: false` and literal argv, retains the workspace/task cwd,
+and removes the snapshot after the child terminates. Package-relative imports
+therefore use the verified bytes rather than reopening the mutable catalog
+package. A changed script cannot execute through an existing definition.
+Runtime script verification does not reload or reinterpret `workflow.json` or
+prompt files as workflow configuration.
 
 Each execute activation runs its script once and applies the frozen exit outcome
 through the normal durable workflow disposition path:
@@ -219,7 +228,9 @@ MCP grants, or gain coordinator authority from package contents.
 
 Catalog, MCP, status, graph, and webview projections never expose manifest or
 instruction bodies, scripts, filesystem paths, credentials, or physical
-artifact identities.
+artifact identities. Graph topology uses only manifest node keys and input
+references; durable run, dependency-gate, feedback-round, and child-run
+identifiers remain repository-private.
 
 Status and graph projections derive decision state from durable activation and
 repair rows. They may expose a node's bounded display `title`, whether its agent

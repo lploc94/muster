@@ -3,11 +3,11 @@ import type {
   WorkflowGraphChildRunProjection,
   WorkflowGraphEdgeProjection,
   WorkflowGraphFeedbackRoundProjection,
+  WorkflowGraphGateProjection,
   WorkflowGraphNodeProjection,
   WorkflowGraphProjection,
   WorkflowGraphProgressProjection,
   WorkflowGraphReuseProjection,
-  WorkflowGateStatusProjection,
   WorkflowIntegrityDiagnosticProjection,
   WorkflowRunStatus,
 } from '../task/workflow-types';
@@ -30,12 +30,11 @@ export interface WorkflowGraphViewEdge extends WorkflowGraphEdgeProjection {
  * It must not be used by agent-facing tool or bridge projections.
  */
 export interface WorkflowGraphView {
-  runId: string;
   runStatus: WorkflowRunStatus;
   nodes: readonly WorkflowGraphViewNode[];
   edges: readonly WorkflowGraphViewEdge[];
-  gates: readonly WorkflowGateStatusProjection[];
-  activeGate?: WorkflowGateStatusProjection;
+  gates: readonly WorkflowGraphGateProjection[];
+  activeGate?: WorkflowGraphGateProjection;
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   childRuns: readonly WorkflowGraphChildRunProjection[];

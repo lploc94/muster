@@ -90,6 +90,7 @@ async function createCallerAuthority(
   repository: SqliteTaskRepository,
   label: string,
   createdAt: string,
+  cwd?: string,
 ) {
   const taskId = `caller-${label}`;
   const turnId = `caller-turn-${label}`;
@@ -107,6 +108,7 @@ async function createCallerAuthority(
       backend: 'grok',
       capabilities: [],
       executionPolicy: { maxTurns: 40, maxAutomaticRetries: 1 },
+      ...(cwd !== undefined ? { cwd } : {}),
       revision: 0,
       createdAt,
       updatedAt: createdAt,
@@ -131,6 +133,56 @@ async function createCallerAuthority(
 }
 
 describe('Workflow shell materialization', () => {
+  it('persists the durable caller cwd on every top-level workflow task', async () => {
+    const ctx = await openRepo('top-level-cwd');
+    try {
+      const createdAt = '2026-08-01T00:00:00.000Z';
+      const workflowCwd = path.join(ctx.dir, 'folder-b');
+      await ctx.repo.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-top-level-cwd',
+        version: 1,
+        name: 'top-level-cwd',
+        topology: canonicalTopology(
+          [{ nodeId: 'entry' }, { nodeId: 'sink' }],
+          [{ fromNodeId: 'entry', toNodeId: 'sink', inputRef: 'from_entry' }],
+        ),
+        createdAt,
+      });
+      const callerAuthority = await createCallerAuthority(
+        ctx.repo,
+        'top-level-cwd',
+        createdAt,
+        workflowCwd,
+      );
+
+      const started = await ctx.repo.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: 'wf-top-level-cwd',
+        version: 1,
+        startIdempotencyKey: 'top-level-cwd-1',
+        createdAt,
+        ...callerAuthority,
+      });
+
+      expect(started, started.reason).toMatchObject({ ok: true, changed: true });
+      const runId = (started.operation?.result.data as { runId: string }).runId;
+      const nodeTasks = await ctx.client.all<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+        ['ws', runId],
+      );
+      expect(nodeTasks).toHaveLength(2);
+      for (const row of nodeTasks) {
+        expect((await ctx.repo.getTask(row.task_id))?.cwd).toBe(workflowCwd);
+      }
+    } finally {
+      await ctx.close();
+    }
+  });
+
   it('carries frozen instructions, never display titles, into entry and dependency activations', async () => {
     const ctx = await openRepo('canonical-instructions');
     const entryInstructions = 'Inspect the implementation and publish evidence.';
@@ -937,6 +989,7 @@ describe('Workflow shell materialization', () => {
     const repo = new SqliteTaskRepository(client, 'ws');
     try {
       const createdAt = '2026-08-01T00:00:00.000Z';
+      const workflowCwd = path.join(dir, 'folder-b');
       // Child topology: entry -> middle -> sink ; middle and sink pending
       const childTopology = canonicalTopology(
         [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
@@ -976,7 +1029,12 @@ describe('Workflow shell materialization', () => {
         ],
         createdAt,
       });
-      const callerAuthority = await createCallerAuthority(repo, 'top-shell', createdAt);
+      const callerAuthority = await createCallerAuthority(
+        repo,
+        'top-shell',
+        createdAt,
+        workflowCwd,
+      );
       const topStart = await repo.execute({
         kind: 'startWorkflowRun',
         workspaceId: 'ws',
@@ -993,6 +1051,7 @@ describe('Workflow shell materialization', () => {
       const topData = topStart.operation?.result.data as any;
       const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; gateId: string; activationId: string };
       const topTask = await repo.getTask(topEntry.taskId);
+      expect(topTask?.cwd).toBe(workflowCwd);
       const topTurn = await repo.getTurn(topEntry.activationTurnId);
       await client.run(
         `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
@@ -1067,6 +1126,14 @@ describe('Workflow shell materialization', () => {
       expect(sinkRow?.task_id).toEqual(expect.any(String));
       const middleTask = await repo.getTask(middleRow!.task_id);
       const sinkTask = await repo.getTask(sinkRow!.task_id);
+      const childEntryTask = await repo.getTask((await client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = 'entry'`,
+        ['ws', childRunId],
+      ))!.task_id);
+      expect(childEntryTask?.cwd).toBe(workflowCwd);
+      expect(middleTask?.cwd).toBe(workflowCwd);
+      expect(sinkTask?.cwd).toBe(workflowCwd);
       expect(middleTask?.workflowShell).toMatchObject({ runId: childRunId, nodeId: 'middle' });
       expect(sinkTask?.workflowShell).toMatchObject({ runId: childRunId, nodeId: 'sink' });
       expect(await repo.listTurns(middleRow!.task_id)).toHaveLength(0);

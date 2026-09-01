@@ -40,7 +40,6 @@ export interface WorkflowGraphGateInputView {
 }
 
 export interface WorkflowGraphGateView {
-  id: string;
   consumerNodeId: string;
   status: string;
   statusLabel: string;
@@ -59,7 +58,6 @@ export interface WorkflowGraphProgressView extends Omit<WorkflowGraphWireGraph["
 }
 
 export interface WorkflowGraphFeedbackRoundView {
-  id: string;
   requesterNodeId: string;
   status: string;
   statusLabel: string;
@@ -70,7 +68,7 @@ export interface WorkflowGraphFeedbackRoundView {
 }
 
 export interface WorkflowGraphChildRunView {
-  id: string;
+  label: string;
   status: string;
   statusLabel: string;
 }
@@ -91,7 +89,6 @@ export type WorkflowGraphNodeTone =
   | "success" | "attention" | "info" | "warning" | "danger" | "muted" | "neutral";
 
 export interface WorkflowGraphPanelView {
-  runId: string;
   nodes: WorkflowGraphNodeView[];
   edges: WorkflowGraphEdgeView[];
   gates: WorkflowGraphGateView[];
@@ -215,7 +212,6 @@ function reduceGate(gate: WorkflowGraphWireGraph["gates"][number]): WorkflowGrap
   if (pendingRefs.length > 0) blockingParts.push(`Waiting on ${pendingRefs.join(", ")}`);
   if (blockingRefs.length > 0) blockingParts.push(`Blocked by ${blockingRefs.join(", ")}`);
   return {
-    id: gate.gateId,
     consumerNodeId: gate.consumerNodeId,
     status: gate.status,
     statusLabel: workflowGraphStatusLabel(gate.status),
@@ -260,7 +256,6 @@ export function buildWorkflowGraphPanelView(
   const gates = graph.gates.map(reduceGate);
 
   return {
-    runId: graph.runId,
     nodes: graph.nodes.map((node) => ({
       id: node.nodeId,
       ...(node.title ? { title: node.title } : {}),
@@ -288,7 +283,6 @@ export function buildWorkflowGraphPanelView(
     activeNodeId,
     activeGate: graph.activeGate ? reduceGate(graph.activeGate) : null,
     feedbackRounds: graph.feedbackRounds.map((round) => ({
-      id: round.roundId,
       requesterNodeId: round.requesterNodeId,
       status: round.status,
       statusLabel: workflowGraphStatusLabel(round.status),
@@ -297,8 +291,8 @@ export function buildWorkflowGraphPanelView(
       required: round.required,
       progressLabel: `${round.responded} of ${round.required} responses received`,
     })),
-    childRuns: graph.childRuns.map((childRun) => ({
-      id: childRun.runId,
+    childRuns: graph.childRuns.map((childRun, index) => ({
+      label: `Child workflow ${index + 1}`,
       status: childRun.status,
       statusLabel: workflowGraphStatusLabel(childRun.status),
     })),
