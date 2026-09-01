@@ -422,6 +422,56 @@ describe('workflow graph wire contract', () => {
     ).toBeNull();
   });
 
+  it('keeps terminal workflow-node truth authoritative over lagging execution activity', () => {
+    const terminalWithLiveActivity: WorkflowGraphResult = {
+      type: 'workflowGraphResult',
+      requestId: 'terminal-live-activity',
+      taskId: 'terminal-task',
+      ok: true,
+      graph: {
+        runStatus: 'failed',
+        nodes: [{
+          nodeId: 'worker',
+          workflowNodeStatus: 'failed',
+          executionActivity: 'executing',
+          displayState: 'failed',
+          progressBucket: 'failed',
+          reused: false,
+        }],
+        edges: [],
+        gates: [],
+        progress: {
+          total: 1, completed: 0, queued: 0, executing: 0, waiting: 0,
+          blocked: 0, notStarted: 0, failed: 1, cancelled: 0, skipped: 0,
+          frontierNodeIds: [], activeNodeIds: [],
+        },
+        feedbackRounds: [],
+        childRuns: [],
+        reuse: { nodeCount: 0, edgeCount: 0 },
+        diagnostics: [],
+      },
+    };
+    expect(parseWorkflowGraphResult(terminalWithLiveActivity)).toEqual(terminalWithLiveActivity);
+    expect(parseWorkflowGraphResult({
+      ...terminalWithLiveActivity,
+      graph: {
+        ...terminalWithLiveActivity.graph,
+        nodes: [{
+          ...terminalWithLiveActivity.graph.nodes[0],
+          displayState: 'executing',
+          progressBucket: 'executing',
+        }],
+        progress: {
+          ...terminalWithLiveActivity.graph.progress,
+          executing: 1,
+          failed: 0,
+          frontierNodeIds: ['worker'],
+          activeNodeIds: ['worker'],
+        },
+      },
+    })).toBeNull();
+  });
+
   it('reconciles gate lifecycle status with durable fill counts', () => {
     for (const status of ['satisfied', 'consumed'] as const) {
       expect(

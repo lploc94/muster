@@ -998,7 +998,8 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(crossAxis?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
         workflowNodeStatus: 'succeeded',
         executionActivity: 'executing',
-        displayState: 'executing',
+        displayState: 'completed',
+        progressBucket: 'completed',
       });
       expect(crossAxis?.nodes.find((node) => node.nodeId === 'p2')).toMatchObject({
         workflowNodeStatus: 'succeeded',
@@ -1013,9 +1014,10 @@ describe('M018 S07 bounded workflow status projection', () => {
         reason: 'waiting_for_inputs',
       });
       expect(crossAxis?.progress).toMatchObject({
-        total: 3, completed: 1, executing: 1, notStarted: 0,
+        total: 3, completed: 2, executing: 0, notStarted: 0,
         queued: 0, waiting: 0, blocked: 1, failed: 0, cancelled: 0, skipped: 0,
       });
+      expect(crossAxis?.progress.activeNodeIds).toEqual([]);
 
       const consumer = await ctx.client.get<{ task_id: string }>(
         `SELECT task_id FROM workflow_nodes

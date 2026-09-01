@@ -173,6 +173,10 @@ and attempt 3 exhausts the repair and fails the run with bounded
 `decision_missing` or `decision_invalid` evidence. A valid disposition accepted
 first remains authoritative across races, replay, and reload. Decision repair is
 not PREV: it creates no feedback round, producer turn, hidden node, or graph edge.
+Only a completed third missing/invalid decision marks repair `exhausted` at
+attempt 3. Timeout, cancellation, and workflow-budget closure preserve the
+actual number and evidence of decision attempts, clear any scheduled correction,
+and suppress an otherwise-open correction summary once the run is terminal.
 
 Script execution deliberately separates the package root from process working
 directory:
@@ -240,6 +244,9 @@ such as `Waiting for workflow decision` or `Correcting workflow route` with
 feedback, execution, completion, and failure remain independent display axes:
 normal PREV is revision/waiting-for-feedback, while Failed appears only after
 repair exhaustion or actual semantic/operational closure.
+When process cancellation is still settling, execution activity may temporarily
+report the last live turn; the terminal workflow-node/run state remains
+authoritative for the displayed state and progress counts.
 
 ## 8. Failure and recovery
 

@@ -20,6 +20,8 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { buildWorkflowGraphView } from '../host/workflow-graph';
+import { parseWorkflowGraphResult } from '../shared/workflow-graph-wire';
 import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { stageDispositionForSettlement } from './m018-test-helpers';
@@ -86,6 +88,29 @@ async function openRepo(label: string): Promise<Opened> {
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+async function readReloadedWireGraph(opened: Opened, taskId: string, requestId: string) {
+  const client = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+  try {
+    await client.open(opened.dbPath);
+    const repository = new SqliteTaskRepository(client, 'ws');
+    const graph = await buildWorkflowGraphView(repository, taskId);
+    expect(graph).toBeDefined();
+    const message = {
+      type: 'workflowGraphResult' as const,
+      requestId,
+      taskId,
+      ok: true as const,
+      graph: graph!,
+    };
+    const parsed = parseWorkflowGraphResult(message);
+    expect(parsed, JSON.stringify(message)).toMatchObject({ ok: true });
+    if (!parsed?.ok) throw new Error('terminal workflow graph did not cross the wire boundary');
+    return parsed.graph;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 async function defineAndStartOneNode(
@@ -867,6 +892,20 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       expect(p2Cancel!.kind).toBe('interrupt');
       // Source turn is excluded from interrupt.
       expect(cancels.find((c) => c.turn_id === p1.activationTurnId)).toBeUndefined();
+
+      const graph = await readReloadedWireGraph(
+        opened,
+        p2.taskId,
+        'terminal-node-precedes-live-execution',
+      );
+      expect(graph.runStatus).toBe('failed');
+      expect(graph.nodes.find((node) => node.nodeId === 'p2')).toMatchObject({
+        workflowNodeStatus: 'failed',
+        executionActivity: 'executing',
+        displayState: 'failed',
+        progressBucket: 'failed',
+      });
+      expect(graph.progress).toMatchObject({ executing: 0, failed: 3 });
 
       const p1Task = await opened.repository.getTask(p1.taskId);
       const p2Task = await opened.repository.getTask(p2.taskId);

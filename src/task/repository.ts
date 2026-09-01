@@ -1082,7 +1082,7 @@ type WorkflowDecisionPrecondition = {
 };
 
 type WorkflowDecisionSettlementPlan = WorkflowEffectPlan & {
-  mode: 'none' | 'implicit_next' | 'decided' | 'repair' | 'exhausted';
+  mode: 'none' | 'implicit_next' | 'decided' | 'repair' | 'exhausted' | 'closed';
   precondition?: WorkflowDecisionPrecondition;
   /** Used only when a planned correction cannot be admitted by frozen budgets. */
   budgetExhaustionStatements?: SqlStatement[];
@@ -1118,16 +1118,20 @@ function workflowDecisionGateProjection(rawOutcome: unknown): WorkflowDecisionGa
 function workflowDecisionSummaryProjection(
   gate: WorkflowDecisionGateProjection | undefined,
   row: WorkflowDecisionProjectionRow | undefined,
+  runStatus: WorkflowRunStatus,
 ): WorkflowDecisionSummaryProjection | undefined {
   if (!gate || !row) return undefined;
   if (row.repair_status === null) {
-    return gate === 'required' && (row.activation_status === 'queued' || row.activation_status === 'running')
+    return runStatus === 'running'
+      && gate === 'required'
+      && (row.activation_status === 'queued' || row.activation_status === 'running')
       ? { status: 'waiting', attempt: 1, maxAttempts: 3 }
       : undefined;
   }
   const used = Number(row.attempts_used);
   if (!Number.isSafeInteger(used) || used < 0 || used > 3) return undefined;
   if (row.repair_status === 'open') {
+    if (runStatus !== 'running') return undefined;
     const attempt = Math.min(3, Math.max(1, used + 1)) as 1 | 2 | 3;
     return { status: 'correcting', attempt, maxAttempts: 3 };
   }
@@ -1153,35 +1157,10 @@ function workflowGraphNodeProjection(input: {
         : input.turnStatus === 'waiting_user' ? 'waiting_feedback'
           : input.turnStatus === 'succeeded' ? 'completed'
             : input.turnStatus === 'failed' || input.turnStatus === 'interrupted' ? 'failed'
-              : input.turnStatus === 'cancelled' ? 'cancelled'
-                : 'none';
-  if (executionActivity === 'queued') {
-    return {
-      nodeId: input.nodeId,
-      workflowNodeStatus: input.workflowNodeStatus,
-      executionActivity,
-      displayState: 'queued',
-      progressBucket: 'queued',
-    };
-  }
-  if (executionActivity === 'executing') {
-    return {
-      nodeId: input.nodeId,
-      workflowNodeStatus: input.workflowNodeStatus,
-      executionActivity,
-      displayState: 'executing',
-      progressBucket: 'executing',
-    };
-  }
-  if (executionActivity === 'waiting_feedback') {
-    return {
-      nodeId: input.nodeId,
-      workflowNodeStatus: input.workflowNodeStatus,
-      executionActivity,
-      displayState: 'waiting',
-      progressBucket: 'waiting',
-    };
-  }
+               : input.turnStatus === 'cancelled' ? 'cancelled'
+                 : 'none';
+  // Durable workflow-node state is authoritative for terminal display/progress.
+  // A process can remain running briefly while its interrupt request settles.
   if (input.workflowNodeStatus === 'reused') {
     return {
       nodeId: input.nodeId,
@@ -1191,29 +1170,13 @@ function workflowGraphNodeProjection(input: {
       progressBucket: 'completed',
     };
   }
-  if (
-    input.workflowNodeStatus === 'succeeded'
-  ) {
+  if (input.workflowNodeStatus === 'succeeded') {
     return {
       nodeId: input.nodeId,
       workflowNodeStatus: input.workflowNodeStatus,
       executionActivity,
       displayState: 'completed',
       progressBucket: 'completed',
-    };
-  }
-  if (
-    (input.workflowNodeStatus === 'pending' || input.workflowNodeStatus === 'active')
-    && executionActivity === 'none'
-    && input.runStatus !== 'running'
-  ) {
-    return {
-      nodeId: input.nodeId,
-      workflowNodeStatus: input.workflowNodeStatus,
-      executionActivity,
-      displayState: 'not_started',
-      progressBucket: 'not_started',
-      reason: 'run_closed_before_activation',
     };
   }
   if (input.workflowNodeStatus === 'failed') {
@@ -1241,6 +1204,56 @@ function workflowGraphNodeProjection(input: {
       executionActivity,
       displayState: 'skipped',
       progressBucket: 'skipped',
+    };
+  }
+  if (
+    (input.workflowNodeStatus === 'pending' || input.workflowNodeStatus === 'active')
+    && input.runStatus !== 'running'
+  ) {
+    if (executionActivity === 'none' || input.runStatus === 'succeeded') {
+      return {
+        nodeId: input.nodeId,
+        workflowNodeStatus: input.workflowNodeStatus,
+        executionActivity,
+        displayState: 'not_started',
+        progressBucket: 'not_started',
+        reason: 'run_closed_before_activation',
+      };
+    }
+    const displayState = input.runStatus === 'cancelled' ? 'cancelled' : 'failed';
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState,
+      progressBucket: displayState,
+    };
+  }
+  if (executionActivity === 'queued') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'queued',
+      progressBucket: 'queued',
+    };
+  }
+  if (executionActivity === 'executing') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'executing',
+      progressBucket: 'executing',
+    };
+  }
+  if (executionActivity === 'waiting_feedback') {
+    return {
+      nodeId: input.nodeId,
+      workflowNodeStatus: input.workflowNodeStatus,
+      executionActivity,
+      displayState: 'waiting',
+      progressBucket: 'waiting',
     };
   }
   if (executionActivity === 'failed') {
@@ -3415,6 +3428,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const decision = workflowDecisionSummaryProjection(
       decisionGate,
       decisionRows.get(node.node_id),
+      run.status,
     );
     const activeGateRow = activationRow?.source_gate_id
       ? gates.find((gate) => gate.gateId === activationRow.source_gate_id)
@@ -3625,6 +3639,7 @@ export class SqliteTaskRepository implements TaskRepository {
       const decision = workflowDecisionSummaryProjection(
         decisionGate,
         decisionRows.get(node.node_id),
+        run.status,
       );
       return {
         ...state,
@@ -8450,13 +8465,10 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTurnId: command.turn.id,
       });
       return {
-        mode: 'exhausted',
+        mode: 'closed',
         precondition: { ...precondition, allowExpiredDeadline: true },
-        statements: [
-          repairUpsert({ status: 'exhausted', attemptsUsed: 3, errorCode: 'decision_missing', nextRepairTurnId: null }),
-          ...closure.statements,
-        ],
-        changes: [repairChange, ...closure.changes],
+        statements: closure.statements,
+        changes: closure.changes,
       };
     }
 
@@ -8542,7 +8554,7 @@ export class SqliteTaskRepository implements TaskRepository {
       createdAt: at,
     };
     const budgetExhaustionStatements = [
-      repairUpsert({ status: 'exhausted', attemptsUsed: 3, errorCode, nextRepairTurnId: null }),
+      repairUpsert({ status: 'open', attemptsUsed: attempt, errorCode, nextRepairTurnId: null }),
     ];
     return {
       mode: 'repair',
@@ -8673,7 +8685,9 @@ export class SqliteTaskRepository implements TaskRepository {
     if (decision.mode === 'implicit_next') {
       return { ok: true, changed: false, reason: 'clean optional workflow decision requires implicit NEXT' };
     }
-    const decisionOwnsSettlement = decision.mode === 'repair' || decision.mode === 'exhausted';
+    const decisionOwnsSettlement = decision.mode === 'repair'
+      || decision.mode === 'exhausted'
+      || decision.mode === 'closed';
     // M018 S05: workflow_fail / invalid-route / budget exhaustion close the run first.
     // M018 S04: feedback responses intercept workflow_next on a feedback turn before
     // the forward contribution path. PREV requests open a round; otherwise fall through
@@ -13317,8 +13331,7 @@ export class SqliteTaskRepository implements TaskRepository {
       },
       {
         sql: `UPDATE workflow_decision_repairs
-                 SET status = 'exhausted', attempts_used = 3,
-                     next_repair_turn_id = NULL, updated_at = ?
+                 SET next_repair_turn_id = NULL, updated_at = ?
                WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
                  AND status = 'open'`,
         params: [input.at, this.workspaceId, ...runIds],

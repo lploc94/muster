@@ -289,24 +289,8 @@ function validNodeTuple(node: WorkflowGraphWireNode, runStatus: WorkflowGraphWir
     return node.executionActivity === 'none' && node.displayState === 'reused'
       && node.reason === undefined;
   }
-  if (node.executionActivity === 'queued') {
-    return node.displayState === 'queued' && node.reason === undefined;
-  }
-  if (node.executionActivity === 'executing') {
-    return node.displayState === 'executing' && node.reason === undefined;
-  }
-  if (node.executionActivity === 'waiting_feedback') {
-    return node.displayState === 'waiting' && node.reason === undefined;
-  }
   if (node.workflowNodeStatus === 'succeeded') {
     return node.displayState === 'completed' && node.reason === undefined;
-  }
-  if (
-    (node.workflowNodeStatus === 'pending' || node.workflowNodeStatus === 'active')
-    && node.executionActivity === 'none'
-    && node.reason === 'run_closed_before_activation'
-  ) {
-    return runStatus !== 'running' && node.displayState === 'not_started';
   }
   if (node.workflowNodeStatus === 'failed') {
     return node.displayState === 'failed' && node.reason === undefined;
@@ -316,6 +300,25 @@ function validNodeTuple(node: WorkflowGraphWireNode, runStatus: WorkflowGraphWir
   }
   if (node.workflowNodeStatus === 'skipped') {
     return node.displayState === 'skipped' && node.reason === undefined;
+  }
+  if (
+    (node.workflowNodeStatus === 'pending' || node.workflowNodeStatus === 'active')
+    && runStatus !== 'running'
+  ) {
+    if (node.executionActivity === 'none' || runStatus === 'succeeded') {
+      return node.displayState === 'not_started' && node.reason === 'run_closed_before_activation';
+    }
+    return node.displayState === (runStatus === 'cancelled' ? 'cancelled' : 'failed')
+      && node.reason === undefined;
+  }
+  if (node.executionActivity === 'queued') {
+    return node.displayState === 'queued' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'executing') {
+    return node.displayState === 'executing' && node.reason === undefined;
+  }
+  if (node.executionActivity === 'waiting_feedback') {
+    return node.displayState === 'waiting' && node.reason === undefined;
   }
   if (node.executionActivity === 'failed') {
     return node.displayState === 'failed' && node.reason === undefined;

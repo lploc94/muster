@@ -9,6 +9,8 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { CredentialRegistry } from '../bridge/credentials';
+import { buildWorkflowGraphView } from '../host/workflow-graph';
+import { parseWorkflowGraphResult } from '../shared/workflow-graph-wire';
 import { dispatch } from './coordinator-tools';
 import { TaskEngine, type EngineEvent } from './engine';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
@@ -51,6 +53,36 @@ async function openRepo(label: string) {
       fs.rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+async function readReloadedWireGraph(
+  dbPath: string,
+  taskId: string,
+  requestId: string,
+) {
+  const client = new DbClient({
+    workerPath: path.join(__dirname, 'sqlite', 'worker.ts'),
+    execArgv: ['--import', 'tsx'],
+  });
+  try {
+    await client.open(dbPath);
+    const repository = new SqliteTaskRepository(client, 'ws');
+    const graph = await buildWorkflowGraphView(repository, taskId);
+    expect(graph).toBeDefined();
+    const message = {
+      type: 'workflowGraphResult' as const,
+      requestId,
+      taskId,
+      ok: true as const,
+      graph: graph!,
+    };
+    const parsed = parseWorkflowGraphResult(message);
+    expect(parsed, JSON.stringify(message)).toMatchObject({ ok: true });
+    if (!parsed?.ok) throw new Error('terminal workflow graph did not cross the wire boundary');
+    return parsed.graph;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 async function missingWorkflowDecisionSettlement(
@@ -1236,8 +1268,8 @@ describe('M018 S01 one-node workflow activation', () => {
           FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
       )).resolves.toEqual({
-        status: 'exhausted',
-        attempts_used: 3,
+        status: 'open',
+        attempts_used: 1,
         next_repair_turn_id: null,
       });
       await expect(ctx.client.get(
@@ -1245,6 +1277,17 @@ describe('M018 S01 one-node workflow activation', () => {
           WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
       )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'run_timeout' });
+      const graph = await readReloadedWireGraph(
+        ctx.dbPath,
+        payload.entryTaskId,
+        'timeout-preserves-decision-attempt-one',
+      );
+      expect(graph.runStatus).toBe('failed');
+      expect(graph.nodes.find((node) => node.nodeId === 'decision')).toMatchObject({
+        workflowNodeStatus: 'failed',
+        displayState: 'failed',
+      });
+      expect(graph.nodes.find((node) => node.nodeId === 'decision')).not.toHaveProperty('decision');
     } finally {
       await ctx.close();
     }
@@ -1308,8 +1351,8 @@ describe('M018 S01 one-node workflow activation', () => {
           WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
       )).resolves.toMatchObject({
-        status: 'exhausted',
-        attempts_used: 3,
+        status: 'open',
+        attempts_used: 1,
         last_attempt_turn_id: payload.activationTurnId,
         last_error_code: 'decision_missing',
         next_repair_turn_id: null,
@@ -1336,6 +1379,13 @@ describe('M018 S01 one-node workflow activation', () => {
           WHERE workspace_id = ? AND entity_id IN (?, ?)`,
         ['ws', rejectedRepairTurnId, rejectedRepairMessageId],
       )).resolves.toEqual([]);
+      const graph = await readReloadedWireGraph(
+        ctx.dbPath,
+        payload.entryTaskId,
+        'budget-preserves-decision-attempt-one',
+      );
+      expect(graph.runStatus).toBe('failed');
+      expect(graph.nodes[0]).not.toHaveProperty('decision');
     } finally {
       await ctx.close();
     }
@@ -1390,17 +1440,11 @@ describe('M018 S01 one-node workflow activation', () => {
       await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
       await expect(ctx.client.get(
         `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
-                next_repair_turn_id
-           FROM workflow_decision_repairs
-          WHERE workspace_id = ? AND run_id = ?`,
+                 next_repair_turn_id
+            FROM workflow_decision_repairs
+           WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
-      )).resolves.toMatchObject({
-        status: 'exhausted',
-        attempts_used: 3,
-        last_attempt_turn_id: payload.activationTurnId,
-        last_error_code: 'decision_missing',
-        next_repair_turn_id: null,
-      });
+      )).resolves.toBeUndefined();
       await expect(ctx.client.get(
         `SELECT status, terminal_reason_code, deadline_at
            FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
@@ -1410,6 +1454,95 @@ describe('M018 S01 one-node workflow activation', () => {
         terminal_reason_code: 'run_timeout',
         deadline_at: '2026-07-19T00:00:01.000Z',
       });
+      const graph = await readReloadedWireGraph(
+        ctx.dbPath,
+        payload.entryTaskId,
+        'deadline-preserves-zero-decision-attempts',
+      );
+      expect(graph.runStatus).toBe('failed');
+      expect(graph.nodes[0]).not.toHaveProperty('decision');
+    } finally {
+      await ctx.close();
+    }
+  });
+
+  it('cancels an open third correction without fabricating decision exhaustion', async () => {
+    const ctx = await openRepo('decision-repair-cancel-attempt-two');
+    try {
+      const fixture = await startStrictDecisionRepair(
+        ctx.repository,
+        ctx.client,
+        'cancel-attempt-two',
+        '2026-07-19T07:00:00.000Z',
+      );
+      await expect(missingWorkflowDecisionSettlement(
+        ctx.repository,
+        ctx.client,
+        fixture.entryTaskId,
+        fixture.correctionTurnId,
+        '2026-07-19T07:00:02.000Z',
+      )).resolves.toMatchObject({ result: { ok: true, changed: true } });
+      const thirdTurnId = deriveWorkflowDecisionRepairTurnId(fixture.activationId, 3);
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, next_repair_turn_id
+           FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 2,
+        last_attempt_turn_id: fixture.correctionTurnId,
+        next_repair_turn_id: thirdTurnId,
+      });
+
+      const task = await ctx.repository.getTask(fixture.entryTaskId);
+      const thirdTurn = await ctx.repository.getTurn(thirdTurnId);
+      const cancelledAt = '2026-07-19T07:00:03.000Z';
+      await expect(ctx.repository.execute({
+        kind: 'applyTaskLifecycle',
+        workspaceId: 'ws',
+        taskId: fixture.entryTaskId,
+        expectedTaskRevision: task!.revision,
+        task: {
+          ...task!,
+          lifecycle: 'cancelled',
+          revision: task!.revision + 1,
+          updatedAt: cancelledAt,
+        },
+        turns: [{ ...thirdTurn!, status: 'cancelled', finishedAt: cancelledAt }],
+        expectedTurns: [{ id: thirdTurnId, status: 'queued' }],
+      })).resolves.toMatchObject({ ok: true, changed: true });
+
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_attempt_turn_id, last_error_code,
+                next_repair_turn_id
+           FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 2,
+        last_attempt_turn_id: fixture.correctionTurnId,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
+      await expect(ctx.client.get(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', fixture.runId],
+      )).resolves.toEqual({
+        status: 'cancelled',
+        terminal_reason_code: 'required_target_cancelled',
+      });
+      const graph = await readReloadedWireGraph(
+        ctx.dbPath,
+        fixture.entryTaskId,
+        'cancellation-preserves-decision-attempt-two',
+      );
+      expect(graph.runStatus).toBe('cancelled');
+      expect(graph.nodes[0]).toMatchObject({
+        workflowNodeStatus: 'cancelled',
+        displayState: 'cancelled',
+      });
+      expect(graph.nodes[0]).not.toHaveProperty('decision');
     } finally {
       await ctx.close();
     }
