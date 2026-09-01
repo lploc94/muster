@@ -160,6 +160,10 @@ async function focusFileMentionOption(
   optionIndex: number,
 ) {
   const target = `file-mention-option-${optionIndex}`;
+  // A popup can open under the pointer left by a prior option click. Move the
+  // real pointer away before keyboard navigation so a delayed hover event cannot
+  // overwrite the active option after this helper observes it.
+  await composer.page().mouse.move(0, 0);
   await expect
     .poll(
       async () => {
