@@ -14,7 +14,11 @@
 import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import { createHash } from 'node:crypto';
-import { CURRENT_SCHEMA_STATEMENTS, terminalWorkflowRunSafetyPredicate } from './schema';
+import {
+  CURRENT_SCHEMA_STATEMENTS,
+  terminalWorkflowPayloadReclamationSafetyPredicate,
+  terminalWorkflowRunSafetyPredicate,
+} from './schema';
 import { normalizeSchemaSql } from './schema-fingerprint';
 
 const TRIGGER_NAME = 'trg_terminal_workflow_history_prune_before_turn_delete';
@@ -86,6 +90,27 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
       'workflow_feedback_rounds round_row',
       'workflow_activations activation',
       'workflow_decision_repairs repair',
+      'workflow_continuations continuation',
+      'workflow_return_gates return_gate',
+      'workflow_gate_fills gate_fill',
+      'workflow_nodes reused_node',
+      'workflow_artifact_sources derived_source',
+      'workflow_return_gates return_gate_artifact',
+    ]) {
+      expect(predicate).toContain(table);
+    }
+  });
+
+  it('omits only the open-repair guard when reclaiming terminal payload bodies', () => {
+    const predicate = terminalWorkflowPayloadReclamationSafetyPredicate('run');
+    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(11);
+    expect(predicate).not.toContain('workflow_decision_repairs repair');
+    for (const table of [
+      'workflow_runs child',
+      'workflow_nodes node',
+      'workflow_dependency_gates gate_row',
+      'workflow_feedback_rounds round_row',
+      'workflow_activations activation',
       'workflow_continuations continuation',
       'workflow_return_gates return_gate',
       'workflow_gate_fills gate_fill',

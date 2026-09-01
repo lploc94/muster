@@ -121,7 +121,10 @@ import {
   truncateUtf8Bytes,
 } from './content-limits';
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
-import { CHANGE_FEED_RETAIN_REVISIONS, terminalWorkflowRunSafetyPredicate } from './sqlite/schema';
+import {
+  CHANGE_FEED_RETAIN_REVISIONS,
+  terminalWorkflowPayloadReclamationSafetyPredicate,
+} from './sqlite/schema';
 import {
   ASSISTANT_ORDERING_FALLBACK,
   KIND_RANK,
@@ -13516,7 +13519,7 @@ export class SqliteTaskRepository implements TaskRepository {
               FROM workflow_runs
              WHERE workflow_runs.workspace_id = ?
                AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-               ${terminalWorkflowRunSafetyPredicate('workflow_runs')}
+                ${terminalWorkflowPayloadReclamationSafetyPredicate('workflow_runs')}
           )`,
       [this.workspaceId, this.workspaceId],
     );

@@ -1162,7 +1162,18 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
  * would reject existing stores as incompatible. Whitespace is normalized away
  * and may change freely.
  */
-export function terminalWorkflowRunSafetyPredicate(alias: string): string {
+export function terminalWorkflowRunSafetyPredicate(
+  alias: string,
+  options: { includeOpenDecisionRepairGuard?: boolean } = {},
+): string {
+  const openDecisionRepairGuard = options.includeOpenDecisionRepairGuard === false
+    ? ''
+    : `AND NOT EXISTS (
+            SELECT 1 FROM workflow_decision_repairs repair
+             WHERE repair.workspace_id = ${alias}.workspace_id
+               AND repair.run_id = ${alias}.run_id
+               AND repair.status = 'open'
+          )`;
   return `AND NOT EXISTS (
             SELECT 1 FROM workflow_runs child
              WHERE child.workspace_id = ${alias}.workspace_id
@@ -1196,12 +1207,7 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
                AND activation.run_id = ${alias}.run_id
                AND activation.status IN ('queued', 'running')
           )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_decision_repairs repair
-             WHERE repair.workspace_id = ${alias}.workspace_id
-               AND repair.run_id = ${alias}.run_id
-               AND repair.status = 'open'
-          )
+          ${openDecisionRepairGuard}
           AND NOT EXISTS (
             SELECT 1 FROM workflow_continuations continuation
              WHERE continuation.workspace_id = ${alias}.workspace_id
@@ -1240,7 +1246,16 @@ export function terminalWorkflowRunSafetyPredicate(alias: string): string {
              WHERE return_gate_artifact.workspace_id = ${alias}.workspace_id
                AND return_gate_artifact.result_run_id = ${alias}.run_id
                AND return_gate_artifact.continuation_run_id <> ${alias}.run_id
-          )`;
+           )`;
+}
+
+/**
+ * Terminal open repair rows are durable audit evidence, not resumable work.
+ * Payload reclamation may therefore ignore only that guard while preserving
+ * every liveness and cross-run reference check used by run deletion.
+ */
+export function terminalWorkflowPayloadReclamationSafetyPredicate(alias: string): string {
+  return terminalWorkflowRunSafetyPredicate(alias, { includeOpenDecisionRepairGuard: false });
 }
 
 const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [

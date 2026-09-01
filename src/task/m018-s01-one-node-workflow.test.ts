@@ -1288,6 +1288,38 @@ describe('M018 S01 one-node workflow activation', () => {
         displayState: 'failed',
       });
       expect(graph.nodes.find((node) => node.nodeId === 'decision')).not.toHaveProperty('decision');
+      const closureMessage = await ctx.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', payload.runId],
+      );
+      expect(JSON.parse(closureMessage!.body_json)).toMatchObject({
+        kind: 'run_closure',
+        reasonCode: 'run_timeout',
+      });
+      await expect(ctx.repository.execute({
+        kind: 'reclaimTerminalWorkflowMetadata',
+        workspaceId: 'ws',
+      })).resolves.toMatchObject({
+        ok: true,
+        changed: true,
+        strippedWorkflowMessageBodies: 1,
+      });
+      await expect(ctx.client.get(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', payload.runId],
+      )).resolves.toEqual({ body_json: '{"retentionStripped":true}' });
+      await expect(ctx.client.get(
+        `SELECT status, attempts_used, last_error_code, next_repair_turn_id
+           FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', payload.runId],
+      )).resolves.toEqual({
+        status: 'open',
+        attempts_used: 1,
+        last_error_code: 'decision_missing',
+        next_repair_turn_id: null,
+      });
     } finally {
       await ctx.close();
     }

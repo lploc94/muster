@@ -177,6 +177,9 @@ Only a completed third missing/invalid decision marks repair `exhausted` at
 attempt 3. Timeout, cancellation, and workflow-budget closure preserve the
 actual number and evidence of decision attempts, clear any scheduled correction,
 and suppress an otherwise-open correction summary once the run is terminal.
+The retained open repair row is terminal audit evidence, not live execution
+state: retention may strip routed transport payload bodies while preserving the
+repair status, attempt count, and bounded evidence.
 
 Script execution deliberately separates the package root from process working
 directory:
