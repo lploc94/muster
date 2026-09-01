@@ -10,9 +10,9 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Plan path: `docs/plans/workflow-definition-outcome-routing-implementation.md`
 
 ## Current State
-- Completed: Commit `bd2590c` adds the authoritative design; Phases 1-7 implement the canonical definition, package, persistence, composition, decision-repair, execute-routing, bounded projection, and assembled-journey contracts. Phase 7 passes its focused matrix, complete gate, exact VS Code 1.135.0 packaged qualification, and working-tree implementation review.
-- Remaining: Run the final global gates and complete-plan branch review before final bookkeeping.
-- Worktree: Phase 7 code, tests, docs, evidence, and plan bookkeeping are phase-owned. Preserve unrelated user changes and never stage diagnostic experiments or generated native artifacts unless the phase contract owns them.
+- Completed: Commit `bd2590c` adds the authoritative design; Phases 1-7 implement the canonical definition, package, persistence, composition, decision-repair, execute-routing, bounded projection, and assembled-journey contracts. Final qualification through `ffb1d2c` passes every Global Gate, including exact VS Code 1.135.0 packaged qualification, and the complete-plan branch review is APPROVE after all nine findings were fixed.
+- Remaining: None.
+- Worktree: No pre-existing unrelated changes were present. Final review fixes are isolated in `8ebb88f` and `ffb1d2c`; generated native artifacts remain untracked/ignored rather than entering plan commits.
 
 ## Codebase Evidence
 - Current flow: `src/bridge/server.ts (define_workflow/start_workflow/invoke_child_workflow and disposition schemas) -> src/task/coordinator-tools.ts:parseSemanticWorkflowDefinition/parseSemanticWorkflowInputs/tool command parsing -> src/task/workflow.ts:validateDefineWorkflow/validateStartWorkflow -> src/task/engine-graph.ts:bindPredefinedWorkflowScripts/freezeWorkflowDefinitionRouting/prepareWorkflowStart/executeToolCommand -> src/task/repository.ts:defineWorkflowVersion/startWorkflowRun/settleTurnAndApplyEffects -> src/task/sqlite/schema.ts authority tables -> src/task/engine.ts reload, execution, implicit NEXT, and post-commit scheduling`.
@@ -349,11 +349,11 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 - Commit: `refactor(workflow): surface state and complete design cutover`
 
 ## Completion Criteria
-- [ ] Every phase is complete and committed exactly once.
-- [ ] Every acceptance criterion is checked.
-- [ ] All global gates pass on final HEAD.
-- [ ] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
-- [ ] Worktree is clean apart from pre-existing unrelated changes.
+- [x] Every phase is complete and committed exactly once.
+- [x] Every acceptance criterion is checked.
+- [x] All global gates pass on final HEAD.
+- [x] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
+- [x] Worktree is clean apart from pre-existing unrelated changes.
 
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
@@ -365,3 +365,4 @@ Refactor Muster's existing workflow definition, package, persistence, and routin
 | 5 | complete | this phase commit (`feat(workflow-routing): add durable decision repair`) | Focused: 176/176; prompt/workflow boundaries: 77/77; `npx tsc -p . --noEmit`; `git diff --check`; compile; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 4 rounds; 7 findings fixed, 1 disputed from the approved closed error-code contract |
 | 6 | complete | this phase commit (`feat(workflow-execute): map exit outcomes to dispositions`) | Focused: 130/130; script-workflow QA: 156/156; QA docs: 3/3; `npx tsc -p . --noEmit`; compile; source-boundary + fixtures passed; native VS Code 1.135.0 qualification remains truthfully PENDING at its pre-run workspace-setting blocker | `codex-impl-review` APPROVE in 1 round; no findings |
 | 7 | complete | this phase commit (`refactor(workflow): surface state and complete design cutover`) | Focused: 142/142; QA verifier: 3/3; M024 S05: 5/5; M024 S06: 15/15; exact VS Code 1.135.0 packaged native PASS with live resource transition and exact restoration; SQLite docs; `npx tsc -p . --noEmit`; Svelte 0 errors/0 warnings; compile; full Vitest 2917/2917; Playwright 92/92; source-boundary + fixtures passed | `codex-impl-review` APPROVE in 2 rounds; 4 findings fixed; renewed resource-scope plan review APPROVE in 2 rounds |
+| Final qualification | complete | `8ebb88f`, `ffb1d2c`, and this plan-finalization commit | M024 S05: 5/5 plus 2/2 focused Playwright; M024 S06: 15/15 probe, 9/9 assembly, 4/4 evidence; script-workflow QA: 162/162; exact VS Code 1.135.0 native PASS (`catalog=5`, `policy=3`, `runtime=15`) with live resource transition and exact restoration; SQLite docs: 3/3; `npx tsc -p . --noEmit`; Svelte 0 errors/0 warnings; compile; full Vitest 2929/2929; Playwright 92/92; source-boundary 24 checks, repository boundary, and fixtures 46/46 passed | Complete-plan branch `codex-impl-review` for `bd2590c...ffb1d2c` APPROVE in 3 rounds; 9 findings fixed, none disputed; session `codex-impl-review-20260901-002` finalized and stopped |
