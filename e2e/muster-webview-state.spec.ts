@@ -154,7 +154,7 @@ async function readVsCodeState(page: Page): Promise<unknown> {
   return readMusterWebviewState(page);
 }
 
-/** Move file-mention highlight to option index (retries ArrowDown if the first key is dropped). */
+/** Move file-mention highlight to option index, rejecting stale ids reused by a new popup. */
 async function focusFileMentionOption(
   composer: ReturnType<Page['getByPlaceholder']>,
   optionIndex: number,
@@ -163,10 +163,18 @@ async function focusFileMentionOption(
   await expect
     .poll(
       async () => {
-        const current = await composer.getAttribute('aria-activedescendant');
-        if (current === target) return target;
+        const selected = await composer.evaluate((element, targetId) => (
+          element.getAttribute('aria-activedescendant') === targetId
+          && element.ownerDocument.getElementById(targetId)?.getAttribute('aria-selected') === 'true'
+        ), target);
+        if (selected) return target;
         await composer.press('ArrowDown');
-        return composer.getAttribute('aria-activedescendant');
+        return composer.evaluate((element, targetId) => (
+          element.getAttribute('aria-activedescendant') === targetId
+          && element.ownerDocument.getElementById(targetId)?.getAttribute('aria-selected') === 'true'
+            ? targetId
+            : null
+        ), target);
       },
       { timeout: 5_000 },
     )
