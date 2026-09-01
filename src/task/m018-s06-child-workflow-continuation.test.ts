@@ -55,7 +55,15 @@ async function defineCallerAndChild(harness: NamedWorkflowHarness): Promise<void
         },
       ],
       outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-      nodes: [{ nodeId: 'entry' }],
+      nodes: [{
+        nodeId: 'entry',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The child result is ready.' },
+          fail: { when: 'The child cannot complete safely.' },
+        },
+      }],
       edges: [],
     },
   });
@@ -386,6 +394,236 @@ describe('M018 S06 named child workflow continuation', () => {
         `SELECT COUNT(*) AS count FROM workflow_continuations
           WHERE workspace_id = ? AND run_id = ?`,
         [NAMED_WORKSPACE_ID, caller.runId],
+      )).resolves.toEqual({ count: 1 });
+      await expect(harness.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
+    } finally {
+      await harness.close();
+    }
+  }, 30_000);
+
+  it('same child key is isolated across callers and conflicts on changed same-caller bindings', async () => {
+    const harness = await openNamedWorkflowHarness('child-key-scope');
+    try {
+      await defineCallerAndChild(harness);
+      const bindings = [
+        { name: 'request', fromInputRef: 'source' },
+        { name: 'context', fromInputRef: 'source' },
+      ];
+      const first = await startCaller(harness, 'caller-key-first', 'FIRST parent value');
+      const settleFirst = await prepareCallerSettlement(
+        harness,
+        first.entryTaskId,
+        first.activationTurnId,
+        childRoute(bindings, 'shared-child-key'),
+        'stage-shared-child-first',
+      );
+      await expect(settleFirst()).resolves.toMatchObject({ ok: true, changed: true });
+
+      const second = await startCaller(harness, 'caller-key-second', 'SECOND parent value');
+      const settleSecond = await prepareCallerSettlement(
+        harness,
+        second.entryTaskId,
+        second.activationTurnId,
+        childRoute(bindings, 'shared-child-key'),
+        'stage-shared-child-second',
+      );
+      await expect(settleSecond()).resolves.toMatchObject({ ok: true, changed: true });
+      const firstChildren = await childRuns(harness, first.runId);
+      const secondChildren = await childRuns(harness, second.runId);
+      expect(firstChildren).toHaveLength(1);
+      expect(secondChildren).toHaveLength(1);
+      expect(firstChildren[0]!.run_id).not.toBe(secondChildren[0]!.run_id);
+
+      const conflicting = await startCaller(
+        harness,
+        'caller-key-conflict',
+        'CONFLICT parent value',
+      );
+      await expect(stageCallerDisposition(
+        harness,
+        conflicting.entryTaskId,
+        conflicting.activationTurnId,
+        childRoute(bindings, 'original-child-key'),
+        'stage-original-child-key',
+      )).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(stageCallerDisposition(
+        harness,
+        conflicting.entryTaskId,
+        conflicting.activationTurnId,
+        childRoute(bindings, 'changed-child-key'),
+        'stage-changed-child-key',
+      )).resolves.toMatchObject({
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'turn already has a different disposition',
+      });
+      expect(await childRuns(harness, conflicting.runId)).toEqual([]);
+      await expect(harness.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
+    } finally {
+      await harness.close();
+    }
+  }, 30_000);
+
+  it('propagates child failure through the parent continuation exactly once', async () => {
+    const harness = await openNamedWorkflowHarness('child-failure-propagation');
+    try {
+      await defineCallerAndChild(harness);
+      const caller = await startCaller(harness, 'caller-child-failure', 'FAIL parent value');
+      const invoke = await prepareCallerSettlement(
+        harness,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        childRoute([
+          { name: 'request', fromInputRef: 'source' },
+          { name: 'context', fromInputRef: 'source' },
+        ], 'failing-child-key'),
+        'stage-failing-child',
+      );
+      await expect(invoke()).resolves.toMatchObject({ ok: true, changed: true });
+      const childRunId = (await childRuns(harness, caller.runId))[0]!.run_id;
+      const childNode = await harness.client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = 'entry'`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      );
+      const childTurn = (await harness.repository.listTurns(childNode!.task_id))[0]!;
+      const failChild = await prepareCallerSettlement(
+        harness,
+        childNode!.task_id,
+        childTurn.id,
+        { kind: 'workflow_fail', reason: 'declared child failure' },
+        'stage-child-failure',
+      );
+      await expect(failChild()).resolves.toMatchObject({ ok: true, changed: true });
+      await expect(failChild()).resolves.toMatchObject({ ok: true, changed: false });
+
+      const runs = await harness.client.all<{
+        run_id: string;
+        status: string;
+        terminal_reason_code: string | null;
+      }>(
+        `SELECT run_id, status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id IN (?,?) ORDER BY run_id`,
+        [NAMED_WORKSPACE_ID, caller.runId, childRunId],
+      );
+      expect(runs).toHaveLength(2);
+      expect(runs.every((run) =>
+        run.status === 'failed' && run.terminal_reason_code === 'agent_fail')).toBe(true);
+      await expect(harness.client.get(
+        `SELECT status, outcome, reason_code, result_artifact_id
+           FROM workflow_continuations WHERE workspace_id = ? AND child_run_id = ?`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      )).resolves.toEqual({
+        status: 'failed',
+        outcome: 'failed',
+        reason_code: 'agent_fail',
+        result_artifact_id: null,
+      });
+      await expect(harness.client.get(
+        `SELECT status, result_artifact_id FROM workflow_return_gates
+          WHERE workspace_id = ? AND child_run_id = ?`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      )).resolves.toEqual({ status: 'failed', result_artifact_id: null });
+      await expect(harness.repository.getTask(caller.entryTaskId)).resolves.toMatchObject({
+        lifecycle: 'failed',
+      });
+      await expect(harness.repository.getTask(childNode!.task_id)).resolves.toMatchObject({
+        lifecycle: 'failed',
+      });
+      await expect(harness.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
+    } finally {
+      await harness.close();
+    }
+  }, 30_000);
+
+  it('propagates typed child cancellation through the parent continuation exactly once', async () => {
+    const harness = await openNamedWorkflowHarness('child-cancellation-propagation');
+    try {
+      await defineCallerAndChild(harness);
+      const caller = await startCaller(harness, 'caller-child-cancel', 'CANCEL parent value');
+      const invoke = await prepareCallerSettlement(
+        harness,
+        caller.entryTaskId,
+        caller.activationTurnId,
+        childRoute([
+          { name: 'request', fromInputRef: 'source' },
+          { name: 'context', fromInputRef: 'source' },
+        ], 'cancelled-child-key'),
+        'stage-cancelled-child',
+      );
+      await expect(invoke()).resolves.toMatchObject({ ok: true, changed: true });
+      const childRunId = (await childRuns(harness, caller.runId))[0]!.run_id;
+      const childNode = await harness.client.get<{ task_id: string }>(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = ? AND run_id = ? AND node_id = 'entry'`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      );
+      const childTask = await harness.repository.getTask(childNode!.task_id);
+      const childTurn = (await harness.repository.listTurns(childNode!.task_id))[0]!;
+      const cancelledAt = harness.nextTimestamp();
+      const cancelCommand = {
+        kind: 'applyTaskLifecycle' as const,
+        workspaceId: NAMED_WORKSPACE_ID,
+        taskId: childTask!.id,
+        expectedTaskRevision: childTask!.revision,
+        task: {
+          ...childTask!,
+          lifecycle: 'cancelled' as const,
+          revision: childTask!.revision + 1,
+          updatedAt: cancelledAt,
+        },
+        turns: [{ ...childTurn, status: 'cancelled' as const, finishedAt: cancelledAt }],
+        expectedTurns: [{ id: childTurn.id, status: 'queued' as const }],
+      };
+      await expect(harness.repository.execute(cancelCommand)).resolves.toMatchObject({
+        ok: true,
+        changed: true,
+      });
+
+      const runs = await harness.client.all<{
+        run_id: string;
+        status: string;
+        terminal_reason_code: string | null;
+      }>(
+        `SELECT run_id, status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id IN (?,?) ORDER BY run_id`,
+        [NAMED_WORKSPACE_ID, caller.runId, childRunId],
+      );
+      expect(runs).toHaveLength(2);
+      expect(runs.every((run) =>
+        run.status === 'cancelled'
+        && run.terminal_reason_code === 'required_target_cancelled')).toBe(true);
+      await expect(harness.client.get(
+        `SELECT status, outcome, reason_code, result_artifact_id
+           FROM workflow_continuations WHERE workspace_id = ? AND child_run_id = ?`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      )).resolves.toEqual({
+        status: 'cancelled',
+        outcome: 'cancelled',
+        reason_code: 'required_target_cancelled',
+        result_artifact_id: null,
+      });
+      await expect(harness.client.get(
+        `SELECT status FROM workflow_return_gates
+          WHERE workspace_id = ? AND child_run_id = ?`,
+        [NAMED_WORKSPACE_ID, childRunId],
+      )).resolves.toEqual({ status: 'cancelled' });
+      await expect(harness.repository.getTask(caller.entryTaskId)).resolves.toMatchObject({
+        lifecycle: 'cancelled',
+      });
+      await expect(harness.repository.getTask(childNode!.task_id)).resolves.toMatchObject({
+        lifecycle: 'cancelled',
+      });
+
+      await reopenNamedWorkflowHarness(harness);
+      await expect(harness.repository.execute(cancelCommand)).resolves.toMatchObject({
+        changed: false,
+      });
+      await expect(harness.client.get<{ count: number }>(
+        `SELECT COUNT(*) AS count FROM workflow_continuations
+          WHERE workspace_id = ? AND child_run_id = ?`,
+        [NAMED_WORKSPACE_ID, childRunId],
       )).resolves.toEqual({ count: 1 });
       await expect(harness.client.all('PRAGMA foreign_key_check')).resolves.toEqual([]);
     } finally {

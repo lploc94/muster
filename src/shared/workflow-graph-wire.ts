@@ -14,6 +14,7 @@ export const WORKFLOW_GRAPH_GATE_INPUTS_MAX = 64;
 export const WORKFLOW_GRAPH_FEEDBACK_ROUNDS_MAX = 32;
 export const WORKFLOW_GRAPH_CHILD_RUNS_MAX = 64;
 export const WORKFLOW_GRAPH_DIAGNOSTICS_MAX = 8;
+export const WORKFLOW_GRAPH_TITLE_MAX = 200;
 
 export const WORKFLOW_GRAPH_ERROR_CODES = [
   'invalidRequest',
@@ -44,13 +45,22 @@ export type WorkflowGraphWireDisplayState =
   | 'queued' | 'executing' | 'waiting' | 'completed' | 'reused'
   | 'blocked' | 'not_started' | 'failed' | 'cancelled' | 'skipped';
 export type WorkflowGraphWireProgressBucket = Exclude<WorkflowGraphWireDisplayState, 'reused'>;
+export type WorkflowGraphWireDecisionGate = 'optional' | 'required';
+export interface WorkflowGraphWireDecision {
+  status: 'waiting' | 'correcting' | 'decided' | 'exhausted';
+  attempt: 1 | 2 | 3;
+  maxAttempts: 3;
+}
 export interface WorkflowGraphWireNode {
   nodeId: string;
+  title?: string;
   workflowNodeStatus: WorkflowGraphWireNodeStatus;
   executionActivity: WorkflowGraphWireExecutionActivity;
   displayState: WorkflowGraphWireDisplayState;
   progressBucket: WorkflowGraphWireProgressBucket;
   reason?: 'waiting_for_inputs' | 'run_closed_before_activation' | 'awaiting_workflow_route';
+  decisionGate?: WorkflowGraphWireDecisionGate;
+  decision?: WorkflowGraphWireDecision;
   reused: boolean;
 }
 export interface WorkflowGraphWireEdge {
@@ -145,6 +155,8 @@ const PROGRESS_BUCKETS = new Set<string>([
 const NODE_REASONS = new Set<string>([
   'waiting_for_inputs', 'run_closed_before_activation', 'awaiting_workflow_route',
 ]);
+const DECISION_GATES = new Set<string>(['optional', 'required']);
+const DECISION_STATUSES = new Set<string>(['waiting', 'correcting', 'decided', 'exhausted']);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -195,26 +207,60 @@ export function parseRequestWorkflowGraph(raw: unknown): Omit<RequestWorkflowGra
   return parsed.ok ? { requestId: parsed.requestId, taskId: parsed.taskId } : null;
 }
 
+function parseDecision(raw: unknown): WorkflowGraphWireDecision | null {
+  if (
+    !isRecord(raw)
+    || !hasExactKeys(raw, ['status', 'attempt', 'maxAttempts'])
+    || typeof raw.status !== 'string'
+    || !DECISION_STATUSES.has(raw.status)
+    || typeof raw.attempt !== 'number'
+    || !Number.isSafeInteger(raw.attempt)
+    || (raw.attempt !== 1 && raw.attempt !== 2 && raw.attempt !== 3)
+    || raw.maxAttempts !== 3
+  ) return null;
+  return {
+    status: raw.status as WorkflowGraphWireDecision['status'],
+    attempt: raw.attempt,
+    maxAttempts: 3,
+  };
+}
+
 function parseNode(raw: unknown): WorkflowGraphWireNode | null {
   if (!isRecord(raw)) return null;
   const baseKeys = [
     'nodeId', 'workflowNodeStatus', 'executionActivity', 'displayState', 'progressBucket', 'reused',
   ];
-  if (!hasExactKeys(raw, 'reason' in raw ? [...baseKeys, 'reason'] : baseKeys)
+  const exactKeys = [
+    ...baseKeys,
+    ...('title' in raw ? ['title'] : []),
+    ...('reason' in raw ? ['reason'] : []),
+    ...('decisionGate' in raw ? ['decisionGate'] : []),
+    ...('decision' in raw ? ['decision'] : []),
+  ];
+  const decision = 'decision' in raw ? parseDecision(raw.decision) : undefined;
+  if (!hasExactKeys(raw, exactKeys)
     || !isBoundedString(raw.nodeId) || typeof raw.workflowNodeStatus !== 'string'
     || !NODE_STATUSES.has(raw.workflowNodeStatus)
     || typeof raw.executionActivity !== 'string' || !EXECUTION_ACTIVITIES.has(raw.executionActivity)
     || typeof raw.displayState !== 'string' || !DISPLAY_STATES.has(raw.displayState)
     || typeof raw.progressBucket !== 'string' || !PROGRESS_BUCKETS.has(raw.progressBucket)
     || typeof raw.reused !== 'boolean'
-    || ('reason' in raw && (typeof raw.reason !== 'string' || !NODE_REASONS.has(raw.reason)))) return null;
+    || ('title' in raw && !isBoundedString(raw.title, WORKFLOW_GRAPH_TITLE_MAX))
+    || ('reason' in raw && (typeof raw.reason !== 'string' || !NODE_REASONS.has(raw.reason)))
+    || ('decisionGate' in raw && (typeof raw.decisionGate !== 'string' || !DECISION_GATES.has(raw.decisionGate)))
+    || ('decision' in raw && !decision)) return null;
   const node: WorkflowGraphWireNode = {
     nodeId: raw.nodeId,
+    ...('title' in raw ? { title: raw.title as string } : {}),
     workflowNodeStatus: raw.workflowNodeStatus as WorkflowGraphWireNodeStatus,
     executionActivity: raw.executionActivity as WorkflowGraphWireExecutionActivity,
     displayState: raw.displayState as WorkflowGraphWireDisplayState,
     progressBucket: raw.progressBucket as WorkflowGraphWireProgressBucket,
     ...('reason' in raw ? { reason: raw.reason as WorkflowGraphWireNode['reason'] } : {}),
+    ...('decisionGate' in raw
+      ? { decisionGate: raw.decisionGate as WorkflowGraphWireDecisionGate }
+      : {}),
+    ...(decision ? { decision } : {}),
     reused: raw.reused,
   };
   return node;
@@ -222,6 +268,26 @@ function parseNode(raw: unknown): WorkflowGraphWireNode | null {
 function validNodeTuple(node: WorkflowGraphWireNode, runStatus: WorkflowGraphWireRunStatus): boolean {
   const expectedBucket = node.displayState === 'reused' ? 'completed' : node.displayState;
   if (node.progressBucket !== expectedBucket) return false;
+  if (node.decision && !node.decisionGate) return false;
+  if (node.decision?.status === 'waiting') {
+    if (
+      node.decisionGate !== 'required'
+      || node.decision.attempt !== 1
+      || runStatus !== 'running'
+      || node.workflowNodeStatus !== 'active'
+    ) return false;
+  }
+  if (node.decision?.status === 'correcting') {
+    if (runStatus !== 'running' || node.workflowNodeStatus !== 'active') return false;
+  }
+  if (node.decision?.status === 'exhausted') {
+    if (
+      node.decision.attempt !== 3
+      || runStatus !== 'failed'
+      || node.workflowNodeStatus !== 'failed'
+      || node.displayState !== 'failed'
+    ) return false;
+  }
   if (node.workflowNodeStatus === 'reused') {
     return node.executionActivity === 'none' && node.displayState === 'reused'
       && node.reason === undefined;

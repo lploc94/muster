@@ -180,6 +180,7 @@
         "muster.verification.hostRun": {
           "type": "boolean",
           "default": false,
+          "scope": "resource",
           "description": "Allow the host to execute a task's verification commands (workspace-trusted, allowlisted runners only)."
         },
         "muster.permissions.mode": {

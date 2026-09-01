@@ -8,7 +8,7 @@ import { createVSIX } from '@vscode/vsce';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(scriptDir, '..');
-const version = process.env.MUSTER_VSCODE_VERSION || 'stable';
+const version = process.env.MUSTER_VSCODE_VERSION || '1.135.0';
 const vscodeExecutablePath = process.env.MUSTER_VSCODE_EXECUTABLE_PATH;
 const downloadTimeout = Number.parseInt(
   process.env.MUSTER_VSCODE_DOWNLOAD_TIMEOUT_MS || '120000',
@@ -60,6 +60,9 @@ async function main() {
   const compiledTest = path.join(root, 'dist', 'scripts', 'script-workflow-native-host.js');
   const vsixPath = path.join(tempDir, 'muster.vsix');
   try {
+    if (version !== '1.135.0') {
+      throw new Error('qualifying script workflow native QA requires VS Code 1.135.0');
+    }
     await createVSIX({
       cwd: root,
       packagePath: vsixPath,
@@ -120,6 +123,9 @@ async function main() {
       host?.hostMode !== 'extension-development-host'
     ) {
       throw new Error('native host result has invalid provenance');
+    }
+    if (host.vscodeVersion !== version) {
+      throw new Error('native host reported an unexpected VS Code version');
     }
     const evidence = {
       verdict: 'PASS',

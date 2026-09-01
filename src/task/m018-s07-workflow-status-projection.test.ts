@@ -570,6 +570,286 @@ describe('M018 S07 bounded workflow status projection', () => {
     }
   }, 30_000);
 
+  it('projects bounded display title and durable decision repair attempt state after reload', async () => {
+    const ctx = await openRepo('decision-repair-projection');
+    let reopened: DbClient | undefined;
+    try {
+      const createdAt = '2026-08-01T00:00:00.000Z';
+      const base = makeGraphFanInDefinition({
+        definitionId: 'wf-decision-projection',
+        createdAt,
+      });
+      const secretCondition = 'PRIVATE_CONDITION_TEXT_MUST_NOT_CROSS';
+      const definition = {
+        ...base,
+        topology: {
+          ...base.topology,
+          nodes: base.topology.nodes.map((node) => node.nodeId === 'p1'
+            ? {
+                ...node,
+                title: 'Repair planner',
+                outcome: {
+                  kind: 'agent' as const,
+                  requireExplicitDisposition: true,
+                  next: { when: secretCondition },
+                  fail: { when: 'No safe route remains.' },
+                },
+              }
+            : node),
+        },
+      };
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: definition.definitionId,
+        version: definition.version,
+        name: definition.name,
+        topology: definition.topology,
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: definition.definitionId,
+        version: definition.version,
+        startIdempotencyKey: 'decision-projection-start',
+        createdAt,
+        goal: 'project durable decision state',
+        backend: 'grok',
+      });
+      expect(started).toMatchObject({ ok: true, changed: true });
+      const data = started.operation?.result?.data as StartPayload;
+      const p1 = data.entries.find((entry) => entry.nodeId === 'p1')!;
+      const activation = await ctx.client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+        ['ws', data.runId, 'p1'],
+      );
+      expect(activation).toBeTruthy();
+
+      await ctx.client.run(
+        `UPDATE turns SET status = 'succeeded', settled_at = ?,
+                          payload_json = json_set(payload_json, '$.status', 'succeeded')
+          WHERE workspace_id = ? AND id = ?`,
+        ['2026-08-01T00:00:01.000Z', 'ws', p1.activationTurnId],
+      );
+      const correctionTurnId = 'turn-decision-projection-attempt-2';
+      await expect(ctx.repository.execute({
+        kind: 'createTurn',
+        workspaceId: 'ws',
+        turn: {
+          id: correctionTurnId,
+          taskId: p1.taskId,
+          sequence: 2,
+          trigger: 'engine',
+          status: 'queued',
+          inputs: [],
+          createdAt: '2026-08-01T00:00:02.000Z',
+        },
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await ctx.client.transaction([
+        {
+          sql: `INSERT INTO workflow_decision_repairs (
+                  workspace_id, run_id, activation_id, status, attempts_used,
+                  last_attempt_turn_id, last_error_code, last_response_message_id,
+                  next_repair_turn_id, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          params: [
+            'ws', data.runId, activation!.activation_id, 'open', 1,
+            p1.activationTurnId, 'decision_invalid', null, correctionTurnId,
+            '2026-08-01T00:00:02.000Z', '2026-08-01T00:00:02.000Z',
+          ],
+        },
+        {
+          sql: `UPDATE workflow_activations
+                   SET execution_turn_id = ?, status = 'queued', updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+          params: [
+            correctionTurnId, '2026-08-01T00:00:02.000Z',
+            'ws', data.runId, activation!.activation_id,
+          ],
+        },
+      ]);
+
+      const expectedDecision = {
+        status: 'correcting',
+        attempt: 2,
+        maxAttempts: 3,
+      };
+      await expect(ctx.repository.getWorkflowStatusForTask(p1.taskId)).resolves.toMatchObject({
+        nodeId: 'p1',
+        title: 'Repair planner',
+        decisionGate: 'required',
+        decision: expectedDecision,
+        activation: { executionTurnId: correctionTurnId },
+      });
+      const graph = await ctx.repository.getWorkflowGraphForTask(p1.taskId);
+      expect(graph?.nodes).toHaveLength(3);
+      expect(graph?.nodes.find((node) => node.nodeId === 'p1')).toMatchObject({
+        title: 'Repair planner',
+        decisionGate: 'required',
+        decision: expectedDecision,
+      });
+      expect(JSON.stringify(graph)).not.toContain(secretCondition);
+      expect(JSON.stringify(graph)).not.toMatch(/last_response|last_error|activation_id|turn-decision/);
+
+      await ctx.client.close();
+      reopened = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+      await reopened.open(path.join(ctx.dir, 'muster.sqlite3'));
+      const reloadedRepository = new SqliteTaskRepository(reopened, 'ws');
+      await expect(reloadedRepository.getWorkflowStatusForTask(p1.taskId)).resolves.toMatchObject({
+        title: 'Repair planner',
+        decisionGate: 'required',
+        decision: expectedDecision,
+      });
+      await expect(reloadedRepository.getWorkflowGraphForTask(p1.taskId)).resolves.toMatchObject({
+        nodes: expect.arrayContaining([
+          expect.objectContaining({ nodeId: 'p1', decision: expectedDecision }),
+        ]),
+      });
+    } finally {
+      await reopened?.close().catch(() => undefined);
+      await ctx.client.close().catch(() => undefined);
+      fs.rmSync(ctx.dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('retries the complete status read when decision exhaustion closes the run concurrently', async () => {
+    const ctx = await openRepo('decision-exhaustion-read-race');
+    const peer = new DbClient({ workerPath: WORKER_TS, execArgv: TSX_ARGV });
+    try {
+      await peer.open(path.join(ctx.dir, 'muster.sqlite3'));
+      const createdAt = '2026-08-01T00:10:00.000Z';
+      const base = makeGraphFanInDefinition({
+        definitionId: 'wf-decision-exhaustion-read-race',
+        createdAt,
+      });
+      const definition = {
+        ...base,
+        topology: {
+          ...base.topology,
+          nodes: base.topology.nodes.map((node) => node.nodeId === 'p1'
+            ? {
+                ...node,
+                outcome: {
+                  kind: 'agent' as const,
+                  requireExplicitDisposition: true,
+                  next: { when: 'Proceed safely.' },
+                  fail: { when: 'No safe route remains.' },
+                },
+              }
+            : node),
+        },
+      };
+      await expect(ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: definition.definitionId,
+        version: definition.version,
+        name: definition.name,
+        topology: definition.topology,
+        createdAt,
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      const started = await ctx.repository.execute({
+        kind: 'startWorkflowRun',
+        workspaceId: 'ws',
+        definitionId: definition.definitionId,
+        version: definition.version,
+        startIdempotencyKey: 'decision-exhaustion-read-race',
+        createdAt,
+        goal: 'read one coherent terminal decision state',
+        backend: 'grok',
+      });
+      const data = started.operation?.result?.data as StartPayload;
+      const p1 = data.entries.find((entry) => entry.nodeId === 'p1')!;
+      const activation = await ctx.client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+        ['ws', data.runId, 'p1'],
+      );
+      expect(activation).toBeTruthy();
+      await ctx.client.run(
+        `INSERT INTO workflow_decision_repairs (
+           workspace_id, run_id, activation_id, status, attempts_used,
+           last_attempt_turn_id, last_error_code, last_response_message_id,
+           next_repair_turn_id, created_at, updated_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+        [
+          'ws', data.runId, activation!.activation_id, 'open', 2,
+          p1.activationTurnId, 'decision_invalid', null, p1.activationTurnId,
+          createdAt, createdAt,
+        ],
+      );
+
+      const originalAll = ctx.client.all.bind(ctx.client);
+      let decisionReads = 0;
+      let exhausted = false;
+      (ctx.client as unknown as { all: typeof ctx.client.all }).all = async (sql, params) => {
+        if (
+          sql.includes('FROM workflow_activations activation')
+          && sql.includes('LEFT JOIN workflow_decision_repairs repair')
+        ) {
+          decisionReads += 1;
+          if (!exhausted) {
+            exhausted = true;
+            await peer.transaction([
+              {
+                sql: `UPDATE turns
+                         SET status = 'failed', settled_at = ?,
+                             payload_json = json_set(payload_json, '$.status', 'failed')
+                       WHERE workspace_id = ? AND task_id IN (
+                         SELECT task_id FROM workflow_nodes
+                          WHERE workspace_id = ? AND run_id = ?
+                       ) AND status IN ('queued', 'running', 'waiting_user')`,
+                params: ['2026-08-01T00:10:01.000Z', 'ws', 'ws', data.runId],
+              },
+              {
+                sql: `UPDATE workflow_activations
+                         SET status = 'failed', updated_at = ?
+                       WHERE workspace_id = ? AND run_id = ?
+                         AND status IN ('queued', 'running')`,
+                params: ['2026-08-01T00:10:01.000Z', 'ws', data.runId],
+              },
+              {
+                sql: `UPDATE workflow_decision_repairs
+                         SET status = 'exhausted', attempts_used = 3,
+                             next_repair_turn_id = NULL, updated_at = ?
+                       WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+                params: [
+                  '2026-08-01T00:10:01.000Z', 'ws', data.runId, activation!.activation_id,
+                ],
+              },
+              {
+                sql: `UPDATE workflow_runs
+                         SET status = 'failed', terminal_reason_code = 'decision_invalid', updated_at = ?
+                       WHERE workspace_id = ? AND run_id = ?`,
+                params: ['2026-08-01T00:10:01.000Z', 'ws', data.runId],
+              },
+              {
+                sql: `INSERT INTO workspace_revisions (workspace_id, revision) VALUES (?, 1)
+                      ON CONFLICT(workspace_id) DO UPDATE
+                      SET revision = workspace_revisions.revision + 1`,
+                params: ['ws'],
+              },
+            ]);
+          }
+        }
+        return originalAll(sql, params);
+      };
+
+      const projection = await ctx.repository.getWorkflowStatusForTask(p1.taskId);
+      expect(decisionReads).toBe(2);
+      expect(projection).toMatchObject({
+        runStatus: 'failed',
+        terminalReason: 'decision_invalid',
+        decision: { status: 'exhausted', attempt: 3, maxAttempts: 3 },
+      });
+    } finally {
+      await peer.close().catch(() => undefined);
+      await ctx.close();
+    }
+  }, 30_000);
+
   it('projects host-only workflow graph topology and lifecycle for a task-bound run', async () => {
     const ctx = await openRepo('host-graph');
     try {

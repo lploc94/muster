@@ -155,6 +155,21 @@ Frozen instruction bytes are persisted as node task content. Normal entry,
 dependency, child, retry, and reload paths use those bytes and never reread a
 mutable prompt file.
 
+An agent node may omit `outcome` and keep final-assistant-message implicit NEXT.
+When an agent outcome is present, the host renders its declared NEXT/PREV/FAIL
+contract and authorizes every attempted disposition against the frozen node
+definition before staging it. PREV can address only one exact declared set of
+direct inbound `inputRef` values and always carries bounded nonempty feedback.
+
+For `requireExplicitDisposition: true`, a completed turn without a valid route
+opens activation-owned decision repair. An authenticated invalid route attempt
+does the same, including for an otherwise optional outcome. The original turn is
+attempt 1; attempts 1 and 2 reserve one deterministic same-task correction turn,
+and attempt 3 exhausts the repair and fails the run with bounded
+`decision_missing` or `decision_invalid` evidence. A valid disposition accepted
+first remains authoritative across races, replay, and reload. Decision repair is
+not PREV: it creates no feedback round, producer turn, hidden node, or graph edge.
+
 Script execution deliberately separates the package root from process working
 directory:
 
@@ -189,10 +204,13 @@ does not install dependencies, invoke `npx`, or load a package-local compiler.
 
 ## 7. Trust and data boundaries
 
-Local script execution requires a trusted workspace, live
-`muster.verification.hostRun=true`, an allowlisted interpreter, valid resource
-bounds, and verified frozen provenance. Package contents cannot weaken those
-checks.
+Local script execution requires a trusted workspace, live resource-scoped
+`muster.verification.hostRun=true` for the task/workflow execution cwd, an
+allowlisted interpreter, valid resource bounds, and verified frozen provenance.
+The engine re-reads the effective setting at workflow start and immediately
+before spawn; verification-task commands also re-read it at settle. In a
+multi-root workspace, folder overrides stay isolated and active-editor focus
+does not retarget an existing task. Package contents cannot weaken those checks.
 
 Child processes receive the filtered execution environment, not the complete
 extension-host environment. Stdout, stderr, timeout, cancellation, and process
@@ -202,6 +220,15 @@ MCP grants, or gain coordinator authority from package contents.
 Catalog, MCP, status, graph, and webview projections never expose manifest or
 instruction bodies, scripts, filesystem paths, credentials, or physical
 artifact identities.
+
+Status and graph projections derive decision state from durable activation and
+repair rows. They may expose a node's bounded display `title`, whether its agent
+outcome has an optional or required decision gate, and a closed repair summary
+such as `Waiting for workflow decision` or `Correcting workflow route` with
+`attempt N of 3`. The graph never fabricates a decision node. Dependency-gate,
+feedback, execution, completion, and failure remain independent display axes:
+normal PREV is revision/waiting-for-feedback, while Failed appears only after
+repair exhaustion or actual semantic/operational closure.
 
 ## 8. Failure and recovery
 
@@ -216,6 +243,8 @@ artifact identities.
 | Prompt changes after definition | Existing activation still uses frozen bytes |
 | Script changes after definition | Integrity failure before spawn |
 | Workspace untrusted or host execution disabled | No script run is admitted |
+| Missing/invalid agent route below attempt 3 | One durable correction turn; run remains open |
+| Missing/invalid agent route at attempt 3 | Repair exhausts and the run fails once |
 
 Recovery is explicit: fix the package, reload the catalog, obtain the new opaque
 reference, and define a new immutable workflow version.
@@ -231,6 +260,10 @@ reference, and define a new immutable workflow version.
   checked, and frozen before persistence.
 - Runtime prompt content comes only from persisted frozen bytes.
 - Runtime script resolution remains package-root-relative with workspace cwd.
+- Agent outcome repair is activation-owned, bounded to three attempts, durable
+  across reload, and visible only through bounded decision metadata.
+- Public starts bind named inputs, and prior-run composition selects one exact
+  named terminal output rather than a run-level aggregate.
 - Legacy flat/bundle Markdown definitions and singular-root fallback are absent.
 - Public catalog and diagnostics remain bounded and path-free.
 

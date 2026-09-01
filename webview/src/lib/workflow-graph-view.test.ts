@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { WorkflowGraphWireGraph } from "../../../src/shared/workflow-graph-wire";
 import {
   buildWorkflowGraphPanelView,
+  workflowGraphDecisionLabel,
   workflowGraphDiagnosticLabel,
   workflowGraphNodeTone,
   workflowGraphStatusLabel,
@@ -146,6 +147,22 @@ function operationalGraph(): WorkflowGraphWireGraph {
 }
 
 describe("buildWorkflowGraphPanelView", () => {
+  it("uses closed decision copy for every durable repair state", () => {
+    expect([
+      { status: "waiting" as const, attempt: 1 as const, maxAttempts: 3 as const },
+      { status: "correcting" as const, attempt: 1 as const, maxAttempts: 3 as const },
+      { status: "correcting" as const, attempt: 3 as const, maxAttempts: 3 as const },
+      { status: "decided" as const, attempt: 2 as const, maxAttempts: 3 as const },
+      { status: "exhausted" as const, attempt: 3 as const, maxAttempts: 3 as const },
+    ].map(workflowGraphDecisionLabel)).toEqual([
+      "Waiting for workflow decision · attempt 1 of 3",
+      "Correcting workflow route · attempt 1 of 3",
+      "Correcting workflow route · attempt 3 of 3",
+      "Workflow route decided · attempt 2 of 3",
+      "Workflow decision failed · attempt 3 of 3",
+    ]);
+  });
+
   it("reduces a five-node reuse closure into stable operator-facing panel data", () => {
     const view = buildWorkflowGraphPanelView(graph());
 
@@ -321,6 +338,71 @@ describe("buildWorkflowGraphPanelView", () => {
       summaryLabel: "1 of 5 completed · 2 executing · 2 blocked",
       frontierLabel: "Frontier: b, d, c, e",
     });
+  });
+
+  it("keeps feedback, repair, completion, and execution independent without hidden nodes", () => {
+    const mixed = operationalGraph();
+    mixed.nodes = [
+      {
+        nodeId: "feedback", title: "Await feedback", workflowNodeStatus: "active",
+        executionActivity: "waiting_feedback", displayState: "waiting", progressBucket: "waiting",
+        reused: false,
+      },
+      {
+        nodeId: "repair", title: "Repair route", workflowNodeStatus: "active",
+        executionActivity: "queued", displayState: "queued", progressBucket: "queued",
+        decisionGate: "required",
+        decision: { status: "correcting", attempt: 2, maxAttempts: 3 },
+        reused: false,
+      },
+      {
+        nodeId: "completed", title: "Completed upstream", workflowNodeStatus: "succeeded",
+        executionActivity: "completed", displayState: "completed", progressBucket: "completed",
+        decisionGate: "optional",
+        decision: { status: "decided", attempt: 1, maxAttempts: 3 },
+        reused: false,
+      },
+      {
+        nodeId: "executing", title: "Execute now", workflowNodeStatus: "active",
+        executionActivity: "executing", displayState: "executing", progressBucket: "executing",
+        reused: false,
+      },
+    ];
+    mixed.edges = [];
+    mixed.gates = [];
+    mixed.activeGate = undefined;
+    mixed.progress = {
+      total: 4, completed: 1, queued: 1, executing: 1, waiting: 1,
+      blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+      frontierNodeIds: ["feedback", "repair", "executing"], activeNodeIds: ["executing"],
+    };
+    mixed.feedbackRounds = [{
+      roundId: "round-open", requesterNodeId: "feedback", status: "open", joinMode: "all",
+      required: 2, responded: 1,
+    }];
+    mixed.reuse = { nodeCount: 0, edgeCount: 0 };
+
+    const view = buildWorkflowGraphPanelView(mixed);
+    expect(view.nodes).toHaveLength(4);
+    expect(view.nodes.find((node) => node.id === "feedback")).toMatchObject({
+      title: "Await feedback", statusLabel: "Waiting",
+    });
+    expect(view.nodes.find((node) => node.id === "repair")).toMatchObject({
+      title: "Repair route",
+      statusLabel: "Queued",
+      decisionGateLabel: "Decision required",
+      decisionLabel: "Correcting workflow route · attempt 2 of 3",
+    });
+    expect(view.nodes.find((node) => node.id === "completed")).toMatchObject({
+      title: "Completed upstream",
+      statusLabel: "Completed",
+      decisionGateLabel: "Decision optional",
+      decisionLabel: "Workflow route decided · attempt 1 of 3",
+    });
+    expect(view.nodes.find((node) => node.id === "executing")).toMatchObject({
+      title: "Execute now", statusLabel: "Executing",
+    });
+    expect(view.progress).toMatchObject({ completed: 1, queued: 1, executing: 1, waiting: 1 });
   });
 
   it("keeps pending and terminal blocking gate explanations distinct", () => {

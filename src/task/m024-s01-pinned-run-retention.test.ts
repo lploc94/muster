@@ -26,7 +26,8 @@ describe('M024 pinned terminal workflow run retention', () => {
 
   it('retains the pinned-run predicate in the current schema version', () => {
     // v5 introduced immutable workflow-node reuse provenance; v6 adds global
-    // preference/verification tables without changing this pinned predicate.
-    expect(SQLITE_SCHEMA_VERSION).toBe(6);
+    // preference/verification tables; v7 adds canonical workflow authority and
+    // decision repair without changing this pinned predicate.
+    expect(SQLITE_SCHEMA_VERSION).toBe(7);
   });
 });

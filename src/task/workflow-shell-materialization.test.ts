@@ -86,6 +86,50 @@ function inlineInstructions(content: string) {
   };
 }
 
+async function createCallerAuthority(
+  repository: SqliteTaskRepository,
+  label: string,
+  createdAt: string,
+) {
+  const taskId = `caller-${label}`;
+  const turnId = `caller-turn-${label}`;
+  await repository.execute({
+    kind: 'createTask',
+    workspaceId: 'ws',
+    task: {
+      id: taskId,
+      role: 'coordinator',
+      lifecycle: 'open',
+      releaseState: 'released',
+      goal: `coordinate ${label}`,
+      parentId: null,
+      prerequisites: [],
+      backend: 'grok',
+      capabilities: [],
+      executionPolicy: { maxTurns: 40, maxAutomaticRetries: 1 },
+      revision: 0,
+      createdAt,
+      updatedAt: createdAt,
+      releasedAt: createdAt,
+    },
+  });
+  await repository.execute({
+    kind: 'createTurn',
+    workspaceId: 'ws',
+    turn: {
+      id: turnId,
+      taskId,
+      sequence: 1,
+      status: 'running',
+      trigger: 'user',
+      inputs: [],
+      createdAt,
+      startedAt: createdAt,
+    },
+  });
+  return { ownerRootTaskId: taskId, callerTaskId: taskId, callerTurnId: turnId };
+}
+
 describe('Workflow shell materialization', () => {
   it('carries frozen instructions, never display titles, into entry and dependency activations', async () => {
     const ctx = await openRepo('canonical-instructions');
@@ -918,6 +962,7 @@ describe('Workflow shell materialization', () => {
       const topTopology = canonicalTopology(
         [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
         [],
+        [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'seed' }],
       );
       await repo.execute({
         kind: 'defineWorkflowVersion',
@@ -926,8 +971,12 @@ describe('Workflow shell materialization', () => {
         version: 1,
         name: 'top-shell',
         topology: topTopology,
+        entryContracts: [
+          { entryNodeId: 'entry', inputRef: 'seed', expectedArtifactKind: 'workflow_input' },
+        ],
         createdAt,
       });
+      const callerAuthority = await createCallerAuthority(repo, 'top-shell', createdAt);
       const topStart = await repo.execute({
         kind: 'startWorkflowRun',
         workspaceId: 'ws',
@@ -935,12 +984,13 @@ describe('Workflow shell materialization', () => {
         version: 1,
         startIdempotencyKey: 'top-shell-1',
         createdAt,
+        inputs: [{ name: 'seed', value: 'seed' }],
+        ...callerAuthority,
         goal: 'top',
         backend: 'grok',
       });
-      expect(topStart.ok).toBe(true);
+      expect(topStart, topStart.reason).toMatchObject({ ok: true, changed: true });
       const topData = topStart.operation?.result.data as any;
-      const topRunId = topData.runId as string;
       const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; gateId: string; activationId: string };
       const topTask = await repo.getTask(topEntry.taskId);
       const topTurn = await repo.getTurn(topEntry.activationTurnId);
@@ -948,19 +998,6 @@ describe('Workflow shell materialization', () => {
         `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
         [createdAt, 'ws', topEntry.activationTurnId],
       );
-      // Need artifact for child entry: use top's start artifact or create ephemeral
-      // Use top's entry artifact directly via start's artifact
-      const artifactIdForChild = 'seed-art';
-      await client.transaction([
-        {
-          sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`,
-          params: [topRunId, artifactIdForChild, createdAt],
-        },
-        {
-          sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`,
-          params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId],
-        },
-      ]);
       const childInvocation: any = {
         kind: 'workflow_next',
         change: 'updated',
@@ -970,10 +1007,8 @@ describe('Workflow shell materialization', () => {
           childDefinitionVersion: 1,
           entryBindings: [
             {
-              childEntryNodeId: 'entry',
-              inputRef: 'engine_start',
-              artifactId: artifactIdForChild,
-              artifactRevision: 1,
+              name: 'seed',
+              fromInputRef: 'seed',
             },
           ],
           childIdempotencyKey: 'child-shell-1',
@@ -1091,26 +1126,25 @@ describe('Workflow shell materialization', () => {
       await client.open(dbPath);
       const repo = new SqliteTaskRepository(client, 'ws');
       const createdAt = '2026-08-01T00:00:00.000Z';
-      const topTopology = canonicalTopology([{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }], []);
-      await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, name: 'top-subtree', topology: topTopology, createdAt });
+      const topTopology = canonicalTopology(
+        [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
+        [],
+        [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'seed' }],
+      );
+      await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, name: 'top-subtree', topology: topTopology, entryContracts: [{ entryNodeId: 'entry', inputRef: 'seed', expectedArtifactKind: 'workflow_input' }], createdAt });
       const childTopology = canonicalTopology(
         [{ nodeId: 'entry' }, { nodeId: 'middle' }, { nodeId: 'sink' }],
         [{ fromNodeId: 'entry', toNodeId: 'middle', inputRef: 'from_entry' }, { fromNodeId: 'middle', toNodeId: 'sink', inputRef: 'from_middle' }],
         [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'engine_start' }],
       );
       await repo.execute({ kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-child-subtree', version: 1, name: 'child-subtree', topology: childTopology, entryContracts: [{ entryNodeId: 'entry', inputRef: 'engine_start', expectedArtifactKind: 'workflow_input' }], createdAt });
-      const topStart = await repo.execute({ kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, startIdempotencyKey: 'top-subtree-1', createdAt, goal: 'top', backend: 'grok' });
-      expect(topStart.ok).toBe(true);
+      const callerAuthority = await createCallerAuthority(repo, 'top-subtree', createdAt);
+      const topStart = await repo.execute({ kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-top-subtree', version: 1, startIdempotencyKey: 'top-subtree-1', createdAt, inputs: [{ name: 'seed', value: 'seed' }], ...callerAuthority, goal: 'top', backend: 'grok' });
+      expect(topStart, topStart.reason).toMatchObject({ ok: true, changed: true });
       const topData = topStart.operation?.result.data as any;
       const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; activationId: string };
-      const topRunId = topData.runId as string;
       await client.run(`UPDATE turns SET status='running', started_at=? WHERE workspace_id='ws' AND id=?`, [createdAt, topEntry.activationTurnId]);
-      const artifactIdForChild = 'seed-subtree';
-      await client.transaction([
-        { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
-        { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId] },
-      ]);
-      const childInvocation: any = { kind: 'workflow_next', change: 'updated', route: { kind: 'child_workflow', childDefinitionId: 'wf-child-subtree', childDefinitionVersion: 1, entryBindings: [{ childEntryNodeId: 'entry', inputRef: 'engine_start', artifactId: artifactIdForChild, artifactRevision: 1 }], childIdempotencyKey: 'child-subtree-1' } };
+      const childInvocation: any = { kind: 'workflow_next', change: 'updated', route: { kind: 'child_workflow', childDefinitionId: 'wf-child-subtree', childDefinitionVersion: 1, entryBindings: [{ name: 'seed', fromInputRef: 'seed' }], childIdempotencyKey: 'child-subtree-1' } };
       const freshTopTask = await repo.getTask(topEntry.taskId);
       const freshTopTurn = await repo.getTurn(topEntry.activationTurnId);
       const staged = await repo.execute({ kind: 'stageDisposition', workspaceId: 'ws', turnId: freshTopTurn!.id, opId: 'subtree-child-stage', turn: { ...freshTopTurn!, disposition: childInvocation } as any, expectedStatuses: ['running'], expectedRuntimeEpoch: freshTopTurn!.runtimeEpoch ?? 1 });
@@ -1295,6 +1329,7 @@ describe('Workflow shell materialization', () => {
       const topTopology = canonicalTopology(
         [{ nodeId: 'entry', role: 'coordinator' as const, capabilities: ['create_child' as const] }],
         [],
+        [{ name: 'seed', semanticKind: 'seed', entryNodeId: 'entry', inputRef: 'seed' }],
       );
       await repo1.execute({
         kind: 'defineWorkflowVersion',
@@ -1303,8 +1338,12 @@ describe('Workflow shell materialization', () => {
         version: 1,
         name: 'top-2repo',
         topology: topTopology,
+        entryContracts: [
+          { entryNodeId: 'entry', inputRef: 'seed', expectedArtifactKind: 'workflow_input' },
+        ],
         createdAt,
       });
+      const callerAuthority = await createCallerAuthority(repo1, 'top-2repo', createdAt);
       const topStart = await repo1.execute({
         kind: 'startWorkflowRun',
         workspaceId: 'ws',
@@ -1312,19 +1351,16 @@ describe('Workflow shell materialization', () => {
         version: 1,
         startIdempotencyKey: 'top-2repo-1',
         createdAt,
+        inputs: [{ name: 'seed', value: 'seed' }],
+        ...callerAuthority,
         goal: 'top',
         backend: 'grok',
       });
-      expect(topStart.ok).toBe(true);
+      expect(topStart, topStart.reason).toMatchObject({ ok: true, changed: true });
       const topData = topStart.operation?.result.data as any;
       const topEntry = topData.entries[0] as { taskId: string; activationTurnId: string; activationId: string };
       const topRunId = topData.runId as string;
       await client1.run(`UPDATE turns SET status='running', started_at=? WHERE workspace_id='ws' AND id=?`, [createdAt, topEntry.activationTurnId]);
-      const artifactIdForChild = 'seed-2repo';
-      await client1.transaction([
-        { sql: `INSERT INTO workflow_artifacts (workspace_id, run_id, artifact_id, producer_node_id, logical_name, revision, kind, payload_json, created_at) VALUES ('ws', ?, ?, 'entry', 'seed', 1, 'workflow_input', '{"value":"seed"}', ?)`, params: [topRunId, artifactIdForChild, createdAt] },
-        { sql: `INSERT INTO workflow_artifact_sources (workspace_id, run_id, artifact_id, artifact_revision, source_kind, producer_run_id, producer_node_id, producer_task_id, producing_turn_id, producing_activation_id) VALUES ('ws', ?, ?, 1, 'workflow_node', ?, ?, ?, ?, ?)`, params: [topRunId, artifactIdForChild, topRunId, 'entry', topEntry.taskId, topEntry.activationTurnId, topEntry.activationId] },
-      ]);
       const childInvocation: any = {
         kind: 'workflow_next',
         change: 'updated',
@@ -1333,8 +1369,8 @@ describe('Workflow shell materialization', () => {
           childDefinitionId: 'wf-child-2repo',
           childDefinitionVersion: 1,
           entryBindings: [
-            { childEntryNodeId: 'p1', inputRef: 'engine_start_p1', artifactId: artifactIdForChild, artifactRevision: 1 },
-            { childEntryNodeId: 'p2', inputRef: 'engine_start_p2', artifactId: artifactIdForChild, artifactRevision: 1 },
+            { name: 'first', fromInputRef: 'seed' },
+            { name: 'second', fromInputRef: 'seed' },
           ],
           childIdempotencyKey: 'child-2repo-1',
         },
@@ -1497,7 +1533,11 @@ describe('Workflow shell materialization', () => {
         [closureRevision],
       );
       expect(closureTaskChanges.map((change) => change.entity_id)).toEqual(
-        [...new Set([topEntry.taskId, ...childTaskIdsVia2])].sort(),
+        [...new Set([
+          callerAuthority.ownerRootTaskId,
+          topEntry.taskId,
+          ...childTaskIdsVia2,
+        ])].sort(),
       );
     } finally {
       await client1.close().catch(() => {});

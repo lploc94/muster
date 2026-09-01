@@ -14,9 +14,15 @@ function openFixture(): DatabaseSync {
     INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
     VALUES ('ws', 'ws', 'ws', 'now', 'now');
     INSERT INTO workflow_definitions (
-      workspace_id, definition_id, version, name, entry_node_id, topology_json, created_at
-    ) VALUES ('ws', 'wf', 1, 'wf', 'node',
-      '{"kind":"one_node_v1","entryNodeId":"node","nodes":[{"nodeId":"node"}]}', 'now');
+      workspace_id, definition_id, version, name, fingerprint, created_at
+    ) VALUES ('ws', 'wf', 1, 'wf', 'fixture-fingerprint', 'now');
+    INSERT INTO workflow_definition_nodes (
+      workspace_id, definition_id, definition_version, node_id, ordinal
+    ) VALUES ('ws', 'wf', 1, 'node', 0);
+    INSERT INTO workflow_definition_outputs (
+      workspace_id, definition_id, definition_version, name, semantic_kind,
+      terminal_node_id, ordinal, expected_artifact_kind
+    ) VALUES ('ws', 'wf', 1, 'result', 'result', 'node', 0, 'next_result');
     INSERT INTO workflow_runs (
       workspace_id, run_id, definition_id, definition_version, status, origin, created_at, updated_at
     ) VALUES

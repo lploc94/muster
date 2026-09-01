@@ -232,12 +232,12 @@ export interface TaskEngineConfig {
    * falls back to the worker's self-reported verdict (Phase A behavior) — so host
    * execution is user-authorized, never agent-triggerable.
    *
-   * Accepts a live RESOLVER (`() => boolean`) as well as a static boolean: the engine
-   * evaluates it at settle time, so toggling the `muster.verification.hostRun` setting
-   * OFF revokes host execution immediately (no reload). Host wires a callback that reads
-   * the current setting value each time.
+   * Accepts a live cwd-aware RESOLVER as well as a static boolean: the engine evaluates
+   * it at each authorization point, so toggling the resource-scoped
+   * `muster.verification.hostRun` setting OFF revokes host execution immediately (no
+   * reload). Host wires a callback that reads the current value for that task cwd.
    */
-  allowHostVerification?: boolean | (() => boolean);
+  allowHostVerification?: boolean | ((cwd?: string) => boolean);
   /**
    * Host-run verification gate (verify-gate-loop Phase C). Injectable so tests are
    * deterministic and never shell out. Default: real host runner (`spawnSync`,
@@ -624,7 +624,7 @@ export class TaskEngine {
    * the raw config value (static boolean OR live resolver) and evaluated per settle via
    * {@link resolveAllowHostVerification}.
    */
-  private readonly allowHostVerification: boolean | (() => boolean);
+  private readonly allowHostVerification: boolean | ((cwd?: string) => boolean);
   /** Phase C host gate + drift probe (injectable; default real host shell/git). */
   private readonly runVerificationGate: (
     commands: string[],
@@ -1129,7 +1129,7 @@ export class TaskEngine {
       onScheduleTurn: (turnId) => void this.scheduleTurn(turnId),
       onRescanSchedulableTurns: (ids) => this.rescanSchedulableTurns(ids),
       isWorkspaceTrusted: () => this.isWorkspaceTrusted(),
-      allowLocalExecution: () => this.resolveAllowHostVerification(),
+      allowLocalExecution: (cwd) => this.resolveAllowHostVerification(cwd),
       getHostEnvironment: this.getHostEnvironment
         ? () => this.getHostEnvironment!()
         : undefined,
@@ -3555,15 +3555,15 @@ export class TaskEngine {
 
   /**
    * ISSUE 13 — resolve the host-authorization switch LIVE. When configured with a
-   * resolver callback (the host wires one reading `muster.verification.hostRun`), it is
-   * called every time so a mid-session toggle is honored. A throwing resolver fails
-   * CLOSED (never authorizes host execution).
+   * resolver callback (the host wires one reading resource-scoped
+   * `muster.verification.hostRun`), it is called with the relevant task/execution cwd
+   * every time so a mid-session toggle is honored. A throwing resolver fails CLOSED.
    */
-  private resolveAllowHostVerification(): boolean {
+  private resolveAllowHostVerification(cwd?: string): boolean {
     const value = this.allowHostVerification;
     if (typeof value === 'function') {
       try {
-        return value() === true;
+        return value(cwd) === true;
       } catch {
         return false;
       }
@@ -3597,7 +3597,8 @@ export class TaskEngine {
     // (Phase A behavior). Host execution is user-authorized, not agent-triggerable.
     // ISSUE 13 — resolved LIVE here (before any spawn), so disabling the setting
     // mid-session revokes host execution on the very next settle without a reload.
-    if (!this.resolveAllowHostVerification()) {
+    const cwd = this.resolveHostSnapshot(task).cwd;
+    if (!this.resolveAllowHostVerification(cwd)) {
       return undefined;
     }
     // ISSUE 2 — re-check workspace trust IMMEDIATELY before any host spawn (the same
@@ -3611,7 +3612,6 @@ export class TaskEngine {
         at: nowIso(this.clock),
       };
     }
-    const cwd = this.resolveHostSnapshot(task).cwd;
     const commands = task.brief.verification.commands ?? [];
     return this.runVerificationGate(commands, cwd).verdict;
   }
@@ -4334,6 +4334,7 @@ export class TaskEngine {
     before: EngineProjection,
     draft: EngineProjection,
     turnId: string,
+    claimedDisposition?: TurnDisposition,
   ): Promise<{ ok: true } | { ok: false; reason: string }> {
     const previousTurn = before.turns[turnId];
     const nextTurn = draft.turns[turnId];
@@ -4355,6 +4356,7 @@ export class TaskEngine {
         expectedTaskRevision: previousTask.revision,
         task: nextTask,
         turn: nextTurn,
+        ...(claimedDisposition !== undefined ? { claimedDisposition } : {}),
         expectedStatuses: previousTurn.status === 'waiting_user' ? ['waiting_user'] : ['running'],
         relatedTurns,
         messages,
@@ -4764,7 +4766,7 @@ export class TaskEngine {
             signal: abort.signal,
             cwd: executionCwd,
             localExecution: {
-              authorize: () => this.resolveAllowHostVerification() && this.isWorkspaceTrusted(),
+              authorize: () => this.resolveAllowHostVerification(executionCwd) && this.isWorkspaceTrusted(),
               timeoutMs: remainingMs ?? taskForDispatch.executionPolicy.runTimeoutOverrideMs ?? DEFAULT_RUN_LIMIT_MS,
               maxStdoutBytes: scriptContext.maxArtifactBytes,
               maxStderrBytes: this.getResourceLimits().maxErrorBytes,
@@ -6212,7 +6214,14 @@ export class TaskEngine {
         return { ok: true };
       })();
       const commit = prepared.ok
-        ? await this.persistSettlementDraft(before, draft, turnId)
+        ? await this.persistSettlementDraft(
+            before,
+            draft,
+            turnId,
+            hostVerdict && before.turns[turnId]?.disposition?.kind === 'complete'
+              ? before.turns[turnId]?.disposition
+              : undefined,
+          )
         : prepared;
       if (commit.ok) {
         const file = this.store.getFile();

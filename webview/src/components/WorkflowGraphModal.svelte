@@ -177,11 +177,14 @@
         <div class="workflow-modal__section-title">Nodes — {view.nodes.length}</div>
         <div class="workflow-modal__node-legend">
           {#each view.nodes as n (n.id)}
-            <span class="workflow-modal__legend-item {n.active ? 'is-active' : ''}" data-node-id={n.id} title={`${n.id} — ${n.statusLabel}${n.reused ? ' · reused' : ''}`}>
+            <span class="workflow-modal__legend-item {n.active ? 'is-active' : ''}" data-node-id={n.id} title={`${n.title ? `${n.title} (${n.id})` : n.id} — ${n.statusLabel}${n.decisionLabel ? ` · ${n.decisionLabel}` : ''}${n.reused ? ' · reused' : ''}`}>
               <span class="codicon {n.active ? 'codicon-loading' : n.status === 'completed' || n.status==='reused' ? 'codicon-pass-filled' : n.status==='failed' ? 'codicon-error' : n.status === 'blocked' ? 'codicon-warning' : 'codicon-circle-large-outline'}" aria-hidden="true"></span>
-              {n.id}
+              {n.title ?? n.id}
+              {#if n.title}<span class="workflow-modal__node-id">{n.id}</span>{/if}
               <span class="workflow-modal__badge">{n.statusLabel}</span>
               {#if n.reasonLabel}<span class="workflow-modal__reason">{n.reasonLabel}</span>{/if}
+              {#if n.decisionGateLabel}<span class="workflow-modal__decision-gate">{n.decisionGateLabel}</span>{/if}
+              {#if n.decisionLabel}<span class="workflow-modal__decision">{n.decisionLabel}</span>{/if}
               {#if n.reused}<span class="workflow-modal__reused">reused</span>{/if}
               {#if n.active}<span class="workflow-modal__active">active</span>{/if}
             </span>
@@ -317,6 +320,9 @@
   .workflow-modal__reused { font-size: 10px; font-style: italic; color: var(--vscode-charts-blue, #3794ff); }
   .workflow-modal__active { font-size: 10px; font-weight: 700; color: var(--vscode-focusBorder, #3794ff); }
   .workflow-modal__reason { font-size: 10px; color: var(--vscode-editorWarning-foreground, #cca700); }
+  .workflow-modal__node-id { font-size: 9px; color: var(--vscode-descriptionForeground, #9ca3af); font-family: var(--vscode-editor-font-family, ui-monospace, monospace); }
+  .workflow-modal__decision-gate { font-size: 10px; color: var(--vscode-charts-yellow, #cca700); }
+  .workflow-modal__decision { font-size: 10px; font-weight: 600; color: var(--vscode-charts-yellow, #cca700); }
   .workflow-modal__gates { display: grid; gap: 8px; margin-top: 6px; }
   .workflow-modal__gate { padding: 6px; border: 1px solid var(--vscode-panel-border, #3c3c3c); border-radius: 5px; }
   .workflow-modal__gate-blocking { margin-top: 3px; font-size: 10px; color: var(--vscode-descriptionForeground, #9ca3af); }

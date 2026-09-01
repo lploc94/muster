@@ -9,6 +9,9 @@ import { WORKFLOW_FEEDBACK_MAX_BYTES } from './content-limits';
 import { TaskEngine } from './engine';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
+import { parseTaskTypeRegistry } from './task-types';
+import type { MusterTask, TaskTurn } from './types';
+import { decodeWorkflowManifest } from './workflow-codec';
 import { mapWorkflowExitResult } from './workflow-exit';
 import type { WorkflowExitOutcome } from './workflow-types';
 
@@ -135,6 +138,7 @@ function toolContext(rootId: string, turnId: string, label: string): CredentialC
 async function coordinator(
   ctx: Awaited<ReturnType<typeof fixture>>,
   label: string,
+  allowHostVerification: boolean | ((cwd?: string) => boolean) = true,
 ): Promise<{ engine: TaskEngine; root: { taskId: string; turnId: string }; context: CredentialContext; release: () => void }> {
   let releaseRoot!: () => void;
   const rootGate = new Promise<void>((resolve) => { releaseRoot = resolve; });
@@ -145,7 +149,7 @@ async function coordinator(
     globalWorkflowFolder: ctx.globalWorkflowFolder,
     makeBackend,
     isWorkspaceTrusted: () => true,
-    allowHostVerification: true,
+    allowHostVerification,
     runTurn: async function* (backend, options) {
       if (backend.name === 'script') {
         yield* backend.run(options);
@@ -388,6 +392,416 @@ describe('script workflow runtime', () => {
     running.release();
   }, 30_000);
 
+  it('assembles package file instructions, literal inputs, PREV correction, reload, named outputs, and exact downstream composition', async () => {
+    const ctx = await fixture('assembled-canonical-journey');
+    const catalogRoot = join(ctx.dir, '.muster', 'workflows');
+    const producerInstructions = '[assembled-producer-original] Build the candidate from the named request.';
+    const auditInstructions = '[assembled-audit-original] Record independent audit evidence.';
+    const packageManifest = workflowManifest(
+      'Assembled canonical journey',
+      [
+        {
+          nodeKey: 'producer',
+          title: 'Candidate producer',
+          taskType: 'review',
+          instructions: { file: 'prompts/producer.md' },
+        },
+        {
+          nodeKey: 'check',
+          title: 'Candidate check',
+          script: { interpreter: 'node', file: 'scripts/check.js', args: [] },
+          outcome: prevExitOutcome(['candidate']),
+        },
+        {
+          nodeKey: 'audit_source',
+          title: 'Audit source',
+          taskType: 'review',
+          instructions: { file: 'prompts/audit.md' },
+        },
+        {
+          nodeKey: 'audit',
+          title: 'Audit evidence',
+          taskType: 'review',
+          instructions: { inline: '[assembled-audit-terminal] Finalize independent audit evidence.' },
+        },
+      ],
+      [
+        { from: 'producer', to: 'check', inputRef: 'candidate' },
+        { from: 'audit_source', to: 'audit', inputRef: 'audit_source' },
+      ],
+      [
+        { name: 'request', kind: 'request', to: 'producer', inputRef: 'request' },
+        { name: 'audit_request', kind: 'request', to: 'audit_source', inputRef: 'audit_request' },
+      ],
+      [
+        { name: 'approved', kind: 'result', from: 'check' },
+        { name: 'audit', kind: 'result', from: 'audit' },
+      ],
+    );
+    expect(decodeWorkflowManifest(packageManifest, 'saved')).toMatchObject({ ok: true });
+    writePackage(
+      catalogRoot,
+      'assembled-journey',
+      packageManifest,
+      {
+        'prompts/producer.md': producerInstructions,
+        'prompts/audit.md': auditInstructions,
+        'scripts/check.js': [
+          "const fs = require('node:fs');",
+          "const counter = process.cwd() + '/assembled-check.count';",
+          "const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;",
+          "fs.writeFileSync(counter, String(count));",
+          "let input = '';",
+          "process.stdin.setEncoding('utf8');",
+          "process.stdin.on('data', chunk => input += chunk);",
+          "process.stdin.on('end', () => {",
+          "  const parsed = JSON.parse(input);",
+          "  if (count === 1) { process.stdout.write('revise candidate'); process.exitCode = 9; return; }",
+          "  if (parsed.candidate.value !== 'draft-v2') throw new Error('corrected candidate missing');",
+          "  process.stdout.write('approved:' + parsed.candidate.value);",
+          "});",
+        ].join('\n'),
+      },
+    );
+    writeFileSync(join(ctx.dir, 'consume-selected.js'), [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  process.stdout.write('downstream:' + parsed.selected.value);",
+      "});",
+    ].join('\n'));
+
+    const observedPrompts: string[] = [];
+    let producerAttempt = 0;
+    let markAuditTerminalStarted!: () => void;
+    const auditTerminalStarted = new Promise<void>((resolve) => {
+      markAuditTerminalStarted = resolve;
+    });
+    let holdAuditTerminal = true;
+    const loadEngine = (repository: SqliteTaskRepository = ctx.repository) => TaskEngine.loadAsync({
+      repository,
+      workspaceId: 'ws',
+      workspaceFolder: ctx.dir,
+      globalWorkflowFolder: ctx.globalWorkflowFolder,
+      makeBackend,
+      isWorkspaceTrusted: () => true,
+      allowHostVerification: true,
+      getTaskTypeRegistry: () => parseTaskTypeRegistry({
+        review: { backend: 'grok', role: 'worker', briefKind: 'generic' },
+      }),
+      runTurn: async function* (backend, options) {
+        if (backend.name === 'script') {
+          yield* backend.run(options);
+          return;
+        }
+        if (options.input.kind !== 'agent') throw new Error('assembled journey expected agent input');
+        const prompt = options.input.prompt;
+        observedPrompts.push(prompt);
+        if (prompt.includes('[assembled-audit-terminal]') && holdAuditTerminal) {
+          markAuditTerminalStarted();
+          await new Promise<void>((resolve) => {
+            if (options.signal?.aborted) resolve();
+            else options.signal?.addEventListener('abort', () => resolve(), { once: true });
+          });
+          if (options.signal?.aborted) {
+            yield { type: 'error', message: 'reload interruption', isCancellation: true };
+            return;
+          }
+        }
+        let response: string;
+        if (prompt.includes('[assembled-producer-original]')) {
+          producerAttempt += 1;
+          response = `draft-v${producerAttempt}`;
+        } else if (prompt.includes('revise candidate')) {
+          producerAttempt += 1;
+          response = `draft-v${producerAttempt}`;
+        } else if (prompt.includes('[assembled-audit-original]')) {
+          response = 'audit-source';
+        } else if (prompt.includes('[assembled-audit-terminal]')) {
+          response = 'audit-evidence';
+        } else if (prompt.includes('Resume the frozen audit step after reload.')) {
+          response = 'audit-evidence';
+        } else {
+          throw new Error('assembled journey received an unfrozen or unknown instruction prompt');
+        }
+        yield { type: 'sessionStarted', sessionId: `assembled-session-${observedPrompts.length}` };
+        yield { type: 'assistantDelta', messageId: `assembled-message-${observedPrompts.length}`, content: response };
+        yield { type: 'turnCompleted' };
+      },
+    });
+
+    let engine = await loadEngine();
+    ctx.setEngine(engine);
+    const rootId = 'assembled-root';
+    const rootTurnId = 'assembled-root-turn';
+    const createdAt = '2026-08-01T00:00:00.000Z';
+    const rootTask: MusterTask = {
+      id: rootId,
+      role: 'coordinator',
+      lifecycle: 'open',
+      releaseState: 'released',
+      goal: 'Coordinate assembled canonical journey',
+      parentId: null,
+      prerequisites: [],
+      backend: 'grok',
+      capabilities: ['create_child'],
+      executionPolicy: { maxTurns: 20, maxAutomaticRetries: 1 },
+      revision: 0,
+      createdAt,
+      updatedAt: createdAt,
+      releasedAt: createdAt,
+    };
+    const rootTurn: TaskTurn = {
+      id: rootTurnId,
+      taskId: rootId,
+      sequence: 1,
+      status: 'running',
+      trigger: 'user',
+      inputs: [],
+      createdAt,
+      startedAt: createdAt,
+    };
+    await expect(ctx.repository.execute({ kind: 'createTask', workspaceId: 'ws', task: rootTask }))
+      .resolves.toMatchObject({ ok: true, changed: true });
+    await expect(ctx.repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: rootTurn }))
+      .resolves.toMatchObject({ ok: true, changed: true });
+    await engine.getProjection()?.refreshTask(rootId);
+    let credential = toolContext(rootId, rootTurnId, 'assembled-canonical-journey');
+    const invokePublic = async (tool: string, args: Record<string, unknown>) => {
+      const routed = dispatch(tool, args, credential);
+      if (!routed.ok) throw new Error(`${tool} routing failed: ${routed.toolError}`);
+      const result = await engine.handleToolCall(credential, tool, routed.command);
+      if (!result.ok) throw new Error(`${tool} failed: ${result.error}`);
+      return result.result;
+    };
+
+    const listed = await invokePublic('list_predefined_workflows', {}) as {
+      workflows: Array<{ workflowRef: string; name: string }>;
+    };
+    const packageEntry = listed.workflows.find((workflow) => workflow.name === 'Assembled canonical journey');
+    expect(packageEntry?.workflowRef).toMatch(/^pwf_/);
+    const defined = await invokePublic('define_workflow', {
+      predefinedWorkflowRef: packageEntry!.workflowRef,
+    }) as { definitionId: string };
+    const frozenDefinition = await ctx.repository.getWorkflowDefinition(defined.definitionId, 1);
+    expect(frozenDefinition?.topology.nodes).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        nodeId: 'producer',
+        title: 'Candidate producer',
+        instructions: expect.objectContaining({ kind: 'file', content: producerInstructions }),
+      }),
+      expect.objectContaining({
+        nodeId: 'audit_source',
+        title: 'Audit source',
+        instructions: expect.objectContaining({ kind: 'file', content: auditInstructions }),
+      }),
+    ]));
+
+    const downstream = await invokePublic('define_workflow', {
+      manifest: workflowManifest(
+        'Selected output consumer',
+        [scriptManifestNode('consume', 'consume-selected.js')],
+        [],
+        [{ name: 'selected', kind: 'result', to: 'consume', inputRef: 'selected' }],
+        [{ name: 'result', kind: 'result', from: 'consume' }],
+      ),
+    }) as { definitionId: string };
+    const started = await invokePublic('start_workflow', {
+      workflow: `${defined.definitionId}@1`,
+      goal: 'Run assembled package',
+      inputs: [
+        { name: 'request', value: 'literal package request' },
+        { name: 'audit_request', value: 'literal audit request' },
+      ],
+    }) as { runId: string; entryTaskId: string };
+    await auditTerminalStarted;
+    let correctionDurable = false;
+    for (let attempt = 0; attempt < 2_000; attempt += 1) {
+      const feedback = await ctx.client.get<{ status: string }>(
+        `SELECT status FROM workflow_feedback_rounds
+          WHERE workspace_id = ? AND run_id = ? ORDER BY created_at DESC LIMIT 1`,
+        ['ws', started.runId],
+      );
+      if (producerAttempt === 2 && feedback?.status === 'consumed') {
+        correctionDurable = true;
+        break;
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(correctionDurable).toBe(true);
+    await expect(ctx.client.get(
+      `SELECT artifact_id FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'audit'
+          AND kind = 'next_result'`,
+      ['ws', started.runId],
+    )).resolves.toBeUndefined();
+    await expect(ctx.client.get(
+      'SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?',
+      ['ws', started.runId],
+    )).resolves.toEqual({ status: 'running' });
+
+    await engine.shutdown();
+    holdAuditTerminal = false;
+    await ctx.client.close();
+    const reloadedClient = new DbClient({
+      workerPath: join(__dirname, 'sqlite', 'worker.ts'),
+      execArgv: ['--import', 'tsx'],
+    });
+    await reloadedClient.open(join(ctx.dir, 'muster.sqlite3'));
+    cleanups.push(async () => reloadedClient.close().catch(() => undefined));
+    const reloadedRepository = new SqliteTaskRepository(reloadedClient, 'ws');
+    engine = await loadEngine(reloadedRepository);
+    ctx.setEngine(engine);
+    const interruptedAudit = await reloadedClient.get<{
+      activation_id: string;
+      execution_turn_id: string;
+      status: 'interrupted';
+    }>(
+      `SELECT activation_id, execution_turn_id, status FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ? AND node_id = 'audit'`,
+      ['ws', started.runId],
+    );
+    expect(interruptedAudit).toMatchObject({ status: 'interrupted' });
+    const recovery = await engine.recoverWorkflowActivationAsync({
+      runId: started.runId,
+      activationId: interruptedAudit!.activation_id,
+      failedTurnId: interruptedAudit!.execution_turn_id,
+      recoveryOperationId: 'assembled-audit-reload-recovery',
+      instruction: 'Resume the frozen audit step after reload.',
+      expectedActivationStatus: 'interrupted',
+    });
+    expect(recovery).toMatchObject({ ok: true, value: { turnId: expect.any(String) } });
+    if (!recovery.ok) return;
+    await expect(reloadedRepository.getTurn(recovery.value.turnId)).resolves.toMatchObject({
+      status: expect.stringMatching(/^(queued|running|succeeded)$/),
+      trigger: 'retry',
+      retryOf: interruptedAudit!.execution_turn_id,
+      workflowInstructions: '[assembled-audit-terminal] Finalize independent audit evidence.',
+    });
+    await engine.whenIdle();
+    const recoveredAuditState = await reloadedClient.get<{
+      turn_status: string;
+      activation_status: string;
+      run_status: string;
+    }>(
+      `SELECT turn.status AS turn_status, activation.status AS activation_status,
+              run.status AS run_status
+         FROM turns turn
+         JOIN workflow_activations activation
+           ON activation.workspace_id = turn.workspace_id
+          AND activation.execution_turn_id = turn.id
+         JOIN workflow_runs run
+           ON run.workspace_id = activation.workspace_id AND run.run_id = activation.run_id
+        WHERE turn.workspace_id = ? AND turn.id = ?`,
+      ['ws', recovery.value.turnId],
+    );
+    expect(recoveredAuditState).toEqual({
+      turn_status: 'succeeded',
+      activation_status: 'consumed',
+      run_status: 'succeeded',
+    });
+    expect(await waitForRun(reloadedClient, started.runId)).toBe('succeeded');
+
+    expect(producerAttempt).toBe(2);
+    expect(observedPrompts.filter((prompt) => prompt.includes(producerInstructions))).toHaveLength(1);
+    expect(observedPrompts.some((prompt) => prompt.includes('revise candidate'))).toBe(true);
+    expect(observedPrompts.filter((prompt) => prompt.includes(auditInstructions))).toHaveLength(1);
+    const terminalArtifacts = await reloadedClient.all<{ producer_node_id: string; payload_json: string }>(
+      `SELECT artifact.producer_node_id, artifact.payload_json
+         FROM workflow_artifacts artifact
+         JOIN workflow_runs run
+           ON run.workspace_id = artifact.workspace_id AND run.run_id = artifact.run_id
+        WHERE artifact.workspace_id = ? AND artifact.run_id = ? AND artifact.kind = 'next_result'
+          AND artifact.artifact_id <> run.terminal_result_artifact_id
+          AND artifact.producer_node_id IN ('check', 'audit') ORDER BY artifact.producer_node_id`,
+      ['ws', started.runId],
+    );
+    expect(terminalArtifacts.map((artifact) => ({
+      nodeId: artifact.producer_node_id,
+      result: (JSON.parse(artifact.payload_json) as { result: string }).result,
+    }))).toEqual([
+      { nodeId: 'audit', result: 'audit-evidence' },
+      { nodeId: 'check', result: 'approved:draft-v2' },
+    ]);
+    await expect(reloadedClient.all<{ status: string }>(
+      'SELECT status FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?',
+      ['ws', started.runId],
+    )).resolves.toEqual([{ status: 'consumed' }]);
+    const firstGraph = await reloadedRepository.getWorkflowGraphForTask(started.entryTaskId);
+    expect(firstGraph).toMatchObject({
+      runStatus: 'succeeded',
+      nodes: expect.arrayContaining([
+        expect.objectContaining({ nodeId: 'producer', title: 'Candidate producer', displayState: 'completed' }),
+        expect.objectContaining({ nodeId: 'audit_source', title: 'Audit source', displayState: 'completed' }),
+        expect.objectContaining({ nodeId: 'audit', title: 'Audit evidence', displayState: 'completed' }),
+        expect.objectContaining({ nodeId: 'check', title: 'Candidate check', displayState: 'completed' }),
+      ]),
+      feedbackRounds: [],
+    });
+    expect(JSON.stringify(firstGraph)).not.toContain('[assembled-');
+    expect(JSON.stringify(firstGraph)).not.toContain(ctx.dir);
+
+    expect(await reloadedRepository.getWorkflowGraphForTask(started.entryTaskId)).toEqual(firstGraph);
+
+    const reloadRootId = rootId;
+    const reloadRootTurnId = 'assembled-reload-root-turn';
+    await expect(reloadedRepository.execute({
+      kind: 'createTurn',
+      workspaceId: 'ws',
+      turn: { ...rootTurn, id: reloadRootTurnId, taskId: reloadRootId, sequence: 2 },
+    })).resolves.toMatchObject({ ok: true, changed: true });
+    await engine.getProjection()?.refreshTask(reloadRootId);
+    credential = toolContext(reloadRootId, reloadRootTurnId, 'assembled-canonical-journey-reload');
+
+    const composed = await invokePublic('start_workflow', {
+      workflow: `${downstream.definitionId}@1`,
+      goal: 'Consume selected exact output',
+      inputs: [{ name: 'selected', fromRun: started.runId, output: 'approved' }],
+    }) as { runId: string };
+    expect(await waitForRun(reloadedClient, composed.runId)).toBe('succeeded');
+    const composedArtifact = await reloadedClient.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'consume' AND kind = 'next_result'`,
+      ['ws', composed.runId],
+    );
+    expect(JSON.parse(composedArtifact!.payload_json)).toMatchObject({
+      result: 'downstream:approved:draft-v2',
+    });
+    const selectedSource = await reloadedClient.get<{ producer_node_id: string; payload_json: string }>(
+      `SELECT original_source.producer_node_id, consumer_input.payload_json
+         FROM workflow_gate_fills fill
+         JOIN workflow_artifacts consumer_input
+           ON consumer_input.workspace_id = fill.workspace_id
+          AND consumer_input.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
+          AND consumer_input.artifact_id = fill.artifact_id
+          AND consumer_input.revision = fill.artifact_revision
+         JOIN workflow_artifact_sources selected
+           ON selected.workspace_id = consumer_input.workspace_id
+          AND selected.run_id = consumer_input.run_id
+          AND selected.artifact_id = consumer_input.artifact_id
+          AND selected.artifact_revision = consumer_input.revision
+         JOIN workflow_artifacts source_artifact
+           ON source_artifact.workspace_id = selected.workspace_id
+          AND source_artifact.run_id = selected.source_artifact_run_id
+          AND source_artifact.artifact_id = selected.source_artifact_id
+          AND source_artifact.revision = selected.source_artifact_revision
+         JOIN workflow_artifact_sources original_source
+           ON original_source.workspace_id = source_artifact.workspace_id
+          AND original_source.run_id = source_artifact.run_id
+          AND original_source.artifact_id = source_artifact.artifact_id
+          AND original_source.artifact_revision = source_artifact.revision
+        WHERE fill.workspace_id = ? AND fill.run_id = ? AND fill.input_ref = 'selected'`,
+      ['ws', composed.runId],
+    );
+    expect(selectedSource?.producer_node_id).toBe('check');
+    expect(JSON.parse(selectedSource!.payload_json)).toMatchObject({
+      value: 'approved:draft-v2',
+      semanticKind: 'result',
+    });
+  }, 30_000);
+
   it('feeds exact canonical script stdout and exit metadata downstream while keeping stderr diagnostic-only', async () => {
     const ctx = await fixture('dataflow');
     writeFileSync(join(ctx.dir, 'produce.js'), [
@@ -447,6 +861,83 @@ describe('script workflow runtime', () => {
     expect(artifacts.map((artifact) => JSON.parse(artifact.payload_json))).toEqual(
       expect.arrayContaining([expect.objectContaining({ result: 'alpha|0' })]),
     );
+  }, 30_000);
+
+  it('re-reads script authorization from the caller and execution cwd before spawn', async () => {
+    const ctx = await fixture('resource-authorization');
+    const marker = join(ctx.dir, 'resource-authorization.marker');
+    writeFileSync(join(ctx.dir, 'resource-authorization.js'), [
+      "require('node:fs').writeFileSync('resource-authorization.marker', 'ran');",
+      "process.stdout.write('authorized');",
+    ].join('\n'));
+
+    const observedResources: Array<string | undefined> = [];
+    let enabled = false;
+    let revokeAfterNextAuthorization = false;
+    const running = await coordinator(ctx, 'resource-authorization', (cwd) => {
+      observedResources.push(cwd);
+      const authorized = enabled;
+      if (authorized && revokeAfterNextAuthorization) {
+        revokeAfterNextAuthorization = false;
+        enabled = false;
+      }
+      return authorized;
+    });
+
+    const routedDefinition = dispatch('define_workflow', {
+      manifest: workflowManifest(
+        'Resource authorization workflow',
+        [scriptManifestNode('run', 'resource-authorization.js')],
+      ),
+    }, running.context);
+    expect(routedDefinition.ok).toBe(true);
+    if (!routedDefinition.ok || routedDefinition.command.kind !== 'define_workflow') return;
+    const defined = await running.engine.handleToolCall(
+      running.context,
+      'define_workflow',
+      routedDefinition.command,
+    );
+    expect(defined).toMatchObject({ ok: true });
+    if (!defined.ok) return;
+    const definitionId = (defined.result as { definitionId: string }).definitionId;
+    let startAttempt = 0;
+    const start = () => {
+      startAttempt += 1;
+      const routed = dispatch('start_workflow', {
+        workflow: `${definitionId}@1`,
+        goal: `exercise live resource authorization ${startAttempt}`,
+      }, running.context);
+      if (!routed.ok || routed.command.kind !== 'start_workflow') {
+        throw new Error('resource authorization start route failed');
+      }
+      return running.engine.handleToolCall(running.context, 'start_workflow', routed.command);
+    };
+
+    const denied = await start();
+    expect(denied).toMatchObject({ ok: false });
+    expect(denied.ok ? '' : denied.error).toContain('host_run_disabled');
+    await expect(ctx.client.get<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?',
+      ['ws', definitionId],
+    )).resolves.toEqual({ count: 0 });
+
+    enabled = true;
+    revokeAfterNextAuthorization = true;
+    const revoked = await start();
+    expect(revoked).toMatchObject({ ok: true });
+    if (!revoked.ok) return;
+    const revokedEntryTaskId = (revoked.result as { entryTaskId: string }).entryTaskId;
+    let revokedTurns: Awaited<ReturnType<typeof ctx.repository.listTurns>> = [];
+    for (let attempt = 0; attempt < 2_000; attempt += 1) {
+      revokedTurns = await ctx.repository.listTurns(revokedEntryTaskId);
+      if (revokedTurns.filter((turn) => turn.status === 'failed').length >= 2) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+    }
+    expect(revokedTurns.filter((turn) => turn.status === 'failed')).toHaveLength(2);
+    expect(() => readFileSync(marker, 'utf8')).toThrow();
+    expect(observedResources.length).toBeGreaterThanOrEqual(4);
+    expect(new Set(observedResources)).toEqual(new Set([ctx.dir]));
+    running.release();
   }, 30_000);
 
   it('executes a global canonical package from its package root while process cwd remains the workspace', async () => {

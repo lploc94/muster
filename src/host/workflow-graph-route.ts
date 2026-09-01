@@ -56,11 +56,14 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
     runStatus: graph.runStatus,
     nodes: graph.nodes.map((node) => ({
       nodeId: node.nodeId,
+      ...(node.title ? { title: node.title } : {}),
       workflowNodeStatus: node.workflowNodeStatus,
       executionActivity: node.executionActivity,
       displayState: node.displayState,
       progressBucket: node.progressBucket,
       ...(node.reason ? { reason: node.reason } : {}),
+      ...(node.decisionGate ? { decisionGate: node.decisionGate } : {}),
+      ...(node.decision ? { decision: { ...node.decision } } : {}),
       reused: node.reused,
     })),
     edges: graph.edges.map((edge) => ({

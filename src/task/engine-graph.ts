@@ -307,8 +307,8 @@ export interface GraphEngineDeps {
   onRescanSchedulableTurns?: (affectedTaskIds?: readonly string[]) => void;
   /** W9: workspace trust predicate for create-and-run paths. */
   isWorkspaceTrusted?: () => boolean;
-  /** Live user setting used to authorize local process execution at workflow start. */
-  allowLocalExecution?: () => boolean;
+  /** Live resource-scoped user setting used to authorize local process execution. */
+  allowLocalExecution?: (cwd?: string) => boolean;
   /** W3: sync host env cache for get_host_context (same as first-turn inject). */
   getHostEnvironment?: () => HostEnvironmentSnapshot | undefined;
   workspaceFolder?: string;
@@ -529,7 +529,7 @@ async function prepareWorkflowStart(
   }
   if (
     definition.topology.nodes.some((node) => node.execution?.kind === 'script') &&
-    deps.allowLocalExecution?.() !== true
+    deps.allowLocalExecution?.(caller.cwd ?? deps.workspaceFolder) !== true
   ) {
     return workflowHostPolicyError(
       'host_run_disabled',

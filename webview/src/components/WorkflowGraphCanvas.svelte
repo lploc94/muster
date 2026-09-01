@@ -76,12 +76,13 @@
       {@const n = nodeById.get(pos.id)}
       {#if n}
         {@const tone = `task-status--${workflowGraphNodeTone(n.status)}`}
+        {@const displayTitle = n.title ?? n.id}
         <g
           transform={`translate(${pos.x}, ${pos.y})`}
           data-node-id={n.id}
           data-node-status={n.status}
           class="workflow-graph-canvas__node {tone}"
-          aria-label={`${n.id} ${n.statusLabel}${n.active ? ' active' : ''}${n.reused ? ' reused' : ''}`}
+          aria-label={`${n.title ?? n.id} ${n.statusLabel}${n.decisionLabel ? ` ${n.decisionLabel}` : ''}${n.active ? ' active' : ''}${n.reused ? ' reused' : ''}`}
         >
           <rect
             x="0"
@@ -100,16 +101,18 @@
           {/if}
           <!-- Icon -->
           <text x="10" y="20" font-size="14" class="workflow-graph-canvas__node-icon" aria-hidden="true">{n.active ? '⟳' : n.status === 'completed' || n.status === 'reused' ? '✓' : n.status === 'failed' ? '✕' : n.status === 'cancelled' ? '⊘' : '○'}</text>
-          <text x="28" y="18" font-size="11" font-weight="700" fill="var(--vscode-foreground, #cccccc)" class="workflow-graph-canvas__node-id">{n.id.length > 14 ? n.id.slice(0, 12) + '…' : n.id}</text>
+          <text x="28" y="18" font-size="11" font-weight="700" fill="var(--vscode-foreground, #cccccc)" class="workflow-graph-canvas__node-id">{displayTitle.length > 14 ? displayTitle.slice(0, 12) + '…' : displayTitle}</text>
           <text x="28" y="32" font-size="10" fill="var(--vscode-descriptionForeground, #9ca3af)">{n.statusLabel}</text>
-          {#if n.reused}
+          {#if n.decisionLabel}
+            <text x="28" y="41" font-size="8" font-style="italic" fill="var(--vscode-charts-yellow, #cca700)">{n.decisionLabel}</text>
+          {:else if n.reused}
             <text x="28" y="40" font-size="8" font-style="italic" fill="var(--vscode-charts-blue, #3794ff)">reused</text>
           {/if}
           {#if n.active}
             <text x={LAYOUT_NODE_W - 34} y="16" font-size="8" font-weight="700" fill="var(--vscode-focusBorder, #3794ff)">ACTIVE</text>
           {/if}
           <!-- Use foreignObject for codicon if needed, but text fallback keeps it simple for test -->
-          <title>{n.id} — {n.statusLabel}{n.reasonLabel ? ` · ${n.reasonLabel}` : ''}{n.reused ? ' · Supplied from a prior result' : ''}{n.active ? ' · Active node' : ''}</title>
+          <title>{n.title ? `${n.title} (${n.id})` : n.id} — {n.statusLabel}{n.decisionGateLabel ? ` · ${n.decisionGateLabel}` : ''}{n.decisionLabel ? ` · ${n.decisionLabel}` : ''}{n.reasonLabel ? ` · ${n.reasonLabel}` : ''}{n.reused ? ' · Supplied from a prior result' : ''}{n.active ? ' · Active node' : ''}</title>
         </g>
       {/if}
     {/each}

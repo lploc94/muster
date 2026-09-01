@@ -21,8 +21,9 @@ const valid: WorkflowGraphResult = {
         displayState: 'reused', progressBucket: 'completed', reused: true,
       },
       {
-        nodeId: 'implement', workflowNodeStatus: 'pending', executionActivity: 'none',
+        nodeId: 'implement', title: 'Implement safely', workflowNodeStatus: 'pending', executionActivity: 'none',
         displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
+        decisionGate: 'required',
         reused: false,
       },
     ],
@@ -96,6 +97,68 @@ describe('workflow graph wire contract', () => {
 
   it('accepts a bounded successful graph result with graph details', () => {
     expect(parseWorkflowGraphResult(valid)).toEqual(valid);
+  });
+
+  it('accepts only closed bounded title and decision-gate summaries', () => {
+    const decisionResult: WorkflowGraphResult = {
+      type: 'workflowGraphResult',
+      requestId: 'decision-request',
+      taskId: 'decision-task',
+      ok: true,
+      graph: {
+        runId: 'decision-run',
+        runStatus: 'running',
+        nodes: [{
+          nodeId: 'repair',
+          title: 'Review route',
+          workflowNodeStatus: 'active',
+          executionActivity: 'queued',
+          displayState: 'queued',
+          progressBucket: 'queued',
+          decisionGate: 'required',
+          decision: { status: 'correcting', attempt: 2, maxAttempts: 3 },
+          reused: false,
+        }],
+        edges: [],
+        gates: [],
+        progress: {
+          total: 1, completed: 0, queued: 1, executing: 0, waiting: 0,
+          blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ['repair'], activeNodeIds: [],
+        },
+        feedbackRounds: [],
+        childRuns: [],
+        reuse: { nodeCount: 0, edgeCount: 0 },
+        diagnostics: [],
+      },
+    };
+    expect(parseWorkflowGraphResult(decisionResult)).toEqual(decisionResult);
+
+    const node = decisionResult.graph.nodes[0]!;
+    for (const invalidNode of [
+      { ...node, title: 'x'.repeat(201) },
+      { ...node, title: 'unsafe\0title' },
+      { ...node, decisionGate: 'hidden' },
+      { ...node, decision: { status: 'correcting', attempt: 0, maxAttempts: 3 } },
+      { ...node, decision: { status: 'correcting', attempt: 2, maxAttempts: 4 } },
+      { ...node, decision: { status: 'private-response', attempt: 2, maxAttempts: 3 } },
+      { ...node, decision: { status: 'correcting', attempt: 2, maxAttempts: 3, response: 'secret' } },
+      { ...node, decisionGate: 'optional', decision: { status: 'waiting', attempt: 1, maxAttempts: 3 } },
+      { ...node, decision: { status: 'waiting', attempt: 2, maxAttempts: 3 } },
+      { ...node, decision: { status: 'exhausted', attempt: 3, maxAttempts: 3 } },
+    ]) {
+      expect(parseWorkflowGraphResult({
+        ...decisionResult,
+        graph: { ...decisionResult.graph, nodes: [invalidNode] },
+      })).toBeNull();
+    }
+    expect(parseWorkflowGraphResult({
+      ...decisionResult,
+      graph: {
+        ...decisionResult.graph,
+        nodes: [{ ...node, decisionGate: undefined }],
+      },
+    })).toBeNull();
   });
 
   it('accepts a bounded correlated failure without a graph', () => {

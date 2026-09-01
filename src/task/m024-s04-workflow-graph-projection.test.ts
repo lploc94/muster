@@ -1,15 +1,16 @@
 import { describe, expect, it } from 'vitest';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
-import { stageDispositionForSettlement } from './m018-test-helpers';
 import { routeRequestWorkflowGraph } from '../host/workflow-graph-route';
 import { buildWorkflowGraphView } from '../host/workflow-graph';
 import { parseWorkflowGraphResult } from '../shared/workflow-graph-wire';
 import { buildWorkflowGraphPanelView } from '../../webview/src/lib/workflow-graph-view';
-import type { MusterTask, TurnDisposition } from './types';
+import type { MusterTask } from './types';
+import { makeOneNodeDefinition } from './workflow';
 
 const WORKSPACE_ID = 'ws';
 const NOW = '2026-08-01T00:00:00.000Z';
@@ -21,30 +22,6 @@ function rootTask(): MusterTask {
     backend: 'grok', capabilities: [], executionPolicy: { maxTurns: 10, maxAutomaticRetries: 1 },
     revision: 0, createdAt: NOW, updatedAt: NOW, releasedAt: NOW,
   };
-}
-
-async function settleSucceeded(
-  repository: SqliteTaskRepository,
-  client: DbClient,
-  taskId: string,
-  turnId: string,
-  disposition: TurnDisposition,
-) {
-  await client.run(
-    `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ?`,
-    ['2026-08-01T00:00:01.000Z', WORKSPACE_ID, turnId],
-  );
-  const [task, turn] = await Promise.all([repository.getTask(taskId), repository.getTurn(turnId)]);
-  expect(task).toBeTruthy();
-  expect(turn).toBeTruthy();
-  await stageDispositionForSettlement(repository, turn!, disposition);
-  return repository.execute({
-    kind: 'settleTurnAndApplyEffects', workspaceId: WORKSPACE_ID,
-    expectedTaskRevision: task!.revision,
-    task: { ...task!, lifecycle: 'succeeded', updatedAt: '2026-08-01T00:00:01.000Z' },
-    turn: { ...turn!, status: 'succeeded', finishedAt: '2026-08-01T00:00:01.000Z', disposition },
-    expectedStatuses: ['running'], relatedTurns: [], messages: [],
-  });
 }
 
 describe('M024 S04 workflow graph projection', () => {
@@ -75,10 +52,16 @@ describe('M024 S04 workflow graph projection', () => {
           status: 'running', trigger: 'user', inputs: [], createdAt: NOW, startedAt: NOW,
         },
       });
+      const revisionDefinition = makeOneNodeDefinition({
+        definitionId: 'wf-revision-read',
+        name: 'revision read',
+        nodeId: 'only',
+        createdAt: NOW,
+      });
       await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID,
-        definitionId: 'wf-revision-read', version: 1, name: 'revision read',
-        topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'only' }], entryNodeId: 'only' },
+        definitionId: revisionDefinition.definitionId, version: 1, name: revisionDefinition.name,
+        topology: revisionDefinition.topology,
         createdAt: NOW,
       });
       const started = await repository.execute({
@@ -149,7 +132,272 @@ describe('M024 S04 workflow graph projection', () => {
     }
   });
 
-  it('reads the durable S03 five-node reuse closure and its reused edge density from on-disk SQLite', async () => {
+  it('keeps simultaneous workflow axes independent while redacting seeded private source data', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s04-private-axes-'));
+    const client = new DbClient({
+      workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
+    });
+    const promptCanary = 'PRIVATE_PROMPT_CANARY';
+    const pathCanary = '/private/PRIVATE_PATH_CANARY';
+    const conditionCanary = 'PRIVATE_CONDITION_CANARY';
+    const responseCanary = 'PRIVATE_RESPONSE_CANARY';
+    const credentialCanary = 'PRIVATE_CREDENTIAL_CANARY';
+    const artifactBodyCanary = 'PRIVATE_ARTIFACT_BODY_CANARY';
+    const artifactIdCanary = 'wfa_private_artifact_canary';
+    const turnIdCanary = 'turn_private_decision_repair_canary';
+    const privateValues = [
+      promptCanary,
+      pathCanary,
+      conditionCanary,
+      responseCanary,
+      credentialCanary,
+      artifactBodyCanary,
+      artifactIdCanary,
+      turnIdCanary,
+    ];
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, WORKSPACE_ID);
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: WORKSPACE_ID,
+        identityKey: 'm024-s04-private-axes', displayName: 'private axes',
+        createdAt: NOW, lastOpenedAt: NOW,
+      });
+      await repository.execute({ kind: 'createTask', workspaceId: WORKSPACE_ID, task: rootTask() });
+      await repository.execute({
+        kind: 'createTurn', workspaceId: WORKSPACE_ID,
+        turn: {
+          id: 'root-private-axes-turn', taskId: 'root-1', sequence: 1,
+          status: 'running', trigger: 'user', inputs: [], createdAt: NOW, startedAt: NOW,
+        },
+      });
+      const frozenInstructions = `${promptCanary}\nRead ${pathCanary}`;
+      const defined = await repository.execute({
+        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-private-axes', version: 1, name: 'private axes', createdAt: NOW,
+        topology: {
+          kind: 'workflow', inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'downstream' }],
+          nodes: [
+            { nodeId: 'feedback', title: 'Await feedback' },
+            {
+              nodeId: 'repair',
+              title: 'Repair route',
+              instructions: {
+                kind: 'inline' as const,
+                content: frozenInstructions,
+                sha256: createHash('sha256').update(frozenInstructions).digest('hex'),
+              },
+              outcome: {
+                kind: 'agent' as const,
+                requireExplicitDisposition: true,
+                next: { when: conditionCanary },
+                fail: { when: 'No bounded route remains.' },
+              },
+            },
+            { nodeId: 'completed', title: 'Completed upstream' },
+            { nodeId: 'executing', title: 'Execute now' },
+            { nodeId: 'downstream', title: 'Collect results' },
+          ],
+          edges: [
+            { fromNodeId: 'feedback', toNodeId: 'downstream', inputRef: 'feedback_result' },
+            { fromNodeId: 'repair', toNodeId: 'downstream', inputRef: 'repair_result' },
+            { fromNodeId: 'completed', toNodeId: 'downstream', inputRef: 'completed_result' },
+            { fromNodeId: 'executing', toNodeId: 'downstream', inputRef: 'executing_result' },
+          ],
+        },
+      });
+      expect(defined).toMatchObject({ ok: true, changed: true });
+      const started = await repository.execute({
+        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID,
+        definitionId: 'wf-private-axes', version: 1,
+        startIdempotencyKey: 'private-axes-start', createdAt: NOW,
+        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-private-axes-turn',
+        goal: 'project independent axes without private source data', backend: 'grok',
+      });
+      expect(started).toMatchObject({ ok: true, changed: true });
+      const data = started.operation!.result.data as {
+        runId: string;
+        entries: Array<{ nodeId: string; taskId: string; activationTurnId: string }>;
+      };
+      const entry = (nodeId: string) => data.entries.find((candidate) => candidate.nodeId === nodeId)!;
+      const feedback = entry('feedback');
+      const repair = entry('repair');
+      const completed = entry('completed');
+      const executing = entry('executing');
+      const activation = await client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND run_id = ? AND node_id = 'repair'`,
+        [WORKSPACE_ID, data.runId],
+      );
+      expect(activation).toBeTruthy();
+
+      await client.run(
+        `UPDATE turns SET status = 'succeeded', settled_at = ?,
+                          payload_json = json_set(payload_json, '$.status', 'succeeded')
+          WHERE workspace_id = ? AND id = ?`,
+        ['2026-08-01T00:00:01.000Z', WORKSPACE_ID, repair.activationTurnId],
+      );
+      await expect(repository.execute({
+        kind: 'createTurn', workspaceId: WORKSPACE_ID,
+        turn: {
+          id: turnIdCanary, taskId: repair.taskId, sequence: 2,
+          status: 'queued', trigger: 'engine', inputs: [],
+          createdAt: '2026-08-01T00:00:02.000Z',
+        },
+      })).resolves.toMatchObject({ ok: true, changed: true });
+      await client.transaction([
+        {
+          sql: `INSERT INTO messages (
+                  id, workspace_id, task_id, turn_id, role, state, ordering,
+                  content, created_at, payload_json
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+          params: [
+            responseCanary, WORKSPACE_ID, repair.taskId, repair.activationTurnId,
+            'assistant', 'complete', 0, responseCanary,
+            '2026-08-01T00:00:02.000Z', JSON.stringify({ content: responseCanary }),
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_decision_repairs (
+                  workspace_id, run_id, activation_id, status, attempts_used,
+                  last_attempt_turn_id, last_error_code, last_response_message_id,
+                  next_repair_turn_id, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+          params: [
+            WORKSPACE_ID, data.runId, activation!.activation_id, 'open', 1,
+            repair.activationTurnId, 'decision_invalid', responseCanary, turnIdCanary,
+            '2026-08-01T00:00:02.000Z', '2026-08-01T00:00:02.000Z',
+          ],
+        },
+        {
+          sql: `UPDATE workflow_activations
+                   SET execution_turn_id = ?, status = 'queued', updated_at = ?
+                 WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+          params: [
+            turnIdCanary, '2026-08-01T00:00:02.000Z',
+            WORKSPACE_ID, data.runId, activation!.activation_id,
+          ],
+        },
+        {
+          sql: `UPDATE turns SET status = 'waiting_user',
+                           payload_json = json_set(payload_json, '$.status', 'waiting_user',
+                                                                '$.privateResponse', ?,
+                                                                '$.credential', ?)
+                 WHERE workspace_id = ? AND id = ?`,
+          params: [responseCanary, credentialCanary, WORKSPACE_ID, feedback.activationTurnId],
+        },
+        {
+          sql: `UPDATE turns SET status = 'succeeded', settled_at = ?,
+                           payload_json = json_set(payload_json, '$.status', 'succeeded')
+                 WHERE workspace_id = ? AND id = ?`,
+          params: ['2026-08-01T00:00:02.000Z', WORKSPACE_ID, completed.activationTurnId],
+        },
+        {
+          sql: `UPDATE workflow_nodes SET status = 'succeeded'
+                 WHERE workspace_id = ? AND run_id = ? AND node_id = 'completed'`,
+          params: [WORKSPACE_ID, data.runId],
+        },
+        {
+          sql: `UPDATE turns SET status = 'running', started_at = ?,
+                           payload_json = json_set(payload_json, '$.status', 'running')
+                 WHERE workspace_id = ? AND id = ?`,
+          params: ['2026-08-01T00:00:02.000Z', WORKSPACE_ID, executing.activationTurnId],
+        },
+        {
+          sql: `INSERT INTO workflow_feedback_rounds (
+                  workspace_id, run_id, round_id, requester_node_id, requester_task_id,
+                  status, join_mode, created_at
+                ) VALUES (?,?,?,?,?,?,?,?)`,
+          params: [
+            WORKSPACE_ID, data.runId, 'round-private-axes', 'feedback', feedback.taskId,
+            'open', 'all', '2026-08-01T00:00:02.000Z',
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_feedback_targets (
+                  workspace_id, run_id, round_id, target_node_id, target_task_id, status
+                ) VALUES (?,?,?,?,?,?)`,
+          params: [
+            WORKSPACE_ID, data.runId, 'round-private-axes',
+            'completed', completed.taskId, 'responded',
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_feedback_targets (
+                  workspace_id, run_id, round_id, target_node_id, target_task_id, status
+                ) VALUES (?,?,?,?,?,?)`,
+          params: [
+            WORKSPACE_ID, data.runId, 'round-private-axes',
+            'executing', executing.taskId, 'pending',
+          ],
+        },
+        {
+          sql: `INSERT INTO workflow_artifacts (
+                  workspace_id, run_id, artifact_id, producer_node_id, logical_name,
+                  revision, kind, payload_json, created_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)`,
+          params: [
+            WORKSPACE_ID, data.runId, artifactIdCanary, 'completed', 'completed_result',
+            1, 'next_result', JSON.stringify({ result: artifactBodyCanary }),
+            '2026-08-01T00:00:02.000Z',
+          ],
+        },
+      ]);
+
+      const graph = await repository.getWorkflowGraphForTask(repair.taskId);
+      expect(graph?.nodes).toHaveLength(5);
+      expect(graph?.nodes.find((node) => node.nodeId === 'feedback')).toMatchObject({
+        displayState: 'waiting', executionActivity: 'waiting_feedback',
+      });
+      expect(graph?.nodes.find((node) => node.nodeId === 'repair')).toMatchObject({
+        decisionGate: 'required',
+        decision: { status: 'correcting', attempt: 2, maxAttempts: 3 },
+      });
+      expect(graph?.nodes.find((node) => node.nodeId === 'completed')).toMatchObject({
+        displayState: 'completed', executionActivity: 'completed',
+      });
+      expect(graph?.nodes.find((node) => node.nodeId === 'executing')).toMatchObject({
+        displayState: 'executing', executionActivity: 'executing',
+      });
+      expect(graph?.feedbackRounds).toEqual([expect.objectContaining({
+        requesterNodeId: 'feedback', status: 'open', joinMode: 'all',
+      })]);
+      expect(graph?.progress).toMatchObject({ completed: 1, queued: 1, executing: 1, waiting: 1 });
+
+      const hostGraph = await buildWorkflowGraphView(repository, repair.taskId);
+      const outcome = await routeRequestWorkflowGraph(
+        { type: 'requestWorkflowGraph', requestId: 'private-axes', taskId: repair.taskId },
+        {
+          getFocused: () => ({ taskId: repair.taskId, generation: 1 }),
+          buildWorkflowGraph: async () => hostGraph,
+        },
+      );
+      expect(outcome.kind).toBe('message');
+      const message = (outcome as { message: unknown }).message;
+      const parsed = parseWorkflowGraphResult(message);
+      expect(parsed, JSON.stringify(message)).toMatchObject({ ok: true });
+      const panel = buildWorkflowGraphPanelView(
+        (parsed as Extract<typeof parsed, { ok: true }>).graph,
+      );
+      expect(panel.nodes).toHaveLength(5);
+      expect(panel.nodes.find((node) => node.id === 'repair')?.decisionLabel)
+        .toBe('Correcting workflow route · attempt 2 of 3');
+      expect(panel.nodes.find((node) => node.id === 'feedback')?.statusLabel).toBe('Waiting');
+      expect(panel.nodes.find((node) => node.id === 'completed')?.statusLabel).toBe('Completed');
+      expect(panel.nodes.find((node) => node.id === 'executing')?.statusLabel).toBe('Executing');
+      for (const value of privateValues) {
+        expect(JSON.stringify(graph)).not.toContain(value);
+        expect(JSON.stringify(outcome)).not.toContain(value);
+        expect(JSON.stringify(panel)).not.toContain(value);
+      }
+    } finally {
+      await client.close().catch(() => {});
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  it('reads a canonical titled five-node graph and bounded child-run diagnostics from SQLite', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s04-graph-'));
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
@@ -168,14 +416,16 @@ describe('M024 S04 workflow graph projection', () => {
         turn: { id: 'root-turn', taskId: 'root-1', sequence: 1, status: 'running', trigger: 'user', inputs: [], createdAt: NOW, startedAt: NOW },
       });
       await repository.execute({
-        kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-four', version: 1,
-        name: 'produce four', topology: { kind: 'one_node_v1', nodes: [{ nodeId: 'four' }], entryNodeId: 'four' }, createdAt: NOW,
-      });
-      await repository.execute({
         kind: 'defineWorkflowVersion', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
         name: 'five node chain', createdAt: NOW,
         topology: {
-          kind: 'graph_v1', nodes: ['one', 'two', 'three', 'four', 'five'].map((nodeId) => ({ nodeId })),
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'five' }],
+          nodes: ['one', 'two', 'three', 'four', 'five'].map((nodeId) => ({
+            nodeId,
+            title: `Step ${nodeId}`,
+          })),
           edges: [
             { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result' },
             { fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result' },
@@ -185,31 +435,9 @@ describe('M024 S04 workflow graph projection', () => {
         },
       });
 
-      const producerStart = await repository.execute({
-        kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-four', version: 1,
-        startIdempotencyKey: 'producer-four', createdAt: NOW,
-        ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
-      });
-      expect(producerStart).toMatchObject({ ok: true, changed: true });
-      const producer = producerStart.operation!.result.data as {
-        runId: string; entryTaskId: string; activationTurnId: string;
-      };
-      await expect(settleSucceeded(
-        repository, client, producer.entryTaskId, producer.activationTurnId,
-        { kind: 'workflow_next', change: 'updated', result: 'four reusable result' },
-      )).resolves.toMatchObject({ ok: true, changed: true });
-
       const consumerStart = await repository.execute({
         kind: 'startWorkflowRun', workspaceId: WORKSPACE_ID, definitionId: 'wf-five-chain', version: 1,
         startIdempotencyKey: 'consumer-five-chain', createdAt: '2026-08-01T00:00:02.000Z',
-        // Bind-only reuse: every ancestor of the live node is bound explicitly to the
-        // producing execution, so the projection's reused set is fully accounted for.
-        reuse: ['one', 'two', 'three', 'four'].map((destinationNodeId) => ({
-          destinationNodeId,
-          sourceRunId: producer.runId,
-          sourceNodeId: 'four',
-          sourceTaskId: producer.entryTaskId,
-        })),
         ownerRootTaskId: 'root-1', callerTaskId: 'root-1', callerTurnId: 'root-turn',
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
@@ -241,30 +469,36 @@ describe('M024 S04 workflow graph projection', () => {
         [WORKSPACE_ID, consumer.runId],
       );
       expect(five?.task_id).toEqual(expect.any(String));
-      const bound = {
-        source_run_id: producer.runId,
-        source_node_id: 'four',
-        source_task_id: producer.entryTaskId,
-        source_artifact_id: expect.any(String),
-        source_artifact_revision: 1,
-      };
-      await expect(client.all(
+      const durableNodes = await client.all<{
+        node_id: string;
+        task_id: string | null;
+        status: string;
+        source_run_id: string | null;
+        source_node_id: string | null;
+        source_task_id: string | null;
+        source_artifact_id: string | null;
+        source_artifact_revision: number | null;
+      }>(
         `SELECT node_id, task_id, status, source_run_id, source_node_id, source_task_id,
-                source_artifact_id, source_artifact_revision
-           FROM workflow_nodes
-          WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
+                 source_artifact_id, source_artifact_revision
+            FROM workflow_nodes
+           WHERE workspace_id = ? AND run_id = ? ORDER BY node_id`,
         [WORKSPACE_ID, consumer.runId],
-      )).resolves.toEqual([
-        {
-          node_id: 'five', task_id: five!.task_id, status: 'active',
-          source_run_id: null, source_node_id: null, source_task_id: null,
-          source_artifact_id: null, source_artifact_revision: null,
-        },
-        { node_id: 'four', task_id: null, status: 'reused', ...bound },
-        { node_id: 'one', task_id: null, status: 'reused', ...bound },
-        { node_id: 'three', task_id: null, status: 'reused', ...bound },
-        { node_id: 'two', task_id: null, status: 'reused', ...bound },
+      );
+      expect(durableNodes.map((node) => [node.node_id, node.status])).toEqual([
+        ['five', 'pending'],
+        ['four', 'pending'],
+        ['one', 'active'],
+        ['three', 'pending'],
+        ['two', 'pending'],
       ]);
+      expect(durableNodes.every((node) => typeof node.task_id === 'string')).toBe(true);
+      expect(durableNodes.every((node) =>
+        node.source_run_id === null
+        && node.source_node_id === null
+        && node.source_task_id === null
+        && node.source_artifact_id === null
+        && node.source_artifact_revision === null)).toBe(true);
 
       const graph = await repository.getWorkflowGraphForTask(five!.task_id);
       expect(graph).toEqual({
@@ -272,61 +506,61 @@ describe('M024 S04 workflow graph projection', () => {
         runStatus: 'running',
         nodes: [
           {
-            nodeId: 'five', workflowNodeStatus: 'active', executionActivity: 'queued',
+            nodeId: 'five', title: 'Step five', workflowNodeStatus: 'pending', executionActivity: 'none',
+            displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
+          },
+          {
+            nodeId: 'four', title: 'Step four', workflowNodeStatus: 'pending', executionActivity: 'none',
+            displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
+          },
+          {
+            nodeId: 'one', title: 'Step one', workflowNodeStatus: 'active', executionActivity: 'queued',
             displayState: 'queued', progressBucket: 'queued',
           },
           {
-            nodeId: 'four', workflowNodeStatus: 'reused', executionActivity: 'none',
-            displayState: 'reused', progressBucket: 'completed',
+            nodeId: 'three', title: 'Step three', workflowNodeStatus: 'pending', executionActivity: 'none',
+            displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
           },
           {
-            nodeId: 'one', workflowNodeStatus: 'reused', executionActivity: 'none',
-            displayState: 'reused', progressBucket: 'completed',
-          },
-          {
-            nodeId: 'three', workflowNodeStatus: 'reused', executionActivity: 'none',
-            displayState: 'reused', progressBucket: 'completed',
-          },
-          {
-            nodeId: 'two', workflowNodeStatus: 'reused', executionActivity: 'none',
-            displayState: 'reused', progressBucket: 'completed',
+            nodeId: 'two', title: 'Step two', workflowNodeStatus: 'pending', executionActivity: 'none',
+            displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
           },
         ],
         edges: [
           {
             fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result',
-            contributionState: 'supplied_reused',
+            contributionState: 'pending',
           },
           {
             fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result',
-            contributionState: 'supplied_reused',
+            contributionState: 'pending',
           },
           {
             fromNodeId: 'three', toNodeId: 'four', inputRef: 'three_result',
-            contributionState: 'supplied_reused',
+            contributionState: 'pending',
           },
           {
             fromNodeId: 'four', toNodeId: 'five', inputRef: 'four_result',
-            contributionState: 'supplied_reused',
+            contributionState: 'pending',
           },
         ],
         gates: expect.arrayContaining([
           expect.objectContaining({
-            consumerNodeId: 'five', status: 'satisfied', required: 1, satisfied: 1,
+            consumerNodeId: 'five', status: 'open', required: 1, satisfied: 0,
             inputs: [{
-              inputRef: 'four_result', producerNodeId: 'four', state: 'supplied_reused',
+              inputRef: 'four_result', producerNodeId: 'four', state: 'pending',
             }],
           }),
         ]),
-        activeGate: expect.objectContaining({ status: 'satisfied', required: 1, satisfied: 1 }),
+        activeGate: expect.objectContaining({ status: 'open', required: 1, satisfied: 0 }),
         progress: {
-          total: 5, completed: 4, queued: 1, executing: 0, waiting: 0,
-          blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
-          frontierNodeIds: ['five'], activeNodeIds: [],
+          total: 5, completed: 0, queued: 1, executing: 0, waiting: 0,
+          blocked: 4, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
+          frontierNodeIds: ['five', 'four', 'one', 'three', 'two'], activeNodeIds: [],
         },
         feedbackRounds: [],
         childRuns: expect.arrayContaining([{ runId: 'child-run-001', status: 'running' }]),
-        reuse: { nodeCount: 4, edgeCount: 4 },
+        reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
       });
       expect(JSON.stringify(graph)).not.toMatch(/payload_json|body_json|prompt|\/tmp\/|api[_-]?key|secret/i);
@@ -343,20 +577,14 @@ describe('M024 S04 workflow graph projection', () => {
       const result = parseWorkflowGraphResult((outcome as { message: unknown }).message);
       expect(result).toMatchObject({ ok: true });
       const panel = buildWorkflowGraphPanelView((result as Extract<typeof result, { ok: true }>).graph);
-      expect(panel.nodes.filter((node) => node.reused)).toHaveLength(4);
-      expect(panel.activeGate).toMatchObject({ satisfied: 1, required: 1 });
+      expect(panel.nodes.filter((node) => node.reused)).toHaveLength(0);
+      expect(panel.nodes.find((node) => node.id === 'five')?.title).toBe('Step five');
+      expect(panel.activeGate).toMatchObject({ satisfied: 0, required: 1 });
       expect(panel.childRuns).toHaveLength(64);
       expect(panel.childRuns[0]).toEqual({ id: 'child-run-001', status: 'running', statusLabel: 'Running' });
-      expect(panel.reuseSummary).toMatchObject({ nodeCount: 4, edgeCount: 4 });
+      expect(panel.reuseSummary).toMatchObject({ nodeCount: 0, edgeCount: 0 });
       expect(panel.degradedRead.diagnostics).toEqual(['Child workflow runs were truncated']);
 
-      await expect(client.get(
-        `SELECT fill.artifact_run_id FROM workflow_gate_bindings binding
-         JOIN workflow_gate_fills fill ON fill.workspace_id = binding.workspace_id AND fill.run_id = binding.run_id
-          AND fill.gate_id = binding.gate_id AND fill.input_ref = binding.input_ref
-         WHERE binding.workspace_id = ? AND binding.run_id = ? AND binding.producer_node_id = 'four'`,
-        [WORKSPACE_ID, consumer.runId],
-      )).resolves.toEqual({ artifact_run_id: producer.runId });
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

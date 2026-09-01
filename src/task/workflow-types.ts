@@ -509,6 +509,15 @@ export interface WorkflowIntegrityDiagnosticProjection {
   code: string;
 }
 
+/** Bounded host display metadata derived from one activation-owned repair row. */
+export interface WorkflowDecisionSummaryProjection {
+  status: 'waiting' | 'correcting' | 'decided' | 'exhausted';
+  attempt: 1 | 2 | 3;
+  maxAttempts: 3;
+}
+
+export type WorkflowDecisionGateProjection = 'optional' | 'required';
+
 /**
  * Bounded workflow orchestration state for a task bound to a workflow node.
  * Relational read: nodes → runs → gates/activations/rounds/continuations.
@@ -528,6 +537,12 @@ export interface WorkflowTaskStatusProjection {
   /** Parent workflow run id when origin is child. */
   parentRunId?: string;
   nodeId: string;
+  /** Frozen display metadata only; never instruction content. */
+  title?: string;
+  /** Present only for a declared agent outcome. */
+  decisionGate?: WorkflowDecisionGateProjection;
+  /** Durable bounded repair/decision state for this node's latest activation. */
+  decision?: WorkflowDecisionSummaryProjection;
   gates: readonly WorkflowGateStatusProjection[];
   activeGate?: WorkflowGateStatusProjection;
   activation?: WorkflowActivationStatusProjection;
@@ -539,6 +554,12 @@ export interface WorkflowTaskStatusProjection {
 /** Host-only bounded workflow graph node state. Never exposed through agent tools. */
 export interface WorkflowGraphNodeProjection {
   nodeId: string;
+  /** Frozen display metadata only; never instruction content. */
+  title?: string;
+  /** Marker for a declared agent outcome; it is not a graph node. */
+  decisionGate?: WorkflowDecisionGateProjection;
+  /** Latest durable decision state, if an activation has reached the gate. */
+  decision?: WorkflowDecisionSummaryProjection;
   workflowNodeStatus: WorkflowNodeStatus;
   executionActivity:
     | 'none'

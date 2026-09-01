@@ -8,6 +8,7 @@ import { executeToolCommand, type GraphEngineDeps } from './engine-graph';
 import { DEFAULT_RESOURCE_LIMITS } from './limits';
 import { SqliteTaskRepository } from './repository';
 import { DbClient } from './sqlite/client';
+import { applySuccessfulTurn } from './transitions';
 import type { EngineProjection, MusterTask, TaskTurn, TurnDisposition } from './types';
 import type { WorkflowAgentOutcome } from './workflow-types';
 import { DEFAULT_WORKFLOW_POLICY } from './workflow';
@@ -28,9 +29,9 @@ function makeClient(): DbClient {
   return client;
 }
 
-function makeTask(): MusterTask {
+function makeTask(id = 'task'): MusterTask {
   return {
-    id: 'task',
+    id,
     role: 'worker',
     lifecycle: 'open',
     releaseState: 'released',
@@ -47,10 +48,10 @@ function makeTask(): MusterTask {
   };
 }
 
-function makeTurn(id: string, sequence: number): TaskTurn {
+function makeTurn(id: string, sequence: number, taskId = 'task'): TaskTurn {
   return {
     id,
-    taskId: 'task',
+    taskId,
     sequence,
     status: 'running',
     trigger: 'engine',
@@ -639,6 +640,103 @@ describe('M018 universal durable disposition claims', () => {
       `SELECT status FROM turn_disposition_claims WHERE workspace_id = 'ws' AND turn_id = ?`,
       [mismatchTurn.id],
     )).resolves.toEqual({ status: 'staged' });
+
+    const hostVerdict = {
+      status: 'pass' as const,
+      source: 'host' as const,
+      testedRevision: 'rev-fixed',
+      at: '2026-07-22T02:00:05.000Z',
+    };
+
+    const changedPayloadTurn = makeTurn('turn-settle-host-verdict-changed-result', 3);
+    await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: changedPayloadTurn });
+    await expect(stage(repository, changedPayloadTurn, 'op-host-verdict-changed', complete)).resolves.toMatchObject({
+      changed: true,
+    });
+    await expect(repository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: task.revision,
+      task: { ...task, updatedAt: '2026-07-22T02:00:05.000Z' },
+      turn: {
+        ...changedPayloadTurn,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:05.000Z',
+        disposition: { kind: 'complete', result: 'changed', verdict: hostVerdict },
+      },
+      claimedDisposition: complete,
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({
+      changed: false,
+      conflict: true,
+      reason: 'host verdict override changed the claimed completion payload',
+    });
+
+    const workerVerdictTurn = makeTurn('turn-settle-worker-verdict', 4);
+    await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: workerVerdictTurn });
+    await expect(stage(repository, workerVerdictTurn, 'op-worker-verdict', complete)).resolves.toMatchObject({
+      changed: true,
+    });
+    await expect(repository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: task.revision,
+      task: { ...task, updatedAt: '2026-07-22T02:00:05.000Z' },
+      turn: {
+        ...workerVerdictTurn,
+        status: 'succeeded',
+        finishedAt: '2026-07-22T02:00:05.000Z',
+        disposition: {
+          ...complete,
+          verdict: {
+            status: 'pass',
+            source: 'worker',
+            at: '2026-07-22T02:00:05.000Z',
+          },
+        },
+      },
+      claimedDisposition: complete,
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({
+      changed: false,
+      conflict: true,
+      reason: 'host verdict override changed the claimed completion payload',
+    });
+
+    const hostTask = makeTask('task-host-verdict');
+    await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: hostTask });
+    const hostOverrideTurn = makeTurn('turn-settle-host-verdict', 1, hostTask.id);
+    await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: hostOverrideTurn });
+    await expect(stage(repository, hostOverrideTurn, 'op-host-verdict', complete)).resolves.toMatchObject({
+      changed: true,
+    });
+    const hostDisposition = { ...complete, verdict: hostVerdict };
+    const hostSettlement = applySuccessfulTurn(
+      hostTask,
+      { ...hostOverrideTurn, disposition: hostDisposition },
+      { now: '2026-07-22T02:00:06.000Z' },
+    );
+    expect(hostSettlement.ok).toBe(true);
+    if (!hostSettlement.ok) return;
+    await expect(repository.execute({
+      kind: 'settleTurnAndApplyEffects',
+      workspaceId: 'ws',
+      expectedTaskRevision: hostTask.revision,
+      task: hostSettlement.next.task,
+      turn: hostSettlement.next.turn,
+      claimedDisposition: complete,
+      expectedStatuses: ['running'],
+      relatedTurns: [],
+      messages: [],
+    })).resolves.toMatchObject({ changed: true });
+    await expect(repository.getTurn(hostOverrideTurn.id)).resolves.toMatchObject({
+      status: 'succeeded',
+      disposition: { kind: 'complete', result: 'done', verdict: hostVerdict },
+    });
   });
 
   it('rejects a workflow disposition on a non-workflow turn without a claim', async () => {

@@ -101,7 +101,7 @@ Command Palette: **Muster: Developer Reset Global Database**
   successful reset hard-quiesce and offer **Reload Window** — they must not keep writing a stale
   projection.
 - **Never automatic:** activation, open, or write failures do **not** auto-reset the database.
-- **Schema v3 and later:** the store remains **reset-only**. An incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
+- **Schema v7:** the store is **reset-only**. Any incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
 
 ---
 
@@ -234,6 +234,11 @@ actions stay available.
   run with `decision_missing` or `decision_invalid`. Replay, reload, competing settlement, task/run
   turn limits, and the workflow deadline are checked in that same transition, without a side store or
   feedback round.
+- Task-status and workflow-graph reads join those durable activation/repair rows; they do not infer
+  repair from transient engine memory, assistant text, or error-message matching. The bounded
+  projection may include display title, an optional/required decision-gate marker, and attempt
+  `N of 3` with a closed waiting/correcting/decided/exhausted state. It excludes outcome condition
+  text, prior assistant responses, prompt bodies, host paths, durable physical IDs, and artifacts.
 - Schema v6 and every earlier marker are rejected rather than interpreted as canonical workflow
   authority. There is no `ALTER TABLE`, row reinterpretation, compatibility decoder, or automatic
   migration path. An already-open stale writer fails closed with terminal `schema_changed` and must

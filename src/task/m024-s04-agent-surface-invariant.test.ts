@@ -45,15 +45,16 @@ describe('M024 S04 agent-facing workflow graph boundary', () => {
     expect(inspection).not.toContain('WorkflowGraph');
   });
 
-  it('pins exact reuse guidance across the active public surfaces', () => {
-    const exactBinding = '{node, fromRun, fromNode, fromTask}';
-    for (const relativePath of [
-      'src/bridge/server.ts',
-      'docs/MUSTER-BRIDGE.md',
-      'docs/TASK-MANAGEMENT.md',
-    ]) {
-      const source = readSource(relativePath);
-      expect(source).toContain(exactBinding);
+  it('pins canonical named-input composition guidance across active public surfaces', () => {
+    const server = readSource('src/bridge/server.ts');
+    const bridgeDocs = readSource('docs/MUSTER-BRIDGE.md');
+    const taskDocs = readSource('docs/TASK-MANAGEMENT.md');
+
+    expect(server).toContain('{name,value} or {name,fromRun,output}');
+    expect(bridgeDocs).toContain('{ "name": "plan", "fromRun": "run-ref", "output": "verifiedPlan" }');
+    expect(taskDocs).toContain('(fromRun, outputName)');
+    for (const source of [server, bridgeDocs, taskDocs]) {
+      expect(source).not.toContain('{node, fromRun, fromNode, fromTask}');
       expect(source).not.toContain('reuse [{node, fromRun}]');
     }
   });

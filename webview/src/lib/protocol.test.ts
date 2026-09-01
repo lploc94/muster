@@ -2480,7 +2480,7 @@ describe('isExtMessage workflowCatalogResult (workflow catalog)', () => {
             name: 'Release checklist',
             description: 'Bounded catalog fixture.',
             scope: 'workspace',
-            packageKind: 'file',
+            packageKind: 'bundle',
           }],
           diagnostics: [],
         },

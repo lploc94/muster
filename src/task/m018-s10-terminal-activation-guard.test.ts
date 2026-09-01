@@ -8,9 +8,18 @@ import { stageDispositionForSettlement } from './m018-test-helpers';
 import { canPromoteTurn } from './scheduler';
 import { DbClient } from './sqlite/client';
 import type { EngineProjection, TaskTurn } from './types';
+import type { WorkflowTopology } from './workflow-types';
 
 const clients: DbClient[] = [];
 const tempDirs: string[] = [];
+
+const ONE_NODE_TOPOLOGY: WorkflowTopology = {
+  kind: 'workflow',
+  inputs: [],
+  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+  nodes: [{ nodeId: 'entry' }],
+  edges: [],
+};
 
 afterEach(async () => {
   await Promise.all(clients.splice(0).map((client) => client.close().catch(() => undefined)));
@@ -35,11 +44,7 @@ describe('M018 terminal workflow activation guards', () => {
       definitionId: 'wf-one',
       version: 1,
       name: 'one',
-      topology: {
-        kind: 'one_node_v1',
-        nodes: [{ nodeId: 'entry' }],
-        entryNodeId: 'entry',
-      },
+      topology: ONE_NODE_TOPOLOGY,
       createdAt: '2026-07-22T04:00:00.000Z',
     });
     const started = await repository.execute({
@@ -162,9 +167,7 @@ describe('M018 terminal workflow activation guards', () => {
     const createdAt = '2026-07-22T04:30:00.000Z';
     await first.execute({
       kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId: 'wf-lock', version: 1,
-      name: 'lock', topology: {
-        kind: 'one_node_v1', nodes: [{ nodeId: 'entry' }], entryNodeId: 'entry',
-      }, createdAt,
+       name: 'lock', topology: ONE_NODE_TOPOLOGY, createdAt,
     });
     const started = await first.execute({
       kind: 'startWorkflowRun', workspaceId: 'ws', definitionId: 'wf-lock', version: 1,
@@ -245,11 +248,7 @@ describe('M018 terminal workflow activation guards', () => {
       definitionId: 'wf-waits',
       version: 1,
       name: 'waits',
-      topology: {
-        kind: 'one_node_v1',
-        nodes: [{ nodeId: 'entry' }],
-        entryNodeId: 'entry',
-      },
+      topology: ONE_NODE_TOPOLOGY,
       createdAt: '2026-07-22T05:00:00.000Z',
     });
     const started = await repository.execute({

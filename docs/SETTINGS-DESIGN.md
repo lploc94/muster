@@ -246,7 +246,7 @@ Entry test: changing the value affects a run after its agent/backend/model has a
 
 #### Verification staging and host contract
 
-`muster.verification.hostRun` currently has a runtime read path but no Settings snapshot/update path. The engine resolves it live at settle time as a fail-closed authorization gate. That runtime read is not sufficient evidence that the custom webview owns an editable setting.
+`muster.verification.hostRun` currently has a resource-scoped runtime read path but no Settings snapshot/update path. The engine resolves it live for the relevant task/workflow cwd at workflow start, immediately before script execution, and at verification settle. A missing or failed lookup denies authorization. That runtime read is not sufficient evidence that the custom webview owns an editable setting.
 
 The refactor therefore follows these rules:
 
@@ -270,11 +270,11 @@ Its host implementation owns:
 
 - an exact-boolean runtime guard and host validator;
 - fallback to the contributed default `false` for malformed stored values;
-- `ConfigurationTarget.Workspace` for custom-webview writes and truthful `Workspace` scope copy;
+- a resource URI owned by the selected task/workflow plus `ConfigurationTarget.WorkspaceFolder` for custom-webview writes and truthful workspace-folder scope copy;
 - sanitized write failures and a refreshed snapshot after successful writes;
 - no mutation when the payload is malformed or the write fails.
 
-The refactor does not silently change the contributed setting's schema scope or add folder-aware runtime resolution. Native VS Code Settings remains the path for other supported scopes. If per-folder verification is proposed later, its runtime read must become resource-aware in the same change; UI scope alone must not imply semantics the engine does not implement.
+The contributed setting uses VS Code `scope: resource`. Native VS Code Settings therefore supports folder-specific overrides, and the runtime read uses the durable task/workflow cwd rather than active-editor focus. Normal user/workspace/workspace-folder precedence applies to that resource; one folder's effective value never authorizes a task bound to a sibling folder. Any future custom control must identify its target resource explicitly and must not present a window-global value as the effective task policy.
 
 Its UI copy must explain all three gates:
 
@@ -282,7 +282,7 @@ Its UI copy must explain all three gates:
 - the verification task brief must opt in with `verification.hostRun`;
 - the workspace must still be trusted immediately before execution.
 
-Effective-time copy must say that the value is read live at settle time. Turning it off revokes host verification for the next eligible settle without reload; turning it on does not itself run commands or bypass the task-level opt-in and workspace-trust gates.
+Effective-time copy must say that the value is read live for the task resource at workflow start, immediately before script spawn, and at verification settle. Turning it off revokes host verification for the next eligible authorization point without reload; turning it on does not itself run commands or bypass the task/workflow opt-in and workspace-trust gates.
 
 The contract remains separate from Permission settings even though both are security-sensitive: Tool access governs backend tool-permission requests, while Verification authorizes Muster host execution of declared verification commands. Their failures, drafts, indicators, and audit semantics stay local to their own child groups.
 

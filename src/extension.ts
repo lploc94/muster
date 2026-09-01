@@ -280,6 +280,11 @@ let lastUatDeactivateTrace: UatDeactivateTrace | null = null;
 let taskEngine: TaskEngine | undefined;
 let taskStore: TaskReadPort | undefined;
 let taskRepository: TaskRepository | undefined;
+let reloadTaskEngineForUat: (() => Promise<{
+  engine: TaskEngine;
+  repository: TaskRepository;
+  client: DbClient;
+}>) | undefined;
 let workspaceRoot: string | undefined;
 /** SQLite is the only task storage source. */
 let sqliteClient: DbClient | undefined;
@@ -4726,9 +4731,8 @@ export async function activate(context: vscode.ExtensionContext) {
     const { port } = await bridgeServer.listen();
     mcpReadiness.noteBridgeGeneration(bridgeServer.getGeneration());
 
-    const sqliteRepository = new SqliteTaskRepository(candidate, repositoryWorkspaceId());
-    taskEngine = await TaskEngine.loadAsync({
-      repository: sqliteRepository,
+    const loadConfiguredTaskEngine = (repository: TaskRepository) => TaskEngine.loadAsync({
+      repository,
       workspaceId: repositoryWorkspaceId(),
       makeBackend,
       askBridge,
@@ -4752,11 +4756,11 @@ export async function activate(context: vscode.ExtensionContext) {
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       // Host execution of a task's verification commands is OFF unless the USER
       // explicitly enables it — commands become host-authorized, not agent-triggerable.
-      // Resolved LIVE per settle (callback), so toggling the setting OFF revokes host
-      // execution immediately without a reload (verify-gate-loop ISSUE 13).
-      allowHostVerification: () =>
+      // Resolved LIVE for the task/workflow cwd, so multi-root folder overrides stay
+      // isolated and toggling OFF revokes the next authorization without a reload.
+      allowHostVerification: (cwd?: string) =>
         vscode.workspace
-          .getConfiguration('muster')
+          .getConfiguration('muster', cwd ? vscode.Uri.file(cwd) : undefined)
           .get<boolean>('verification.hostRun', false),
       prepareHostEnvironment,
       getHostEnvironment,
@@ -4787,10 +4791,22 @@ export async function activate(context: vscode.ExtensionContext) {
         }
       },
     });
+    const sqliteRepository = new SqliteTaskRepository(candidate, repositoryWorkspaceId());
+    taskEngine = await loadConfiguredTaskEngine(sqliteRepository);
     // Share the engine's write-through projection wrapper with host commands so
     // every successful repository mutation is visible to synchronous UI selectors.
     taskStore = taskEngine.getReadModel();
     taskRepository = taskEngine.getRepository();
+    reloadTaskEngineForUat = async () => {
+      await taskEngine?.shutdown();
+      const reloadedEngine = await loadConfiguredTaskEngine(
+        new SqliteTaskRepository(candidate, repositoryWorkspaceId()),
+      );
+      taskEngine = reloadedEngine;
+      taskStore = reloadedEngine.getReadModel();
+      taskRepository = reloadedEngine.getRepository();
+      return { engine: reloadedEngine, repository: taskRepository, client: candidate };
+    };
     presentationManager?.setDocumentStore({
       getPresentation: async (rootId, presentationId) => {
         const row = await taskRepository!.getPresentation(rootId, presentationId);
@@ -5445,34 +5461,51 @@ function registerLiveUatCommands(
     vscode.commands.registerCommand(UAT_COMMANDS.runScriptWorkflowQa, async () => {
       const { repository, workspaceId } = requireRepo();
       if (!taskEngine) throw new Error('UAT task engine unavailable');
-      const configuration = vscode.workspace.getConfiguration('muster');
-      // Capture the *workspace-scoped* override, not the effective value. Writing the
-      // effective boolean back at Workspace scope would pin a new override whenever the
-      // setting came from user/default scope, silently shadowing later user changes.
-      const originalWorkspaceHostRun =
-        configuration.inspect<boolean>('verification.hostRun')?.workspaceValue;
+      const workspaceFolder = resolveTaskCwd();
+      const resource = vscode.Uri.file(workspaceFolder);
+      const configuration = vscode.workspace.getConfiguration('muster', resource);
+      // Capture the folder override itself, not the effective value. Restoring an
+      // inherited boolean would pin a new override and silently change precedence.
+      const originalWorkspaceFolderHostRun =
+        configuration.inspect<boolean>('verification.hostRun')?.workspaceFolderValue;
+      let hostRunRestored = false;
+      const restoreHostRun = async () => {
+        await configuration.update(
+          'verification.hostRun',
+          originalWorkspaceFolderHostRun,
+          vscode.ConfigurationTarget.WorkspaceFolder,
+        );
+        const observed = configuration
+          .inspect<boolean>('verification.hostRun')
+          ?.workspaceFolderValue;
+        if (observed !== originalWorkspaceFolderHostRun) {
+          throw new Error('UAT hostRun workspace-folder value was not restored');
+        }
+        hostRunRestored = true;
+      };
       try {
         return await runScriptWorkflowUatFixture({
           engine: taskEngine,
           repository,
           client: requireClient(),
           workspaceId,
-          workspaceFolder: resolveTaskCwd(),
+          workspaceFolder,
           setHostRun: async (enabled) => {
             await configuration.update(
               'verification.hostRun',
               enabled,
-              vscode.ConfigurationTarget.Workspace,
+              vscode.ConfigurationTarget.WorkspaceFolder,
             );
+          },
+          restoreHostRun,
+          reloadEngine: async () => {
+            if (!reloadTaskEngineForUat) throw new Error('UAT task engine reload unavailable');
+            return reloadTaskEngineForUat();
           },
         });
       } finally {
-        // `undefined` removes the override, restoring the original scope precedence.
-        await configuration.update(
-          'verification.hostRun',
-          originalWorkspaceHostRun,
-          vscode.ConfigurationTarget.Workspace,
-        );
+        // The fixture proves restoration on PASS; this path also cleans up failures.
+        if (!hostRunRestored) await restoreHostRun();
       }
     }),
     // M019/S05 native first-run observations — production-path delegates only.
@@ -5508,6 +5541,7 @@ export async function deactivate(): Promise<void> {
   // provider is module-scoped only via registration; poller is stopped via
   // subscriptions. Clear repository so any late poll exits cleanly.
   taskRepository = undefined;
+  reloadTaskEngineForUat = undefined;
   try {
     chatProvider?.disposeRevisionPoller();
   } catch {

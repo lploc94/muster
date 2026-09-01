@@ -9,9 +9,11 @@ test('script workflow QA plan maps requirements to automated and native evidence
   const plan = await read('docs/qa/script-workflow-qa-plan.md');
   for (const id of [
     'CAT-01', 'CAT-05', 'CMP-01', 'CMP-02', 'EXE-01', 'EXE-06',
-    'SEC-01', 'SEC-05', 'DUR-01', 'DUR-02', 'REG-01',
+    'SEC-01', 'SEC-05', 'DUR-01', 'DUR-02', 'DUR-03', 'E2E-01', 'REG-01',
   ]) assert.match(plan, new RegExp(`\\b${id}\\b`), `missing QA requirement ${id}`);
-  assert.match(plan, /test:script-workflow-native-uat/);
+  assert.match(plan, /MUSTER_VSCODE_VERSION=1\.135\.0 npm run test:script-workflow-native-uat/);
+  assert.match(plan, /resource-scoped `muster\.verification\.hostRun`/);
+  assert.match(plan, /exact original workspace-folder override/);
   assert.match(plan, /Exploratory UI checklist/);
   assert.match(plan, /Do not record bearer tokens/);
 });
@@ -21,14 +23,17 @@ test('native evidence records a truthful packaged Extension Host qualification s
   assert.match(evidence, /^# Script Workflow Native Host QA Evidence$/m);
   assert.match(evidence, /^- Verdict: (?:PASS|PENDING)$/m);
   if (/^- Verdict: PENDING$/m.test(evidence)) {
-    assert.match(evidence, /not release evidence for the current implementation/);
-    assert.match(evidence, /blocked .* before any workflow run was created/);
-    assert.match(evidence, /no terminal observation/);
+    assert.match(evidence, /must not claim native PASS/);
+    assert.match(evidence, /blocked before workflow creation/);
+    assert.match(evidence, /no qualifying host observation emitted/);
+  } else {
+    assert.match(evidence, /VS Code `1\.135\.0`, `extension-development-host`/);
   }
-  assert.match(evidence, /VS Code `1\.135\.0`, `extension-development-host`/);
-  assert.match(evidence, /npm run test:script-workflow-native-uat/);
+  assert.match(evidence, /MUSTER_VSCODE_VERSION=1\.135\.0 npm run test:script-workflow-native-uat/);
   assert.match(evidence, /host_run_disabled/);
   assert.match(evidence, /zero ACP session claims/);
+  assert.match(evidence, /workspaceFolderValueRestored: true/);
+  assert.match(evidence, /including `undefined`/);
   assert.match(evidence, /does not claim pixel-level or human visual approval/);
 });
 
@@ -40,16 +45,25 @@ test('package scripts and native runner keep the reproducible QA path', async ()
     read('src/host/script-workflow-uat-fixture.ts'),
   ]);
   const manifest = JSON.parse(manifestText);
+  const hostRun = manifest.contributes.configuration.properties['muster.verification.hostRun'];
+  assert.deepEqual(
+    { type: hostRun?.type, default: hostRun?.default, scope: hostRun?.scope },
+    { type: 'boolean', default: false, scope: 'resource' },
+  );
   assert.match(manifest.scripts['test:script-workflow-qa'], /script-workflow\.test\.ts/);
   assert.match(manifest.scripts['test:script-workflow-native-uat'], /run-script-workflow-native-uat\.mjs/);
   assert.match(manifest.scripts['test:script-workflow-acceptance'], /test:script-workflow-native-uat/);
   assert.match(runner, /createVSIX/);
   assert.match(runner, /runTests/);
+  assert.match(runner, /MUSTER_VSCODE_VERSION\s*\|\|\s*'1\.135\.0'/);
+  assert.match(runner, /host\.vscodeVersion\s*!==\s*version/);
   assert.match(host, /UAT_COMMANDS\.runScriptWorkflowQa/);
   for (const proof of [
     'workspaceShadowsGlobal', 'staleRefRejected', 'disabledStartRejected',
     'globalBundleExecuted', 'packageIntegrityRejected', 'exactStdoutPreserved',
     'nonzeroPrevCorrected', 'emptyPrevFeedbackSynthesized',
-    'nonzeroFailFailedOnce', 'noAcpSessionClaims',
+    'nonzeroFailFailedOnce', 'namedOutputComposed',
+    'decisionRepairAttemptTwoReloaded', 'engineRepositoryReloadedBeforeComposition',
+    'noAcpSessionClaims', 'workspaceFolderValueRestored',
   ]) assert.match(fixture, new RegExp(proof));
 });

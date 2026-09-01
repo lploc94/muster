@@ -113,6 +113,15 @@ deterministic host feedback naming the check and exit code when stdout is empty.
 Stderr remains diagnostic-only; spawn, timeout, cancellation, integrity,
 missing-exit-status, and output-bound failures remain operational failures.
 
+For an agent outcome, the host renders only the bounded declared routes and
+authorizes each disposition against the live activation and frozen definition.
+A strict missing route or an authenticated invalid route enters one durable
+activation-owned repair sequence. The original turn is attempt 1, at most two
+deterministic correction turns may follow, and attempt 3 exhausts with bounded
+`decision_missing` or `decision_invalid` failure. A clean optional original turn
+may still use implicit NEXT; after invalid evidence opens repair, every correction
+must choose a valid route. The first accepted valid disposition always wins.
+
 The removed authoring fields `label`, edge `as`, start input coordinates, child
 destination coordinates, and `onFailure` are invalid. Authors also cannot provide
 backend, model, role, capabilities, effective policy, durable IDs, artifact coordinates,

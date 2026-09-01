@@ -79,8 +79,11 @@ import {
   formatWorkflowDecisionRepair,
   WORKFLOW_DECISION_PRIOR_RESPONSE_MAX_BYTES,
 } from './brief';
+import { WORKFLOW_TITLE_MAX_LENGTH } from './workflow-types';
 import type {
   StartWorkflowEntryInput,
+  WorkflowDecisionGateProjection,
+  WorkflowDecisionSummaryProjection,
   WorkflowStartInput,
   WorkflowGraphProjection,
   WorkflowGraphNodeProjection,
@@ -567,6 +570,8 @@ export type RepositoryCommand =
        * completion). Claim release is part of the same transaction. */
       kind: 'settleTurnAndApplyEffects'; workspaceId: string; expectedTaskRevision: number;
       task: MusterTask; turn: TaskTurn;
+      /** Original first-valid completion claim when only its verdict is replaced by host evidence. */
+      claimedDisposition?: TurnDisposition;
       expectedStatuses: readonly Extract<TurnStatus, 'running' | 'waiting_user'>[];
       relatedTurns: readonly TaskTurn[]; messages: readonly TaskMessage[];
     }
@@ -1083,6 +1088,56 @@ type WorkflowDecisionSettlementPlan = WorkflowEffectPlan & {
   /** Change-feed entries corresponding only to budget-exhaustion statements. */
   budgetExhaustionChanges?: ChangeRecord[];
 };
+
+type WorkflowDecisionProjectionRow = {
+  node_id: string;
+  activation_status: 'queued' | 'running' | 'failed' | 'interrupted' | 'consumed' | 'cancelled';
+  execution_turn_id: string;
+  repair_status: 'open' | 'decided' | 'exhausted' | null;
+  attempts_used: number | null;
+  next_repair_turn_id: string | null;
+};
+
+function boundedWorkflowDisplayTitle(value: unknown): string | undefined {
+  return typeof value === 'string'
+    && value.length > 0
+    && value.length <= WORKFLOW_TITLE_MAX_LENGTH
+    && !value.includes('\0')
+    ? value
+    : undefined;
+}
+
+function workflowDecisionGateProjection(rawOutcome: unknown): WorkflowDecisionGateProjection | undefined {
+  if (rawOutcome === null || rawOutcome === undefined) return undefined;
+  const decoded = decodeWorkflowNodeOutcome(rawOutcome);
+  if (!decoded.ok || decoded.value.kind !== 'agent') return undefined;
+  return decoded.value.requireExplicitDisposition ? 'required' : 'optional';
+}
+
+function workflowDecisionSummaryProjection(
+  gate: WorkflowDecisionGateProjection | undefined,
+  row: WorkflowDecisionProjectionRow | undefined,
+): WorkflowDecisionSummaryProjection | undefined {
+  if (!gate || !row) return undefined;
+  if (row.repair_status === null) {
+    return gate === 'required' && (row.activation_status === 'queued' || row.activation_status === 'running')
+      ? { status: 'waiting', attempt: 1, maxAttempts: 3 }
+      : undefined;
+  }
+  const used = Number(row.attempts_used);
+  if (!Number.isSafeInteger(used) || used < 0 || used > 3) return undefined;
+  if (row.repair_status === 'open') {
+    const attempt = Math.min(3, Math.max(1, used + 1)) as 1 | 2 | 3;
+    return { status: 'correcting', attempt, maxAttempts: 3 };
+  }
+  if (row.repair_status === 'decided' && used >= 1 && used <= 3) {
+    return { status: 'decided', attempt: used as 1 | 2 | 3, maxAttempts: 3 };
+  }
+  if (row.repair_status === 'exhausted' && used === 3) {
+    return { status: 'exhausted', attempt: 3, maxAttempts: 3 };
+  }
+  return undefined;
+}
 
 function workflowGraphNodeProjection(input: {
   nodeId: string;
@@ -3094,18 +3149,81 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
+  /** One bounded latest activation/repair row per node, preferring live authority. */
+  private async readWorkflowDecisionProjectionRows(
+    runId: string,
+  ): Promise<ReadonlyMap<string, WorkflowDecisionProjectionRow>> {
+    const rows = await this.db.all<WorkflowDecisionProjectionRow>(
+      `SELECT activation.node_id,
+              activation.status AS activation_status,
+              activation.execution_turn_id,
+              repair.status AS repair_status,
+              repair.attempts_used,
+              repair.next_repair_turn_id
+         FROM workflow_activations activation
+         LEFT JOIN workflow_decision_repairs repair
+           ON repair.workspace_id = activation.workspace_id
+          AND repair.run_id = activation.run_id
+          AND repair.activation_id = activation.activation_id
+        WHERE activation.workspace_id = ?
+          AND activation.run_id = ?
+          AND activation.activation_id = (
+            SELECT candidate.activation_id
+              FROM workflow_activations candidate
+             WHERE candidate.workspace_id = activation.workspace_id
+               AND candidate.run_id = activation.run_id
+               AND candidate.node_id = activation.node_id
+             ORDER BY CASE candidate.status
+                        WHEN 'running' THEN 0
+                        WHEN 'queued' THEN 1
+                        ELSE 2
+                      END,
+                      candidate.updated_at DESC,
+                      candidate.activation_id DESC
+             LIMIT 1
+          )
+        ORDER BY activation.node_id
+        LIMIT 65`,
+      [this.workspaceId, runId],
+    );
+    return new Map(rows.slice(0, 64).map((row) => [row.node_id, row]));
+  }
+
   async getWorkflowStatusForTask(
     taskId: string,
   ): Promise<WorkflowTaskStatusProjection | undefined> {
     if (typeof taskId !== 'string' || taskId.length === 0) {
       return undefined;
     }
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const revisionBefore = await this.getWorkspaceRevision();
+      const projection = await this.getWorkflowStatusForTaskAttempt(taskId);
+      const revisionAfter = await this.getWorkspaceRevision();
+      if (revisionBefore === revisionAfter) return projection;
+    }
+    throw new Error('workflow status changed during every bounded read attempt');
+  }
+
+  private async getWorkflowStatusForTaskAttempt(
+    taskId: string,
+  ): Promise<WorkflowTaskStatusProjection | undefined> {
     const node = await this.db.get<{
       run_id: string;
       node_id: string;
+      title: string | null;
+      outcome_json: string | null;
     }>(
-      `SELECT run_id, node_id FROM workflow_nodes
-        WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT node.run_id, node.node_id, definition_node.title, definition_node.outcome_json
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id
+          AND run.run_id = node.run_id
+         LEFT JOIN workflow_definition_nodes definition_node
+           ON definition_node.workspace_id = run.workspace_id
+          AND definition_node.definition_id = run.definition_id
+          AND definition_node.definition_version = run.definition_version
+          AND definition_node.node_id = node.node_id
+        WHERE node.workspace_id = ? AND node.task_id = ?`,
       [this.workspaceId, taskId],
     );
     if (!node || typeof node.run_id !== 'string' || typeof node.node_id !== 'string') {
@@ -3141,7 +3259,10 @@ export class SqliteTaskRepository implements TaskRepository {
       return undefined;
     }
 
-    const gateRead = await this.readWorkflowGateStatusProjections(node.run_id, run.status);
+    const [gateRead, decisionRows] = await Promise.all([
+      this.readWorkflowGateStatusProjections(node.run_id, run.status),
+      this.readWorkflowDecisionProjectionRows(node.run_id),
+    ]);
 
     const activationRows = await this.db.all<{
       activation_id: string;
@@ -3281,6 +3402,19 @@ export class SqliteTaskRepository implements TaskRepository {
 
     const gates = gateRead.gates;
     const activationRow = activationRows.length === 1 ? activationRows[0] : undefined;
+    const title = boundedWorkflowDisplayTitle(node.title);
+    let decisionGate: WorkflowDecisionGateProjection | undefined;
+    if (node.outcome_json !== null) {
+      try {
+        decisionGate = workflowDecisionGateProjection(JSON.parse(node.outcome_json));
+      } catch {
+        decisionGate = undefined;
+      }
+    }
+    const decision = workflowDecisionSummaryProjection(
+      decisionGate,
+      decisionRows.get(node.node_id),
+    );
     const activeGateRow = activationRow?.source_gate_id
       ? gates.find((gate) => gate.gateId === activationRow.source_gate_id)
       : gates.find((gate) =>
@@ -3302,6 +3436,9 @@ export class SqliteTaskRepository implements TaskRepository {
       },
       origin: run.origin,
       nodeId: node.node_id,
+      ...(title ? { title } : {}),
+      ...(decisionGate ? { decisionGate } : {}),
+      ...(decision ? { decision } : {}),
       gates,
       feedbackRounds: roundRows.slice(0, 32).map((round) => ({
         roundId: round.round_id,
@@ -3402,7 +3539,7 @@ export class SqliteTaskRepository implements TaskRepository {
       run.definition_version,
     );
 
-    const [nodeRows, edgeRows, gateRead, roundRows, childRows] = await Promise.all([
+    const [nodeRows, edgeRows, gateRead, roundRows, childRows, decisionRows] = await Promise.all([
       this.db.all<{
         node_id: string;
         status: WorkflowNodeStatus;
@@ -3455,8 +3592,9 @@ export class SqliteTaskRepository implements TaskRepository {
        this.db.all<{ run_id: string; status: WorkflowRunStatus }>(
         `SELECT run_id, status FROM workflow_runs
           WHERE workspace_id = ? AND parent_run_id = ? ORDER BY created_at, run_id LIMIT 65`,
-        [this.workspaceId, run.run_id],
-      ),
+         [this.workspaceId, run.run_id],
+       ),
+      this.readWorkflowDecisionProjectionRows(run.run_id),
     ]);
 
     const diagnostics: Array<{ code: string }> = [];
@@ -3469,13 +3607,31 @@ export class SqliteTaskRepository implements TaskRepository {
     if (childRows.length > 64) diagnostics.push({ code: 'workflow_graph_child_runs_truncated' });
 
     const gateByConsumer = new Map(gateRead.gates.map((gate) => [gate.consumerNodeId, gate]));
-    const nodes = nodeRows.slice(0, 64).map((node) => workflowGraphNodeProjection({
-      nodeId: node.node_id,
-      workflowNodeStatus: node.status,
-      turnStatus: node.turn_status,
-      runStatus: run.status,
-      gate: gateByConsumer.get(node.node_id),
-    }));
+    const definitionNodeById = new Map(
+      (storedDefinition?.topology.nodes ?? []).map((node) => [node.nodeId, node]),
+    );
+    const nodes = nodeRows.slice(0, 64).map((node) => {
+      const state = workflowGraphNodeProjection({
+        nodeId: node.node_id,
+        workflowNodeStatus: node.status,
+        turnStatus: node.turn_status,
+        runStatus: run.status,
+        gate: gateByConsumer.get(node.node_id),
+      });
+      const definitionNode = definitionNodeById.get(node.node_id);
+      const title = boundedWorkflowDisplayTitle(definitionNode?.title);
+      const decisionGate = workflowDecisionGateProjection(definitionNode?.outcome);
+      const decision = workflowDecisionSummaryProjection(
+        decisionGate,
+        decisionRows.get(node.node_id),
+      );
+      return {
+        ...state,
+        ...(title ? { title } : {}),
+        ...(decisionGate ? { decisionGate } : {}),
+        ...(decision ? { decision } : {}),
+      };
+    });
     const contributionByEdge = new Map(
       gateRead.gates.flatMap((gate) => gate.inputs.map((input) => [
         `${gate.consumerNodeId}\0${input.inputRef}`,
@@ -8782,8 +8938,8 @@ export class SqliteTaskRepository implements TaskRepository {
         WHERE workspace_id = ? AND turn_id = ?`,
       [this.workspaceId, command.turn.id],
     );
-    const disposition = command.turn.disposition;
-    if (!disposition) {
+    const settlementDisposition = command.turn.disposition;
+    if (!settlementDisposition) {
       if (command.turn.status === 'succeeded' && row?.status === 'staged') {
         return {
           ok: true,
@@ -8793,6 +8949,23 @@ export class SqliteTaskRepository implements TaskRepository {
         };
       }
       return undefined;
+    }
+    const disposition = command.claimedDisposition ?? settlementDisposition;
+    if (
+      command.claimedDisposition !== undefined &&
+      !(
+        disposition.kind === 'complete' &&
+        settlementDisposition.kind === 'complete' &&
+        settlementDisposition.result === disposition.result &&
+        settlementDisposition.verdict?.source === 'host'
+      )
+    ) {
+      return {
+        ok: true,
+        changed: false,
+        conflict: true,
+        reason: 'host verdict override changed the claimed completion payload',
+      };
     }
     const expected = durableDispositionClaim({
       turnId: command.turn.id,
@@ -12824,7 +12997,12 @@ export class SqliteTaskRepository implements TaskRepository {
         operation,
       };
     }
-    return { ok: true, changed: inserted, operation };
+    return {
+      ok: true,
+      changed: inserted,
+      operation,
+      ...(inserted ? { affectedTaskIds: [oldTurn.taskId] } : {}),
+    };
   }
 
   private async planWorkflowAggregateOverflowClosure(input: {
@@ -14698,12 +14876,13 @@ function guardedSettleTurnStatement(
   const statePredicates: string[] = [];
   const stateParams: SqlValue[] = [];
   if (turn.disposition) {
+    const claimedDisposition = command.claimedDisposition ?? turn.disposition;
     const expectedClaim = durableDispositionClaim({
       turnId: turn.id,
       taskId: turn.taskId,
       runtimeEpoch: epoch,
       opId: 'settlement-guard',
-      disposition: turn.disposition,
+      disposition: claimedDisposition,
     });
     statePredicates.push(`AND json_extract(turns.payload_json, '$.disposition') = ?
       AND EXISTS (

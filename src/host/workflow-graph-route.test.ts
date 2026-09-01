@@ -11,8 +11,10 @@ function deps(overrides?: Partial<WorkflowGraphRouteDeps>): WorkflowGraphRouteDe
       runId: 'run-1',
       runStatus: 'running',
       nodes: [{
-        nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'executing',
+        nodeId: 'node-1', title: 'Review route', workflowNodeStatus: 'active', executionActivity: 'executing',
         displayState: 'executing', progressBucket: 'executing', reused: false,
+        decisionGate: 'required',
+        decision: { status: 'correcting', attempt: 2, maxAttempts: 3 },
       }],
       edges: [],
       gates: [],
@@ -155,8 +157,10 @@ describe('routeRequestWorkflowGraph', () => {
           runId: 'run-1',
           runStatus: 'running',
           nodes: [{
-            nodeId: 'node-1', workflowNodeStatus: 'active', executionActivity: 'executing',
+            nodeId: 'node-1', title: 'Review route', workflowNodeStatus: 'active', executionActivity: 'executing',
             displayState: 'executing', progressBucket: 'executing', reused: false,
+            decisionGate: 'required',
+            decision: { status: 'correcting', attempt: 2, maxAttempts: 3 },
           }],
           edges: [],
           gates: [],

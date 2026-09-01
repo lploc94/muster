@@ -107,6 +107,127 @@ describe('TaskEngine repository-only boundary', () => {
     }
   }, 20_000);
 
+  it('resolves live host verification by task cwd in both multi-root call orders', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-verification-resource-'));
+    const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
+    let engine: TaskEngine | undefined;
+    let releaseTurns: (() => void) | undefined;
+    const folderA = path.join(dir, 'folder-a');
+    const folderB = path.join(dir, 'folder-b');
+    const throwingFolder = path.join(dir, 'folder-throw');
+    try {
+      await client.open(path.join(dir, 'muster.sqlite3'));
+      const repository = new SqliteTaskRepository(client, 'ws');
+      await repository.execute({
+        kind: 'upsertWorkspace', workspaceId: 'ws', identityKey: 'verification-resource',
+        displayName: 'Verification resource', createdAt: 'now', lastOpenedAt: 'now',
+      });
+      const rows = [
+        { id: '01-verify-b-denied', cwd: folderB },
+        { id: '02-verify-a-allowed', cwd: folderA },
+        { id: '03-verify-a-denied', cwd: folderA },
+        { id: '04-verify-b-allowed', cwd: folderB },
+        { id: '05-verify-read-failure', cwd: throwingFolder },
+      ];
+      for (const [index, row] of rows.entries()) {
+        await repository.execute({
+          kind: 'createTask', workspaceId: 'ws', task: currentTask(row.id, {
+            cwd: row.cwd,
+            brief: {
+              version: 1,
+              kind: 'verify',
+              title: row.id,
+              objective: row.id,
+              acceptanceCriteria: ['host verification runs for the matching resource'],
+              verification: { commands: ['npm test'], hostRun: true },
+            },
+          }),
+        });
+        await repository.execute({
+          kind: 'createTurn', workspaceId: 'ws', turn: {
+            id: `${row.id}-turn`, taskId: row.id, sequence: 1, status: 'queued',
+            trigger: 'engine', inputs: [], createdAt: `2026-07-16T00:00:0${index}.000Z`, runtimeEpoch: 1,
+          },
+        });
+      }
+
+      const decisions = new Map<string, boolean[]>([
+        [folderA, [true, false]],
+        [folderB, [false, true]],
+      ]);
+      const authorizationResources: Array<string | undefined> = [];
+      const verificationRuns: string[] = [];
+      const credentials = new CredentialRegistry();
+      const turnGate = new Promise<void>((resolve) => { releaseTurns = resolve; });
+      engine = await TaskEngine.loadAsync({
+        repository,
+        workspaceId: 'ws',
+        credentialRegistry: credentials,
+        makeBackend: () => ({
+          name: 'fake',
+          capabilities: { supportsMCP: true, supportsReasoning: false, supportsDetailedToolEvents: false },
+          run: async function* () {},
+        }),
+        runTurn: async function* () {
+          await turnGate;
+          yield { type: 'turnCompleted' };
+        },
+        allowHostVerification: (cwd?: string) => {
+          authorizationResources.push(cwd);
+          if (cwd === throwingFolder) throw new Error('configuration read failed');
+          return decisions.get(cwd ?? '')?.shift() === true;
+        },
+        runVerificationGate: (_commands, cwd) => {
+          verificationRuns.push(cwd);
+          return {
+            verdict: {
+              status: 'pass', source: 'host', at: '2026-07-16T00:00:10.000Z',
+              testedRevision: 'rev-fixed',
+            },
+          };
+        },
+        computeSourceRevision: () => 'rev-fixed',
+        clock: () => '2026-07-16T00:00:10.000Z',
+      });
+
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const turns = await Promise.all(rows.map((row) => repository.getTurn(`${row.id}-turn`)));
+        if (turns.every((turn) => turn?.status === 'running')) break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+      }
+      for (const row of rows) {
+        await expect(repository.getTurn(`${row.id}-turn`)).resolves.toMatchObject({ status: 'running' });
+        const token = credentials.issue({
+          rootId: row.id,
+          callerTaskId: row.id,
+          turnId: `${row.id}-turn`,
+          attemptId: `${row.id}-attempt`,
+          allowedActions: new Set(['complete_task']),
+          ttlMs: 60_000,
+        });
+        await expect(engine.handleToolCall(credentials.verify(token)!, 'complete_task', {
+          kind: 'complete_task',
+          opId: `${row.id}-complete`,
+          result: 'worker verification complete',
+        })).resolves.toMatchObject({ ok: true });
+      }
+      releaseTurns?.();
+      await engine.whenIdle();
+      expect([...authorizationResources].sort()).toEqual(
+        [folderA, folderA, folderB, folderB, throwingFolder].sort(),
+      );
+      expect([...verificationRuns].sort()).toEqual([folderA, folderB].sort());
+      for (const row of rows) {
+        await expect(repository.getTurn(`${row.id}-turn`)).resolves.toMatchObject({ status: 'succeeded' });
+      }
+    } finally {
+      releaseTurns?.();
+      await engine?.shutdown().catch(() => undefined);
+      await client.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
   it('replays a root send when concurrent engines race after preflight', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-engine-root-receipt-race-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });

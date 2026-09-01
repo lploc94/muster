@@ -81,6 +81,8 @@ describe("workflow graph webview wiring", () => {
     expect(canvasSource).toContain("data-node-id");
     expect(canvasSource).toContain("data-edge-from");
     expect(canvasSource).toContain("data-input-state");
+    expect(canvasSource).toContain("n.title");
+    expect(canvasSource).toContain("n.decisionLabel");
     expect(canvasSource).not.toContain('role="button"');
     expect(canvasSource).not.toContain("onNodeClick");
     expect(layoutSource).toContain("computeWorkflowGraphLayout");
@@ -89,6 +91,8 @@ describe("workflow graph webview wiring", () => {
     expect(modalSource).toContain("ResizeObserver");
     expect(modalSource).toContain("view.progress.summaryLabel");
     expect(modalSource).toContain("view.gates");
+    expect(modalSource).toContain("n.decisionGateLabel");
+    expect(modalSource).toContain("n.decisionLabel");
     expect(modalSource).toContain("workflowGraphTopologyKey");
     expect(modalSource).toContain("untrack");
   });

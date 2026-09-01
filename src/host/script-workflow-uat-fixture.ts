@@ -1,11 +1,11 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import type { CredentialContext } from '../bridge/credentials';
 import { dispatch, type ToolCommand } from '../task/coordinator-tools';
 import type { TaskEngine } from '../task/engine';
-import type { TaskRepository } from '../task/repository';
+import { SqliteTaskRepository, type TaskRepository } from '../task/repository';
 import type { DbClient } from '../task/sqlite/client';
 import type { MusterTask, TaskTurn } from '../task/types';
 
@@ -25,6 +25,7 @@ export interface ScriptWorkflowUatResult {
   policy: {
     disabledStartRejected: true;
     enabledStartAccepted: true;
+    workspaceFolderValueRestored: true;
   };
   runtime: {
     graphSucceeded: true;
@@ -37,6 +38,9 @@ export interface ScriptWorkflowUatResult {
     stderrDiagnosticOnly: true;
     emptyStdoutSucceeded: true;
     nonzeroFailFailedOnce: true;
+    namedOutputComposed: true;
+    decisionRepairAttemptTwoReloaded: true;
+    engineRepositoryReloadedBeforeComposition: true;
     noAcpSessionClaims: true;
     graphProjected: true;
   };
@@ -49,6 +53,12 @@ export interface ScriptWorkflowUatDeps {
   workspaceId: string;
   workspaceFolder: string;
   setHostRun: (enabled: boolean) => Promise<void>;
+  restoreHostRun: () => Promise<void>;
+  reloadEngine: () => Promise<{
+    engine: Pick<TaskEngine, 'getProjection' | 'handleToolCall'>;
+    repository: TaskRepository;
+    client: DbClient;
+  }>;
 }
 
 function assertQa(condition: unknown, message: string): asserts condition {
@@ -148,9 +158,9 @@ function scriptNode(nodeKey: string, file: string, args: string[] = []) {
 function canonicalManifest(
   name: string,
   nodes: readonly Record<string, unknown>[],
-  edges: readonly Record<string, unknown>[] = [],
-  inputs: readonly Record<string, unknown>[] = [],
-  outputs: readonly Record<string, unknown>[] = [{ name: 'result', kind: 'result', from: 'run' }],
+  edges: readonly Record<string, unknown>[],
+  inputs: readonly Record<string, unknown>[],
+  outputs: readonly Record<string, unknown>[],
 ): Record<string, unknown> {
   return {
     schema: 'muster.workflow/v2',
@@ -196,6 +206,7 @@ async function defineAndStart(
   credential: CredentialContext,
   semantic: Record<string, unknown>,
   goal: string,
+  inputs?: readonly Record<string, unknown>[],
 ): Promise<{ definitionId: string; runId: string; entryTaskId: string }> {
   const definition = route('define_workflow', semantic, credential);
   assertQa(definition.kind === 'define_workflow', 'define route returned the wrong command');
@@ -207,6 +218,7 @@ async function defineAndStart(
   const start = route('start_workflow', {
     workflow: `${definitionId}@1`,
     goal,
+    ...(inputs ? { inputs } : {}),
   }, credential);
   assertQa(start.kind === 'start_workflow', 'start route returned the wrong command');
   const result = await invoke(deps, credential, 'start_workflow', start) as {
@@ -216,6 +228,79 @@ async function defineAndStart(
   assertQa(typeof result.runId === 'string', 'start returned no runId');
   assertQa(typeof result.entryTaskId === 'string', 'start returned no entryTaskId');
   return { definitionId, runId: result.runId, entryTaskId: result.entryTaskId };
+}
+
+async function settleMissingDecision(
+  repository: TaskRepository,
+  client: DbClient,
+  workspaceId: string,
+  taskId: string,
+  turnId: string,
+  finishedAt: string,
+): Promise<void> {
+  await client.run(
+    `UPDATE turns SET status = 'running', started_at = ?, settled_at = NULL
+      WHERE workspace_id = ? AND id = ?`,
+    [finishedAt, workspaceId, turnId],
+  );
+  const [task, turn] = await Promise.all([
+    repository.getTask(taskId),
+    repository.getTurn(turnId),
+  ]);
+  assertQa(task && turn, 'decision repair task or turn was unavailable');
+  const settled = await repository.execute({
+    kind: 'settleTurnAndApplyEffects',
+    workspaceId,
+    expectedTaskRevision: task.revision,
+    task: { ...task, updatedAt: finishedAt },
+    turn: { ...turn, status: 'succeeded', finishedAt },
+    expectedStatuses: ['running'],
+    relatedTurns: [],
+    messages: [],
+  });
+  assertQa(settled.changed, 'missing decision did not create the next bounded repair attempt');
+}
+
+async function holdQueuedTurn(
+  client: DbClient,
+  workspaceId: string,
+  turnId: string,
+): Promise<void> {
+  const result = await client.run(
+    `UPDATE turns
+        SET payload_json = json_set(payload_json, '$.holdAutoPromote', json('true'))
+      WHERE workspace_id = ? AND id = ? AND status = 'queued'`,
+    [workspaceId, turnId],
+  );
+  assertQa(result.changes === 1, 'decision repair turn could not be held across reload');
+}
+
+async function expectNativeDecisionExhaustion(
+  client: DbClient,
+  workspaceId: string,
+  runId: string,
+): Promise<void> {
+  const state = await client.get<{
+    repair_status: string;
+    attempts_used: number;
+    run_status: string;
+    terminal_reason_code: string | null;
+  }>(
+    `SELECT repair.status AS repair_status, repair.attempts_used,
+            run.status AS run_status, run.terminal_reason_code
+       FROM workflow_decision_repairs repair
+       JOIN workflow_runs run
+         ON run.workspace_id = repair.workspace_id AND run.run_id = repair.run_id
+      WHERE repair.workspace_id = ? AND repair.run_id = ?`,
+    [workspaceId, runId],
+  );
+  assertQa(
+    state?.repair_status === 'exhausted' &&
+    state.attempts_used === 3 &&
+    state.run_status === 'failed' &&
+    state.terminal_reason_code === 'decision_missing',
+    'native decision cleanup did not close at the bounded third attempt',
+  );
 }
 
 /**
@@ -259,7 +344,7 @@ export async function runScriptWorkflowUatFixture(
   await deps.repository.execute({ kind: 'createTask', workspaceId: deps.workspaceId, task: root });
   await deps.repository.execute({ kind: 'createTurn', workspaceId: deps.workspaceId, turn });
   await deps.engine.getProjection()?.refreshTask(rootId);
-  const credential = context(rootId, turnId);
+  let credential = context(rootId, turnId);
 
    const workspaceCatalog = join(deps.workspaceFolder, '.muster', 'workflows');
    const globalCatalog = join(homedir(), '.muster', 'workflows');
@@ -290,10 +375,13 @@ export async function runScriptWorkflowUatFixture(
      writeCanonicalPackage(globalCatalog, 'native-qa-saved', savedManifest('global native QA'), {}),
      writeCanonicalPackage(workspaceCatalog, 'native-qa-saved', savedManifest('workspace native QA'), {}),
      mkdir(invalidSaved, { recursive: true }).then(() => writeFile(join(invalidSaved, 'workflow.json'), '{invalid json', 'utf8')),
-     writeFile(globalBundleManifest, JSON.stringify(canonicalManifest(
-       'Native global bundle',
-       [scriptNode('global', 'scripts/native-global.ts')],
-     )), 'utf8'),
+      writeFile(globalBundleManifest, JSON.stringify(canonicalManifest(
+        'Native global bundle',
+        [scriptNode('global', 'scripts/native-global.ts')],
+        [],
+        [],
+        [{ name: 'result', kind: 'result', from: 'global' }],
+      )), 'utf8'),
      writeFile(globalBundleScript, [
        'const result: string = "global-bundle";',
        'process.stdout.write(result);',
@@ -343,6 +431,27 @@ export async function runScriptWorkflowUatFixture(
       "  }",
       "  if (parsed.candidate.value !== 'native-prev-v2') throw new Error('native feedback revision missing');",
       "  process.stdout.write('native-prev-accepted');",
+      "});",
+    ].join('\n'), 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'native-audit-source.js'),
+      "process.stdout.write('native-audit-source');", 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'native-audit.js'), [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  if (parsed.audit_source.value !== 'native-audit-source') throw new Error('native audit source missing');",
+      "  process.stdout.write('native-audit-terminal');",
+      "});",
+    ].join('\n'), 'utf8'),
+    writeFile(join(deps.workspaceFolder, 'native-compose.js'), [
+      "let input = '';",
+      "process.stdin.setEncoding('utf8');",
+      "process.stdin.on('data', chunk => input += chunk);",
+      "process.stdin.on('end', () => {",
+      "  const parsed = JSON.parse(input);",
+      "  process.stdout.write('native-composed:' + parsed.selected.value);",
       "});",
     ].join('\n'), 'utf8'),
     writeFile(join(deps.workspaceFolder, 'native-fail.js'),
@@ -406,7 +515,7 @@ export async function runScriptWorkflowUatFixture(
      }, credential);
      assertQa(dataflowDefinition.kind === 'define_workflow', 'dataflow definition route failed');
      assertQa('definitionId' in dataflowDefinition, 'inline dataflow definition returned no identity');
-     await invoke(deps, credential, 'define_workflow', dataflowDefinition);
+      await invoke(deps, credential, 'define_workflow', dataflowDefinition);
     const dataflowStart = route('start_workflow', {
       workflow: `${dataflowDefinition.definitionId}@1`,
       goal: 'Native dataflow QA',
@@ -567,18 +676,26 @@ export async function runScriptWorkflowUatFixture(
     const corrected = await defineAndStart(deps, credential, {
       manifest: canonicalManifest(
         `Native PREV correction ${rootId}`,
-        [
-          scriptNode('producer', 'native-prev-producer.js', [producerCounter]),
+         [
+           scriptNode('producer', 'native-prev-producer.js', [producerCounter]),
           {
             nodeKey: 'check',
             title: 'Native PREV check',
             script: { interpreter: 'node', file: 'native-prev-check.js', args: [checkCounter] },
-            outcome: prevExitOutcome(['candidate']),
-          },
-        ],
-        [{ from: 'producer', to: 'check', inputRef: 'candidate' }],
-        [],
-        [{ name: 'result', kind: 'result', from: 'check' }],
+             outcome: prevExitOutcome(['candidate']),
+           },
+           scriptNode('audit_source', 'native-audit-source.js'),
+           scriptNode('audit', 'native-audit.js'),
+         ],
+         [
+           { from: 'producer', to: 'check', inputRef: 'candidate' },
+           { from: 'audit_source', to: 'audit', inputRef: 'audit_source' },
+         ],
+         [],
+         [
+           { name: 'approved', kind: 'result', from: 'check' },
+           { name: 'audit', kind: 'result', from: 'audit' },
+         ],
       ),
     }, 'Native PREV correction QA');
     assertQa(
@@ -627,6 +744,227 @@ export async function runScriptWorkflowUatFixture(
       JSON.parse(correctedArtifact.payload_json).result === 'native-prev-accepted',
       'PREV resume did not consume the revised producer artifact',
     );
+    const auditArtifact = await deps.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'audit' AND kind = 'next_result'`,
+      [deps.workspaceId, corrected.runId],
+    );
+    assertQa(
+      auditArtifact !== undefined &&
+      JSON.parse(auditArtifact.payload_json).result === 'native-audit-terminal',
+      'second named terminal output did not complete independently',
+    );
+
+    const decisionDefinitionId = `native-decision-${randomUUID()}`;
+    const decisionPromptCanary = 'PRIVATE_NATIVE_DECISION_PROMPT';
+    const decisionConditionCanary = 'PRIVATE_NATIVE_DECISION_CONDITION';
+    const decisionRepository = new SqliteTaskRepository(deps.client, deps.workspaceId);
+    const decisionDefined = await decisionRepository.execute({
+      kind: 'defineWorkflowVersion',
+      workspaceId: deps.workspaceId,
+      definitionId: decisionDefinitionId,
+      version: 1,
+      name: 'Native decision repair reload',
+      topology: {
+        kind: 'workflow',
+        inputs: [],
+        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'decision' }],
+        nodes: [{
+          nodeId: 'decision',
+          title: 'Native decision gate',
+          instructions: {
+            kind: 'inline',
+            content: decisionPromptCanary,
+            sha256: createHash('sha256').update(decisionPromptCanary).digest('hex'),
+          },
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: decisionConditionCanary },
+            fail: { when: 'The native decision cannot be completed.' },
+          },
+        }],
+        edges: [],
+      },
+      createdAt: new Date().toISOString(),
+    });
+    assertQa(
+      decisionDefined.changed,
+      `native decision workflow was not defined: ${JSON.stringify(decisionDefined)}`,
+    );
+    const decisionStarted = await decisionRepository.execute({
+      kind: 'startWorkflowRun',
+      workspaceId: deps.workspaceId,
+      definitionId: decisionDefinitionId,
+      version: 1,
+      startIdempotencyKey: `native-decision-${randomUUID()}`,
+      createdAt: new Date().toISOString(),
+      goal: 'Project a native decision repair after reload',
+      backend: 'grok',
+      ownerRootTaskId: rootId,
+      callerTaskId: rootId,
+      callerTurnId: turnId,
+    });
+    const decisionData = decisionStarted.operation?.result?.data as {
+      runId?: unknown;
+      entryTaskId?: unknown;
+      activationTurnId?: unknown;
+    } | undefined;
+    assertQa(typeof decisionData?.runId === 'string', 'native decision run returned no identity');
+    assertQa(typeof decisionData.entryTaskId === 'string', 'native decision run returned no task');
+    assertQa(typeof decisionData.activationTurnId === 'string', 'native decision run returned no turn');
+    await settleMissingDecision(
+      decisionRepository,
+      deps.client,
+      deps.workspaceId,
+      decisionData.entryTaskId,
+      decisionData.activationTurnId,
+      new Date().toISOString(),
+    );
+    const decisionRepair = await deps.client.get<{
+      activation_id: string;
+      status: string;
+      attempts_used: number;
+      next_repair_turn_id: string | null;
+    }>(
+      `SELECT activation_id, status, attempts_used, next_repair_turn_id
+         FROM workflow_decision_repairs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [deps.workspaceId, decisionData.runId],
+    );
+    assertQa(
+      decisionRepair?.status === 'open' &&
+      decisionRepair.attempts_used === 1 &&
+      typeof decisionRepair.next_repair_turn_id === 'string',
+      'native decision repair did not reach attempt 2',
+    );
+    await holdQueuedTurn(deps.client, deps.workspaceId, decisionRepair.next_repair_turn_id);
+
+    const previousEngine = deps.engine;
+    const previousRepository = deps.repository;
+    const reloaded = await deps.reloadEngine();
+    assertQa(reloaded.engine !== previousEngine, 'native engine instance was not reloaded');
+    assertQa(reloaded.repository !== previousRepository, 'native repository instance was not reloaded');
+    deps.engine = reloaded.engine;
+    deps.repository = reloaded.repository;
+    deps.client = reloaded.client;
+
+    const reloadedDecisionStatus = await deps.repository.getWorkflowStatusForTask(
+      decisionData.entryTaskId,
+    );
+    assertQa(
+      reloadedDecisionStatus?.title === 'Native decision gate' &&
+      reloadedDecisionStatus.decisionGate === 'required' &&
+      reloadedDecisionStatus.decision?.status === 'correcting' &&
+      reloadedDecisionStatus.decision.attempt === 2 &&
+      reloadedDecisionStatus.decision.maxAttempts === 3,
+      'native reload did not project decision repair attempt 2 of 3',
+    );
+    const reloadedDecisionGraph = await deps.repository.getWorkflowGraphForTask(
+      decisionData.entryTaskId,
+    );
+    const decisionGraphText = JSON.stringify(reloadedDecisionGraph);
+    assertQa(
+      reloadedDecisionGraph?.nodes.length === 1 &&
+      reloadedDecisionGraph.nodes[0]?.decision?.status === 'correcting' &&
+      reloadedDecisionGraph.nodes[0].decision.attempt === 2,
+      'native decision reload added a hidden node or lost repair state',
+    );
+    assertQa(
+      !decisionGraphText.includes(decisionPromptCanary) &&
+      !decisionGraphText.includes(decisionConditionCanary),
+      'native decision projection leaked prompt or route condition text',
+    );
+    const decisionActivationCount = await deps.client.get<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workflow_activations
+        WHERE workspace_id = ? AND run_id = ?`,
+      [deps.workspaceId, decisionData.runId],
+    );
+    assertQa(decisionActivationCount?.count === 1, 'decision repair created a hidden activation');
+
+    const decisionCleanupRepository = new SqliteTaskRepository(deps.client, deps.workspaceId);
+    await settleMissingDecision(
+      decisionCleanupRepository,
+      deps.client,
+      deps.workspaceId,
+      decisionData.entryTaskId,
+      decisionRepair.next_repair_turn_id,
+      new Date().toISOString(),
+    );
+    const finalRepair = await deps.client.get<{
+      status: string;
+      attempts_used: number;
+      next_repair_turn_id: string | null;
+    }>(
+      `SELECT status, attempts_used, next_repair_turn_id
+         FROM workflow_decision_repairs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [deps.workspaceId, decisionData.runId],
+    );
+    assertQa(
+      finalRepair?.status === 'open' &&
+      finalRepair.attempts_used === 2 &&
+      typeof finalRepair.next_repair_turn_id === 'string',
+      'native decision repair did not reach its final bounded attempt',
+    );
+    await holdQueuedTurn(deps.client, deps.workspaceId, finalRepair.next_repair_turn_id);
+    await settleMissingDecision(
+      decisionCleanupRepository,
+      deps.client,
+      deps.workspaceId,
+      decisionData.entryTaskId,
+      finalRepair.next_repair_turn_id,
+      new Date().toISOString(),
+    );
+    await expectNativeDecisionExhaustion(
+      deps.client,
+      deps.workspaceId,
+      decisionData.runId,
+    );
+
+    const reloadTurnId = `uat-script-reload-turn-${randomUUID()}`;
+    const reloadAt = new Date().toISOString();
+    const reloadTurn: TaskTurn = {
+      ...turn,
+      id: reloadTurnId,
+      sequence: 2,
+      createdAt: reloadAt,
+      startedAt: reloadAt,
+    };
+    const rootTurnCreated = await deps.repository.execute({
+      kind: 'createTurn',
+      workspaceId: deps.workspaceId,
+      turn: reloadTurn,
+    });
+    assertQa(rootTurnCreated.changed, 'native reload coordinator turn was not created');
+    await deps.engine.getProjection()?.refreshTask(rootId);
+    credential = context(rootId, reloadTurnId);
+
+    const composed = await defineAndStart(deps, credential, {
+      manifest: canonicalManifest(
+        `Native selected output composition ${rootId}`,
+        [scriptNode('consume', 'native-compose.js')],
+        [],
+        [{ name: 'selected', kind: 'result', to: 'consume', inputRef: 'selected' }],
+        [{ name: 'result', kind: 'result', from: 'consume' }],
+      ),
+    }, 'Native selected output composition QA', [
+      { name: 'selected', fromRun: corrected.runId, output: 'approved' },
+    ]);
+    assertQa(
+      await waitForRun(deps.repository, composed.runId, rootId) === 'succeeded',
+      'selected named output composition did not succeed',
+    );
+    const composedArtifact = await deps.client.get<{ payload_json: string }>(
+      `SELECT payload_json FROM workflow_artifacts
+        WHERE workspace_id = ? AND run_id = ? AND producer_node_id = 'consume' AND kind = 'next_result'`,
+      [deps.workspaceId, composed.runId],
+    );
+    assertQa(
+      composedArtifact !== undefined &&
+      JSON.parse(composedArtifact.payload_json).result === 'native-composed:native-prev-accepted',
+      'downstream workflow consumed an aggregate or the wrong named terminal output',
+    );
 
      const failed = await defineAndStart(deps, credential, {
        manifest: canonicalManifest(
@@ -640,7 +978,7 @@ export async function runScriptWorkflowUatFixture(
     assertQa(await waitForRun(deps.repository, failed.runId, rootId) === 'failed', 'declared nonzero FAIL succeeded');
     assertQa((await deps.repository.listTurns(failed.entryTaskId)).length === 1, 'declared nonzero FAIL retried');
 
-    await deps.setHostRun(false);
+    await deps.restoreHostRun();
     hostRunRestored = true;
     return {
       ok: true,
@@ -656,6 +994,7 @@ export async function runScriptWorkflowUatFixture(
       policy: {
         disabledStartRejected: true,
         enabledStartAccepted: true,
+        workspaceFolderValueRestored: true,
       },
       runtime: {
         graphSucceeded: true,
@@ -668,11 +1007,14 @@ export async function runScriptWorkflowUatFixture(
         stderrDiagnosticOnly: true,
         emptyStdoutSucceeded: true,
         nonzeroFailFailedOnce: true,
+        namedOutputComposed: true,
+        decisionRepairAttemptTwoReloaded: true,
+        engineRepositoryReloadedBeforeComposition: true,
         noAcpSessionClaims: true,
         graphProjected: true,
       },
     };
   } finally {
-    if (!hostRunRestored) await deps.setHostRun(false).catch(() => undefined);
+    if (!hostRunRestored) await deps.restoreHostRun().catch(() => undefined);
   }
 }

@@ -782,9 +782,9 @@ a `NEXT` route and remains mutually exclusive with the three base workflow outco
 `inspect_workflow_run` is a bounded recovery/diagnostic read, not a routing or polling
 mechanism. It returns semantic workflow/node/activation/feedback/child state and
 integrity codes without policy budgets, routing IDs, artifact coordinates, task trees,
-topology, prompts, artifact bodies, paths, or secrets. Succeeded materialized nodes expose
-an opaque `taskRef` for exact node reuse. Workflow progress shown by the host or UI is
-derived from this durable state; agents do not report percentages.
+topology, prompts, artifact bodies, paths, or secrets. Succeeded materialized nodes may
+expose an opaque `taskRef` for bounded diagnostics only. Workflow progress shown by the
+host or UI is derived from this durable state; agents do not report percentages.
 
 `start_workflow` creates the run and a top-level `start_wait` continuation in one
 transaction, then returns an `accepted` tool result. Only after the adapter reports
@@ -800,10 +800,11 @@ Invalid or unauthorized calls remain ordinary tool errors and never suspend the 
 Only one unresolved top-level start wait is allowed per caller task. Workflow
 activations use `invoke_child_workflow` and retain their separate `child_wait`
 continuation semantics. `inspect_workflow_run` is not a normal completion polling loop.
-Optional reuse is exactly `{node, fromRun, fromNode, fromTask}`: `node` is the destination
-in the new workflow, while the other fields come from an owned completed run's `runRef`,
-node name, and succeeded node `taskRef`. Only explicitly bound nodes are `reused`;
-unbound predecessors materialize and route normally before the bound result advances.
+`start_workflow` binds each public destination input exactly once as `{name,value}` or
+`{name,fromRun,output}`. The latter selects one declared named terminal output from an
+owned succeeded source run; the repository resolves and pins its exact immutable
+artifact in the same transaction that creates the consumer run. Node names, task refs,
+gate coordinates, run aggregates, and partial-node reuse are not composition authority.
 
 A successful backend turn is not the same thing as a sealed task lifecycle. Root
 coordinators remain `open` after each normal or workflow-resume response so the user can
@@ -1737,50 +1738,40 @@ planner session
 
 There is no live planner process between those turns.
 
-### 20.4 Workflow definition and frozen run
+### 20.4 Canonical workflow definition and frozen run
 
-The concrete TypeScript may differ, but it must preserve these semantics:
+The sole authoring contract is a closed `muster.workflow/v2` manifest. Its normalized
+domain shape preserves these semantics:
 
 ```ts
-interface WorkflowDefinitionV1 {
-  id: string;
+interface WorkflowDefinition {
+  definitionId: string;
   version: number;
-  entryTaskIds: string[];
-  tasks: Record<string, WorkflowTaskDefinition>;
-  terminalTaskId: string;
-  policy: {
-    maxFeedbackRounds: number;
-    maxTurnsPerTask: number;
-    runTimeoutMs: number;
-    failure: 'fail_workflow';
+  name: string;
+  topology: {
+    kind: 'workflow';
+    inputs: Array<{ name: string; semanticKind: string; entryNodeId: string; inputRef: string }>;
+    outputs: Array<{ name: string; semanticKind: string; terminalNodeId: string }>;
+    nodes: WorkflowNodeSpec[];
+    edges: Array<{ fromNodeId: string; toNodeId: string; inputRef: string }>;
   };
-}
-
-interface WorkflowTaskDefinition {
-  taskId: string;
-  dependencies: Array<{
-    inputRef: string;
-    sourceTaskId: string;
-    required: true;
-  }>;
-  next?: {
-    destinationTaskId: string;
-    destinationInputRef: string;
-  };
+  policy: WorkflowPolicy;
 }
 ```
 
-For v1, the coordinator defines the graph before execution and the engine freezes the
-definition version into the workflow run. Dynamic addition/removal of nodes during a
-run, partial/streaming gates, `ANY`, quorum, and arbitrary predicate gates are outside
-the base contract. They may be added later without changing the v1 rule that a gate
-must close before it activates its consumer.
+The coordinator defines the complete semantic graph before execution and the engine
+freezes its public interfaces, topology, optional display titles, instruction bytes,
+outcomes, resolved task profiles, script provenance, and effective policy into the
+workflow run. Authors never provide physical task/gate/artifact IDs or host routing
+authority. Dynamic graph mutation, partial/streaming gates, `ANY`, quorum, and arbitrary
+predicate gates are outside the contract. A dependency gate must close before it
+activates its consumer.
 
 The engine validates before release:
 
 - every task and edge exists inside the permitted workflow scope;
 - every `inputRef` is unique within its consumer;
-- v1 allows at most one direct dependency/input reference from a given source task
+- the canonical graph allows at most one direct dependency/input reference from a given source task
   to a given consumer;
 - every task belongs to exactly one workflow run and has zero or one outgoing routing
   edge: every terminal sink has none and every non-terminal task has exactly one;
@@ -1798,14 +1789,18 @@ graph; it does not make dependency readiness itself cyclic.
 
 ### 20.4.1 Run start and entry activation
 
-Starting a workflow is one idempotent repository command. It:
+Starting a workflow is one idempotent repository command. The caller binds every
+destination only by its public input `name`, using either a literal value or a
+`(fromRun, outputName)` source. Internal entry coordinates are resolved from the frozen
+definition inside the transaction. The command:
 
 1. Persists the frozen definition version, workflow run, caller continuation (when
    nested), and caller-supplied entry artifacts.
 2. Creates one dependency gate for every task. Entry gates include the exact declared
    caller-input references; an entry with no caller data receives one explicit
    engine-authored start artifact rather than an implicit empty prompt.
-3. Contributes and pins all caller inputs to their named entry gates.
+3. Resolves named literal/prior-run inputs, enforces exact semantic-kind equality for
+   selected prior outputs, and contributes/pins them to their derived entry gates.
 4. For every entry gate satisfied by those inputs, atomically closes the gate and
    inserts its aggregate message and queued `TaskTurn` in the same transaction.
 5. Commits before any process or adapter run is started.
@@ -1815,12 +1810,19 @@ workflow run and cannot create duplicate gates, messages, or entry turns. An ent
 whose declared caller inputs are incomplete remains blocked; release validation must
 reject a run request that cannot ever supply its required entry contract.
 
+For a prior-run input, output selection and start creation share this transaction. The
+repository authorizes a succeeded source run, resolves the frozen public output name to
+its declared terminal node, loads that exact immutable `next_result` artifact/revision,
+checks semantic-kind equality, pins provenance, and fills the destination gate. The
+multi-terminal run aggregate remains continuation data and is never named-output
+authority. Changing only the selected output name changes start idempotency material.
+
 ### 20.5 Dependency gate and aggregate activation
 
 Each consumer gets a durable gate for the exact required input set and run revision:
 
 ```ts
-interface DependencyGateV1 {
+interface DependencyGate {
   gateId: string;
   workflowRunId: string;
   consumerTaskId: string;
@@ -1875,11 +1877,13 @@ another without an explicit dependency.
 ### 20.6 `NEXT` contract
 
 `NEXT` is one of three mutually exclusive workflow dispositions (`NEXT`, `PREV`, or
-workflow `FAIL`) that an agent may stage on its live turn. If the agent stages none,
-the host creates an implicit `NEXT` with `change: 'updated'` and the final assistant
-message as its result. Explicit dispositions always take precedence. Staging is
-idempotent by turn and does not route work immediately. As with existing turn
-dispositions, only adapter `turnCompleted` may commit it. The successful
+workflow `FAIL`) that an agent may stage on its live turn. A node with no declared
+agent outcome retains final-assistant-message implicit NEXT. An optional declared
+outcome may use implicit NEXT only on a clean original attempt with no invalid evidence
+or open repair. Strict outcomes and every correction attempt require an explicit valid
+route. Explicit dispositions always take precedence. Staging is idempotent by turn and
+does not route work immediately. As with existing turn dispositions, only adapter
+`turnCompleted` may commit it. The successful
 turn-settlement repository transaction commits session identity, the workflow
 disposition, artifacts, gate/round contributions, and durable outgoing routing
 messages together. A failed or interrupted turn discards any staged disposition and
@@ -1888,7 +1892,7 @@ cannot activate downstream work.
 `NEXT` yields the current task result to the engine:
 
 ```ts
-interface NextOutcomeV1 {
+interface NextOutcome {
   type: 'next';
   change: 'updated' | 'unchanged';
   artifact: ArtifactRef;
@@ -1904,7 +1908,7 @@ interface NextOutcomeV1 {
 - A coordinator/caller with no configured downstream consumer may select the
   child-workflow invocation route defined in §20.12; it remains a `NEXT` disposition,
   not a fourth base outcome. A non-terminal workflow task that already has `next`
-  cannot invoke a child workflow in v1.
+  cannot invoke a child workflow when it already has a frozen downstream edge.
 - A `NEXT` responding to feedback satisfies only the matching feedback-round target;
   it cannot accidentally close a later or unrelated round.
 - If the node is terminal, `NEXT` completes the nested workflow result and resolves
@@ -1919,12 +1923,38 @@ For a feedback response, artifact lineage is validated before commit:
 - cross-task artifacts, unrelated lineage, reused stale revisions, and revisions not
   produced by the responding turn fail closed and do not satisfy the round.
 
+### 20.6.1 Declared outcomes and durable decision repair
+
+An agent outcome declares its allowed NEXT/PREV/FAIL routes and whether an original
+missing disposition is permitted to fall through to implicit NEXT. The host renders
+bounded route conditions as untrusted decision guidance, then re-authorizes every
+attempt against the frozen activation before a universal disposition claim can be
+staged. PREV targets must match one exact declared set of direct inbound `inputRef`
+values and include bounded nonempty feedback.
+
+One logical activation owns at most one durable decision-repair row. The original
+completed turn is attempt 1. A strict missing route or authenticated invalid route on
+attempts 1 or 2 atomically settles that turn, records only bounded response/error
+evidence, reserves the next workflow-turn budget, and queues one deterministic
+same-task correction turn. Attempt 3 exhausts the row and fails the run with
+`decision_missing` or `decision_invalid`. A first accepted valid claim marks the row
+decided and wins over concurrent invalid calls or settlement replay. Reload resumes
+from the durable row and correction turn; no in-memory retry loop, PREV round, or hidden
+decision node exists.
+
+Host status and graph reads may expose only the node's bounded display title, an
+optional/required decision-gate marker, a closed waiting/correcting/decided/exhausted
+summary, and `attempt N of 3`. They never expose outcome condition text, prior response
+bodies, prompts, host paths, artifact bodies, or physical durable IDs. Normal PREV is
+shown as revision/waiting for feedback, not failure; Failed appears only after repair
+exhaustion or an actual semantic/operational closure.
+
 ### 20.7 `PREV` targeting and feedback routing
 
 `PREV` asks existing upstream task sessions to continue with additional feedback:
 
 ```ts
-interface PrevOutcomeV1 {
+interface PrevOutcome {
   type: 'prev';
   feedback: unknown;
   route:
@@ -1936,7 +1966,7 @@ interface PrevOutcomeV1 {
 Targeted routing is preferred. The engine gives every task provenance-bearing inputs:
 
 ```ts
-interface WorkflowInputV1 {
+interface WorkflowInput {
   inputRef: string;
   sourceTaskId: string;       // routing metadata; topology remains engine-owned
   artifactId: string;
@@ -1946,22 +1976,20 @@ interface WorkflowInputV1 {
 ```
 
 The task names logical `inputRef` values, not parent/peer relationships or raw graph
-positions. The engine resolves those references to direct source sessions. When the
-problem is cross-cutting or its source is unknown, `all_direct_dependencies` targets
-every direct dependency. Broadcast is a fallback, not the default for known provenance.
+positions. The engine resolves those references to direct source sessions. The selected
+set, including `all_direct_dependencies`, is accepted only when it equals one PREV route
+declared by the frozen outcome contract; it is never an undeclared broad fallback.
 
 An empty/invalid selected target set fails closed and cannot silently become a broad
-broadcast. A task with no direct dependency cannot route `PREV` locally; at a workflow
-entry boundary the engine may bubble the feedback through the workflow continuation
-according to the caller's declared route, otherwise it reports a bounded routing
-failure/escalation.
+broadcast. A task with no direct dependency, including an entry node, cannot declare or
+route PREV. Child workflow boundaries likewise never infer an undeclared feedback route.
 
 ### 20.8 Feedback round and join
 
 One `PREV` atomically creates one feedback round:
 
 ```ts
-interface FeedbackRoundV1 {
+interface FeedbackRound {
   feedbackRoundId: string;
   workflowRunId: string;
   requesterTaskId: string;
@@ -1972,13 +2000,13 @@ interface FeedbackRoundV1 {
     inputRef: string;
     baseArtifact: ArtifactRef;
   }>;
-  responses: Record<string, NextOutcomeV1>; // keyed by feedbackTargetId
+  responses: Record<string, NextOutcome>; // keyed by feedbackTargetId
   status: 'open' | 'satisfied' | 'consumed' | 'failed' | 'cancelled';
   resumeTurnId?: string;
 }
 ```
 
-V1 uses an `ALL` join:
+The canonical runtime uses an `ALL` join:
 
 1. Resolve selected input references to unique source task/sessions, assign one stable
    `feedbackTargetId` to each, then persist the round, targets, feedback message, and
@@ -2048,7 +2076,7 @@ Every routed event must carry enough identity to reject cross-run, stale, and du
 delivery. The concrete envelope must include equivalents of:
 
 ```ts
-interface WorkflowMessageIdentityV1 {
+interface WorkflowMessageIdentity {
   messageId: string;
   workflowRunId: string;
   sourceTaskId: string;
@@ -2077,8 +2105,8 @@ Required transaction boundaries:
 
 Artifact revisions are immutable and pinned by each gate. A feedback update does not
 silently rewrite a prior consumed input. Only the unique requester waiting on that
-feedback round is resumed. V1 has no other consumers to notify and therefore no
-cross-branch revision cascade.
+feedback round is resumed. The frozen no-fan-out graph has no other consumers to notify
+and therefore no cross-branch revision cascade.
 
 All workflow definitions/runs, artifacts/revisions, gates/contributions, feedback
 rounds/responses, routed messages, continuations, turns, and idempotency records belong
@@ -2096,10 +2124,10 @@ Workflow outcomes are distinct from infrastructure failures:
 | `NEXT(updated)` | Relevant work produced a new revision | Contribute to named gate/round |
 | `NEXT(unchanged)` | Feedback was irrelevant or already satisfied | Satisfy named feedback target without revision mutation |
 | `PREV` | More work is required from upstream sessions | Create and await a feedback round |
-| `FAIL` | Task cannot produce the required workflow result | Apply v1 `fail_workflow`; never reinterpret as `NEXT` |
+| `FAIL` | Task cannot produce the required workflow result | Apply the frozen fail-workflow policy; never reinterpret as `NEXT` |
 | Adapter crash/timeout/interruption | Execution uncertainty or infrastructure failure | Preserve turn evidence and use existing explicit recovery policy; do not silently replay |
 
-V1 has one required fail-fast policy, `failure: 'fail_workflow'`. An upstream workflow
+The canonical runtime has one required fail-fast policy. An upstream workflow
 `FAIL`, invalid route, run timeout, exhausted feedback/turn budget, cancelled required
 target, or unrecoverable target failure atomically:
 
@@ -2118,8 +2146,8 @@ cancellation seals them `cancelled`, with `finishedAt` and
 `lifecycleAuthority: { kind: 'workflow', runId }`. Recursive child-run failure/cancellation uses the
 same rule. `PREV` remains non-terminal and may reactivate an existing node task.
 Caller/root tasks outside `workflow_nodes` remain open for their own lifecycle owner.
-There is no v1 per-edge choice to skip, continue, or guess another target. A future
-policy variant must be separately versioned.
+There is no per-edge choice to skip, continue, or guess another target. A future policy
+variant requires a separately approved contract.
 
 Cancellation closes open gates/rounds in the cancelled scope, prevents their reserved
 activations from starting, and follows the existing descendant-cascade and lifecycle
@@ -2128,35 +2156,34 @@ diagnostics or rejected idempotently; they never reopen work automatically.
 
 ### 20.12 Child-workflow invocation and return boundary
 
-V1 supports the coordinator/caller-continuation case: a currently executing task may
-create and enter one child workflow, then be resumed when that child returns. V1 does
-**not** represent an arbitrary child workflow as a static node inside another frozen
-workflow graph. General nested graph nodes with their own incoming/outgoing edges are
-a future versioned extension.
+The canonical runtime supports the coordinator/caller-continuation case: a currently
+executing task may create and enter one child workflow, then be resumed when that child
+returns. It does **not** represent an arbitrary child workflow as a static node inside
+another frozen workflow graph. General nested graph nodes with their own incoming/
+outgoing edges are a future versioned extension.
 
 Every workflow definition has one or more terminal sink tasks. A child workflow returns
 only after every terminal sink succeeds; the engine combines their reports in frozen
 topology order and sends that single result through the caller's return gate. The caller
 stages `NEXT` with a child-workflow invocation route as its mutually exclusive workflow
-disposition for the current turn. The invocation explicitly maps caller artifacts into
-child entry inputs and creates a one-result return gate for the caller:
+disposition for the current turn. Public bindings map each frozen child input `name` to
+one current-activation `fromInput`; callers never provide child node/gate coordinates.
+The transaction derives those coordinates and creates a one-result return gate:
 
 ```ts
-interface ChildWorkflowInvocationV1 {
+interface ChildWorkflowInvocation {
   invocationId: string;
   callerTaskId: string;
   callerTurnId: string;
   callerWorkflowRunId?: string;
-  childDefinitionId: string;
-  childDefinitionVersion: number;
+  childWorkflowRef: string;
   entryBindings: Array<{
-    callerArtifact: ArtifactRef;
-    childEntryTaskId: string;
-    childInputRef: string;
+    name: string;
+    fromInput: string;
   }>;
 }
 
-interface WorkflowContinuationV1 {
+interface WorkflowContinuation {
   continuationId: string;
   invocationId: string;
   callerTaskId: string;
@@ -2169,13 +2196,14 @@ interface WorkflowContinuationV1 {
 }
 ```
 
-On successful caller-turn settlement, one repository transaction validates every
-entry binding against the frozen child definition, persists the child run and unique
-continuation, creates all child gates, contributes the pinned caller artifacts, and
-inserts queued turns for child entry gates that are satisfied. A missing, duplicate,
-or type-incompatible entry binding fails the caller disposition without partially
-starting the child. The caller then has no live process; its durable return gate is the
-wait state.
+On successful caller-turn settlement, one repository transaction validates exact child
+input-name coverage against the frozen definition, verifies every `fromInput` against
+the live parent activation's pinned provenance, adapts it to the declared child semantic
+kind, persists the child run and unique continuation, creates all child gates,
+contributes the pinned values, and inserts queued turns for satisfied child entry gates.
+A missing, duplicate, unknown, foreign, or type-incompatible binding fails without
+partially starting the child. The caller then has no live process; its durable return
+gate is the wait state.
 
 Invocation validation also requires that the caller has no configured downstream
 consumer, no open feedback round, and no pending child continuation. While the child
@@ -2190,7 +2218,7 @@ become competing feedback authorities for the caller session.
   inserts one aggregate return message plus one queued caller turn.
 - The caller resumes only from that aggregate return message. If it belongs to another
   workflow, it may then emit its own `NEXT` or `PREV` through that workflow normally.
-- Entry-boundary `PREV` never bubbles to the caller in v1; §20.11 fail-fast handling
+- Entry-boundary `PREV` never bubbles to the caller; §20.11 fail-fast handling
   applies.
 - Resolution and consumption are idempotent; reload can distinguish an unresolved,
   resolved-but-not-consumed, consumed, failed, or cancelled continuation. A failed or
@@ -2234,7 +2262,7 @@ Operationally:
 7. Verifier terminal `NEXT` completes the workflow and satisfies the coordinator's
    continuation gate. Only then does the coordinator receive one aggregate resume turn.
 
-### 20.14 Explicit v1 exclusions and future extensions
+### 20.14 Explicit canonical exclusions and future extensions
 
 The base contract intentionally excludes:
 

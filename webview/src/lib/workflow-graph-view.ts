@@ -11,12 +11,15 @@ import type {
 
 export interface WorkflowGraphNodeView {
   id: string;
+  title?: string;
   status: WorkflowGraphWireGraph["nodes"][number]["displayState"];
   statusLabel: string;
   reused: boolean;
   active: boolean;
   provenanceLabel: string;
   reasonLabel?: string;
+  decisionGateLabel?: string;
+  decisionLabel?: string;
 }
 
 export interface WorkflowGraphEdgeView {
@@ -152,6 +155,16 @@ export function workflowGraphNodeTone(status: WorkflowGraphWireGraph["nodes"][nu
   return "neutral";
 }
 
+export function workflowGraphDecisionLabel(
+  decision: NonNullable<WorkflowGraphWireGraph["nodes"][number]["decision"]>,
+): string {
+  const attempt = `attempt ${decision.attempt} of ${decision.maxAttempts}`;
+  if (decision.status === "waiting") return `Waiting for workflow decision · ${attempt}`;
+  if (decision.status === "correcting") return `Correcting workflow route · ${attempt}`;
+  if (decision.status === "decided") return `Workflow route decided · ${attempt}`;
+  return `Workflow decision failed · ${attempt}`;
+}
+
 function plural(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? "" : "s"}`;
 }
@@ -250,12 +263,17 @@ export function buildWorkflowGraphPanelView(
     runId: graph.runId,
     nodes: graph.nodes.map((node) => ({
       id: node.nodeId,
+      ...(node.title ? { title: node.title } : {}),
       status: node.displayState,
       statusLabel: workflowGraphStatusLabel(node.displayState),
       reused: node.reused,
       active: activeNodeIds.has(node.nodeId),
       provenanceLabel: node.reused ? "Supplied from a prior result" : "",
       ...(node.reason ? { reasonLabel: NODE_REASON_LABELS[node.reason] } : {}),
+      ...(node.decisionGate
+        ? { decisionGateLabel: node.decisionGate === "required" ? "Decision required" : "Decision optional" }
+        : {}),
+      ...(node.decision ? { decisionLabel: workflowGraphDecisionLabel(node.decision) } : {}),
     })),
     edges: graph.edges.map((edge) => ({
       fromNodeId: edge.fromNodeId,

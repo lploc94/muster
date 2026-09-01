@@ -1960,6 +1960,10 @@ test('file mention autocomplete keyboard mouse IME and caret interactions', asyn
   const tabListbox = page.getByRole('listbox', { name: 'File mention suggestions' });
   await expect(tabListbox).toBeVisible();
   await focusFileMentionOption(composer, 1);
+  await expect(tabListbox.getByRole('option', { name: 'table.md' })).toHaveAttribute(
+    'aria-selected',
+    'true',
+  );
   await composer.press('Tab');
   await expect(tabListbox).toHaveCount(0);
   await expect(composer).toHaveValue('Pick @table.md ');
@@ -11285,11 +11289,15 @@ test.describe('M019 S05 Assembled First Run', () => {
         runId: 'run-m024-s05',
         runStatus: 'running',
         nodes: [
-          { nodeId: 'node-1', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
-          { nodeId: 'node-2', workflowNodeStatus: 'succeeded', executionActivity: 'completed', displayState: 'completed', progressBucket: 'completed', reused: false },
-          { nodeId: 'node-3', workflowNodeStatus: 'active', executionActivity: 'executing', displayState: 'executing', progressBucket: 'executing', reused: false },
-          { nodeId: 'node-4', workflowNodeStatus: 'active', executionActivity: 'executing', displayState: 'executing', progressBucket: 'executing', reused: false },
-          { nodeId: 'node-5', workflowNodeStatus: 'pending', executionActivity: 'none', displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs', reused: false },
+          { nodeId: 'node-1', title: 'Prior result', workflowNodeStatus: 'reused', executionActivity: 'none', displayState: 'reused', progressBucket: 'completed', reused: true },
+          { nodeId: 'node-2', title: 'Completed source', workflowNodeStatus: 'succeeded', executionActivity: 'completed', displayState: 'completed', progressBucket: 'completed', reused: false },
+          {
+            nodeId: 'node-3', title: 'Route correction', workflowNodeStatus: 'active', executionActivity: 'executing',
+            displayState: 'executing', progressBucket: 'executing', reused: false,
+            decisionGate: 'required', decision: { status: 'correcting', attempt: 2, maxAttempts: 3 },
+          },
+          { nodeId: 'node-4', title: 'Parallel execution', workflowNodeStatus: 'active', executionActivity: 'executing', displayState: 'executing', progressBucket: 'executing', reused: false },
+          { nodeId: 'node-5', title: 'Feedback join', workflowNodeStatus: 'pending', executionActivity: 'none', displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs', reused: false },
         ],
         edges: [
           { fromNodeId: 'node-1', toNodeId: 'node-5', inputRef: 'reuse_result', contributionState: 'supplied_reused', reused: true },
@@ -11352,6 +11360,10 @@ test.describe('M019 S05 Assembled First Run', () => {
     await expect(modal).toContainText('1 reused node · 1 reused edge');
     await expect(modal.locator('.workflow-modal__legend-item.is-active')).toHaveCount(2);
     await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-5"]')).toContainText('Blocked');
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-3"]')).toContainText('Route correction');
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-3"]')).toContainText('Decision required');
+    await expect(modal.locator('.workflow-modal__legend-item[data-node-id="node-3"]')).toContainText('Correcting workflow route · attempt 2 of 3');
+    await expect(canvas.locator('[data-node-id="node-3"]')).toHaveAttribute('aria-label', /Route correction.*Correcting workflow route.*attempt 2 of 3/);
     await expect(modal.getByTestId('workflow-progress-summary')).toContainText('2 of 5 completed · 2 executing · 1 blocked');
     await expect(modal.getByTestId('workflow-frontier-summary')).toContainText('Frontier: node-3, node-4, node-5');
     await expect(modal.locator('[data-gate-id]')).toHaveCount(5);
@@ -11515,7 +11527,7 @@ test.describe('Workflow catalog surface', () => {
     name: 'Release notes',
     description: 'Draft release notes',
     scope: 'global',
-    packageKind: 'file',
+    packageKind: 'bundle',
   } as const;
 
   type CatalogRequest = {
@@ -11562,7 +11574,7 @@ test.describe('Workflow catalog surface', () => {
         reason: 'initial',
         workflows: [workspaceEntry, globalEntry],
         diagnostics: [{
-          file: 'messy.md',
+          file: 'messy',
           code: 'invalid_workflow_file',
           message: 'missing name',
         }],
@@ -11644,7 +11656,7 @@ test.describe('Workflow catalog surface', () => {
             name: 'Deploy',
             description: 'Ship the current build',
             scope: 'workspace',
-            packageKind: 'file',
+            packageKind: 'bundle',
           },
         ],
         diagnostics: [],
@@ -11705,7 +11717,7 @@ test.describe('Workflow catalog surface', () => {
         reason: 'initial',
         workflows: [],
         diagnostics: [{
-          file: 'broken.md',
+          file: 'broken',
           code: 'invalid_workflow_file',
           message: 'missing name',
         }],
