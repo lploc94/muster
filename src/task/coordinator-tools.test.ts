@@ -65,6 +65,12 @@ function canonicalManifest(): WorkflowManifestFixture {
         taskType: 'research',
         title: 'Research',
         instructions: { inline: 'Inspect the request and report evidence.' },
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The research evidence is ready.' },
+          fail: { when: 'The request cannot be researched.' },
+        },
       },
       {
         nodeKey: 'review',
@@ -72,8 +78,9 @@ function canonicalManifest(): WorkflowManifestFixture {
         title: 'Review',
         outcome: {
           kind: 'agent',
-          requireExplicitDisposition: false,
+          requireExplicitDisposition: true,
           next: { when: 'The review is complete.' },
+          fail: { when: 'Verification cannot be completed.' },
         },
       },
     ],
@@ -1652,7 +1659,7 @@ describe('workflow_next tool surface', () => {
     });
   });
 
-  it('maps workflow_fail with optional reason', () => {
+  it('requires a bounded workflow_fail reason', () => {
     expect(
       dispatch(
         'workflow_fail',
@@ -1660,13 +1667,14 @@ describe('workflow_next tool surface', () => {
         ctx(['workflow_fail']),
       ),
     ).toEqual({
-      ok: true,
-      command: { kind: 'workflow_fail', opId: 'op-f' },
+      ok: false,
+      toolError: 'reason is required',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
     });
     expect(
       dispatch(
         'workflow_fail',
-        { opId: 'op-f', reason: 'cannot continue' },
+        { opId: 'op-f', reason: '  cannot continue  ' },
         ctx(['workflow_fail']),
       ),
     ).toEqual({
@@ -1685,6 +1693,17 @@ describe('workflow_next tool surface', () => {
     ).toEqual({
       ok: false,
       toolError: 'reason must be a non-empty string when provided',
+      invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
+    });
+    expect(
+      dispatch(
+        'workflow_fail',
+        { opId: 'op-f', reason: '   ' },
+        ctx(['workflow_fail']),
+      ),
+    ).toEqual({
+      ok: false,
+      toolError: 'reason is required',
       invalidWorkflowAttempt: invalidWorkflowAttempt('workflow_fail'),
     });
     expect(

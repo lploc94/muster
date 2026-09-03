@@ -143,6 +143,7 @@ const validFixture = {
   'src/extension.ts': "import * as vscode from 'vscode';\nimport { makeBackend } from './backends/index';\nwebview.postMessage({ type: 'done' });\n",
   'src/backends/claude.ts': "import { spawn } from 'child_process';\nimport { Backend, NormalizedEvent, RunOptions } from '../types';\nspawn('claude', []);\nyield { type: 'turnCompleted' };\n",
   'src/runner.ts': "import { Backend, NormalizedEvent, RunOptions } from './types';\nexport async function* runTurn(backend: Backend, options: RunOptions): AsyncIterable<NormalizedEvent> { yield* backend.run(options); }\n",
+  'src/task/brief.ts': 'export function formatWorkflowAgentOutcomeContract() {}\n',
   'src/bridge/server.ts': 'export const publicWorkflowTools = [];\n',
   'src/task/capabilities.ts': 'export const workflowMutationActions = new Set();\n',
   'src/task/coordinator-tools.ts': 'export function dispatch() {}\n',
@@ -192,6 +193,25 @@ test('rejects retired nested-workflow execution paths in active surfaces', async
     assert.match(result.failures.join('\n'), /invoke_child_workflow/);
     assert.match(result.failures.join('\n'), /child_workflow/);
     assert.match(result.failures.join('\n'), /planWorkflowChildInvocation/);
+  });
+});
+
+test('rejects retired implicit-NEXT synthesis paths in active surfaces', async () => {
+  const fixture = {
+    ...validFixture,
+    'src/task/brief.ts': 'A clean original attempt may omit a disposition and use its final response as NEXT.\n',
+    'src/task/engine.ts': "await executeToolCommand(graphDeps, ctx, { kind: 'workflow_next', opId: 'engine-implicit-workflow-next' });\n",
+    'src/task/repository.ts': `${validFixture['src/task/repository.ts']}\nconst mode = 'implicit_next';\n`,
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /src\/task\/brief\.ts/);
+    assert.match(result.failures.join('\n'), /src\/task\/engine\.ts/);
+    assert.match(result.failures.join('\n'), /src\/task\/repository\.ts/);
+    assert.match(result.failures.join('\n'), /implicit-NEXT/);
   });
 });
 

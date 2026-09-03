@@ -507,10 +507,13 @@ export function projectTaskSummary(
   const latestTurn = [...turns].sort((a, b) => b.sequence - a.sequence)[0];
   const timedOut =
     latestTurn?.termination?.kind === 'run_timeout' ? latestTurn : undefined;
-  const timeoutLabel = timedOut?.termination
-    ? timedOut.termination.limitMs >= 60 * 60_000 && timedOut.termination.limitMs % (60 * 60_000) === 0
-      ? `${timedOut.termination.limitMs / (60 * 60_000)}-hour`
-      : `${Math.max(1, Math.round(timedOut.termination.limitMs / 60_000))}-minute`
+  const timeoutTermination = timedOut?.termination?.kind === 'run_timeout'
+    ? timedOut.termination
+    : undefined;
+  const timeoutLabel = timeoutTermination
+    ? timeoutTermination.limitMs >= 60 * 60_000 && timeoutTermination.limitMs % (60 * 60_000) === 0
+      ? `${timeoutTermination.limitMs / (60 * 60_000)}-hour`
+      : `${Math.max(1, Math.round(timeoutTermination.limitMs / 60_000))}-minute`
     : undefined;
   return {
     id: task.id,

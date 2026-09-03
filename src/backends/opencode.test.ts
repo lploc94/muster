@@ -309,6 +309,15 @@ describe('OpenCodeBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({ type: 'error', message: 'OpenCode stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
+  it('preserves typed refusal metadata for workflow settlement', async () => {
+    const events = await runTurn(new OpenCodeBackend(), options(), fake, { result: { stopReason: 'refusal' } });
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'OpenCode stopped: refusal',
+      meta: { failureClass: 'terminal_received', stopReason: 'refusal' },
+    });
+  });
+
   it('max_turn_requests is a failure stopReason for OpenCode -> error WITHOUT meta', async () => {
     const events = await runTurn(new OpenCodeBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },

@@ -337,6 +337,15 @@ describe('KiroBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({ type: 'error', message: 'Kiro stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
+  it('preserves typed refusal metadata for workflow settlement', async () => {
+    const events = await runTurn(new KiroBackend(), options(), fake, { result: { stopReason: 'refusal' } });
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'Kiro stopped: refusal',
+      meta: { failureClass: 'terminal_received', stopReason: 'refusal' },
+    });
+  });
+
   it('drift #1: max_turn_requests is a failure stopReason for Kiro -> error WITHOUT meta', async () => {
     const events = await runTurn(new KiroBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },

@@ -159,6 +159,19 @@ type SuccessfulTurnSettlement =
   | { status: 'missing_session' }
   | { status: 'failed'; reason: string };
 
+type WorkflowTurnDisposition = Extract<
+  TurnDisposition,
+  { kind: 'workflow_next' | 'workflow_prev' | 'workflow_fail' }
+>;
+
+function isWorkflowTurnDisposition(
+  disposition: TurnDisposition | undefined,
+): disposition is WorkflowTurnDisposition {
+  return disposition?.kind === 'workflow_next'
+    || disposition?.kind === 'workflow_prev'
+    || disposition?.kind === 'workflow_fail';
+}
+
 export interface DispositionLimits {
   maxResult: number;
   maxError: number;
@@ -5668,6 +5681,101 @@ export class TaskEngine {
             } else {
               const terminalReceived = event.meta?.failureClass === 'terminal_received';
               const mcpSetupExhausted = event.meta?.mcpSetupCode === 'attempts_exhausted';
+              // Phase 2: typed ACP refusal on a live workflow agent activation
+              // with no winning staged disposition closes the run immediately
+              // as agent_fail. Any valid staged workflow claim (including PREV
+              // and FAIL) must instead take the normal successful-disposition
+              // path; the repository keeps the final claim/settlement race
+              // atomic.
+              if (event.meta?.stopReason === 'refusal' && !mcpSetupExhausted) {
+                const refusalSource = await this.loadTurnAggregate(turnId);
+                const refusalTurn = refusalSource?.turns[turnId];
+                if (
+                  refusalTurn?.workflowActivation &&
+                  isWorkflowTurnDisposition(refusalTurn.disposition)
+                ) {
+                  // A claim visible before the refusal event is the winner.
+                  // Settle it through the ordinary successful-disposition path;
+                  // do not first arm backend_refusal, since the repository's
+                  // atomic refusal guard must remain reserved for the losing
+                  // failure settlement.
+                  const successOutcome = await this.settleSuccess(
+                    turnId,
+                    observedSessionId,
+                    rawOutput,
+                    backend,
+                  );
+                  if (successOutcome.status === 'settled') {
+                    terminalSettled = true;
+                    workflowRouteSettled = true;
+                    this.safeEmit({ type: 'turnDone', taskId: turn.taskId, turnId });
+                  }
+                  break;
+                }
+                if (
+                  refusalTurn?.workflowActivation &&
+                  !refusalTurn.disposition
+                ) {
+                  const refusalReportId = Object.values(refusalSource?.messages ?? {})
+                    .filter((message) =>
+                      message.turnId === turnId &&
+                      message.role === 'assistant' &&
+                      message.content.trim().length > 0,
+                    )
+                    .sort((a, b) =>
+                      (a.order ?? Number.MIN_SAFE_INTEGER) - (b.order ?? Number.MIN_SAFE_INTEGER) ||
+                      a.createdAt.localeCompare(b.createdAt) ||
+                      a.id.localeCompare(b.id),
+                    )
+                    .at(-1)?.id;
+                  // The replacement can lose a race when the turn is
+                  // superseded or a staged disposition settles first. Only
+                  // proceed when the durable turn carries backend_refusal;
+                  // otherwise the winner owns the turn and no generic
+                  // failure may be recorded.
+                  let refusalArmed = false;
+                  try {
+                    const replacement = await this.replaceLiveTurn(turnId, (current) => ({
+                      ...current,
+                      termination: {
+                        kind: 'backend_refusal' as const,
+                        ...(refusalReportId !== undefined ? { responseMessageId: refusalReportId } : {}),
+                      },
+                    }));
+                    if (replacement.ok) {
+                      const durable = await this.repository.getTurn(turnId).catch(() => undefined);
+                      refusalArmed = durable?.termination?.kind === 'backend_refusal';
+                    }
+                  } catch {
+                    refusalArmed = false;
+                  }
+                  if (!refusalArmed) {
+                    break;
+                  }
+                  const preFlush = await this.streamBatcher.flushTurn(turnId);
+                  if (!preFlush.ok) {
+                    await markStreamPersistenceFailure(preFlush.message);
+                    break;
+                  }
+                  terminalSettled = await this.settleFailed(
+                    turnId,
+                    event.message,
+                    observedSessionId,
+                    rawOutput,
+                    backend,
+                    {
+                      terminalReceived: true,
+                      failureClass: 'terminal_received',
+                      suppressAutoRetry: true,
+                      suppressRuntimeFallback: true,
+                    },
+                  );
+                  if (terminalSettled) {
+                    this.emitFailureSettlement(turn.taskId, turnId, event.message);
+                  }
+                  break;
+                }
+              }
               const livePhase = this.store.getFile().turns[turnId]?.dispatchPhase;
               const failureClass =
                 terminalReceived
@@ -6011,73 +6119,6 @@ export class TaskEngine {
         let missingSession = false;
         let source = await this.loadTurnAggregate(turnId);
       if (!source) return { status: 'failed', reason: 'turn settlement state not found' };
-      const liveTurn = source.turns[turnId];
-      const workflowDecision = liveTurn?.workflowActivation?.decision;
-      const implicitWorkflowNextEligible =
-        workflowDecision === undefined ||
-        (
-          workflowDecision.outcome.requireExplicitDisposition === false &&
-          workflowDecision.attempt === 1 &&
-          workflowDecision.invalidEvidence === false &&
-          workflowDecision.repairStatus === undefined
-        );
-      if (
-        liveTurn?.workflowActivation &&
-        !liveTurn.disposition &&
-        implicitWorkflowNextEligible
-      ) {
-        const finalAssistantMessage = Object.values(source.messages)
-          .filter((message) =>
-            message.turnId === turnId &&
-            message.role === 'assistant' &&
-            message.content.trim().length > 0,
-          )
-          .sort((a, b) =>
-            (a.order ?? Number.MIN_SAFE_INTEGER) - (b.order ?? Number.MIN_SAFE_INTEGER) ||
-            a.createdAt.localeCompare(b.createdAt) ||
-            a.id.localeCompare(b.id),
-          )
-          .at(-1)
-          ?.content.trim();
-        const result = finalAssistantMessage;
-        if (!result) {
-          return { status: 'failed', reason: 'workflow activation ended without a final assistant message' };
-        }
-        let rootId = liveTurn.taskId;
-        const seen = new Set<string>();
-        while (source.tasks[rootId]?.parentId && !seen.has(rootId)) {
-          seen.add(rootId);
-          rootId = source.tasks[rootId]!.parentId!;
-        }
-        const implicitNext = await executeToolCommand(
-          this.graphDeps(),
-          {
-            callerTaskId: liveTurn.taskId,
-            turnId,
-            rootId,
-            allowedActions: new Set(['workflow_next']),
-          },
-          {
-            kind: 'workflow_next',
-            opId: 'engine-implicit-workflow-next',
-            change: 'updated',
-            message: result,
-          },
-        );
-        source = await this.loadTurnAggregate(turnId);
-        if (!source) return { status: 'failed', reason: 'turn settlement state not found' };
-        if (!implicitNext.ok && !source.turns[turnId]?.disposition) {
-          this.logLifecycle('workflow.implicit_next.failed', {
-            taskId: liveTurn.taskId,
-            turnId,
-            error: implicitNext.error,
-          }, 'error');
-          return {
-            status: 'failed',
-            reason: `implicit workflow_next failed: ${implicitNext.error}`,
-          };
-        }
-      }
       const before = cloneEngineProjection(source);
       const draft = cloneEngineProjection(before);
       const prepared = (() => {

@@ -14,6 +14,7 @@ const SOURCE_FILES = [
   'src/backends/claude.ts',
   'src/bridge/server.ts',
   'src/runner.ts',
+  'src/task/brief.ts',
   'src/task/capabilities.ts',
   'src/task/coordinator-tools.ts',
   'src/task/engine-graph.ts',
@@ -51,6 +52,22 @@ const RETIRED_CHILD_RUN_SYMBOLS = [
   'listWorkflowChildRuns',
   'readWorkflowChildRun',
   'startWorkflowChildRun',
+];
+
+// Phase 2: agent implicit-NEXT synthesis and optional-disposition prompt
+// branches are retired. Text-only completions must enter bounded decision
+// repair; refusal is never classified from assistant prose.
+const RETIRED_IMPLICIT_NEXT_TOKENS = [
+  'engine-implicit-workflow-next',
+  'implicit_next',
+  'may omit a disposition and use its final response as NEXT',
+  'clean optional workflow decision requires implicit NEXT',
+];
+
+const FAIL_CLOSED_BOUNDARY_FILES = [
+  'src/task/brief.ts',
+  'src/task/engine.ts',
+  'src/task/repository.ts',
 ];
 
 const FORBIDDEN_LIVE_CLAIMS = [
@@ -426,6 +443,20 @@ function expectWorkflowRootBoundary(textFiles, failures) {
   }
 }
 
+function expectWorkflowFailClosed(textFiles, failures) {
+  for (const relativePath of FAIL_CLOSED_BOUNDARY_FILES) {
+    const text = textFiles.get(relativePath);
+    if (text === undefined) continue;
+    for (const token of RETIRED_IMPLICIT_NEXT_TOKENS) {
+      if (text.includes(token)) {
+        failures.push(
+          `Expected ${displayPath(relativePath)} to exclude retired implicit-NEXT token '${token}'.`,
+        );
+      }
+    }
+  }
+}
+
 export async function runSourceBoundarySmoke(options = {}) {
   const rootDir = options.rootDir ?? process.cwd();
   const failures = [];
@@ -563,6 +594,9 @@ export async function runSourceBoundarySmoke(options = {}) {
 
   expectWorkflowRootBoundary(textFiles, failures);
   checked.push('root-only workflow orchestration boundary');
+
+  expectWorkflowFailClosed(textFiles, failures);
+  checked.push('fail-closed agent outcome boundary');
 
   for (const [relativePath, text] of textFiles.entries()) {
     if (text === undefined) continue;

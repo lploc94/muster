@@ -1455,6 +1455,14 @@ export function stageDisposition(
     : undefined;
   if (limitViolation) return { ok: false, reason: limitViolation };
 
+  // Phase 2: workflow_fail requires a nonblank outer-trimmed reason.
+  if (disposition.kind === 'workflow_fail') {
+    const reason = (disposition as { reason?: unknown }).reason;
+    if (typeof reason !== 'string' || reason.trim().length === 0) {
+      return { ok: false, reason: 'reason is required' };
+    }
+  }
+
   if (!turn.disposition) {
     return {
       ok: true,

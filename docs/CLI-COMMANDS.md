@@ -99,7 +99,11 @@ grok --no-auto-update agent stdio   # JSON-RPC 2.0, newline-delimited stdin/stdo
 | `user_message_chunk`, `available_commands_update` | ignored |
 | other | `raw` |
 
-`stopReason` observed: `end_turn` (success), `cancelled` (cancellation). Map `refusal` / `error` / `max_tokens` to adapter `error`.
+`stopReason` observed: `end_turn` (normal completion), `cancelled` (cancellation),
+and `refusal` (typed refusal). Preserve `refusal` as typed terminal metadata;
+`error` and `max_tokens` remain adapter error paths. Workflow handling decides
+whether typed refusal closes the activation; it is never inferred from assistant
+text.
 
 ### MCP injection (ACP)
 

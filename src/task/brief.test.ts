@@ -413,6 +413,8 @@ describe('assembleFirstTurnPrompt', () => {
     expect(() => formatWorkflowAgentOutcomeContract({
       kind: 'agent',
       requireExplicitDisposition: true,
+      next: { when: 'A valid result is ready.' },
+      fail: { when: 'A valid result cannot be produced.' },
       prev: Array.from({ length: 128 }, (_, index) => ({
         when: `${index}:`.padEnd(4_096, 'x'),
         targets: [`input${index}`],

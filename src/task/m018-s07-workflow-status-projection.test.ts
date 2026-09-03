@@ -285,7 +285,15 @@ describe('M018 S07 bounded workflow status projection', () => {
           kind: 'workflow',
           inputs: [],
           outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-          nodes: [{ nodeId: 'entry' }],
+          nodes: [{
+            nodeId: 'entry',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
+            },
+          }],
           edges: [],
         },
         createdAt: childCreatedAt,
@@ -1092,14 +1100,19 @@ describe('M018 S07 bounded workflow status projection', () => {
           {
             nodeId: 'p1', workflowNodeStatus: 'active', executionActivity: 'queued',
             displayState: 'queued', progressBucket: 'queued',
+            decisionGate: 'required',
+            decision: { status: 'waiting', attempt: 1, maxAttempts: 3 },
           },
           {
             nodeId: 'p2', workflowNodeStatus: 'active', executionActivity: 'queued',
             displayState: 'queued', progressBucket: 'queued',
+            decisionGate: 'required',
+            decision: { status: 'waiting', attempt: 1, maxAttempts: 3 },
           },
           {
             nodeId: 'consumer', workflowNodeStatus: 'pending', executionActivity: 'none',
             displayState: 'blocked', progressBucket: 'blocked', reason: 'waiting_for_inputs',
+            decisionGate: 'required',
           },
         ]),
         edges: expect.arrayContaining([

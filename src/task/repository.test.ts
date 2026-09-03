@@ -218,8 +218,9 @@ function canonicalStorageFixture(definitionId = 'wf-canonical-storage') {
         model: 'gpt-5',
         outcome: {
           kind: 'agent',
-          requireExplicitDisposition: false,
+          requireExplicitDisposition: true,
           next: { when: 'The right branch result is ready.' },
+          fail: { when: 'The right branch cannot be produced.' },
         },
       },
       {
@@ -258,6 +259,7 @@ function canonicalStorageFixture(definitionId = 'wf-canonical-storage') {
           kind: 'agent',
           requireExplicitDisposition: true,
           next: { when: 'Publication is complete.' },
+          fail: { when: 'Publication cannot be completed.' },
         },
       },
       {
@@ -3137,6 +3139,7 @@ describe('SqliteTaskRepository', () => {
                 kind: 'agent',
                 requireExplicitDisposition: true,
                 next: { when: 'The producer result is ready.' },
+                fail: { when: 'The producer cannot be completed.' },
               },
             },
             {
@@ -3150,6 +3153,7 @@ describe('SqliteTaskRepository', () => {
                 kind: 'agent',
                 requireExplicitDisposition: true,
                 next: { when: 'The consumer result is ready.' },
+                fail: { when: 'The consumer cannot be completed.' },
                 prev: [{
                   when: 'The producer result needs correction.',
                   targets: ['producer_result'],
@@ -3470,6 +3474,12 @@ describe('SqliteTaskRepository', () => {
               content: instructions,
               sha256: sha256(instructions),
             },
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The entry result is ready.' },
+              fail: { when: 'The entry cannot be completed.' },
+            },
           }],
           edges: [],
         },
@@ -3662,6 +3672,7 @@ describe('SqliteTaskRepository', () => {
         relatedTurns: [],
         messages: [],
       });
+      console.log('settle workflow_fail', JSON.stringify(settle));
       expect(settle.ok).toBe(true);
       expect(settle.changed).toBe(true);
 
@@ -3669,6 +3680,7 @@ describe('SqliteTaskRepository', () => {
         'SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?',
         ['ws', data.runId],
       );
+      console.log('runRows', runRows);
       expect(runRows[0]?.status).toBe('failed');
 
       const after = await repository.getTask(data.entryTaskId);
@@ -3735,7 +3747,7 @@ describe('SqliteTaskRepository', () => {
       const turn = await repository.getTurn(data.activationTurnId);
       expect(task).toBeTruthy();
       expect(turn).toBeTruthy();
-      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const };
+      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const, note: 'invalid feedback' };
       await stageDispositionForSettlement(repository, turn!, disposition);
 
       const settle = await repository.execute({

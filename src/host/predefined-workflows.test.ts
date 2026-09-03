@@ -32,7 +32,7 @@ function manifest(
   description = 'A canonical workflow',
   overrides: Record<string, unknown> = {},
 ): Record<string, unknown> {
-  return {
+  const base: Record<string, unknown> = {
     schema: 'muster.workflow/v2',
     name,
     description,
@@ -43,10 +43,31 @@ function manifest(
       taskType: 'review',
       title: 'Display title only',
       instructions: { file: 'prompts/check.md' },
+      outcome: {
+        kind: 'agent',
+        requireExplicitDisposition: true,
+        next: { when: 'The check is complete.' },
+        fail: { when: 'The check cannot be completed.' },
+      },
     }],
     edges: [],
     ...overrides,
   };
+  const defaultOutcome = {
+    kind: 'agent',
+    requireExplicitDisposition: true,
+    next: { when: 'The check is complete.' },
+    fail: { when: 'The check cannot be completed.' },
+  };
+  if (Array.isArray(base.nodes)) {
+    base.nodes = (base.nodes as Record<string, unknown>[]).map((node) => {
+      if (node && typeof node === 'object' && !('outcome' in node) && !('script' in node)) {
+        return { ...node, outcome: defaultOutcome };
+      }
+      return node;
+    });
+  }
+  return base;
 }
 
 function writePackage(

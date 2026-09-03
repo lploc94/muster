@@ -235,7 +235,7 @@ async function settleSucceeded(
   taskId: string,
   turnId: string,
   disposition:
-    | { kind: 'workflow_fail'; reason?: string }
+    | { kind: 'workflow_fail'; reason: string }
     | { kind: 'workflow_prev'; targets: 'all' | string[]; note?: string }
     | { kind: 'workflow_next'; change: 'updated' | 'unchanged'; result?: string },
   finishedAt: string,
@@ -285,7 +285,7 @@ async function settleWithTimeout(
       ...turn!,
       status: 'failed',
       finishedAt,
-      termination: { kind: 'run_timeout' },
+      termination: { kind: 'run_timeout', limitMs: 1000, deadlineAt: finishedAt },
     },
     expectedStatuses: ['running'],
     relatedTurns: [],
@@ -315,6 +315,95 @@ async function roundStatuses(client: DbClient, runId: string): Promise<string[]>
     ['ws', runId],
   );
   return rows.map((r) => r.status);
+}
+
+type RefusalRaceDisposition =
+  | { kind: 'workflow_fail'; reason: string }
+  | { kind: 'workflow_prev'; targets: 'all' | string[]; note?: string };
+
+/**
+ * Drive the actual engine error-event path after staging a workflow disposition.
+ * The generator remains blocked after the refusal so any feedback turns queued
+ * by PREV cannot start before the assertions inspect the winning settlement.
+ */
+async function runEngineRefusalRace(
+  opened: Opened,
+  taskId: string,
+  turnId: string,
+  disposition: RefusalRaceDisposition,
+  settled: () => Promise<boolean>,
+): Promise<void> {
+  let engine: TaskEngine | undefined;
+  let release: (() => void) | undefined;
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let invokedResolve: (() => void) | undefined;
+  let invokedReject: ((error: unknown) => void) | undefined;
+  let firstInvocation = true;
+  const invoked = new Promise<void>((resolve, reject) => {
+    invokedResolve = resolve;
+    invokedReject = reject;
+  });
+  try {
+    engine = await TaskEngine.loadAsync({
+      repository: opened.repository,
+      workspaceId: 'ws',
+      clock: () => '2026-07-20T00:00:01.000Z',
+      makeBackend: (name) => ({
+        name,
+        capabilities: {
+          supportsMCP: false,
+          supportsReasoning: false,
+          supportsDetailedToolEvents: false,
+        },
+        run: async function* () {},
+      }),
+      runTurn: async function* (backend, options) {
+        void backend;
+        // PREV queues target turns immediately. Keep any subsequent adapter
+        // invocation behind the same test barrier so it cannot obscure the
+        // settlement under test.
+        if (!firstInvocation) {
+          await held;
+          return;
+        }
+        firstInvocation = false;
+        try {
+          if (options.input.kind !== 'agent') throw new Error('expected agent input');
+          const current = await opened.repository.getTurn(turnId);
+          if (!current) throw new Error('refusal race turn disappeared');
+          const staged = await stageDispositionForSettlement(
+            opened.repository,
+            current,
+            disposition,
+            `refusal-race:${disposition.kind}:${turnId}`,
+          );
+          if (!staged.changed) {
+            throw new Error(`failed to stage refusal race disposition: ${staged.reason ?? 'unknown'}`);
+          }
+          invokedResolve?.();
+          yield {
+            type: 'error',
+            message: 'backend refused the request',
+            meta: { failureClass: 'terminal_received', stopReason: 'refusal' },
+          };
+          await held;
+        } catch (error) {
+          invokedReject?.(error);
+          throw error;
+        }
+      },
+    });
+
+    await invoked;
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (await settled()) break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(await settled()).toBe(true);
+  } finally {
+    release?.();
+    await engine?.shutdown().catch(() => undefined);
+  }
 }
 
 async function cancelRequestsForRun(
@@ -397,6 +486,24 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       });
       expect(after?.attention).toBeUndefined();
 
+      // Phase 2: the closure envelope carries the exact bounded tool
+      // reason plus semantic node identity; a racing late closure cannot
+      // replace either code or report.
+      const closure = await opened.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', data.runId],
+      );
+      expect(JSON.parse(closure!.body_json)).toMatchObject({
+        kind: 'run_closure', schema: 1,
+        reasonCode: 'agent_fail', terminalStatus: 'failed',
+        detail: {
+          schema: 1, code: 'agent_fail', source: 'workflow_fail',
+          nodeKey: 'entry',
+          report: { text: 'agent gave up', truncated: false },
+        },
+      });
+
       // Double-close via a second turn on the same task is a no-op for run/task status.
       const secondTurnId = `${data.activationTurnId}-2`;
       const secondSeq = await nextTurnSequence(opened.client, data.entryTaskId);
@@ -430,6 +537,245 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
     }
   }, 30_000);
 
+  it('typed backend refusal closes the run immediately with the persisted assistant report', async () => {
+    const opened = await openRepo('refusal');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const finishedAt = '2026-07-20T00:00:01.000Z';
+      const data = await defineAndStartOneNode(
+        opened.repository,
+        createdAt,
+        's05-refusal-1',
+        'wf-s05-refusal',
+      );
+      await promoteRunning(opened.client, data.activationTurnId, createdAt);
+      await opened.client.run(
+        `INSERT INTO messages (
+           id, workspace_id, task_id, turn_id, role, state, ordering,
+           content, created_at, payload_json
+         ) VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [
+          `${data.activationTurnId}-assistant-1`, 'ws', data.entryTaskId,
+          data.activationTurnId, 'assistant', 'completed', 1,
+          'I cannot help with that request.', finishedAt, '{"payloadVersion":1}',
+        ],
+      );
+      const task = await opened.repository.getTask(data.entryTaskId);
+      const turn = await opened.repository.getTurn(data.activationTurnId);
+      expect(task).toBeTruthy();
+      expect(turn).toBeTruthy();
+      const settle = await opened.repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        task: { ...task!, updatedAt: finishedAt },
+        turn: {
+          ...turn!,
+          status: 'failed',
+          finishedAt,
+          termination: { kind: 'backend_refusal' },
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settle.ok).toBe(true);
+      expect(await runStatus(opened.client, data.runId)).toBe('failed');
+      const closure = await opened.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', data.runId],
+      );
+      expect(JSON.parse(closure!.body_json)).toMatchObject({
+        kind: 'run_closure', schema: 1,
+        reasonCode: 'agent_fail', terminalStatus: 'failed',
+        detail: {
+          schema: 1, code: 'agent_fail', source: 'backend_refusal',
+          nodeKey: 'entry',
+          report: { text: 'I cannot help with that request.', truncated: false },
+        },
+      });
+      // No decision correction turn is queued for a typed refusal.
+      await expect(opened.client.get(
+        `SELECT id FROM turns WHERE workspace_id = ? AND task_id = ? AND id != ?`,
+        ['ws', data.entryTaskId, data.activationTurnId],
+      )).resolves.toBeUndefined();
+    } finally {
+      await opened.close();
+    }
+  }, 30_000);
+
+  it('a valid staged disposition wins over a late typed refusal', async () => {
+    const opened = await openRepo('refusal-race');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const finishedAt = '2026-07-20T00:00:01.000Z';
+      const data = await defineAndStartOneNode(
+        opened.repository,
+        createdAt,
+        's05-refusal-race-1',
+        'wf-s05-refusal-race',
+      );
+      await promoteRunning(opened.client, data.activationTurnId, createdAt);
+      const task = await opened.repository.getTask(data.entryTaskId);
+      const turn = await opened.repository.getTurn(data.activationTurnId);
+      expect(task).toBeTruthy();
+      expect(turn).toBeTruthy();
+      await stageDispositionForSettlement(
+        opened.repository,
+        turn!,
+        { kind: 'workflow_next', change: 'updated', result: 'staged result' },
+      );
+      // A late backend refusal must not overwrite the accepted disposition,
+      // discard the staged claim, fail the activation, or create a closure:
+      // the refusal settlement aborts atomically and the staged claim wins.
+      const settle = await opened.repository.execute({
+        kind: 'settleTurnAndApplyEffects',
+        workspaceId: 'ws',
+        expectedTaskRevision: task!.revision,
+        task: { ...task!, updatedAt: finishedAt },
+        turn: {
+          ...turn!,
+          status: 'failed',
+          finishedAt,
+          termination: { kind: 'backend_refusal' },
+        },
+        expectedStatuses: ['running'],
+        relatedTurns: [],
+        messages: [],
+      });
+      expect(settle.ok).toBe(true);
+      expect(settle.changed).toBe(false);
+      expect(await runStatus(opened.client, data.runId)).toBe('running');
+      await expect(opened.client.get(
+        `SELECT status FROM turn_disposition_claims
+          WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', data.activationTurnId],
+      )).resolves.toMatchObject({ status: 'staged' });
+      await expect(opened.client.get(
+        `SELECT COUNT(*) AS count FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', data.runId],
+      )).resolves.toMatchObject({ count: 0 });
+    } finally {
+      await opened.close();
+    }
+  }, 30_000);
+
+  it('late typed refusal settles a staged PREV through the successful route path', async () => {
+    const opened = await openRepo('refusal-prev-race');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const data = await defineAndStartFanIn(
+        opened.repository,
+        createdAt,
+        's05-refusal-prev-race-1',
+      );
+      const { p1, p2, consumerTaskId, consumerTurnId } = await activateFanInConsumer(
+        opened,
+        data,
+        '2026-07-20T00:00:01.000Z',
+      );
+      await runEngineRefusalRace(
+        opened,
+        consumerTaskId,
+        consumerTurnId,
+        { kind: 'workflow_prev', targets: 'all', note: 'late refusal must not discard PREV' },
+        async () => {
+          const turn = await opened.repository.getTurn(consumerTurnId);
+          const rounds = await roundStatuses(opened.client, data.runId);
+          return turn?.status === 'succeeded' && rounds.length === 1;
+        },
+      );
+
+      await expect(opened.repository.getTurn(consumerTurnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        disposition: {
+          kind: 'workflow_prev',
+          targets: 'all',
+          note: 'late refusal must not discard PREV',
+        },
+      });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM turn_disposition_claims
+          WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', consumerTurnId],
+      )).resolves.toEqual({ status: 'consumed' });
+      await expect(runStatus(opened.client, data.runId)).resolves.toBe('running');
+      await expect(opened.client.all(
+        `SELECT target_node_id, status FROM workflow_feedback_targets
+          WHERE workspace_id = ? AND run_id = ? ORDER BY target_node_id`,
+        ['ws', data.runId],
+      )).resolves.toEqual([
+        { target_node_id: 'p1', status: 'pending' },
+        { target_node_id: 'p2', status: 'pending' },
+      ]);
+      await expect(opened.repository.listTurns(p1.taskId)).resolves.toHaveLength(2);
+      await expect(opened.repository.listTurns(p2.taskId)).resolves.toHaveLength(2);
+      await expect(opened.client.get(
+        `SELECT 1 FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', data.runId],
+      )).resolves.toBeUndefined();
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
+  it('late typed refusal settles a staged FAIL through the successful route path', async () => {
+    const opened = await openRepo('refusal-fail-race');
+    try {
+      const createdAt = '2026-07-20T00:00:00.000Z';
+      const data = await defineAndStartOneNode(
+        opened.repository,
+        createdAt,
+        's05-refusal-fail-race-1',
+        'wf-s05-refusal-fail-race',
+      );
+      const reason = 'late refusal must not discard FAIL';
+      await runEngineRefusalRace(
+        opened,
+        data.entryTaskId,
+        data.activationTurnId,
+        { kind: 'workflow_fail', reason },
+        async () => (await runStatus(opened.client, data.runId)) === 'failed',
+      );
+
+      await expect(opened.repository.getTurn(data.activationTurnId)).resolves.toMatchObject({
+        status: 'succeeded',
+        disposition: { kind: 'workflow_fail', reason },
+      });
+      await expect(opened.client.get<{ status: string }>(
+        `SELECT status FROM turn_disposition_claims
+          WHERE workspace_id = ? AND turn_id = ?`,
+        ['ws', data.activationTurnId],
+      )).resolves.toEqual({ status: 'consumed' });
+      await expect(opened.client.get<{ status: string; terminal_reason_code: string }>(
+        `SELECT status, terminal_reason_code FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        ['ws', data.runId],
+      )).resolves.toEqual({ status: 'failed', terminal_reason_code: 'agent_fail' });
+      const closure = await opened.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', data.runId],
+      );
+      expect(JSON.parse(closure!.body_json)).toMatchObject({
+        reasonCode: 'agent_fail',
+        terminalStatus: 'failed',
+        detail: {
+          source: 'workflow_fail',
+          report: { text: reason, truncated: false },
+        },
+      });
+      expect(JSON.parse(closure!.body_json)).not.toMatchObject({
+        detail: { source: 'backend_refusal' },
+      });
+    } finally {
+      await opened.close();
+    }
+  }, 45_000);
+
   it('invalid PREV on entry closes the run and owned task with invalid_route', async () => {
     const opened = await openRepo('prev');
     try {
@@ -445,7 +791,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         opened.client,
         data.entryTaskId,
         data.activationTurnId,
-        { kind: 'workflow_prev', targets: 'all' },
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' },
         '2026-07-20T00:00:01.000Z',
       );
       expect(settle.ok).toBe(true);
@@ -477,7 +823,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
       await promoteRunning(opened.client, p1.activationTurnId, '2026-07-22T14:01:00.000Z');
       const p1Task = await opened.repository.getTask(p1.taskId);
       const p1Turn = await opened.repository.getTurn(p1.activationTurnId);
-      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const };
+      const disposition = { kind: 'workflow_prev' as const, targets: 'all' as const, note: 'invalid feedback' };
       await stageDispositionForSettlement(opened.repository, p1Turn!, disposition);
       let promotedBetweenPlanAndCommit = false;
       const stalePlannerRepository = new SqliteTaskRepository({
@@ -576,7 +922,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
 
       await expect(settleSucceeded(
         opened.repository, opened.client, active.consumerTaskId, active.consumerTurnId,
-        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:02:00.000Z',
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' }, '2026-07-20T00:02:00.000Z',
       )).resolves.toMatchObject({ changed: true });
       await expect(opened.client.get(
         `SELECT status, feedback_rounds_reserved FROM workflow_runs
@@ -602,7 +948,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         .find((turn) => turn.status === 'queued')!;
       await expect(settleSucceeded(
         opened.repository, opened.client, active.consumerTaskId, requesterResume.id,
-        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:05:00.000Z',
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' }, '2026-07-20T00:05:00.000Z',
       )).resolves.toMatchObject({ changed: true });
 
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
@@ -639,7 +985,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
 
       await expect(settleSucceeded(
         opened.repository, opened.client, active.consumerTaskId, active.consumerTurnId,
-        { kind: 'workflow_prev', targets: 'all' }, '2026-07-20T00:02:00.000Z',
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' }, '2026-07-20T00:02:00.000Z',
       )).resolves.toMatchObject({ changed: true });
       expect(await runStatus(opened.client, data.runId)).toBe('failed');
       const after = await opened.repository.getTask(active.consumerTaskId);
@@ -693,7 +1039,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         feedback.client,
         active.consumerTaskId,
         active.consumerTurnId,
-        { kind: 'workflow_prev', targets: 'all' },
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' },
         '2026-07-22T16:02:00.000Z',
       )).resolves.toMatchObject({ changed: true });
       const p1Feedback = (await feedback.repository.listTurns(active.p1.taskId))
@@ -728,7 +1074,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         feedback.client,
         active.consumerTaskId,
         requesterResume.id,
-        { kind: 'workflow_prev', targets: 'all' },
+        { kind: 'workflow_prev', targets: 'all', note: 'invalid feedback' },
         '2026-07-22T16:05:00.000Z',
       )).resolves.toMatchObject({ changed: true });
       expect(await runStatus(feedback.client, data.runId)).toBe('failed');

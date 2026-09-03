@@ -4,6 +4,7 @@ import { McpReadinessSupervisor } from './mcp-readiness';
 import { formatToolError, MusterBridgeServer } from './server';
 import { capabilitiesFor, PUBLIC_MCP_TOOL_ACTIONS } from '../task/capabilities';
 import { PRESENTATION_REF_PATTERN, WORKFLOW_REF_PATTERN } from '../task/coordinator-tools';
+import { TASK_ERROR_MAX_BYTES } from '../task/content-limits';
 import { WORKFLOW_INSTRUCTIONS_MAX_LENGTH } from '../task/workflow-types';
 
 const REMOVED_MCP_TOOLS = [
@@ -49,8 +50,24 @@ function canonicalManifest(): WorkflowManifestFixture {
         taskType: 'research',
         title: 'Research',
         instructions: { inline: 'Inspect the request.' },
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The research is complete.' },
+          fail: { when: 'The research cannot be completed.' },
+        },
       },
-      { nodeKey: 'review', taskType: 'review', title: 'Review' },
+      {
+        nodeKey: 'review',
+        taskType: 'review',
+        title: 'Review',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The review is complete.' },
+          fail: { when: 'The review cannot be completed.' },
+        },
+      },
     ],
     edges: [{ from: 'research', to: 'review', inputRef: 'research' }],
   };
@@ -325,7 +342,7 @@ describe('MusterBridgeServer auth', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['define_workflow', 'start_workflow']),
+      allowedActions: new Set(['define_workflow', 'start_workflow', 'workflow_fail']),
       ttlMs: 60_000,
     });
     const session = await openMcpSession(port, token);
@@ -348,6 +365,8 @@ describe('MusterBridgeServer auth', () => {
     expect(defineTool?.description).toContain('predefinedWorkflowRef');
     expect(defineTool?.description).toContain('title is display-only');
     expect(defineTool?.description).toContain('instructions.inline');
+    expect(defineTool?.description).toContain('explicit');
+    expect(defineTool?.description).toContain('FAIL');
     expect(defineTool?.description).toContain('engine generates a stable workflowRef');
     expect(defineTool?.description).toContain('Never send internal');
     expect(defineTool?.inputSchema).toMatchObject({
@@ -373,14 +392,16 @@ describe('MusterBridgeServer auth', () => {
               items: {
                 oneOf: [
                   {
-                    required: ['nodeKey', 'taskType'],
+                    required: ['nodeKey', 'taskType', 'outcome'],
                     additionalProperties: false,
                     properties: {
                       instructions: {
                         oneOf: [{ properties: { inline: { maxLength: WORKFLOW_INSTRUCTIONS_MAX_LENGTH } } }],
                       },
                       outcome: {
+                        required: ['kind', 'requireExplicitDisposition', 'next', 'fail'],
                         properties: {
+                          requireExplicitDisposition: { const: true },
                           prev: {
                             items: {
                               properties: {
@@ -450,6 +471,15 @@ describe('MusterBridgeServer auth', () => {
     expect(startTool?.inputSchema.properties).not.toHaveProperty('instanceKey');
 
     expect(names).not.toContain('invoke_child_workflow');
+
+    const failTool = workflowTools.find((tool) => tool.name === 'workflow_fail');
+    expect(failTool?.inputSchema).toMatchObject({
+      required: ['reason'],
+      properties: {
+        reason: { minLength: 1, maxLength: TASK_ERROR_MAX_BYTES },
+      },
+    });
+    expect(failTool?.description).toContain('required');
 
     const defined = await session.request('tools/call', {
       name: 'define_workflow',

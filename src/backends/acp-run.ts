@@ -327,6 +327,13 @@ function terminalFromPrompt(result: PromptResult, cancelled: boolean, spec: AcpA
     };
   }
   if (spec.failureStopReasons.has(stopReason)) {
+    if (stopReason === 'refusal') {
+      return {
+        type: 'error',
+        message: `${spec.label} stopped: ${stopReason}`,
+        meta: { ...terminalMeta, stopReason },
+      };
+    }
     return {
       type: 'error',
       message: `${spec.label} stopped: ${stopReason}`,

@@ -40,7 +40,7 @@ import {
   type ExecutionPolicyBounds,
   type ResourceLimits,
 } from './limits';
-import { TASK_RESULT_MAX_BYTES, TRUNCATED_CONTENT_MARKER } from './content-limits';
+import { TASK_ERROR_MAX_BYTES, TASK_RESULT_MAX_BYTES, TRUNCATED_CONTENT_MARKER, fitsUtf8Bytes } from './content-limits';
 import {
   DEFAULT_RUN_LIMIT_MS,
   remainingRunTimeMs,
@@ -2674,15 +2674,19 @@ export async function executeToolCommand(
     case 'workflow_fail': {
       // M018 S05: stage workflow_fail disposition. Does not seal lifecycle; run
       // closure is owned by the repository commit path (T02).
+      // Phase 2: reason is mandatory and oversize input is rejected, never truncated.
+      if (typeof command.reason !== 'string' || command.reason.trim().length === 0) {
+        return { ok: false, error: 'reason is required' };
+      }
+      if (!fitsUtf8Bytes(command.reason, TASK_ERROR_MAX_BYTES)) {
+        return { ok: false, error: `reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes` };
+      }
       const staged = await executeGraphCommand(deps, 'workflowFailGraphTask', (draft) => {
         const turn = draft.turns[ctx.turnId];
         if (!turn) return { ok: false, reason: 'turn not found' };
         const result = stageDisposition(
           turn,
-          {
-            kind: 'workflow_fail',
-            ...(command.reason !== undefined ? { reason: command.reason } : {}),
-          },
+          { kind: 'workflow_fail', reason: command.reason.trim() },
           command.opId,
           {
             limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },

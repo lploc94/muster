@@ -123,7 +123,7 @@ const WORKFLOW_REF = {
 
 const DEFINE_WORKFLOW_DESCRIPTION = [
   `Define one immutable ${WORKFLOW_SCHEMA} workflow from exactly one source: inline manifest or predefinedWorkflowRef.`,
-  'Inline manifests declare public named semantic inputs and outputs, canonical nodes, and producer-to-consumer edges using inputRef. Agent nodes choose taskType and may omit outcome; execute nodes choose script and require a complete exit outcome.',
+  'Inline manifests declare public named semantic inputs and outputs, canonical nodes, and producer-to-consumer edges using inputRef. Agent nodes choose taskType and require an explicit outcome with literal requireExplicitDisposition:true, mandatory NEXT and FAIL routes (PREV optional); execute nodes choose script and require a complete exit outcome.',
   'title is display-only. Executable task content belongs only in optional instructions.inline for inline manifests; instructions.file is resolved only from a saved package.',
   'The engine generates a stable workflowRef from normalized immutable content. Object member order is irrelevant, while semantic array order and every normalized interface, instruction, outcome, and routing difference are significant.',
   'Never send internal fields such as workflowKey, definitionId, version, topology, entryContracts, policy, backend, model, role, capabilities, opId, task ids, artifact coordinates, revisions, or physical routing destinations.',
@@ -143,10 +143,10 @@ const WORKFLOW_INSTRUCTIONS_SCHEMA = {
 
 const WORKFLOW_AGENT_OUTCOME_SCHEMA = {
   type: 'object',
-  required: ['kind', 'requireExplicitDisposition'],
+  required: ['kind', 'requireExplicitDisposition', 'next', 'fail'],
   properties: {
     kind: { const: 'agent' },
-    requireExplicitDisposition: { type: 'boolean' },
+    requireExplicitDisposition: { const: true },
     next: {
       type: 'object', required: ['when'], additionalProperties: false,
       properties: { when: { type: 'string', minLength: 1, maxLength: WORKFLOW_OUTCOME_WHEN_MAX_LENGTH } },
@@ -249,7 +249,7 @@ const WORKFLOW_MANIFEST_SCHEMA = {
       items: {
         oneOf: [
           {
-            type: 'object', required: ['nodeKey', 'taskType'], additionalProperties: false,
+            type: 'object', required: ['nodeKey', 'taskType', 'outcome'], additionalProperties: false,
             properties: {
               nodeKey: { ...PRESENTATION_ID },
               taskType: { ...PRESENTATION_ID },
@@ -476,8 +476,9 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   workflow_fail: {
     type: 'object',
     description: 'Close the current workflow run as failed when no usable result can be produced.',
+    required: ['reason'],
     properties: {
-      reason: { type: 'string', minLength: 1, maxLength: TASK_ERROR_MAX_BYTES, description: 'Concise diagnostic reason; do not include prompts, paths, or artifact bodies.' },
+      reason: { type: 'string', minLength: 1, maxLength: TASK_ERROR_MAX_BYTES, description: 'Required concise diagnostic reason; do not include prompts, paths, or artifact bodies.' },
     },
     additionalProperties: false,
   },
@@ -559,7 +560,7 @@ const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   inspect_workflow_run: 'Inspect bounded durable state for one owned workflow using the opaque runRef returned by start_workflow. Use only for recovery and diagnosis after uncertainty; do not poll for normal routing or pass internal gate, activation, task, or artifact ids.',
   workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
   workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
-  workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide an optional concise diagnostic reason. This is a terminal disposition for the current turn.',
+  workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide a required concise diagnostic reason. This is a terminal disposition for the current turn.',
   upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
   start_workflow: 'Start a saved workflow from an open top-level root coordinator using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run named output for every declared public input name.',

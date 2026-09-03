@@ -29,6 +29,22 @@ export type ScriptInterpreter = 'node' | 'python' | 'python3';
 export type WorkflowPackageKind = 'bundle';
 export type WorkflowCatalogRootKind = 'canonical' | 'custom';
 
+/** Closed reason codes for durable workflow failure details and run closure. */
+export const WORKFLOW_FAIL_REASON_CODES = [
+  'agent_fail',
+  'decision_missing',
+  'decision_invalid',
+  'invalid_route',
+  'run_timeout',
+  'aggregate_too_large',
+  'feedback_budget_exhausted',
+  'turn_budget_exhausted',
+  'required_target_cancelled',
+  'required_target_unavailable',
+] as const;
+
+export type WorkflowFailReasonCode = (typeof WORKFLOW_FAIL_REASON_CODES)[number];
+
 /** Host-authored provenance for a predefined workflow package. */
 export interface WorkflowPackageSource {
   kind: 'predefined';
@@ -114,10 +130,10 @@ export interface WorkflowAgentFailRoute {
 
 export interface WorkflowAgentOutcome {
   kind: 'agent';
-  requireExplicitDisposition: boolean;
-  next?: WorkflowAgentNextRoute;
+  requireExplicitDisposition: true;
+  next: WorkflowAgentNextRoute;
   prev?: readonly WorkflowAgentPrevRoute[];
-  fail?: WorkflowAgentFailRoute;
+  fail: WorkflowAgentFailRoute;
 }
 
 export interface WorkflowExitNextRoute {
@@ -662,6 +678,34 @@ export interface WorkflowNextResultProjection {
   result?: string;
 }
 
+/** Closed source of a terminal workflow failure. */
+export type WorkflowFailureSource =
+  | 'workflow_fail'
+  | 'backend_refusal'
+  | 'decision_exhausted'
+  | 'engine';
+
+/** One immutable bounded failure envelope for a terminal failed/cancelled run. */
+export interface WorkflowFailureDetail {
+  schema: 1;
+  code: WorkflowFailReasonCode;
+  source: WorkflowFailureSource;
+  /** Semantic node key when an agent node is responsible; never a physical id. */
+  nodeKey?: string;
+  /** Safe display title for the responsible node, when available. */
+  nodeTitle?: string;
+  /** Semantic component key for composite runs (Phase 5); omitted for ordinary runs. */
+  componentKey?: string;
+  report: {
+    text: string;
+    truncated: boolean;
+  };
+  attempt?: {
+    number: number;
+    limit: number;
+  };
+}
+
 /** Authorized terminal state delivered to a resumed start_workflow caller. */
 export interface WorkflowRunCompletionProjection {
   runId: string;
@@ -669,6 +713,7 @@ export interface WorkflowRunCompletionProjection {
   terminalReason?: string;
   terminalResult?: WorkflowArtifactReferenceProjection;
   workflowNext?: WorkflowNextResultProjection;
+  failure?: WorkflowFailureDetail;
 }
 
 /**
@@ -691,5 +736,6 @@ export interface WorkflowRunInspectionProjection {
   feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
   continuations: readonly WorkflowContinuationStatusProjection[];
   terminalResult?: WorkflowArtifactReferenceProjection;
+  failure?: WorkflowFailureDetail;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

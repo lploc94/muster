@@ -247,18 +247,26 @@ actions stay available.
   schema cutover removes the obsolete structure.
 - Schema v7 owns one activation-scoped `workflow_decision_repairs` row for bounded agent outcome
   repair. An authenticated invalid route attempt records only a closed error code before any
-  disposition claim; a later valid claim remains authoritative. A clean optional original attempt
-  may still use final-message NEXT, while strict missing decisions and every invalid decision settle
-  through the repair transition. Attempts one and two atomically persist bounded evidence and reserve
-  one deterministic same-task correction turn; attempt three marks the row exhausted and closes the
-  run with `decision_missing` or `decision_invalid`. Replay, reload, competing settlement, task/run
-  turn limits, and the workflow deadline are checked in that same transition, without a side store or
-  feedback round.
+  disposition claim; a later valid claim remains authoritative. Every accepted agent node requires
+  an explicit disposition, so a text-only completion never becomes final-message NEXT. Missing
+  decisions and every invalid decision settle through the repair transition. Attempts one and two
+  atomically persist bounded evidence and reserve one deterministic same-task correction turn;
+  attempt three marks the row exhausted and closes the run with `decision_missing` or
+  `decision_invalid`. A valid `workflow_fail` claim instead closes immediately as `agent_fail` with
+  its bounded reason. Typed ACP refusal is stored as `backend_refusal` evidence and closes the
+  workflow run without correction or generic runtime fallback. Replay, reload, competing settlement,
+  task/run turn limits, and the workflow deadline are checked in that same transition, without a
+  side store or feedback round.
 - Task-status and workflow-graph reads join those durable activation/repair rows; they do not infer
   repair from transient engine memory, assistant text, or error-message matching. The bounded
-  projection may include display title, an optional/required decision-gate marker, and attempt
+  projection may include display title, the required decision-gate marker, and attempt
   `N of 3` with a closed waiting/correcting/decided/exhausted state. It excludes outcome condition
   text, prior assistant responses, prompt bodies, host paths, durable physical IDs, and artifacts.
+- Each failed/cancelled workflow run retains one validated bounded `run_closure` failure detail with
+  closed source/code, safe semantic node identity when applicable, one UTF-8-bounded report and
+  truncation state, and the decision attempt when applicable. The detail survives completion,
+  root-continuation delivery, reload, and safe reclamation; malformed/private/raw values are never
+  projected.
 - Schema v6 and every earlier marker are rejected rather than interpreted as canonical workflow
   authority. There is no `ALTER TABLE`, row reinterpretation, compatibility decoder, or automatic
   migration path. An already-open stale writer fails closed with terminal `schema_changed` and must

@@ -25,9 +25,9 @@ The public MCP catalog is exactly:
 
 The workflow protocol in `TASK-MANAGEMENT.md` §20 defines the routing and durable
 state semantics. A live activation settles through one mutually exclusive route:
-explicit `workflow_next`, contextual `workflow_prev`, `workflow_fail`, or an implicit
-host-generated `NEXT` from the final assistant message when the model ends without a
-disposition.
+explicit `workflow_next`, contextual `workflow_prev`, or `workflow_fail`. A
+text-only assistant completion is protocol evidence for bounded decision repair,
+never a host-generated semantic `NEXT`.
 
 The public boundary is semantic. Models provide definition-local node keys, configured
 `taskType` values, named semantic workflow interfaces, dependency `inputRef` values,
@@ -61,7 +61,13 @@ An inline manifest uses the literal schema `muster.workflow/v2`:
         "nodeKey": "research",
         "taskType": "research",
         "title": "Research",
-        "instructions": { "inline": "Investigate the request and report evidence." }
+        "instructions": { "inline": "Investigate the request and report evidence." },
+        "outcome": {
+          "kind": "agent",
+          "requireExplicitDisposition": true,
+          "next": { "when": "The research evidence is ready for review." },
+          "fail": { "when": "The request cannot be researched." }
+        }
       },
       {
         "nodeKey": "review",
@@ -69,7 +75,7 @@ An inline manifest uses the literal schema `muster.workflow/v2`:
         "title": "Review",
         "outcome": {
           "kind": "agent",
-          "requireExplicitDisposition": false,
+          "requireExplicitDisposition": true,
           "next": { "when": "The review is complete." },
           "prev": [
             {
@@ -77,7 +83,8 @@ An inline manifest uses the literal schema `muster.workflow/v2`:
               "targets": ["research"],
               "feedback": "required"
             }
-          ]
+          ],
+          "fail": { "when": "Verification cannot be completed." }
         }
       }
     ],
@@ -104,9 +111,9 @@ content before persistence. Frozen instructions enter a bounded host-owned workf
 instructions section on normal entry and dependency activations and are not exposed by
 status or graph projections.
 
-An agent `outcome` may be omitted for implicit NEXT. When present it must have
-`kind: "agent"` and an explicit `requireExplicitDisposition` boolean; `false` requires a
-declared `next` route. PREV targets are unique inbound `inputRef` values and require the
+Every agent node must declare an `outcome` with `kind: "agent"` and literal
+`requireExplicitDisposition: true`, a declared `next` route, and a declared `fail`
+route. PREV is optional; its targets are unique inbound `inputRef` values and require the
 literal `feedback: "required"`. Execute nodes require a closed `kind: "exit"` outcome
 that maps exit code `0` to NEXT and every nonzero exit to exactly PREV with
 `feedback: "stdout"` or FAIL. NEXT carries bounded stdout as its result. PREV reaches
@@ -120,9 +127,16 @@ authorizes each disposition against the live activation and frozen definition.
 A strict missing route or an authenticated invalid route enters one durable
 activation-owned repair sequence. The original turn is attempt 1, at most two
 deterministic correction turns may follow, and attempt 3 exhausts with bounded
-`decision_missing` or `decision_invalid` failure. A clean optional original turn
-may still use implicit NEXT; after invalid evidence opens repair, every correction
-must choose a valid route. The first accepted valid disposition always wins.
+`decision_missing` or `decision_invalid` failure. There is no optional implicit
+NEXT. The first accepted valid disposition always wins.
+
+The `workflow_fail` reason is mandatory, nonblank, and bounded. A valid
+`workflow_fail` claim closes the run immediately as `agent_fail` using the exact
+trimmed reason. A typed ACP `stopReason: "refusal"` with no winning claim also
+closes immediately as `agent_fail`, records `backend_refusal`, and retains the
+latest persisted assistant response or a fixed fallback. It does not enter
+decision repair or generic retry/runtime fallback. Refusal wording in ordinary
+assistant text is never inspected or classified.
 
 The removed authoring fields `label`, edge `as`, start input coordinates, child
 destination coordinates, and `onFailure` are invalid. Authors also cannot provide
@@ -219,8 +233,12 @@ The transcript shows `Workflow dispatched. Waiting for results...` for this tech
 suspension and suppresses backend cancellation text such as `Conversation interrupted`.
 When the run succeeds, fails, or is cancelled, the repository atomically resolves the
 continuation and queues one deterministic engine turn on the caller with terminal
-status/reason and the committed terminal `workflow_next` body when one exists. Reload
-drains the same resolver, so a terminal result cannot be lost or resumed twice.
+status/reason, the bounded semantic failure detail when one exists, and the committed
+terminal `workflow_next` body when one exists. Failure detail contains only the safe
+semantic node identity, closed source/code, bounded report text plus truncation, and
+the decision attempt when applicable. The report is framed as untrusted node data;
+it is explanatory evidence, never routing or executable instruction. Reload drains
+the same resolver, so a terminal result cannot be lost or resumed twice.
 Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid or
 unauthorized starts return ordinary tool errors and do not suspend the caller. A live
 workflow activation cannot define or start another workflow; it may still delegate

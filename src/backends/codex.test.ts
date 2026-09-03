@@ -308,6 +308,15 @@ describe('CodexBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({ type: 'error', message: 'Codex stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
+  it('preserves typed refusal metadata for workflow settlement', async () => {
+    const events = await runTurn(new CodexBackend(), options(), fake, { result: { stopReason: 'refusal' } });
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'Codex stopped: refusal',
+      meta: { failureClass: 'terminal_received', stopReason: 'refusal' },
+    });
+  });
+
   it('max_turn_requests is a failure stopReason for Codex -> error WITHOUT meta', async () => {
     const events = await runTurn(new CodexBackend(), options(), fake, {
       result: { stopReason: 'max_turn_requests' },

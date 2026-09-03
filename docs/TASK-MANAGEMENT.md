@@ -670,9 +670,9 @@ On adapter `turnCompleted`, the engine atomically:
    - `wait_tasks` → task stays `open` and receives a child wait set.
     - `idle` on an ordinary turn → task stays `open` without an automatic next turn
       and without a new outcome proposal;
-    - no disposition on a live workflow activation → the host stages an implicit
-      `workflow_next` with `change: 'updated'` and the final assistant message as
-      its result before applying the same settlement transaction.
+    - no disposition on a live workflow activation → the host records bounded
+      protocol evidence and enters the activation-owned decision-repair transition;
+      it never synthesizes a `workflow_next` from assistant text.
 4. Marks user-message inputs assigned to that turn as `complete`.
 5. Emits task and turn updates (lifecycle + proposal + runtime activity + authority).
 
@@ -680,10 +680,10 @@ A staged disposition is discarded if the adapter turn fails or is interrupted.
 This prevents an MCP call made early in a failed invocation from becoming a
 completion proposal or an unauthorized seal.
 
-Workflow agents should stage `workflow_next`, contextual `workflow_prev`, or
-`workflow_fail` when they need explicit routing. Otherwise the host forwards the
-final assistant message as an updated `workflow_next`; explicit dispositions always
-win. Turn/task
+Workflow agents must stage exactly one declared `workflow_next`, contextual
+`workflow_prev`, or `workflow_fail` route. A missing route is repaired durably and
+then fails closed after the bounded attempt limit; assistant text is retained only
+as bounded evidence. Explicit dispositions always win. Turn/task
 **timeouts** are runtime events: leave `open` + `needs_recovery`, unless an
 an authorized user or parent transition explicitly seals `failed`.
 
@@ -1881,13 +1881,12 @@ another without an explicit dependency.
 ### 20.6 `NEXT` contract
 
 `NEXT` is one of three mutually exclusive workflow dispositions (`NEXT`, `PREV`, or
-workflow `FAIL`) that an agent may stage on its live turn. A node with no declared
-agent outcome retains final-assistant-message implicit NEXT. An optional declared
-outcome may use implicit NEXT only on a clean original attempt with no invalid evidence
-or open repair. Strict outcomes and every correction attempt require an explicit valid
-route. Explicit dispositions always take precedence. Staging is idempotent by turn and
-does not route work immediately. As with existing turn dispositions, only adapter
-`turnCompleted` may commit it. The successful
+workflow `FAIL`) that an agent may stage on its live turn. Every accepted agent node
+declares explicit disposition, NEXT, and FAIL; PREV remains optional. A text-only
+completion is never implicit NEXT. Missing or invalid claims enter the durable
+activation-owned repair sequence, while a valid `workflow_fail` closes immediately.
+Staging is idempotent by turn and does not route work immediately. As with existing
+turn dispositions, only adapter `turnCompleted` may commit it. The successful
 turn-settlement repository transaction commits session identity, the workflow
 disposition, artifacts, gate/round contributions, and durable outgoing routing
 messages together. A failed or interrupted turn discards any staged disposition and
@@ -1925,12 +1924,13 @@ For a feedback response, artifact lineage is validated before commit:
 
 ### 20.6.1 Declared outcomes and durable decision repair
 
-An agent outcome declares its allowed NEXT/PREV/FAIL routes and whether an original
-missing disposition is permitted to fall through to implicit NEXT. The host renders
-bounded route conditions as untrusted decision guidance, then re-authorizes every
-attempt against the frozen activation before a universal disposition claim can be
-staged. PREV targets must match one exact declared set of direct inbound `inputRef`
-values and include bounded nonempty feedback.
+An agent outcome declares its allowed NEXT/PREV/FAIL routes. Every accepted outcome
+has literal `requireExplicitDisposition: true`, mandatory NEXT/FAIL, and optional
+PREV. The host renders bounded route conditions as untrusted decision guidance, then
+re-authorizes every attempt against the frozen activation before a universal
+disposition claim can be staged. PREV targets must match one exact declared set of
+direct inbound `inputRef` values and include bounded nonempty feedback. `workflow_fail`
+requires a bounded nonblank `reason`.
 
 One logical activation owns at most one durable decision-repair row. The original
 completed turn is attempt 1. A strict missing route or authenticated invalid route on
@@ -1942,12 +1942,19 @@ decided and wins over concurrent invalid calls or settlement replay. Reload resu
 from the durable row and correction turn; no in-memory retry loop, PREV round, or hidden
 decision node exists.
 
-Host status and graph reads may expose only the node's bounded display title, an
-optional/required decision-gate marker, a closed waiting/correcting/decided/exhausted
-summary, and `attempt N of 3`. They never expose outcome condition text, prior response
+Host status and graph reads may expose only the node's bounded display title, a
+required decision-gate marker, a closed waiting/correcting/decided/exhausted summary,
+and `attempt N of 3`. They never expose outcome condition text, prior response
 bodies, prompts, host paths, artifact bodies, or physical durable IDs. Normal PREV is
 shown as revision/waiting for feedback, not failure; Failed appears only after repair
 exhaustion or an actual semantic/operational closure.
+
+Terminal workflow failures retain one validated bounded `WorkflowFailureDetail`
+containing the semantic node key/title when applicable, closed source/code, one
+UTF-8-bounded report with truncation state, and the decision attempt when applicable.
+The owning root receives it through `start_wait` and same-root inspection under an
+explicit untrusted-data warning. The report cannot authorize routing, mutation, or
+execution and is never copied into diagnostics or unrelated activations.
 
 ### 20.7 `PREV` targeting and feedback routing
 

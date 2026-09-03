@@ -285,18 +285,22 @@ function decodeAgentOutcome(raw: Record<string, unknown>): ValueDecodeResult<Wor
   if (!onlyKeys(raw, ['kind', 'requireExplicitDisposition', 'next', 'prev', 'fail'])) {
     return { ok: false, reason: 'invalid agent outcome field' };
   }
-  if (typeof raw.requireExplicitDisposition !== 'boolean') {
-    return { ok: false, reason: 'agent outcome requireExplicitDisposition must be boolean' };
+  if (raw.requireExplicitDisposition !== true) {
+    return { ok: false, reason: 'agent outcome requireExplicitDisposition must be literal true' };
+  }
+
+  if (raw.next === undefined) {
+    return { ok: false, reason: 'agent outcome requires FAIL and NEXT routes: missing NEXT' };
+  }
+  if (raw.fail === undefined) {
+    return { ok: false, reason: 'agent outcome requires FAIL route' };
   }
 
   let next: WorkflowAgentOutcome['next'];
-  if (raw.next !== undefined) {
-    if (
-      !isRecord(raw.next) || !onlyKeys(raw.next, ['when']) ||
+  if (!isRecord(raw.next) || !onlyKeys(raw.next, ['when']) ||
       !isNonEmptyString(raw.next.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH)
-    ) return { ok: false, reason: 'invalid agent NEXT outcome route' };
-    next = { when: raw.next.when };
-  }
+  ) return { ok: false, reason: 'invalid agent NEXT outcome route' };
+  next = { when: raw.next.when };
 
   let prev: WorkflowAgentOutcome['prev'];
   if (raw.prev !== undefined) {
@@ -328,28 +332,19 @@ function decodeAgentOutcome(raw: Record<string, unknown>): ValueDecodeResult<Wor
   }
 
   let fail: WorkflowAgentOutcome['fail'];
-  if (raw.fail !== undefined) {
-    if (
-      !isRecord(raw.fail) || !onlyKeys(raw.fail, ['when']) ||
+  if (!isRecord(raw.fail) || !onlyKeys(raw.fail, ['when']) ||
       !isNonEmptyString(raw.fail.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH)
-    ) return { ok: false, reason: 'invalid agent FAIL outcome route' };
-    fail = { when: raw.fail.when };
-  }
+  ) return { ok: false, reason: 'invalid agent FAIL outcome route' };
+  fail = { when: raw.fail.when };
 
-  if (!next && !prev && !fail) {
-    return { ok: false, reason: 'agent outcome requires at least one route' };
-  }
-  if (!raw.requireExplicitDisposition && !next) {
-    return { ok: false, reason: 'agent outcome with requireExplicitDisposition false requires a NEXT route' };
-  }
   return {
     ok: true,
     value: {
       kind: 'agent',
-      requireExplicitDisposition: raw.requireExplicitDisposition,
-      ...(next ? { next } : {}),
+      requireExplicitDisposition: true,
+      next,
       ...(prev ? { prev } : {}),
-      ...(fail ? { fail } : {}),
+      fail,
     },
   };
 }
@@ -469,7 +464,7 @@ function decodeNormalizedNode(raw: unknown): WorkflowNodeSpec | undefined {
       raw.role === 'coordinator' || (capabilities?.length ?? 0) > 0 || outcome?.kind !== 'exit'
     ) return undefined;
   } else {
-    if (raw.backend === 'script' || outcome?.kind === 'exit') return undefined;
+    if (raw.backend === 'script' || !outcome || outcome.kind !== 'agent') return undefined;
   }
   return {
     nodeId: raw.nodeId,
@@ -702,8 +697,11 @@ function decodeManifestNode(
   if (decodedOutcome && !decodedOutcome.ok) return decodedOutcome;
   const outcome = decodedOutcome?.value;
   if (hasTaskType) {
-    if (!isStableId(raw.taskType) || outcome?.kind === 'exit') {
-      return { ok: false, reason: 'agent node requires taskType and optional agent outcome' };
+    if (!isStableId(raw.taskType)) {
+      return { ok: false, reason: 'agent node requires taskType' };
+    }
+    if (!outcome || outcome.kind !== 'agent') {
+      return { ok: false, reason: 'agent node requires explicit outcome with NEXT and FAIL' };
     }
     return {
       ok: true,
@@ -712,7 +710,7 @@ function decodeManifestNode(
         taskType: raw.taskType,
         ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
         ...(instructions.instructions ? { instructions: instructions.instructions } : {}),
-        ...(outcome ? { outcome } : {}),
+        outcome,
       },
     };
   }
@@ -1030,8 +1028,8 @@ function decodePolicy(raw: unknown): { ok: true; policy: WorkflowPolicy } | { ok
     }
     (policy as unknown as Record<string, number>)[key] = value as number;
   }
-  if (typeof raw.failWorkflow !== 'boolean') return { ok: false, reason: 'invalid policy failWorkflow' };
-  policy.failWorkflow = raw.failWorkflow;
+  if (raw.failWorkflow !== true) return { ok: false, reason: 'policy failWorkflow must be literal true' };
+  policy.failWorkflow = true;
   if (policy.maxConcurrency > policy.maxTaskCount) return { ok: false, reason: 'policy concurrency exceeds task count' };
   if (policy.maxArtifactBytes > policy.maxAggregateBytes) return { ok: false, reason: 'policy artifact bound exceeds aggregate bound' };
   return { ok: true, policy };

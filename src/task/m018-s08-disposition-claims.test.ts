@@ -96,6 +96,12 @@ async function bindWorkflowActivation(
   const parentRunId = origin === 'child' ? `parent-${runId}` : null;
   const activationKind = options.activationKind ?? 'entry_start';
   const messageId = `message-${turn.id}`;
+  const defaultOutcome: WorkflowAgentOutcome = {
+    kind: 'agent',
+    requireExplicitDisposition: true,
+    next: { when: 'The result is complete.' },
+    fail: { when: 'The result cannot be produced.' },
+  };
   await repository.execute({
     kind: 'defineWorkflowVersion',
     workspaceId: 'ws',
@@ -106,7 +112,7 @@ async function bindWorkflowActivation(
       kind: 'workflow',
       inputs: [],
       outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'node' }],
-      nodes: [{ nodeId: 'node', ...(outcome ? { outcome } : {}) }],
+      nodes: [{ nodeId: 'node', outcome: outcome ?? defaultOutcome }],
       edges: [],
     },
     entryContracts: [],
@@ -372,6 +378,7 @@ describe('M018 universal durable disposition claims', () => {
       kind: 'agent',
       requireExplicitDisposition: true,
       next: { when: 'The result is ready.' },
+      fail: { when: 'The result cannot be produced.' },
     }, {
       origin: 'top_level',
       activationStatus: 'queued',
@@ -1593,12 +1600,14 @@ describe('M018 universal durable disposition claims', () => {
       kind: 'agent',
       requireExplicitDisposition: true,
       next: { when: 'The result is ready.' },
+      fail: { when: 'The result cannot be produced.' },
     });
 
     const [invalid, valid] = await Promise.all([
-      stage(first, turn, 'op-invalid-fail', {
-        kind: 'workflow_fail',
-        reason: 'undeclared route',
+      stage(first, turn, 'op-invalid-prev', {
+        kind: 'workflow_prev',
+        targets: ['nonexistent'],
+        note: 'invalid route',
       }),
       stage(second, turn, 'op-valid-next', {
         kind: 'workflow_next',
@@ -1653,6 +1662,7 @@ describe('M018 universal durable disposition claims', () => {
       kind: 'agent',
       requireExplicitDisposition: true,
       next: { when: 'The result is ready.' },
+      fail: { when: 'The result cannot be produced.' },
     });
     const validRace = await Promise.all([
       stage(first, validRaceTurn, 'op-valid-a', {
@@ -1706,8 +1716,17 @@ describe('M018 universal durable disposition claims', () => {
             kind: 'agent',
             requireExplicitDisposition: true,
             next: { when: 'The result is ready.' },
+            fail: { when: 'The result cannot be produced.' },
           },
-        }, { nodeId: 'consumer' }],
+        }, {
+          nodeId: 'consumer',
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The consumer result is ready.' },
+            fail: { when: 'The consumer cannot complete.' },
+          },
+        }],
         edges: [{ fromNodeId: 'producer', toNodeId: 'consumer', inputRef: 'source' }],
       },
       entryContracts: [],
@@ -2185,7 +2204,17 @@ describe('M018 universal durable disposition claims', () => {
           kind: 'workflow',
           inputs: [],
           outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-          nodes: [{ nodeId: 'entry', role: 'worker', backend: 'unsupported' }],
+          nodes: [{
+            nodeId: 'entry',
+            role: 'worker',
+            backend: 'unsupported',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
+            },
+          }],
           edges: [],
         },
         entryContracts: [],
@@ -2205,7 +2234,17 @@ describe('M018 universal durable disposition claims', () => {
         kind: 'workflow',
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{ nodeId: 'entry', role: 'worker', backend: 'grok' }],
+        nodes: [{
+          nodeId: 'entry',
+          role: 'worker',
+          backend: 'grok',
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The result is ready.' },
+            fail: { when: 'The result cannot be produced.' },
+          },
+        }],
         edges: [],
       },
       entryContracts: [],
@@ -2573,7 +2612,7 @@ describe('M018 universal durable disposition claims', () => {
         kind: 'workflow',
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{ nodeId: 'entry', backend: 'grok' }],
+        nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
       entryContracts: [],
@@ -2615,7 +2654,7 @@ describe('M018 universal durable disposition claims', () => {
         kind: 'workflow',
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{ nodeId: 'entry', backend: 'grok' }],
+        nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
       entryContracts: [],
@@ -2694,7 +2733,7 @@ describe('M018 universal durable disposition claims', () => {
         kind: 'workflow',
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{ nodeId: 'entry', backend: 'grok' }],
+        nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
       entryContracts: [],
@@ -2751,7 +2790,16 @@ describe('M018 universal durable disposition claims', () => {
           kind: 'workflow',
           inputs: [],
           outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-          nodes: [{ nodeId: 'entry', backend: 'grok' }],
+          nodes: [{
+            nodeId: 'entry',
+            backend: 'grok',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
+            },
+          }],
           edges: [],
         },
         entryContracts: [],
@@ -2854,7 +2902,7 @@ describe('M018 universal durable disposition claims', () => {
         kind: 'workflow' as const,
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{ nodeId: 'entry', role: 'worker' as const, backend: 'grok' }],
+        nodes: [{ nodeId: 'entry', role: 'worker' as const, backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
       entryContracts: [],

@@ -54,9 +54,7 @@ export function formatWorkflowAgentOutcomeContract(outcome: WorkflowAgentOutcome
       clampSection(outcome.fail.when, WORKFLOW_OUTCOME_WHEN_MAX_LENGTH),
     ].join('\n'));
   }
-  sections.push(outcome.requireExplicitDisposition
-    ? 'Explicit disposition is required.'
-    : 'A clean original attempt may omit a disposition and use its final response as NEXT. An invalid route requires correction.');
+  sections.push('Explicit disposition is required.');
   const contract = sections.join('\n\n');
   if (contract.length > BRIEF_SECTION_MAX) {
     throw new Error(

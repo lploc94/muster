@@ -44,7 +44,40 @@ const FAN_IN_TOPOLOGY = {
   kind: 'workflow' as const,
   inputs: [],
   outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
-  nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
+  nodes: [
+    {
+      nodeId: 'p1',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The producer result is ready.' },
+        fail: { when: 'The producer cannot be completed.' },
+      },
+    },
+    {
+      nodeId: 'p2',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The producer result is ready.' },
+        fail: { when: 'The producer cannot be completed.' },
+      },
+    },
+    {
+      nodeId: 'consumer',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The combined result is ready.' },
+        prev: [{
+          when: 'Both producer results need revision.',
+          targets: ['from_p1', 'from_p2'],
+          feedback: 'required' as const,
+        }],
+        fail: { when: 'The combined result cannot be produced.' },
+      },
+    },
+  ],
   edges: [
     { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
     { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2' },
@@ -275,6 +308,21 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
             nodeKey: node.nodeId,
             taskType: 'worker',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The result is ready.' },
+              ...(node.nodeId === 'consumer'
+                ? {
+                    prev: [{
+                      when: 'Both producer results need revision.',
+                      targets: ['from_p1', 'from_p2'],
+                      feedback: 'required',
+                    }],
+                  }
+                : {}),
+              fail: { when: 'The result cannot be produced.' },
+            },
           })),
           edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
             from: edge.fromNodeId,
@@ -340,6 +388,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
             targets: ['from_p1', 'from_p2'],
             feedback: 'required',
           }],
+          fail: { when: 'The combined result cannot be produced.' },
         },
       );
       const { consumerTaskId, consumerActivationTurnId } = await activateConsumer(
@@ -354,6 +403,14 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       );
       const consumerTurn = await ctx.repository.getTurn(consumerActivationTurnId);
       expect(consumerTurn).toBeTruthy();
+      // Strict outcomes give every activation a repair row once decided, so
+      // scope repair assertions to the consumer activation.
+      const consumerActivation = await ctx.client.get<{ activation_id: string }>(
+        `SELECT activation_id FROM workflow_activations
+          WHERE workspace_id = ? AND execution_turn_id = ?`,
+        ['ws', consumerActivationTurnId],
+      );
+      expect(consumerActivation?.activation_id).toBeTruthy();
 
       await expect(stageDispositionForSettlement(
         ctx.repository,
@@ -370,8 +427,8 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       await expect(ctx.client.get(
         `SELECT status, attempts_used, last_attempt_turn_id, last_error_code
            FROM workflow_decision_repairs
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['ws', data.runId],
+          WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+        ['ws', data.runId, consumerActivation!.activation_id],
       )).resolves.toMatchObject({
         status: 'open',
         attempts_used: 0,
@@ -418,8 +475,8 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       await expect(ctx.client.get(
         `SELECT status, attempts_used, last_error_code, next_repair_turn_id
            FROM workflow_decision_repairs
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['ws', data.runId],
+          WHERE workspace_id = ? AND run_id = ? AND activation_id = ?`,
+        ['ws', data.runId, consumerActivation!.activation_id],
       )).resolves.toMatchObject({
         status: 'decided',
         attempts_used: 1,
@@ -732,12 +789,14 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       expect((await ctx.repository.getTask(consumerTaskId))?.lifecycle).toBe('open');
 
       // Targeted PREV with foreign inputRef rejects without opening another round.
+      // Strict authorization rejects it at staging, so the satisfied round is
+      // preserved rather than consumed through the legacy ordinary path.
       const invalidPrev = await settleSucceeded(
         ctx.repository,
         ctx.client,
         consumerTaskId,
         resume.id,
-        { kind: 'workflow_prev', targets: ['not_a_binding'] },
+        { kind: 'workflow_prev', targets: ['not_a_binding'], note: 'revise' },
         '2026-07-19T00:07:00.000Z',
       );
       expect(invalidPrev.ok).toBe(true);
@@ -747,7 +806,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
             WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
           ['ws', data.runId, roundId],
         ),
-      ).toMatchObject({ status: 'consumed' });
+      ).toMatchObject({ status: 'satisfied' });
       expect(
         await ctx.client.all(
           `SELECT round_id FROM workflow_feedback_rounds WHERE workspace_id = ? AND run_id = ?`,
@@ -768,7 +827,45 @@ describe('M018 S04 PREV feedback ALL-join', () => {
         kind: 'workflow' as const,
         inputs: [],
         outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'c' }],
-        nodes: [{ nodeId: 'a' }, { nodeId: 'b' }, { nodeId: 'c' }],
+        nodes: [
+          {
+            nodeId: 'a',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
+            },
+          },
+          {
+            nodeId: 'b',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The result is ready.' },
+              prev: [{
+                when: 'The producer result needs revision.',
+                targets: ['from_a'],
+                feedback: 'required' as const,
+              }],
+              fail: { when: 'The result cannot be produced.' },
+            },
+          },
+          {
+            nodeId: 'c',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The result is ready.' },
+              prev: [{
+                when: 'The producer result needs revision.',
+                targets: ['from_b'],
+                feedback: 'required' as const,
+              }],
+              fail: { when: 'The result cannot be produced.' },
+            },
+          },
+        ],
         edges: [
           { fromNodeId: 'a', toNodeId: 'b', inputRef: 'from_a' },
           { fromNodeId: 'b', toNodeId: 'c', inputRef: 'from_b' },
@@ -1366,7 +1463,32 @@ describe('M018 S04 PREV feedback ALL-join', () => {
     const ctx = await openRepo('prev-targeted');
     try {
       const createdAt = '2026-07-19T11:00:00.000Z';
-      const data = await defineAndStartFanIn(ctx.repository, createdAt, 's04-prev-targeted-1');
+      // Strict authorization matches exact declared routes, so the consumer
+      // declares both the ALL-join route and the targeted single-producer route.
+      const data = await defineAndStartFanIn(
+        ctx.repository,
+        createdAt,
+        's04-prev-targeted-1',
+        DEFAULT_WORKFLOW_POLICY,
+        {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The combined result is ready.' },
+          prev: [
+            {
+              when: 'Both producer results need revision.',
+              targets: ['from_p1', 'from_p2'],
+              feedback: 'required',
+            },
+            {
+              when: 'Only the first producer result needs revision.',
+              targets: ['from_p1'],
+              feedback: 'required',
+            },
+          ],
+          fail: { when: 'The combined result cannot be produced.' },
+        },
+      );
       const { p1, p2, consumerTaskId, consumerActivationTurnId } = await activateConsumer(
         ctx.repository,
         ctx.client,
@@ -1378,7 +1500,7 @@ describe('M018 S04 PREV feedback ALL-join', () => {
         ctx.client,
         consumerTaskId,
         consumerActivationTurnId,
-        { kind: 'workflow_prev', targets: ['from_p1'] },
+        { kind: 'workflow_prev', targets: ['from_p1'], note: 'revise p1' },
         '2026-07-19T11:03:00.000Z',
       );
       expect(prev.ok).toBe(true);

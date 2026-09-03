@@ -3,10 +3,17 @@ import {
   DEFAULT_WORKFLOW_POLICY,
   WORKFLOW_RUN_BUDGET_BOUNDS,
   WORKFLOW_FAIL_REASON_CODES,
+  WORKFLOW_FAILURE_FIXED_REPORT,
+  WORKFLOW_FAILURE_UNAVAILABLE_REPORT,
+  WORKFLOW_ENGINE_FAILURE_REPORTS,
   boundWorkflowFailReason,
+  buildWorkflowFailureReport,
   clampWorkflowRunBudgets,
+  decodeRunClosureEnvelope,
   decodeTopology,
+  decodeWorkflowFailureDetail,
   decodeWorkflowManifest,
+  unavailableWorkflowFailureDetail,
   defineWorkflowConflict,
   defineWorkflowCreated,
   defineWorkflowInvalid,
@@ -87,6 +94,12 @@ function oneNodeManifest(): TestManifest {
         taskType: 'research',
         title: 'Inspection title',
         instructions: { inline: 'Inspect the implementation and report evidence.' },
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The inspection report is complete.' },
+          fail: { when: 'The implementation cannot be inspected.' },
+        },
       },
     ],
     edges: [],
@@ -105,8 +118,26 @@ function fanInManifest(): TestManifest {
       { name: 'verifiedPlan', kind: 'plan', from: 'verify' },
     ],
     nodes: [
-      { nodeKey: 'plan', taskType: 'planner' },
-      { nodeKey: 'research', taskType: 'research' },
+      {
+        nodeKey: 'plan',
+        taskType: 'planner',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The plan draft is ready.' },
+          fail: { when: 'The plan cannot be produced.' },
+        },
+      },
+      {
+        nodeKey: 'research',
+        taskType: 'research',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The research evidence is ready.' },
+          fail: { when: 'The evidence cannot be gathered.' },
+        },
+      },
       {
         nodeKey: 'verify',
         taskType: 'reviewer',
@@ -150,10 +181,46 @@ function multiSinkManifest(): TestManifest {
       { name: 'rightReport', kind: 'report', from: 'rightResult' },
     ],
     nodes: [
-      { nodeKey: 'left', taskType: 'research' },
-      { nodeKey: 'leftResult', taskType: 'review' },
-      { nodeKey: 'right', taskType: 'research' },
-      { nodeKey: 'rightResult', taskType: 'review' },
+      {
+        nodeKey: 'left',
+        taskType: 'research',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The left draft is ready.' },
+          fail: { when: 'The left draft cannot be produced.' },
+        },
+      },
+      {
+        nodeKey: 'leftResult',
+        taskType: 'review',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The left review is complete.' },
+          fail: { when: 'The left review cannot be completed.' },
+        },
+      },
+      {
+        nodeKey: 'right',
+        taskType: 'research',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The right draft is ready.' },
+          fail: { when: 'The right draft cannot be produced.' },
+        },
+      },
+      {
+        nodeKey: 'rightResult',
+        taskType: 'review',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The right review is complete.' },
+          fail: { when: 'The right review cannot be completed.' },
+        },
+      },
     ],
     edges: [
       { from: 'left', to: 'leftResult', inputRef: 'draft' },
@@ -226,15 +293,33 @@ describe('canonical workflow manifest contract', () => {
     });
   });
 
-  it('accepts optional and required agent outcomes and complete execute outcomes', () => {
+  it('accepts explicit agent and complete execute outcomes', () => {
+    const explicit = oneNodeManifest();
+    explicit.nodes[0]!.outcome = {
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The report is complete.' },
+      fail: { when: 'The report cannot be completed.' },
+    };
+    expect(decodeWorkflowManifest(explicit, 'inline').ok).toBe(true);
+    expect(decodeWorkflowManifest(fanInManifest(), 'inline').ok).toBe(true);
+
     const optional = oneNodeManifest();
     optional.nodes[0]!.outcome = {
       kind: 'agent',
       requireExplicitDisposition: false,
       next: { when: 'The report is complete.' },
+      fail: { when: 'The report cannot be completed.' },
     };
-    expect(decodeWorkflowManifest(optional, 'inline').ok).toBe(true);
-    expect(decodeWorkflowManifest(fanInManifest(), 'inline').ok).toBe(true);
+    expectInvalidManifest(optional, /requireExplicitDisposition|literal.*true/i);
+
+    const missingFail = oneNodeManifest();
+    missingFail.nodes[0]!.outcome = {
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The report is complete.' },
+    };
+    expectInvalidManifest(missingFail, /FAIL|fail/i);
 
     const executeFail = oneNodeManifest();
     executeFail.nodes = [{
@@ -448,7 +533,7 @@ describe('canonical workflow manifest contract', () => {
     const optionalOutcome = record(optionalWithoutNext.nodes[2]!.outcome);
     optionalOutcome.requireExplicitDisposition = false;
     delete optionalOutcome.next;
-    expectInvalidManifest(optionalWithoutNext, /NEXT/i);
+    expectInvalidManifest(optionalWithoutNext, /requireExplicitDisposition|literal.*true|NEXT/i);
 
     const illegalTarget = clone(fanInManifest());
     recordArray(record(illegalTarget.nodes[2]!.outcome).prev)[0]!.targets = ['research'];
@@ -466,6 +551,8 @@ describe('canonical workflow manifest contract', () => {
     entryPrev.nodes[0]!.outcome = {
       kind: 'agent',
       requireExplicitDisposition: true,
+      next: { when: 'The result is ready.' },
+      fail: { when: 'The result cannot be produced.' },
       prev: [{ when: 'Retry caller input.', targets: ['request'], feedback: 'required' }],
     };
     expectInvalidManifest(entryPrev, /entry.*PREV|inbound/i);
@@ -483,6 +570,17 @@ describe('canonical workflow manifest contract', () => {
       inline: 'x'.repeat(WORKFLOW_INSTRUCTIONS_MAX_LENGTH + 1),
     };
     expectInvalidManifest(oversizedInstructions, /instructions/i);
+  });
+
+  it('rejects a false failWorkflow policy before definition validation succeeds', () => {
+    const definition = definitionFromManifest(oneNodeManifest());
+    expect(validateDefineWorkflow({
+      ...definition,
+      policy: { ...definition.policy, failWorkflow: false },
+    })).toMatchObject({
+      ok: false,
+      reason: expect.stringMatching(/failWorkflow/i),
+    });
   });
 
   it('rejects agent/exit mismatches and incomplete exit coverage', () => {
@@ -539,13 +637,31 @@ describe('canonical workflow manifest contract', () => {
     expectInvalidManifest(cycle, /cycle/i);
 
     const fanOut = clone(fanInManifest());
-    fanOut.nodes.push({ nodeKey: 'other', taskType: 'reviewer' });
+    fanOut.nodes.push({
+      nodeKey: 'other',
+      taskType: 'reviewer',
+      outcome: {
+        kind: 'agent',
+        requireExplicitDisposition: true,
+        next: { when: 'The other review is complete.' },
+        fail: { when: 'The other review cannot be completed.' },
+      },
+    });
     fanOut.edges.push({ from: 'plan', to: 'other', inputRef: 'plan' });
     fanOut.outputs.push({ name: 'other', kind: 'review', from: 'other' });
     expectInvalidManifest(fanOut, /fan-out/i);
 
     const isolated = clone(fanInManifest());
-    isolated.nodes.push({ nodeKey: 'isolated', taskType: 'research' });
+    isolated.nodes.push({
+      nodeKey: 'isolated',
+      taskType: 'research',
+      outcome: {
+        kind: 'agent',
+        requireExplicitDisposition: true,
+        next: { when: 'The isolated research is complete.' },
+        fail: { when: 'The isolated research cannot be completed.' },
+      },
+    });
     isolated.outputs.push({ name: 'isolated', kind: 'report', from: 'isolated' });
     expectInvalidManifest(isolated, /isolated|workflow path/i);
 
@@ -867,5 +983,196 @@ describe('workflow runtime identities and bounded status helpers', () => {
     const bounded = boundWorkflowFailReason('x'.repeat(2_000));
     expect(new TextEncoder().encode(bounded!).byteLength)
       .toBeLessThanOrEqual(WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes);
+  });
+});
+
+describe('WorkflowFailureDetail closed envelope', () => {
+  const maxBytes = WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes;
+
+  it('builds bounded reports with code-point-safe truncation and fixed fallback', () => {
+    expect(buildWorkflowFailureReport(undefined)).toEqual({
+      text: WORKFLOW_FAILURE_FIXED_REPORT, truncated: false,
+    });
+    expect(buildWorkflowFailureReport('   ')).toEqual({
+      text: WORKFLOW_FAILURE_FIXED_REPORT, truncated: false,
+    });
+    expect(buildWorkflowFailureReport('  agent gave up  ')).toEqual({
+      text: 'agent gave up', truncated: false,
+    });
+    // Multibyte text immediately below the limit is preserved exact.
+    const below = 'é'.repeat(Math.floor(maxBytes / 2));
+    expect(buildWorkflowFailureReport(below)).toEqual({ text: below, truncated: false });
+    // Text above the limit truncates without splitting a code point and is marked.
+    const above = 'é'.repeat(Math.floor(maxBytes / 2) + 1);
+    const built = buildWorkflowFailureReport(above);
+    expect(built.truncated).toBe(true);
+    expect(new TextEncoder().encode(built.text).byteLength).toBeLessThanOrEqual(maxBytes);
+    expect('é'.repeat(built.text.length)).toBe(built.text);
+  });
+
+  it('decodes every valid source with code-matched detail', () => {
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', nodeTitle: 'Entry',
+      report: { text: 'tool reason', truncated: false },
+    })).toMatchObject({ ok: true });
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'backend_refusal',
+      nodeKey: 'entry',
+      report: { text: 'final assistant report', truncated: false },
+    })).toMatchObject({ ok: true });
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'decision_missing', source: 'decision_exhausted',
+      nodeKey: 'entry', attempt: { number: 3, limit: 3 },
+      report: { text: 'last response', truncated: false },
+    })).toMatchObject({ ok: true });
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'invalid_route', source: 'engine',
+      nodeKey: 'entry',
+      report: { text: WORKFLOW_ENGINE_FAILURE_REPORTS.invalid_route, truncated: false },
+    })).toMatchObject({ ok: true });
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      report: { text: WORKFLOW_ENGINE_FAILURE_REPORTS.run_timeout, truncated: false },
+    })).toMatchObject({ ok: true });
+  });
+
+  it('rejects source/code mismatch, physical ids, and unbounded or foreign fields', () => {
+    // workflow_fail must carry agent_fail, not a decision code.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'decision_missing', source: 'workflow_fail',
+      nodeKey: 'entry', report: { text: 'x', truncated: false },
+    }).ok).toBe(false);
+    // decision_exhausted requires attempt 3 of 3.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'decision_missing', source: 'decision_exhausted',
+      nodeKey: 'entry', report: { text: 'x', truncated: false },
+    }).ok).toBe(false);
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'decision_missing', source: 'decision_exhausted',
+      nodeKey: 'entry', attempt: { number: 2, limit: 3 },
+      report: { text: 'x', truncated: false },
+    }).ok).toBe(false);
+    // Physical task/turn/message/artifact/run ids are never semantic node keys.
+    for (const physical of ['wft_abc', 'wftn_abc', 'wfm_abc', 'wfa_abc', 'wfr_abc']) {
+      expect(decodeWorkflowFailureDetail({
+        schema: 1, code: 'agent_fail', source: 'workflow_fail',
+        nodeKey: physical, report: { text: 'x', truncated: false },
+      }).ok).toBe(false);
+    }
+    // Unknown fields, raw coordinates, and over-limit reports are rejected.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', taskId: 'wft_abc',
+      report: { text: 'x', truncated: false },
+    }).ok).toBe(false);
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', report: { text: 'x'.repeat(maxBytes + 1), truncated: false },
+    }).ok).toBe(false);
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', report: { text: '', truncated: false },
+    }).ok).toBe(false);
+    // Engine failures without a responsible node must use the closed fixed report.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      report: { text: 'custom model prose', truncated: false },
+    }).ok).toBe(false);
+  });
+
+  it('decodes run_closure envelopes only when code, status, and detail match', () => {
+    const detail = {
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', report: { text: 'tool reason', truncated: false },
+    };
+    expect(decodeRunClosureEnvelope({
+      kind: 'run_closure', schema: 1,
+      reasonCode: 'agent_fail', terminalStatus: 'failed', detail,
+    })).toMatchObject({ ok: true });
+    // Payload-version envelope field from storage is accepted.
+    expect(decodeRunClosureEnvelope({
+      payloadVersion: 1, kind: 'run_closure', schema: 1,
+      reasonCode: 'agent_fail', terminalStatus: 'failed', detail,
+    })).toMatchObject({ ok: true });
+    // Detail code must match the envelope reason; status must match the code mapping.
+    expect(decodeRunClosureEnvelope({
+      kind: 'run_closure', schema: 1,
+      reasonCode: 'decision_missing', terminalStatus: 'failed', detail,
+    }).ok).toBe(false);
+    expect(decodeRunClosureEnvelope({
+      kind: 'run_closure', schema: 1,
+      reasonCode: 'required_target_cancelled', terminalStatus: 'failed', detail,
+    }).ok).toBe(false);
+    expect(unavailableWorkflowFailureDetail('run_timeout')).toMatchObject({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: false },
+    });
+  });
+
+  it('round-trips the fixed unavailable diagnostic for every reason code', () => {
+    for (const code of WORKFLOW_FAIL_REASON_CODES) {
+      const fallback = unavailableWorkflowFailureDetail(code);
+      const decoded = decodeWorkflowFailureDetail(fallback);
+      expect(decoded.ok, code).toBe(true);
+      if (!decoded.ok) continue;
+      expect(decoded.value).toEqual(fallback);
+      // The unavailable envelope carries no attribution.
+      expect(decoded.value).not.toHaveProperty('nodeKey');
+      expect(decoded.value).not.toHaveProperty('attempt');
+    }
+    // An unavailable report with an extra nested field is rejected even
+    // though its text matches the fixed diagnostic.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'agent_fail', source: 'engine',
+      report: {
+        text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT,
+        truncated: false,
+        artifactId: 'wfa_forged',
+      },
+    }).ok).toBe(false);
+  });
+
+  it('accepts versioned envelopes only at payload version 1', () => {
+    const detail = {
+      schema: 1, code: 'agent_fail', source: 'workflow_fail',
+      nodeKey: 'entry', report: { text: 'tool reason', truncated: false },
+    };
+    const base = {
+      kind: 'run_closure', schema: 1,
+      reasonCode: 'agent_fail', terminalStatus: 'failed', detail,
+    };
+    expect(decodeRunClosureEnvelope(base).ok).toBe(true);
+    expect(decodeRunClosureEnvelope({ ...base, payloadVersion: 1 }).ok).toBe(true);
+    expect(decodeRunClosureEnvelope({ ...base, payloadVersion: 2 }).ok).toBe(false);
+    expect(decodeRunClosureEnvelope({ ...base, payloadVersion: 0 }).ok).toBe(false);
+  });
+
+  it('rejects unavailable engine detail carrying attribution', () => {
+    // A forged semantic node attribution on the unavailable diagnostic is
+    // corrupt closure metadata, not the attribution-free fallback.
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      nodeKey: 'worker',
+      report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: false },
+    }).ok).toBe(false);
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'invalid_route', source: 'engine',
+      componentKey: 'worker',
+      report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: false },
+    }).ok).toBe(false);
+  });
+
+  it('rejects fixed engine reports with truncated metadata', () => {
+    const fixed = WORKFLOW_ENGINE_FAILURE_REPORTS.run_timeout;
+    expect(typeof fixed).toBe('string');
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      report: { text: fixed, truncated: true },
+    }).ok).toBe(false);
+    expect(decodeWorkflowFailureDetail({
+      schema: 1, code: 'run_timeout', source: 'engine',
+      report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: true },
+    }).ok).toBe(false);
   });
 });

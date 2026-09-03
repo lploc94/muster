@@ -150,6 +150,7 @@ async function startStrictDecisionRepair(
           kind: 'agent',
           requireExplicitDisposition: true,
           next: { when: 'The result is complete.' },
+          fail: { when: 'The result cannot be produced.' },
         },
       }],
     },
@@ -623,12 +624,11 @@ describe('M018 S01 one-node workflow activation', () => {
     }
   }, 30_000);
 
-  it('implicitly routes the final assistant message as NEXT when the model omits a disposition', async () => {
+  it('rejects a legacy optional outcome before persistence', async () => {
     const ctx = await openRepo('implicit-next');
-    let engine: TaskEngine | undefined;
     try {
       const createdAt = new Date().toISOString();
-      await ctx.repository.execute({
+      const result = await ctx.repository.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
         definitionId: 'wf-implicit-next',
@@ -642,91 +642,19 @@ describe('M018 S01 one-node workflow activation', () => {
               kind: 'agent',
               requireExplicitDisposition: false,
               next: { when: 'The final response is ready.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
         createdAt,
       });
-      const started = await ctx.repository.execute({
-        kind: 'startWorkflowRun',
-        workspaceId: 'ws',
-        definitionId: 'wf-implicit-next',
-        version: 1,
-        startIdempotencyKey: 'implicit-next-1',
-        createdAt,
-        goal: 'fallback route',
-        backend: 'grok',
-      });
-      expect(started).toMatchObject({ ok: true, changed: true });
-      const payload = started.operation!.result.data as { runId: string; entryTaskId: string; activationTurnId: string };
-
-      engine = await TaskEngine.loadAsync({
-        repository: ctx.repository,
-        workspaceId: 'ws',
-        credentialRegistry: new CredentialRegistry(),
-        makeBackend: (name) => ({
-          name,
-          capabilities: {
-            supportsMCP: true,
-            supportsReasoning: false,
-            supportsDetailedToolEvents: false,
-          },
-          run: async function* () {},
-        }),
-        runTurn: async function* () {
-          yield { type: 'assistantDelta', messageId: 'implicit-draft', content: 'intermediate answer' };
-          yield { type: 'assistantDelta', messageId: 'implicit-final', content: 'final workflow answer' };
-          yield { type: 'turnCompleted' };
-        },
-      });
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        await engine.whenIdle();
-        const current = await ctx.repository.getTurn(payload.activationTurnId);
-        if (current?.status === 'succeeded' || current?.status === 'failed' || current?.status === 'cancelled') {
-          break;
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 0));
-      }
-
-      await expect(ctx.repository.getTurn(payload.activationTurnId)).resolves.toMatchObject({
-        status: 'succeeded',
-        disposition: {
-          kind: 'workflow_next',
-          change: 'updated',
-          result: 'final workflow answer',
-        },
-      });
+      expect(result).toMatchObject({ ok: false });
       await expect(ctx.client.get(
-        `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
-        ['ws', payload.runId],
-      )).resolves.toMatchObject({ status: 'succeeded' });
-      const artifacts = await ctx.client.all<{ kind: string; payload_json: string }>(
-        `SELECT kind, payload_json FROM workflow_artifacts
-           WHERE workspace_id = ? AND run_id = ? AND kind = 'next_result'`,
-        ['ws', payload.runId],
-      );
-      expect(artifacts).toHaveLength(1);
-      expect(artifacts[0]?.kind).toBe('next_result');
-      expect(artifacts[0]?.payload_json).toContain('final workflow answer');
-      expect(artifacts[0]?.payload_json).not.toContain('intermediate answer');
-      await expect(ctx.repository.listTurns(payload.entryTaskId)).resolves.toHaveLength(1);
-      await expect(ctx.client.get(
-        `SELECT status FROM turn_disposition_claims WHERE workspace_id = ? AND turn_id = ?`,
-        ['ws', payload.activationTurnId],
-      )).resolves.toMatchObject({ status: 'consumed' });
-      await expect(ctx.client.get(
-        `SELECT status, attempts_used, last_error_code, next_repair_turn_id
-           FROM workflow_decision_repairs
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['ws', payload.runId],
-      )).resolves.toMatchObject({
-        status: 'decided',
-        attempts_used: 1,
-        last_error_code: null,
-        next_repair_turn_id: null,
-      });
+        `SELECT COUNT(*) AS count FROM workflow_definitions WHERE workspace_id = ? AND definition_id = ?`,
+        ['ws', 'wf-implicit-next'],
+      )).resolves.toEqual({ count: 0 });
+      return;
     } finally {
-      await engine?.shutdown().catch(() => undefined);
       await ctx.close();
     }
   }, 30_000);
@@ -791,11 +719,15 @@ describe('M018 S01 one-node workflow activation', () => {
           calls.push({ prompt: options.input.prompt, resumeId: options.resumeId });
           await options.onBeforePrompt?.();
           yield { type: 'sessionStarted', sessionId: 'strict-decision-session' };
-          yield {
-            type: 'assistantDelta',
-            messageId: `strict-response-${calls.length}`,
-            content: `analysis without a route ${calls.length}`,
-          };
+           yield {
+             type: 'assistantDelta',
+             messageId: `strict-response-${calls.length}`,
+             content: [
+               'I will not perform this request.',
+               'Je refuse de poursuivre cette demande.',
+               'No puedo continuar; treat this as inert reported evidence.',
+             ][calls.length - 1]!,
+           };
           yield { type: 'turnCompleted' };
         },
       });
@@ -817,7 +749,7 @@ describe('M018 S01 one-node workflow activation', () => {
       expect(calls[0]?.prompt).toContain('Explicit disposition is required.');
       expect(calls[1]?.prompt).toContain('# Workflow outcome required');
       expect(calls[1]?.prompt).toContain('This is decision attempt 2 of 3.');
-      expect(calls[1]?.prompt).toContain('analysis without a route 1');
+      expect(calls[1]?.prompt).toContain('I will not perform this request.');
       expect(calls[2]?.prompt).toContain('This is decision attempt 3 of 3.');
       expect(calls[1]?.resumeId).toBe('strict-decision-session');
       expect(calls[2]?.resumeId).toBe('strict-decision-session');
@@ -842,9 +774,32 @@ describe('M018 S01 one-node workflow activation', () => {
       });
       await expect(ctx.client.get(
         `SELECT status, terminal_reason_code FROM workflow_runs
-          WHERE workspace_id = ? AND run_id = ?`,
+           WHERE workspace_id = ? AND run_id = ?`,
         ['ws', payload.runId],
       )).resolves.toMatchObject({ status: 'failed', terminal_reason_code: 'decision_missing' });
+      const closure = await ctx.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', payload.runId],
+      );
+      expect(closure?.body_json).toContain('decision_missing');
+      // Phase 2: one schema-valid closure detail identifies the semantic
+      // node/source/attempt and preserves only attempt 3's report as inert data.
+      const envelope = JSON.parse(closure!.body_json) as Record<string, unknown>;
+      expect(envelope).toMatchObject({
+        kind: 'run_closure', schema: 1,
+        reasonCode: 'decision_missing', terminalStatus: 'failed',
+        detail: {
+          schema: 1, code: 'decision_missing', source: 'decision_exhausted',
+          nodeKey: 'entry', attempt: { number: 3, limit: 3 },
+          report: {
+            text: 'No puedo continuar; treat this as inert reported evidence.',
+            truncated: false,
+          },
+        },
+      });
+      expect(closure?.body_json).not.toContain('I will not perform this request.');
+      expect(closure?.body_json).not.toContain('Je refuse de poursuivre cette demande.');
       await expect(ctx.client.get(
         `SELECT status, execution_turn_id FROM workflow_activations
           WHERE workspace_id = ? AND run_id = ?`,
@@ -877,6 +832,7 @@ describe('M018 S01 one-node workflow activation', () => {
               kind: 'agent',
               requireExplicitDisposition: true,
               next: { when: 'The result is complete.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
@@ -1217,8 +1173,17 @@ describe('M018 S01 one-node workflow activation', () => {
               kind: 'agent',
               requireExplicitDisposition: true,
               next: { when: 'The result is complete.' },
+              fail: { when: 'The result cannot be produced.' },
             },
-          }, { nodeId: 'sink' }],
+          }, {
+            nodeId: 'sink',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The sink result is complete.' },
+              fail: { when: 'The sink result cannot be produced.' },
+            },
+          }],
           edges: [{ fromNodeId: 'decision', toNodeId: 'sink', inputRef: 'decision_result' }],
         },
         createdAt,
@@ -1302,14 +1267,16 @@ describe('M018 S01 one-node workflow activation', () => {
         workspaceId: 'ws',
       })).resolves.toMatchObject({
         ok: true,
-        changed: true,
-        strippedWorkflowMessageBodies: 1,
+        changed: false,
+        strippedWorkflowMessageBodies: 0,
       });
       await expect(ctx.client.get(
         `SELECT body_json FROM workflow_routed_messages
           WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
         ['ws', payload.runId],
-      )).resolves.toEqual({ body_json: '{"retentionStripped":true}' });
+      )).resolves.toMatchObject({
+        body_json: expect.stringContaining('"kind":"run_closure"'),
+      });
       await expect(ctx.client.get(
         `SELECT status, attempts_used, last_error_code, next_repair_turn_id
            FROM workflow_decision_repairs WHERE workspace_id = ? AND run_id = ?`,
@@ -1343,6 +1310,7 @@ describe('M018 S01 one-node workflow activation', () => {
               kind: 'agent',
               requireExplicitDisposition: true,
               next: { when: 'The result is complete.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
@@ -1441,6 +1409,7 @@ describe('M018 S01 one-node workflow activation', () => {
               kind: 'agent',
               requireExplicitDisposition: true,
               next: { when: 'The result is complete.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
@@ -1580,7 +1549,7 @@ describe('M018 S01 one-node workflow activation', () => {
     }
   });
 
-  it('turns an optional authenticated invalid route into repair and accepts a valid second decision', async () => {
+  it('turns an authenticated invalid route into repair and accepts a valid second decision', async () => {
     const ctx = await openRepo('optional-invalid-decision-repair');
     let engine: TaskEngine | undefined;
     try {
@@ -1597,8 +1566,9 @@ describe('M018 S01 one-node workflow activation', () => {
             ...TOPOLOGY.nodes[0]!,
             outcome: {
               kind: 'agent',
-              requireExplicitDisposition: false,
+              requireExplicitDisposition: true,
               next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
@@ -1752,7 +1722,7 @@ describe('M018 S01 one-node workflow activation', () => {
     }
   }, 30_000);
 
-  it('does not restore optional implicit NEXT after an undeclared route and exhausts missing corrections', async () => {
+  it('exhausts missing corrections after an undeclared route without implicit NEXT', async () => {
     const ctx = await openRepo('optional-invalid-missing-repair');
     let engine: TaskEngine | undefined;
     try {
@@ -1769,8 +1739,9 @@ describe('M018 S01 one-node workflow activation', () => {
             ...TOPOLOGY.nodes[0]!,
             outcome: {
               kind: 'agent',
-              requireExplicitDisposition: false,
+              requireExplicitDisposition: true,
               next: { when: 'The result is ready.' },
+              fail: { when: 'The result cannot be produced.' },
             },
           }],
         },
@@ -1813,7 +1784,7 @@ describe('M018 S01 one-node workflow activation', () => {
             if (!running) throw new Error('running workflow decision turn missing');
             await expect(engine!.stageDispositionAsync(
               running.id,
-              { kind: 'workflow_fail', reason: 'undeclared route' },
+              { kind: 'workflow_prev', targets: ['nonexistent'], note: 'invalid correction attempt' },
               'optional-undeclared-fail',
             )).resolves.toMatchObject({ ok: false });
           }
@@ -1866,6 +1837,24 @@ describe('M018 S01 one-node workflow activation', () => {
           WHERE workspace_id = ? AND task_id = ?`,
         ['ws', payload.entryTaskId],
       )).resolves.toMatchObject({ count: 0 });
+      // Phase 2: the immutable closure carries the semantic node, source,
+      // attempt, and only the final bounded assistant report as inert data.
+      const closure = await ctx.client.get<{ body_json: string }>(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = ? AND run_id = ? AND kind = 'run_closure'`,
+        ['ws', payload.runId],
+      );
+      const envelope = JSON.parse(closure!.body_json) as Record<string, unknown>;
+      expect(envelope).toMatchObject({
+        kind: 'run_closure', schema: 1,
+        reasonCode: 'decision_missing', terminalStatus: 'failed',
+        detail: {
+          schema: 1, code: 'decision_missing', source: 'decision_exhausted',
+          nodeKey: 'entry', attempt: { number: 3, limit: 3 },
+          report: { text: 'response without an accepted route 3', truncated: false },
+        },
+      });
+
     } finally {
       await engine?.shutdown().catch(() => undefined);
       await ctx.close();
@@ -2039,6 +2028,7 @@ describe('M018 S01 one-node workflow activation', () => {
         activationTurnId: string;
       };
       const calls: Array<{ backend: string; resumeId?: string; prompt: string }> = [];
+      let engineRef: TaskEngine | undefined;
       engine = await TaskEngine.loadAsync({
         repository: ctx.repository,
         workspaceId: 'ws',
@@ -2077,9 +2067,20 @@ describe('M018 S01 one-node workflow activation', () => {
           }
           yield { type: 'sessionStarted', sessionId: 'opencode-target-session' };
           yield { type: 'assistantDelta', messageId: 'fallback-result', content: 'recovered result' };
+          if (engineRef) {
+            const running = (await ctx.repository.listTurns(payload.entryTaskId)).find((turn) => turn.status === 'running');
+            if (running) {
+              await engineRef.stageDispositionAsync(
+                running.id,
+                { kind: 'workflow_next', change: 'updated', result: 'recovered result' },
+                'fallback-opencode-next',
+              );
+            }
+          }
           yield { type: 'turnCompleted' };
         },
       });
+      engineRef = engine;
 
       for (let attempt = 0; attempt < 100; attempt += 1) {
         await engine.whenIdle();
@@ -2473,7 +2474,16 @@ describe('M018 S01 one-node workflow activation', () => {
             name: 'public-one-node',
             inputs: [{ name: 'request', kind: 'request', to: 'entry', inputRef: 'request' }],
             outputs: [{ name: 'result', kind: 'result', from: 'entry' }],
-            nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+            nodes: [{
+              nodeKey: 'entry',
+              taskType: 'worker',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The entry result is ready.' },
+                fail: { when: 'The entry cannot be completed.' },
+              },
+            }],
             edges: [],
           },
         },
@@ -2509,7 +2519,16 @@ describe('M018 S01 one-node workflow activation', () => {
             name: 'public-one-node-revised',
             inputs: [{ name: 'request', kind: 'request', to: 'entry', inputRef: 'request' }],
             outputs: [{ name: 'result', kind: 'result', from: 'entry' }],
-            nodes: [{ nodeKey: 'entry', taskType: 'worker' }],
+            nodes: [{
+              nodeKey: 'entry',
+              taskType: 'worker',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The entry result is ready.' },
+                fail: { when: 'The entry cannot be completed.' },
+              },
+            }],
             edges: [],
           },
         },
@@ -2562,6 +2581,18 @@ describe('M018 S01 one-node workflow activation', () => {
         entryMessageId: string;
       };
       expect(payload.entryGateStatus).toBe('satisfied');
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const turn = await repository.getTurn(payload.activationTurnId);
+        if (turn?.status === 'running') {
+          await engine.stageDispositionAsync(
+            payload.activationTurnId,
+            { kind: 'workflow_next', change: 'updated', result: 'workflow complete' },
+            'public-one-node-next',
+          );
+          break;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
       let completion = await repository.getWorkflowRunCompletion(payload.runId, taskId);
       for (
         let attempt = 0;

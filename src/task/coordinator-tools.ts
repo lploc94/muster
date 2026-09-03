@@ -181,11 +181,11 @@ export type ToolCommand =
       targets: 'all' | string[];
       message: string;
     }
-  /** M018 S05: stage workflow FAIL (optional reason; engine owns run closure). */
+  /** M018 S05: stage workflow FAIL (mandatory bounded reason; engine owns run closure). */
   | {
       kind: 'workflow_fail';
       opId: string;
-      reason?: string;
+      reason: string;
     }
   /** Internal authenticated evidence for a parser/contract-rejected route attempt. */
   | {
@@ -1134,23 +1134,29 @@ export function dispatch(
         };
       }
       case 'workflow_fail': {
-        // Optional reason; empty string rejected at parse time. Closure is repository-owned (T02).
-        let reason: string | undefined;
-        if (Object.prototype.hasOwnProperty.call(args, 'reason')) {
-          if (typeof args.reason !== 'string' || args.reason.trim().length === 0) {
-            return workflowFailure('reason must be a non-empty string when provided');
-          }
-          if (!fitsUtf8Bytes(args.reason, TASK_ERROR_MAX_BYTES)) {
-            return workflowFailure(`reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`);
-          }
-          reason = args.reason;
+        if (!Object.prototype.hasOwnProperty.call(args, 'reason')) {
+          return workflowFailure('reason is required');
+        }
+        const rawReason = args.reason;
+        if (typeof rawReason !== 'string') {
+          return workflowFailure('reason must be a non-empty string when provided');
+        }
+        if (rawReason.length === 0) {
+          return workflowFailure('reason must be a non-empty string when provided');
+        }
+        const trimmed = rawReason.trim();
+        if (trimmed.length === 0) {
+          return workflowFailure('reason is required');
+        }
+        if (!fitsUtf8Bytes(trimmed, TASK_ERROR_MAX_BYTES)) {
+          return workflowFailure(`reason exceeds ${TASK_ERROR_MAX_BYTES} UTF-8 bytes`);
         }
         return {
           ok: true,
           command: {
             kind: 'workflow_fail',
             opId,
-            ...(reason !== undefined ? { reason } : {}),
+            reason: trimmed,
           },
         };
       }

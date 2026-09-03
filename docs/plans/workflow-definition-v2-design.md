@@ -35,7 +35,7 @@ actually operates.
 - Give each workflow a named semantic input and output interface.
 - Represent author-defined decision gates as node outcome contracts.
 - Keep physical dependency gates and feedback rounds engine-owned.
-- Preserve implicit NEXT for workflows that intentionally allow it.
+- Require explicit agent disposition; text-only completion enters bounded decision repair.
 - Repair missing or invalid required dispositions before failing a workflow.
 - Let deterministic execute nodes map successful checks to NEXT and failed checks
   to PREV.
@@ -374,26 +374,24 @@ The condition text is untrusted workflow content. It guides the agent but does
 not become host policy. The host can enforce declared routes and target sets; it
 cannot prove that the natural-language condition was evaluated correctly.
 
-## 11. Explicit Disposition and Implicit NEXT
+## 11. Explicit Disposition and Fail-Closed Outcomes
 
-`requireExplicitDisposition` controls missing-disposition behavior, not whether
-the workflow fails on the first protocol mistake.
+Every accepted agent node uses literal `requireExplicitDisposition: true` with
+declared NEXT and FAIL routes. A missing disposition is protocol evidence and never
+becomes semantic success through assistant prose.
 
-### 11.1 `requireExplicitDisposition: false`
+### 11.1 Mandatory agent outcome
 
+- Static validation rejects omitted outcomes, `false`, missing NEXT, missing FAIL,
+  empty/unbounded conditions, and `policy.failWorkflow: false`.
 - A valid explicit NEXT/PREV/FAIL is committed normally.
-- If the agent calls no disposition, its final assistant message becomes the
-  existing implicit NEXT result.
-- Static validation requires a declared `next` route when
-  `requireExplicitDisposition` is false.
-- An explicitly attempted but invalid disposition is repaired rather than
-  silently converted to NEXT.
-- Invalid explicit dispositions use the same three-attempt decision-repair
-  budget as missing required dispositions, then fail with `decision_invalid`.
+- `workflow_fail` is the single machine-level failure action. Its reason is
+  required, nonblank, and bounded; a valid first claim closes immediately as
+  `agent_fail`.
+- Assistant wording, sentiment, language, and refusal-like phrases are never
+  parsed as a route or failure category.
 
-This preserves current behavior for flexible nodes.
-
-### 11.2 `requireExplicitDisposition: true`
+### 11.2 Missing and invalid decisions
 
 - The agent must call one declared disposition.
 - A missing or invalid disposition does not fail the run immediately.
@@ -420,7 +418,9 @@ Do not repeat the full analysis unless needed. Select an outcome now.
 
 The repair is a durable engine continuation on the same task. It is not PREV and
 does not open a feedback round. Missing disposition is a protocol omission by
-the current node, not evidence that a producer must redo its work.
+the current node, not evidence that a producer must redo its work. A text-only refusal
+therefore follows exactly the same bounded `decision_missing` path as neutral or
+multilingual text; no wording inspection is performed.
 
 Invalid cases eligible for bounded repair include:
 
@@ -437,7 +437,42 @@ reclassify it as a repair attempt. Only a completed turn with no valid claim may
 be classified from durable missing/invalid-call evidence as `decision_missing` or
 `decision_invalid`.
 
-### 11.3 Durable decision-repair state
+### 11.3 Typed backend refusal
+
+An ACP `stopReason: "refusal"` is machine evidence, not assistant prose. When no
+valid disposition claim has already won, the engine persists `backend_refusal`,
+records the latest nonempty persisted assistant response (or a fixed host fallback),
+and atomically closes the workflow activation/run as `agent_fail`. It queues no
+correction, generic retry, or runtime fallback. Ordinary tasks and non-refusal
+provider/transport errors retain their existing recovery paths.
+
+### 11.4 Bounded workflow failure detail
+
+Every failed or cancelled workflow run retains one validated bounded
+`WorkflowFailureDetail` in its deterministic `run_closure` envelope:
+
+```text
+schemaVersion
+source = workflow_fail | backend_refusal | decision_exhausted | engine
+code
+node = { key, title? }          # omitted when no node is responsible
+report = { text, truncated }
+attempt = { number, limit }?   # only for decision exhaustion
+```
+
+The node identity is semantic and comes from frozen workflow authority. Report
+text is copied from the accepted tool reason or the identified persisted assistant
+response, trimmed at its outer boundary and UTF-8 bounded without splitting code
+points. Missing text receives a fixed host explanation. Physical IDs, prompt/script/
+artifact bodies, paths, credentials, raw errors, and SQL are invalid detail fields.
+
+The owning root receives the same validated detail through `start_wait` and
+same-root inspection with an explicit warning that the report is untrusted node
+evidence. It can explain the report or choose a next action, but the report never
+authorizes routing, mutation, or execution. Malformed or mismatched stored detail
+falls back to a fixed bounded unavailable diagnostic and never leaks raw payload.
+
+### 11.5 Durable decision-repair state
 
 Decision repair is owned by one logical workflow activation, not by the task or
 the whole run. Each activation with an agent outcome has a durable repair record
@@ -470,9 +505,9 @@ outcomes when an attempt finishes:
 3. A missing/invalid decision at attempt three marks the record `exhausted`,
    consumes/closes the activation, and atomically applies bounded workflow failure.
 
-The missing/invalid branches bypass current implicit-NEXT injection before normal
-workflow settlement. No successfully routed activation is reopened, and no
-missing strict activation is marked consumed before a valid route or exhaustion.
+The missing/invalid branches never inject an implicit NEXT before normal workflow
+settlement. No successfully routed activation is reopened, and no missing
+activation is marked consumed before a valid route or exhaustion.
 Transaction replay is a no-op through the deterministic fence, so a crash cannot
 lose or duplicate a repair turn.
 
@@ -588,7 +623,7 @@ enforces:
 - every agent PREV route contains `feedback: "required"`;
 - staged agent PREV feedback is trimmed, nonempty, and within the existing bound;
 - entry nodes cannot declare PREV because caller inputs have no workflow producer;
-- outcomes with `requireExplicitDisposition: false` declare NEXT;
+- every agent outcome uses literal `requireExplicitDisposition: true` and declares NEXT and FAIL;
 - nonempty bounded `when` text for every declared agent route;
 - required zero and nonzero coverage for an exit outcome;
 - no NEXT destination, PREV node ID, or FAIL target; and
@@ -697,8 +732,11 @@ receive prompt bodies or host paths.
 
 ## 18. Compatibility
 
-- Definitions without `outcome` retain current agent implicit NEXT behavior.
-- V2 agent outcomes require an explicit `requireExplicitDisposition` boolean.
+- Definitions without an agent `outcome`, optional outcomes, missing NEXT/FAIL, or
+  `requireExplicitDisposition: false` are rejected by the V2 decoder; no implicit-NEXT
+  compatibility path is retained.
+- V2 agent outcomes require literal `requireExplicitDisposition: true`, declared NEXT,
+  and declared FAIL.
 - Legacy script `onFailure: "fail_run"` remains nonzero -> FAIL.
 - Legacy script `onFailure: "continue"` remains nonzero -> NEXT.
 - Legacy edge `as`, entry input `name`, and node `label` are decoded only through
@@ -750,9 +788,10 @@ gate fill from the selected terminal artifact rather than the legacy aggregate.
 - Node decision gates are authored as `outcome` contracts.
 - Agent routes carry separate NEXT, PREV, and FAIL conditions.
 - Execute routes use deterministic zero/nonzero conditions.
-- `requireExplicitDisposition: false` preserves implicit NEXT.
 - `requireExplicitDisposition: true` performs bounded same-node decision repair
-  and fails only after three unsuccessful decision attempts.
+  and fails only after three unsuccessful decision attempts; there is no implicit NEXT.
+- Typed ACP refusal closes the workflow immediately as `agent_fail` with bounded
+  `backend_refusal` evidence and no generic retry/fallback.
 - Missing disposition never triggers PREV automatically.
 - PREV is reserved for an actual decision that direct producer work needs revision.
 - No separate workflow runtime is introduced.

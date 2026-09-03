@@ -483,10 +483,11 @@ export type TurnDisposition =
    * M018 S05: fail-fast close the current workflow run (FAIL). Mutually exclusive
    * with complete/fail/wait/idle/workflow_next/workflow_prev. Staging never seals
    * lifecycle; run/gate/round closure is owned by the repository commit path (T02).
+   * Phase 2: reason is mandatory, nonblank, outer-trimmed, UTF-8-bounded.
    */
   | {
       kind: 'workflow_fail';
-      reason?: string;
+      reason: string;
     };
 /**
  * Durable ACP boundary phase for a live/settled turn (Phase C).
@@ -519,11 +520,16 @@ export interface TaskTurn {
   /** Frozen at durable promotion; setting changes cannot move a live deadline. */
   effectiveRunLimitMs?: number;
   runDeadlineAt?: string;
-  termination?: {
-    kind: 'run_timeout';
-    limitMs: number;
-    deadlineAt: string;
-  };
+  termination?:
+    | {
+        kind: 'run_timeout';
+        limitMs: number;
+        deadlineAt: string;
+      }
+    | {
+        kind: 'backend_refusal';
+        responseMessageId?: string;
+      };
   /** Runtime generation captured when the turn is queued. */
   runtimeEpoch?: number;
   workflowActivation?: {

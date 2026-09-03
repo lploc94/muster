@@ -286,6 +286,15 @@ describe('GrokBackend.run — terminal classification', () => {
     expect(events.at(-1)).toEqual({ type: 'error', message: 'Grok stopped: max_tokens', meta: { failureClass: 'terminal_received' } });
   });
 
+  it('preserves typed refusal metadata for workflow settlement', async () => {
+    const events = await runTurn(new GrokBackend(), options(), fake, { result: { stopReason: 'refusal' } });
+    expect(events.at(-1)).toEqual({
+      type: 'error',
+      message: 'Grok stopped: refusal',
+      meta: { failureClass: 'terminal_received', stopReason: 'refusal' },
+    });
+  });
+
   it('treats max_turn_requests as a failure stopReason -> "stopped" error WITHOUT meta', async () => {
     // Normalized (4b): max_turn_requests is now in Grok's FAILURE set (as in the
     // other adapters), so it hits the failure branch (no meta) instead of the

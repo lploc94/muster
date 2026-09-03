@@ -213,17 +213,19 @@ describe('capabilitiesFor', () => {
           decision: {
             attempt: 2,
             outcome: {
-              kind: 'agent',
-              requireExplicitDisposition: true,
-              prev: [{ when: 'revise', targets: ['source'], feedback: 'required' }],
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'ready after revision' },
+            fail: { when: 'cannot continue after revision' },
+            prev: [{ when: 'revise', targets: ['source'], feedback: 'required' }],
             },
           },
         },
       } as any,
     });
-    expect(prevOnly.has('workflow_next')).toBe(false);
+    expect(prevOnly.has('workflow_next')).toBe(true);
     expect(prevOnly.has('workflow_prev')).toBe(true);
-    expect(prevOnly.has('workflow_fail')).toBe(false);
+    expect(prevOnly.has('workflow_fail')).toBe(true);
   });
 
   it('keeps ordinary delegation but removes authoring from workflow coordinators', () => {

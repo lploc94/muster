@@ -70,7 +70,7 @@ includes:
 - mutually exclusive agent and execute nodes;
 - optional inline or package-file instructions;
 - converging acyclic edges using stable `inputRef` identities; and
-- optional agent outcomes or complete numeric exit outcomes.
+- mandatory explicit agent outcomes or complete numeric exit outcomes.
 
 Saved packages may use either instruction form:
 
@@ -155,31 +155,44 @@ Frozen instruction bytes are persisted as node task content. Normal entry,
 dependency, child, retry, and reload paths use those bytes and never reread a
 mutable prompt file.
 
-Child invocation fingerprints canonically order public binding names by their
+Workflow start fingerprints canonically order public binding names by their
 UTF-8 bytes. Replay identity is therefore independent of the host locale and
 ICU version; it never uses locale-sensitive collation.
 
-An agent node may omit `outcome` and keep final-assistant-message implicit NEXT.
-When an agent outcome is present, the host renders its declared NEXT/PREV/FAIL
-contract and authorizes every attempted disposition against the frozen node
-definition before staging it. PREV can address only one exact declared set of
-direct inbound `inputRef` values and always carries bounded nonempty feedback.
+Every agent node declares an `outcome` with literal
+`requireExplicitDisposition: true`, a mandatory NEXT route, and a mandatory FAIL
+route. PREV is optional. The host renders the declared NEXT/PREV/FAIL contract
+and authorizes every attempted disposition against the frozen node definition
+before staging it. PREV can address only one exact declared set of direct
+inbound `inputRef` values and always carries bounded nonempty feedback.
 
-For `requireExplicitDisposition: true`, a completed turn without a valid route
-opens activation-owned decision repair. An authenticated invalid route attempt
-does the same, including for an otherwise optional outcome. The original turn is
-attempt 1; attempts 1 and 2 reserve one deterministic same-task correction turn,
-and attempt 3 exhausts the repair and fails the run with bounded
+The existing `workflow_fail` action is the only machine-level failure route.
+Its `reason` is required, nonblank, and UTF-8 bounded. The host never classifies
+assistant prose, sentiment, language, or refusal-like wording as a failure route.
+
+For a completed turn without a valid route, the host records protocol evidence
+and opens activation-owned decision repair. The original turn is attempt 1;
+attempts 1 and 2 reserve one deterministic same-task correction turn, and
+attempt 3 exhausts the repair and fails the run with bounded
 `decision_missing` or `decision_invalid` evidence. A valid disposition accepted
 first remains authoritative across races, replay, and reload. Decision repair is
 not PREV: it creates no feedback round, producer turn, hidden node, or graph edge.
 Only a completed third missing/invalid decision marks repair `exhausted` at
-attempt 3. Timeout, cancellation, and workflow-budget closure preserve the
-actual number and evidence of decision attempts, clear any scheduled correction,
-and suppress an otherwise-open correction summary once the run is terminal.
+attempt 3. A valid `workflow_fail` claim instead closes the run immediately as
+`agent_fail` with its exact bounded reason and queues no correction. Timeout,
+cancellation, and workflow-budget closure preserve the actual number and
+evidence of decision attempts, clear any scheduled correction, and suppress an
+otherwise-open correction summary once the run is terminal.
 The retained open repair row is terminal audit evidence, not live execution
 state: retention may strip routed transport payload bodies while preserving the
 repair status, attempt count, and bounded evidence.
+
+A typed ACP `stopReason: "refusal"` is handled separately from ordinary adapter
+errors. If no valid disposition claim has already won, it immediately closes the
+workflow activation/run as `agent_fail`, records `backend_refusal`, retains the
+latest nonempty persisted assistant response (or a fixed host fallback), and
+suppresses correction, retry, and runtime fallback. Ordinary tasks and
+non-refusal provider/transport errors retain their existing recovery behavior.
 
 Script execution deliberately separates the package root from process working
 directory:
@@ -240,8 +253,8 @@ references; durable run, dependency-gate, feedback-round, and start-continuation
 identifiers remain repository-private.
 
 Status and graph projections derive decision state from durable activation and
-repair rows. They may expose a node's bounded display `title`, whether its agent
-outcome has an optional or required decision gate, and a closed repair summary
+repair rows. They may expose a node's bounded display `title`, its required agent
+decision gate, and a closed repair summary
 such as `Waiting for workflow decision` or `Correcting workflow route` with
 `attempt N of 3`. The graph never fabricates a decision node. Dependency-gate,
 feedback, execution, completion, and failure remain independent display axes:
@@ -265,7 +278,9 @@ authoritative for the displayed state and progress counts.
 | Script changes after definition | Integrity failure before spawn |
 | Workspace untrusted or host execution disabled | No script run is admitted |
 | Missing/invalid agent route below attempt 3 | One durable correction turn; run remains open |
-| Missing/invalid agent route at attempt 3 | Repair exhausts and the run fails once |
+| Missing/invalid agent route at attempt 3 | Repair exhausts and the run fails once with bounded detail |
+| `workflow_fail` with a valid reason | Immediate `agent_fail`; no correction or retry |
+| Typed ACP `refusal` without a winning disposition | Immediate `agent_fail` with `backend_refusal`; no generic fallback |
 
 Recovery is explicit: fix the package, reload the catalog, obtain the new opaque
 reference, and define a new immutable workflow version.
@@ -281,8 +296,11 @@ reference, and define a new immutable workflow version.
   checked, and frozen before persistence.
 - Runtime prompt content comes only from persisted frozen bytes.
 - Runtime script resolution remains package-root-relative with workspace cwd.
-- Agent outcome repair is activation-owned, bounded to three attempts, durable
-  across reload, and visible only through bounded decision metadata.
+- Agent outcomes are explicit with mandatory NEXT/FAIL, and `workflow_fail` has a
+  required bounded reason. Missing/invalid outcomes use activation-owned repair,
+  bounded to three attempts and durable across reload; terminal workflow failures
+  retain one bounded semantic failure detail delivered to the owning root as
+  untrusted evidence.
 - Public starts bind named inputs, and prior-run composition selects one exact
   named terminal output rather than a run-level aggregate.
 - Legacy flat/bundle Markdown definitions and singular-root fallback are absent.

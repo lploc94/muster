@@ -16,7 +16,11 @@ import {
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
 } from './workflow-codec';
-import { WORKFLOW_RUN_GOAL_MAX_LENGTH } from './workflow-types';
+import {
+  WORKFLOW_FAIL_REASON_CODES,
+  WORKFLOW_RUN_GOAL_MAX_LENGTH,
+  WORKFLOW_TITLE_MAX_LENGTH,
+} from './workflow-types';
 import type {
   DefineWorkflowInput,
   DefineWorkflowResult,
@@ -27,6 +31,9 @@ import type {
   WorkflowDefinition,
   WorkflowDependencyEdge,
   WorkflowEntryContract,
+  WorkflowFailureDetail,
+  WorkflowFailureSource,
+  WorkflowFailReasonCode,
   WorkflowInputContract,
   WorkflowPolicy,
   WorkflowStartInput,
@@ -55,7 +62,9 @@ export type {
   WorkflowNodeSpec,
   WorkflowPolicy,
   WorkflowTopology,
+  WorkflowFailReasonCode,
 } from './workflow-types';
+export { WORKFLOW_FAIL_REASON_CODES } from './workflow-types';
 
 /** Operations ledger key for an immutable definition claim. */
 export function defineWorkflowLedgerKey(
@@ -172,7 +181,17 @@ export function makeOneNodeDefinition(overrides?: {
       kind: 'workflow',
       inputs: [],
       outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: nodeId }],
-      nodes: [{ nodeId }],
+      nodes: [
+        {
+          nodeId,
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The result is complete.' },
+            fail: { when: 'The result cannot be produced.' },
+          },
+        },
+      ],
       edges: [],
     },
     entryContracts: overrides?.entryContracts ?? [],
@@ -199,14 +218,45 @@ export function makeGraphFanInDefinition(overrides?: {
   const p1 = overrides?.producer1 ?? 'p1';
   const p2 = overrides?.producer2 ?? 'p2';
   const consumer = overrides?.consumer ?? 'consumer';
+  const inputRef1 = overrides?.inputRef1 ?? 'from_p1';
+  const inputRef2 = overrides?.inputRef2 ?? 'from_p2';
   const topology: WorkflowTopology = {
     kind: 'workflow',
     inputs: [],
     outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: consumer }],
-    nodes: [{ nodeId: p1 }, { nodeId: p2 }, { nodeId: consumer }],
+    nodes: [
+      {
+        nodeId: p1,
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The producer result is ready.' },
+          fail: { when: 'The producer cannot complete.' },
+        },
+      },
+      {
+        nodeId: p2,
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The producer result is ready.' },
+          fail: { when: 'The producer cannot complete.' },
+        },
+      },
+      {
+        nodeId: consumer,
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The consumer result is ready.' },
+          fail: { when: 'The consumer cannot complete.' },
+          prev: [{ when: 'The consumer needs correction.', targets: [inputRef1, inputRef2], feedback: 'required' }],
+        },
+      },
+    ],
     edges: [
-      { fromNodeId: p1, toNodeId: consumer, inputRef: overrides?.inputRef1 ?? 'from_p1' },
-      { fromNodeId: p2, toNodeId: consumer, inputRef: overrides?.inputRef2 ?? 'from_p2' },
+      { fromNodeId: p1, toNodeId: consumer, inputRef: inputRef1 },
+      { fromNodeId: p2, toNodeId: consumer, inputRef: inputRef2 },
     ],
   };
   return {
@@ -580,22 +630,6 @@ export function deriveFeedbackResumeActivationId(runId: string, roundId: string)
  * Budgets are derived from existing rows against these host clamps (no schema column).
  */
 
-/** Bounded reason codes for durable TaskAttention + closure diagnostics. */
-export const WORKFLOW_FAIL_REASON_CODES = [
-  'agent_fail',
-  'decision_missing',
-  'decision_invalid',
-  'invalid_route',
-  'run_timeout',
-  'aggregate_too_large',
-  'feedback_budget_exhausted',
-  'turn_budget_exhausted',
-  'required_target_cancelled',
-  'required_target_unavailable',
-] as const;
-
-export type WorkflowFailReasonCode = (typeof WORKFLOW_FAIL_REASON_CODES)[number];
-
 /** Terminal workflow_runs.status produced by a reason code. */
 export type WorkflowRunTerminalStatus = 'failed' | 'cancelled';
 
@@ -690,6 +724,273 @@ export function boundWorkflowFailReason(reason: string | undefined): string | un
     end -= 1;
   }
   return buf.subarray(0, end).toString('utf8');
+}
+
+/** Closed failure sources for the immutable WorkflowFailureDetail envelope. */
+export const WORKFLOW_FAILURE_SOURCES = [
+  'workflow_fail',
+  'backend_refusal',
+  'decision_exhausted',
+  'engine',
+] as const;
+
+/** Fixed host explanation when a workflow agent produces no usable report text. */
+export const WORKFLOW_FAILURE_FIXED_REPORT =
+  'The workflow agent did not produce a disposition.';
+
+/** Fixed bounded diagnostic when stored closure detail is missing or corrupt. */
+export const WORKFLOW_FAILURE_UNAVAILABLE_REPORT =
+  'Workflow failure detail is unavailable.';
+
+/** Closed host-generated reports for engine-source failures (no model text). */
+export const WORKFLOW_ENGINE_FAILURE_REPORTS: Record<string, string> = {
+  invalid_route: 'The workflow agent selected a route that is not declared for the current node.',
+  run_timeout: 'The workflow run exceeded its deadline.',
+  aggregate_too_large: 'The workflow result exceeded the aggregate size bound.',
+  feedback_budget_exhausted: 'The workflow run exhausted its feedback budget.',
+  turn_budget_exhausted: 'The workflow run exhausted its turn budget.',
+  required_target_cancelled: 'A required workflow target was cancelled.',
+  required_target_unavailable: 'A required workflow target is unavailable.',
+};
+
+const WORKFLOW_FAILURE_NODE_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const WORKFLOW_FAILURE_PHYSICAL_PREFIXES = [
+  'wft_', 'wftn_', 'wfm_', 'wfa_', 'wfr_', 'wfc_', 'wfg_', 'wfact_', 'wfrm_', 'wfrd_', 'wftg_',
+];
+
+function isFailureNodeKey(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 128) return false;
+  if (!WORKFLOW_FAILURE_NODE_KEY_RE.test(value)) return false;
+  if (value.includes('\0')) return false;
+  return !WORKFLOW_FAILURE_PHYSICAL_PREFIXES.some((prefix) => value.startsWith(prefix));
+}
+
+function isFailureTitle(value: unknown): value is string {
+  return typeof value === 'string' &&
+    value.length > 0 &&
+    value.length <= WORKFLOW_TITLE_MAX_LENGTH &&
+    !value.includes('\0');
+}
+
+/** Build a bounded failure report from model text without splitting code points. */
+export function buildWorkflowFailureReport(raw: string | undefined): { text: string; truncated: boolean } {
+  if (raw === undefined) return { text: WORKFLOW_FAILURE_FIXED_REPORT, truncated: false };
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return { text: WORKFLOW_FAILURE_FIXED_REPORT, truncated: false };
+  const max = WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes;
+  const buf = Buffer.from(trimmed, 'utf8');
+  if (buf.byteLength <= max) return { text: trimmed, truncated: false };
+  let end = max;
+  while (end > 0 && (buf[end] & 0b1100_0000) === 0b1000_0000) {
+    end -= 1;
+  }
+  return { text: buf.subarray(0, end).toString('utf8'), truncated: true };
+}
+
+/** Strict decoder for the immutable WorkflowFailureDetail envelope. */
+export function decodeWorkflowFailureDetail(raw: unknown):
+  | { ok: true; value: WorkflowFailureDetail }
+  | { ok: false; reason: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, reason: 'invalid failure detail' };
+  }
+  const record = raw as Record<string, unknown>;
+  const allowed = ['schema', 'code', 'source', 'nodeKey', 'nodeTitle', 'componentKey', 'report', 'attempt'];
+  if (!Object.keys(record).every((key) => allowed.includes(key))) {
+    return { ok: false, reason: 'invalid failure detail field' };
+  }
+  if (record.schema !== 1) return { ok: false, reason: 'invalid failure detail schema' };
+  if (typeof record.code !== 'string' || !(WORKFLOW_FAIL_REASON_CODES as readonly string[]).includes(record.code)) {
+    return { ok: false, reason: 'invalid failure detail code' };
+  }
+  if (typeof record.source !== 'string' || !(WORKFLOW_FAILURE_SOURCES as readonly string[]).includes(record.source)) {
+    return { ok: false, reason: 'invalid failure detail source' };
+  }
+  const source = record.source as WorkflowFailureSource;
+  const code = record.code as WorkflowFailReasonCode;
+  // The fixed unavailable diagnostic is the one engine envelope valid for
+  // every closed reason code: exact fixed text, untruncated, with no
+  // node/component/attempt attribution. Projections emit it when stored
+  // closure metadata is missing or corrupt.
+  if (
+    source === 'engine' &&
+    record.nodeKey === undefined &&
+    record.nodeTitle === undefined &&
+    record.componentKey === undefined &&
+    record.attempt === undefined &&
+    record.report !== null &&
+    typeof record.report === 'object' &&
+    !Array.isArray(record.report) &&
+    Object.keys(record.report as Record<string, unknown>).length === 2 &&
+    (record.report as Record<string, unknown>).text === WORKFLOW_FAILURE_UNAVAILABLE_REPORT &&
+    (record.report as Record<string, unknown>).truncated === false
+  ) {
+    return {
+      ok: true,
+      value: {
+        schema: 1,
+        code,
+        source,
+        report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: false },
+      },
+    };
+  }
+  // Closed code/source matching: the envelope must describe its own origin.
+  const sourceOk =
+    (source === 'workflow_fail' && code === 'agent_fail') ||
+    (source === 'backend_refusal' && code === 'agent_fail') ||
+    (source === 'decision_exhausted' && (code === 'decision_missing' || code === 'decision_invalid')) ||
+    (source === 'engine' && (
+      code === 'invalid_route' || code === 'run_timeout' || code === 'aggregate_too_large' ||
+      code === 'feedback_budget_exhausted' || code === 'turn_budget_exhausted' ||
+      code === 'required_target_cancelled' || code === 'required_target_unavailable'
+    ));
+  if (!sourceOk) return { ok: false, reason: 'failure detail source/code mismatch' };
+  let nodeKey: string | undefined;
+  if (record.nodeKey !== undefined) {
+    if (!isFailureNodeKey(record.nodeKey)) return { ok: false, reason: 'invalid failure detail node' };
+    nodeKey = record.nodeKey;
+  } else if (source !== 'engine') {
+    return { ok: false, reason: 'failure detail node is required' };
+  }
+  let nodeTitle: string | undefined;
+  if (record.nodeTitle !== undefined) {
+    if (!isFailureTitle(record.nodeTitle)) return { ok: false, reason: 'invalid failure detail title' };
+    nodeTitle = record.nodeTitle;
+  }
+  let componentKey: string | undefined;
+  if (record.componentKey !== undefined) {
+    if (!isFailureNodeKey(record.componentKey)) return { ok: false, reason: 'invalid failure detail component' };
+    componentKey = record.componentKey;
+  }
+  if (!record.report || typeof record.report !== 'object' || Array.isArray(record.report)) {
+    return { ok: false, reason: 'invalid failure detail report' };
+  }
+  const report = record.report as Record<string, unknown>;
+  if (!Object.keys(report).every((key) => key === 'text' || key === 'truncated')) {
+    return { ok: false, reason: 'invalid failure detail report field' };
+  }
+  if (typeof report.text !== 'string' || report.text.trim().length === 0) {
+    return { ok: false, reason: 'invalid failure detail report text' };
+  }
+  // Closure construction trims accepted model text at its outer boundary;
+  // stored detail with surrounding whitespace is noncanonical.
+  if ((report.text as string) !== (report.text as string).trim()) {
+    return { ok: false, reason: 'failure detail report must be trimmed' };
+  }
+  if (Buffer.byteLength(report.text, 'utf8') > WORKFLOW_RUN_BUDGET_BOUNDS.maxFailReasonBytes) {
+    return { ok: false, reason: 'failure detail report exceeds bounds' };
+  }
+  if (typeof report.truncated !== 'boolean') return { ok: false, reason: 'invalid failure detail truncation' };
+  // Engine reports are always closed host text, never model prose,
+  // whether or not a responsible node is identified. Fixed host reports are
+  // generated locally and are never truncated; the unavailable diagnostic is
+  // valid only as the attribution-free fallback (handled by the early return
+  // above), never with a forged semantic node/component attribution.
+  if (source === 'engine') {
+    const fixed = WORKFLOW_ENGINE_FAILURE_REPORTS[code] ?? WORKFLOW_FAILURE_UNAVAILABLE_REPORT;
+    if (report.text === WORKFLOW_FAILURE_UNAVAILABLE_REPORT) {
+      if (
+        nodeKey !== undefined || nodeTitle !== undefined ||
+        componentKey !== undefined || record.attempt !== undefined
+      ) {
+        return { ok: false, reason: 'unavailable failure detail must not carry attribution' };
+      }
+      if (report.truncated !== false) {
+        return { ok: false, reason: 'engine failure detail must not be truncated' };
+      }
+    } else {
+      if (report.text !== fixed) {
+        return { ok: false, reason: 'engine failure detail report mismatch' };
+      }
+      if (report.truncated !== false) {
+        return { ok: false, reason: 'engine failure detail must not be truncated' };
+      }
+    }
+  }
+  let attempt: { number: number; limit: number } | undefined;
+  if (record.attempt !== undefined) {
+    if (source !== 'decision_exhausted') return { ok: false, reason: 'failure detail attempt mismatch' };
+    if (!record.attempt || typeof record.attempt !== 'object' || Array.isArray(record.attempt)) {
+      return { ok: false, reason: 'invalid failure detail attempt' };
+    }
+    const attemptRecord = record.attempt as Record<string, unknown>;
+    if (!Object.keys(attemptRecord).every((key) => key === 'number' || key === 'limit')) {
+      return { ok: false, reason: 'invalid failure detail attempt field' };
+    }
+    if (!Number.isInteger(attemptRecord.number) || !Number.isInteger(attemptRecord.limit)) {
+      return { ok: false, reason: 'invalid failure detail attempt' };
+    }
+    const number = attemptRecord.number as number;
+    const limit = attemptRecord.limit as number;
+    // Closure detail records the exhausted third attempt only.
+    if (limit !== 3 || number !== 3) {
+      return { ok: false, reason: 'invalid failure detail attempt range' };
+    }
+    attempt = { number, limit };
+  } else if (source === 'decision_exhausted') {
+    return { ok: false, reason: 'failure detail attempt is required' };
+  }
+  const value: WorkflowFailureDetail = {
+    schema: 1,
+    code,
+    source,
+    report: { text: report.text as string, truncated: report.truncated as boolean },
+  };
+  if (nodeKey !== undefined) value.nodeKey = nodeKey;
+  if (nodeTitle !== undefined) value.nodeTitle = nodeTitle;
+  if (componentKey !== undefined) value.componentKey = componentKey;
+  if (attempt !== undefined) value.attempt = attempt;
+  return { ok: true, value };
+}
+
+/** Strict decoder for the deterministic run_closure envelope carrying failure detail. */
+export function decodeRunClosureEnvelope(raw: unknown):
+  | { ok: true; value: { reasonCode: WorkflowFailReasonCode; terminalStatus: WorkflowRunTerminalStatus; detail: WorkflowFailureDetail } }
+  | { ok: false; reason: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { ok: false, reason: 'invalid run closure' };
+  }
+  const record = raw as Record<string, unknown>;
+  // encodePayload adds a payloadVersion envelope field. In-memory envelopes
+  // may omit it, but a persisted envelope carrying an unsupported version is
+  // corrupt rather than canonical.
+  if (!Object.keys(record).every((key) =>
+    key === 'kind' || key === 'schema' || key === 'reasonCode' ||
+    key === 'terminalStatus' || key === 'detail' || key === 'payloadVersion')) {
+    return { ok: false, reason: 'invalid run closure field' };
+  }
+  if (record.payloadVersion !== undefined && record.payloadVersion !== 1) {
+    return { ok: false, reason: 'unsupported run closure payload version' };
+  }
+  if (record.kind !== 'run_closure' || record.schema !== 1) {
+    return { ok: false, reason: 'invalid run closure envelope' };
+  }
+  if (typeof record.reasonCode !== 'string' || !(WORKFLOW_FAIL_REASON_CODES as readonly string[]).includes(record.reasonCode)) {
+    return { ok: false, reason: 'invalid run closure reason' };
+  }
+  if (record.terminalStatus !== 'failed' && record.terminalStatus !== 'cancelled') {
+    return { ok: false, reason: 'invalid run closure status' };
+  }
+  const reasonCode = record.reasonCode as WorkflowFailReasonCode;
+  const terminalStatus = record.terminalStatus as WorkflowRunTerminalStatus;
+  if (workflowRunTerminalStatusForReason(reasonCode) !== terminalStatus) {
+    return { ok: false, reason: 'run closure status/code mismatch' };
+  }
+  const detail = decodeWorkflowFailureDetail(record.detail);
+  if (!detail.ok) return detail;
+  if (detail.value.code !== reasonCode) return { ok: false, reason: 'run closure detail/code mismatch' };
+  return { ok: true, value: { reasonCode, terminalStatus, detail: detail.value } };
+}
+
+/** Fixed unavailable detail used when stored closure metadata is missing or corrupt. */
+export function unavailableWorkflowFailureDetail(reasonCode: WorkflowFailReasonCode): WorkflowFailureDetail {
+  return {
+    schema: 1,
+    code: reasonCode,
+    source: 'engine',
+    report: { text: WORKFLOW_FAILURE_UNAVAILABLE_REPORT, truncated: false },
+  };
 }
 
 
