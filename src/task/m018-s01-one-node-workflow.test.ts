@@ -331,7 +331,7 @@ describe('M018 S01 one-node workflow activation', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'script' }],
+          outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'script' }],
           nodes: [{
             nodeId: 'script',
             backend: 'script',
@@ -1166,7 +1166,10 @@ describe('M018 S01 one-node workflow activation', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'sink' }],
+           outputs: [
+             { name: 'decisionResult', semanticKind: 'checkpoint.decision', sourceNodeId: 'decision' },
+             { name: 'result', semanticKind: 'result', sourceNodeId: 'sink' },
+           ],
           nodes: [{
             nodeId: 'decision',
             outcome: {

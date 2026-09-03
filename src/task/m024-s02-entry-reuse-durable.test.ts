@@ -50,12 +50,48 @@ describe('M024 S02 durable named output composition', () => {
           kind: 'workflow',
           inputs: [],
           outputs: [
-            { name: 'leftPlan', semanticKind: 'plan', terminalNodeId: 'left' },
-            { name: 'rightPlan', semanticKind: 'plan', terminalNodeId: 'right' },
+            { name: 'leftSourceResult', semanticKind: 'checkpoint.leftSource', sourceNodeId: 'leftSource' },
+            { name: 'leftPlan', semanticKind: 'plan', sourceNodeId: 'left' },
+            { name: 'rightSourceResult', semanticKind: 'checkpoint.rightSource', sourceNodeId: 'rightSource' },
+            { name: 'rightPlan', semanticKind: 'plan', sourceNodeId: 'right' },
           ],
           nodes: [
-            { nodeId: 'leftSource' }, { nodeId: 'left' },
-            { nodeId: 'rightSource' }, { nodeId: 'right' },
+            {
+              nodeId: 'leftSource',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The left seed is ready.' },
+                fail: { when: 'The left seed cannot be produced.' },
+              },
+            },
+            {
+              nodeId: 'left',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The left plan is ready.' },
+                fail: { when: 'The left plan cannot be produced.' },
+              },
+            },
+            {
+              nodeId: 'rightSource',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The right seed is ready.' },
+                fail: { when: 'The right seed cannot be produced.' },
+              },
+            },
+            {
+              nodeId: 'right',
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The right plan is ready.' },
+                fail: { when: 'The right plan cannot be produced.' },
+              },
+            },
           ],
           edges: [
             { fromNodeId: 'leftSource', toNodeId: 'left', inputRef: 'leftSeed' },
@@ -70,8 +106,16 @@ describe('M024 S02 durable named output composition', () => {
         topology: {
           kind: 'workflow',
           inputs: [{ name: 'plan', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'plan' }],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-          nodes: [{ nodeId: 'entry' }],
+          outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
+          nodes: [{
+            nodeId: 'entry',
+            outcome: {
+              kind: 'agent',
+              requireExplicitDisposition: true,
+              next: { when: 'The consumer result is ready.' },
+              fail: { when: 'The consumer cannot complete.' },
+            },
+          }],
           edges: [],
         },
         entryContracts: [{ entryNodeId: 'entry', inputRef: 'plan', expectedArtifactKind: 'workflow_input' }],

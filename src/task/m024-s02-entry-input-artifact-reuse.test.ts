@@ -143,8 +143,16 @@ describe('start_workflow entry input artifact reuse', () => {
         name: 'consumer', topology: {
           kind: 'workflow',
           inputs: [{ name: 'request', semanticKind: 'plan', entryNodeId: 'entry', inputRef: 'request' }],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-          nodes: [{ nodeId: 'entry' }],
+          outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
+           nodes: [{
+             nodeId: 'entry',
+             outcome: {
+               kind: 'agent',
+               requireExplicitDisposition: true,
+               next: { when: 'The consumer result is ready.' },
+               fail: { when: 'The consumer cannot complete.' },
+             },
+           }],
           edges: [],
         },
         entryContracts: [{

@@ -177,27 +177,57 @@ describe('M024 S04 workflow graph projection', () => {
         definitionId: 'wf-private-axes', version: 1, name: 'private axes', createdAt: NOW,
         topology: {
           kind: 'workflow', inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'downstream' }],
-          nodes: [
-            { nodeId: 'feedback', title: 'Await feedback' },
-            {
-              nodeId: 'repair',
+           outputs: [
+             { name: 'feedbackResult', semanticKind: 'checkpoint.feedback', sourceNodeId: 'feedback' },
+             { name: 'repairResult', semanticKind: 'checkpoint.repair', sourceNodeId: 'repair' },
+             { name: 'completedResult', semanticKind: 'checkpoint.completed', sourceNodeId: 'completed' },
+             { name: 'executingResult', semanticKind: 'checkpoint.executing', sourceNodeId: 'executing' },
+             { name: 'result', semanticKind: 'result', sourceNodeId: 'downstream' },
+           ],
+           nodes: [
+             {
+               nodeId: 'feedback', title: 'Await feedback',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Feedback is ready.' }, fail: { when: 'Feedback cannot be produced.' },
+               },
+             },
+             {
+               nodeId: 'repair',
               title: 'Repair route',
               instructions: {
                 kind: 'inline' as const,
                 content: frozenInstructions,
                 sha256: createHash('sha256').update(frozenInstructions).digest('hex'),
               },
-              outcome: {
+               outcome: {
                 kind: 'agent' as const,
                 requireExplicitDisposition: true,
                 next: { when: conditionCanary },
                 fail: { when: 'No bounded route remains.' },
-              },
-            },
-            { nodeId: 'completed', title: 'Completed upstream' },
-            { nodeId: 'executing', title: 'Execute now' },
-            { nodeId: 'downstream', title: 'Collect results' },
+               },
+             },
+             {
+               nodeId: 'completed', title: 'Completed upstream',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Completed result is ready.' }, fail: { when: 'Completed result cannot be produced.' },
+               },
+             },
+             {
+               nodeId: 'executing', title: 'Execute now',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Execution result is ready.' }, fail: { when: 'Execution result cannot be produced.' },
+               },
+             },
+             {
+               nodeId: 'downstream', title: 'Collect results',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Collected result is ready.' }, fail: { when: 'Results cannot be collected.' },
+               },
+             },
           ],
           edges: [
             { fromNodeId: 'feedback', toNodeId: 'downstream', inputRef: 'feedback_result' },
@@ -293,11 +323,17 @@ describe('M024 S04 workflow graph projection', () => {
                  WHERE workspace_id = ? AND id = ?`,
           params: ['2026-08-01T00:00:02.000Z', WORKSPACE_ID, completed.activationTurnId],
         },
-        {
-          sql: `UPDATE workflow_nodes SET status = 'succeeded'
-                 WHERE workspace_id = ? AND run_id = ? AND node_id = 'completed'`,
-          params: [WORKSPACE_ID, data.runId],
-        },
+         {
+           sql: `UPDATE workflow_nodes SET status = 'succeeded'
+                  WHERE workspace_id = ? AND run_id = ? AND node_id = 'completed'`,
+           params: [WORKSPACE_ID, data.runId],
+         },
+         {
+           sql: `UPDATE workflow_activations SET status = 'consumed', updated_at = ?
+                  WHERE workspace_id = ? AND run_id = ? AND node_id = 'completed'
+                    AND kind = 'entry_start'`,
+           params: ['2026-08-01T00:00:02.000Z', WORKSPACE_ID, data.runId],
+         },
         {
           sql: `UPDATE turns SET status = 'running', started_at = ?,
                            payload_json = json_set(payload_json, '$.status', 'running')
@@ -425,11 +461,23 @@ describe('M024 S04 workflow graph projection', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'five' }],
-          nodes: ['one', 'two', 'three', 'four', 'five'].map((nodeId) => ({
-            nodeId,
-            title: `Step ${nodeId}`,
-          })),
+           outputs: [
+             { name: 'oneResult', semanticKind: 'checkpoint.one', sourceNodeId: 'one' },
+             { name: 'twoResult', semanticKind: 'checkpoint.two', sourceNodeId: 'two' },
+             { name: 'threeResult', semanticKind: 'checkpoint.three', sourceNodeId: 'three' },
+             { name: 'fourResult', semanticKind: 'checkpoint.four', sourceNodeId: 'four' },
+             { name: 'result', semanticKind: 'result', sourceNodeId: 'five' },
+           ],
+           nodes: ['one', 'two', 'three', 'four', 'five'].map((nodeId) => ({
+             nodeId,
+             title: `Step ${nodeId}`,
+             outcome: {
+               kind: 'agent' as const,
+               requireExplicitDisposition: true as const,
+               next: { when: `Step ${nodeId} is complete.` },
+               fail: { when: `Step ${nodeId} cannot be completed.` },
+             },
+           })),
           edges: [
             { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result' },
             { fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result' },

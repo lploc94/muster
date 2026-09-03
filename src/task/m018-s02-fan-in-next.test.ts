@@ -30,8 +30,45 @@ import {
 const FAN_IN_TOPOLOGY = {
   kind: 'workflow' as const,
   inputs: [],
-  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
-  nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'consumer' }],
+  outputs: [
+    { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: 'p1' },
+    { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: 'p2' },
+    { name: 'result', semanticKind: 'result', sourceNodeId: 'consumer' },
+  ],
+  nodes: [
+    {
+      nodeId: 'p1',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The producer result is ready.' },
+        fail: { when: 'The producer cannot be completed.' },
+      },
+    },
+    {
+      nodeId: 'p2',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The producer result is ready.' },
+        fail: { when: 'The producer cannot be completed.' },
+      },
+    },
+    {
+      nodeId: 'consumer',
+      outcome: {
+        kind: 'agent' as const,
+        requireExplicitDisposition: true as const,
+        next: { when: 'The consumer result is ready.' },
+        fail: { when: 'The consumer cannot be completed.' },
+        prev: [{
+          when: 'The consumer needs correction.',
+          targets: ['from_p1', 'from_p2'],
+          feedback: 'required' as const,
+        }],
+      },
+    },
+  ],
   edges: [
     { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1', expectedArtifactKind: 'next_result' },
     { fromNodeId: 'p2', toNodeId: 'consumer', inputRef: 'from_p2', expectedArtifactKind: 'next_result' },
@@ -77,10 +114,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
           schema: 'muster.workflow/v2',
           name: 'fan-in',
           inputs: [],
-          outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+           outputs: [
+             { name: 'p1Result', kind: 'checkpoint.p1', from: 'p1' },
+             { name: 'p2Result', kind: 'checkpoint.p2', from: 'p2' },
+             { name: 'result', kind: 'result', from: 'consumer' },
+           ],
           nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
             nodeKey: node.nodeId,
             taskType: 'worker',
+            outcome: node.outcome,
           })),
           edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
             from: edge.fromNodeId,
@@ -203,10 +245,11 @@ describe('M018 S02 fan-in NEXT activation', () => {
           [createdAt, 'ws', entry.activationTurnId],
         );
         const task = await ctx.repository.getTask(entry.taskId);
-        const turn = await ctx.repository.getTurn(entry.activationTurnId);
-        expect(task).toBeTruthy();
-        expect(turn).toBeTruthy();
-        const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
+         const turn = await ctx.repository.getTurn(entry.activationTurnId);
+         expect(task).toBeTruthy();
+         expect(turn).toBeTruthy();
+         expect(turn?.workflowActivation?.isTerminalNode).toBe(false);
+         const disposition = { kind: 'workflow_next' as const, change: 'updated' as const, result };
         await stageDispositionForSettlement(projectedRepository, turn!, disposition);
         return projectedRepository.execute({
           kind: 'settleTurnAndApplyEffects',
@@ -298,12 +341,15 @@ describe('M018 S02 fan-in NEXT activation', () => {
 
       const consumerTurns = await ctx.repository.listTurns(consumerTask!.id);
       expect(consumerTurns).toHaveLength(1);
-      expect(consumerTurns[0]).toMatchObject({
-        status: 'queued',
-        trigger: 'engine',
-        sequence: 1,
-      });
-      expect(projection.getFile().turns[consumerTurns[0]!.id]).toMatchObject({ status: 'queued' });
+       expect(consumerTurns[0]).toMatchObject({
+         status: 'queued',
+         trigger: 'engine',
+         sequence: 1,
+       });
+       await expect(ctx.repository.getTurn(consumerTurns[0]!.id)).resolves.toMatchObject({
+         workflowActivation: { isTerminalNode: true },
+       });
+       expect(projection.getFile().turns[consumerTurns[0]!.id]).toMatchObject({ status: 'queued' });
 
       const msgId = consumerTurns[0]!.inputs.find((i) => i.kind === 'message')?.messageId;
       expect(msgId).toBeTruthy();
@@ -362,12 +408,49 @@ describe('M018 S02 fan-in NEXT activation', () => {
       const topology = {
         kind: 'workflow' as const,
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
+        outputs: [
+          { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: 'p1' },
+          { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: 'p2' },
+          { name: 'p3Result', semanticKind: 'checkpoint.p3', sourceNodeId: 'p3' },
+          { name: 'result', semanticKind: 'result', sourceNodeId: 'consumer' },
+        ],
         nodes: [
-          { nodeId: 'p1' },
-          { nodeId: 'p2' },
-          { nodeId: 'p3' },
-          { nodeId: 'consumer' },
+          {
+            nodeId: 'p1',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The producer result is ready.' },
+              fail: { when: 'The producer cannot be completed.' },
+            },
+          },
+          {
+            nodeId: 'p2',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The producer result is ready.' },
+              fail: { when: 'The producer cannot be completed.' },
+            },
+          },
+          {
+            nodeId: 'p3',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The producer result is ready.' },
+              fail: { when: 'The producer cannot be completed.' },
+            },
+          },
+          {
+            nodeId: 'consumer',
+            outcome: {
+              kind: 'agent' as const,
+              requireExplicitDisposition: true as const,
+              next: { when: 'The consumer result is ready.' },
+              fail: { when: 'The consumer cannot be completed.' },
+            },
+          },
         ],
         edges: [
           { fromNodeId: 'p1', toNodeId: 'consumer', inputRef: 'from_p1' },
@@ -639,10 +722,49 @@ describe('M018 S02 fan-in NEXT activation', () => {
           kind: 'workflow',
           inputs: [],
           outputs: [
-            { name: 'c1Result', semanticKind: 'result.c1', terminalNodeId: 'c1' },
-            { name: 'c2Result', semanticKind: 'result.c2', terminalNodeId: 'c2' },
+            { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: 'p1' },
+            { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: 'p2' },
+            { name: 'c1Result', semanticKind: 'result.c1', sourceNodeId: 'c1' },
+            { name: 'c2Result', semanticKind: 'result.c2', sourceNodeId: 'c2' },
           ],
-          nodes: [{ nodeId: 'p1' }, { nodeId: 'p2' }, { nodeId: 'c1' }, { nodeId: 'c2' }],
+          nodes: [
+            {
+              nodeId: 'p1',
+              outcome: {
+                kind: 'agent' as const,
+                requireExplicitDisposition: true as const,
+                next: { when: 'The producer result is ready.' },
+                fail: { when: 'The producer cannot be completed.' },
+              },
+            },
+            {
+              nodeId: 'p2',
+              outcome: {
+                kind: 'agent' as const,
+                requireExplicitDisposition: true as const,
+                next: { when: 'The producer result is ready.' },
+                fail: { when: 'The producer cannot be completed.' },
+              },
+            },
+            {
+              nodeId: 'c1',
+              outcome: {
+                kind: 'agent' as const,
+                requireExplicitDisposition: true as const,
+                next: { when: 'The first consumer result is ready.' },
+                fail: { when: 'The first consumer cannot be completed.' },
+              },
+            },
+            {
+              nodeId: 'c2',
+              outcome: {
+                kind: 'agent' as const,
+                requireExplicitDisposition: true as const,
+                next: { when: 'The second consumer result is ready.' },
+                fail: { when: 'The second consumer cannot be completed.' },
+              },
+            },
+          ],
           edges: [
             { fromNodeId: 'p1', toNodeId: 'c1', inputRef: 'from_p1' },
             { fromNodeId: 'p2', toNodeId: 'c2', inputRef: 'from_p2' },
@@ -1013,11 +1135,16 @@ describe('M018 S02 fan-in NEXT activation', () => {
             schema: 'muster.workflow/v2',
             name: 'public-fan-in',
             inputs: [],
-            outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+             outputs: [
+               { name: 'p1Result', kind: 'checkpoint.p1', from: 'p1' },
+               { name: 'p2Result', kind: 'checkpoint.p2', from: 'p2' },
+               { name: 'result', kind: 'result', from: 'consumer' },
+             ],
             nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
-              nodeKey: node.nodeId,
-              taskType: 'worker',
-            })),
+               nodeKey: node.nodeId,
+               taskType: 'worker',
+               outcome: node.outcome,
+             })),
             edges: FAN_IN_TOPOLOGY.edges.map((edge) => ({
               from: edge.fromNodeId,
               to: edge.toNodeId,

@@ -23,6 +23,10 @@ export const WORKFLOW_SCRIPT_MAX_ARGS = 64;
 export const WORKFLOW_SCRIPT_ARG_MAX_LENGTH = 4_096;
 export const WORKFLOW_PACKAGE_PATH_MAX_LENGTH = 1_024;
 export const WORKFLOW_PACKAGE_HASH_LENGTH = 64;
+export const WORKFLOW_COMPOSITE_COMPONENTS_MAX = WORKFLOW_GRAPH_MAX_NODES;
+export const WORKFLOW_COMPOSITE_CONNECTIONS_MAX = WORKFLOW_GRAPH_MAX_EDGES;
+export const WORKFLOW_COMPOSITE_INPUTS_MAX = WORKFLOW_ENTRY_CONTRACTS_MAX;
+export const WORKFLOW_COMPOSITE_OUTPUTS_MAX = WORKFLOW_GRAPH_MAX_NODES;
 
 export type ScriptInterpreter = 'node' | 'python' | 'python3';
 
@@ -205,7 +209,15 @@ export interface WorkflowInputContract {
 export interface WorkflowOutputContract {
   name: string;
   semanticKind: string;
-  terminalNodeId: string;
+  /** Semantic source node; may be a terminal or a nonterminal checkpoint. */
+  sourceNodeId: string;
+}
+
+export type WorkflowOutputRole = 'terminal' | 'checkpoint';
+
+/** Safe projected interface entry; role is derived from frozen topology. */
+export interface WorkflowOutputProjection extends WorkflowOutputContract {
+  role: WorkflowOutputRole;
 }
 
 /** The one normalized topology used for one-node and multi-node workflows alike. */
@@ -216,6 +228,102 @@ export interface WorkflowTopology {
   outputs: readonly WorkflowOutputContract[];
   nodes: readonly WorkflowNodeSpec[];
   edges: readonly WorkflowDependencyEdge[];
+}
+
+export interface WorkflowCompositeWorkflowRef {
+  workflowRef: string;
+  definitionId: string;
+  version: number;
+}
+
+/** Normalized inline component authority (the public schema is decoded first). */
+export interface WorkflowCompositeInlineManifest {
+  name: string;
+  topology: WorkflowTopology;
+  entryContracts: readonly WorkflowEntryContract[];
+  policy: WorkflowPolicy;
+}
+
+export type WorkflowCompositeComponent =
+  | {
+      key: string;
+      workflow: WorkflowCompositeWorkflowRef;
+    }
+  | {
+      key: string;
+      inline: WorkflowCompositeInlineManifest;
+    };
+
+export interface WorkflowCompositeConnection {
+  from: { component: string; output: string };
+  to: { component: string; input: string };
+}
+
+export interface WorkflowCompositeInput {
+  name: string;
+  to: { component: string; input: string };
+}
+
+export interface WorkflowCompositeOutput {
+  name: string;
+  from: { component: string; output: string };
+}
+
+/** Closed normalized run-scoped assembly; it is never persisted as a definition. */
+export interface WorkflowCompositeSpec {
+  components: readonly WorkflowCompositeComponent[];
+  connections: readonly WorkflowCompositeConnection[];
+  inputs: readonly WorkflowCompositeInput[];
+  outputs: readonly WorkflowCompositeOutput[];
+}
+
+/** Already authorized/frozen source authority supplied to the pure expander. */
+export type WorkflowCompositeComponentAuthority =
+  | {
+      key: string;
+      source: {
+        kind: 'workflow';
+        workflowRef: string;
+        fingerprint: string;
+      };
+      definition: WorkflowDefinition;
+    }
+  | {
+      key: string;
+      source: {
+        kind: 'inline';
+        fingerprint?: string;
+      };
+      definition: WorkflowDefinition;
+    };
+
+export interface WorkflowCompositeNodeProvenance {
+  nodeId: string;
+  componentKey: string;
+  localNodeKey: string;
+}
+
+export interface WorkflowCompositeOutputProjection extends WorkflowOutputProjection {
+  componentKey: string;
+  localNodeKey: string;
+}
+
+export interface WorkflowCompositeComponentProjection {
+  key: string;
+  source:
+    | { kind: 'workflow'; workflowRef: string; fingerprint: string }
+    | { kind: 'inline'; fingerprint: string };
+}
+
+export interface WorkflowCompositeExpansion {
+  spec: WorkflowCompositeSpec;
+  topology: WorkflowTopology;
+  entryContracts: readonly WorkflowEntryContract[];
+  policy: WorkflowPolicy;
+  components: readonly WorkflowCompositeComponentProjection[];
+  nodeProvenance: readonly WorkflowCompositeNodeProvenance[];
+  outputs: readonly WorkflowCompositeOutputProjection[];
+  fingerprint: string;
 }
 
 /** Explicit caller-input contract for one workflow entry. */

@@ -16,8 +16,16 @@ const tempDirs: string[] = [];
 const ONE_NODE_TOPOLOGY: WorkflowTopology = {
   kind: 'workflow',
   inputs: [],
-  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-  nodes: [{ nodeId: 'entry' }],
+  outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
+  nodes: [{
+    nodeId: 'entry',
+    outcome: {
+      kind: 'agent',
+      requireExplicitDisposition: true,
+      next: { when: 'The result is ready.' },
+      fail: { when: 'The result cannot be produced.' },
+    },
+  }],
   edges: [],
 };
 

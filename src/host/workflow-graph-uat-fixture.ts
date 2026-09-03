@@ -150,8 +150,16 @@ export async function seedWorkflowGraphFixture(
     topology: {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: PRODUCER_NODE_ID }],
-      nodes: [{ nodeId: PRODUCER_NODE_ID }],
+       outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: PRODUCER_NODE_ID }],
+       nodes: [{
+         nodeId: PRODUCER_NODE_ID,
+         outcome: {
+           kind: 'agent',
+           requireExplicitDisposition: true,
+           next: { when: 'The producer result is ready.' },
+           fail: { when: 'The producer result cannot be produced.' },
+         },
+       }],
       edges: [],
     },
     createdAt: iso(0),
@@ -166,8 +174,20 @@ export async function seedWorkflowGraphFixture(
     topology: {
       kind: 'workflow',
       inputs: [{ name: 'seed', semanticKind: 'result', entryNodeId: 'one', inputRef: 'seed' }],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'five' }],
-      nodes: CHAIN_NODES.map((nodeId) => ({ nodeId })),
+       outputs: CHAIN_NODES.map((nodeId, index) => ({
+         name: nodeId === 'five' ? 'result' : `${nodeId}Result`,
+         semanticKind: nodeId === 'five' ? 'result' : `checkpoint.${index + 1}`,
+         sourceNodeId: nodeId,
+       })),
+       nodes: CHAIN_NODES.map((nodeId) => ({
+         nodeId,
+         outcome: {
+           kind: 'agent' as const,
+           requireExplicitDisposition: true,
+           next: { when: `The ${nodeId} result is ready.` },
+           fail: { when: `The ${nodeId} result cannot be produced.` },
+         },
+       })),
       edges: [
         { fromNodeId: 'one', toNodeId: 'two', inputRef: 'one_result' },
         { fromNodeId: 'two', toNodeId: 'three', inputRef: 'two_result' },

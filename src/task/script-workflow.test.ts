@@ -238,9 +238,12 @@ describe('script workflow runtime', () => {
           scriptManifestNode('produce', 'scripts/produce.js'),
           scriptManifestNode('consume', 'scripts/consume.js'),
         ],
-        [{ from: 'produce', to: 'consume', inputRef: 'dep' }],
-        [{ name: 'request', kind: 'request', to: 'produce', inputRef: 'request' }],
-        [{ name: 'result', kind: 'result', from: 'consume' }],
+         [{ from: 'produce', to: 'consume', inputRef: 'dep' }],
+         [{ name: 'request', kind: 'request', to: 'produce', inputRef: 'request' }],
+         [
+           { name: 'produceResult', kind: 'checkpoint.produce', from: 'produce' },
+           { name: 'result', kind: 'result', from: 'consume' },
+         ],
       ),
       {
         'scripts/produce.js': [
@@ -261,21 +264,31 @@ describe('script workflow runtime', () => {
     writePackage(
       packageRoot,
       'invalid-freeze',
-      workflowManifest('Invalid freeze package', [{
-        nodeKey: 'run',
-        taskType: 'review',
-        instructions: { file: 'prompts/missing.md' },
-      }]),
+       workflowManifest('Invalid freeze package', [{
+         nodeKey: 'run',
+         taskType: 'review',
+         instructions: { file: 'prompts/missing.md' },
+         outcome: {
+           kind: 'agent', requireExplicitDisposition: true,
+           next: { when: 'The review is complete.' },
+           fail: { when: 'The review cannot be completed.' },
+         },
+       }]),
       {},
     );
     const swapPackageRoot = writePackage(
       packageRoot,
       'symlink-swap',
-      workflowManifest('Symlink swap package', [{
-        nodeKey: 'run',
-        taskType: 'review',
-        instructions: { file: 'prompts/check.md' },
-      }]),
+       workflowManifest('Symlink swap package', [{
+         nodeKey: 'run',
+         taskType: 'review',
+         instructions: { file: 'prompts/check.md' },
+         outcome: {
+           kind: 'agent', requireExplicitDisposition: true,
+           next: { when: 'The review is complete.' },
+           fail: { when: 'The review cannot be completed.' },
+         },
+       }]),
       { 'prompts/check.md': 'original prompt' },
     );
     const running = await coordinator(ctx, 'public-path');
@@ -400,12 +413,17 @@ describe('script workflow runtime', () => {
     const packageManifest = workflowManifest(
       'Assembled canonical journey',
       [
-        {
-          nodeKey: 'producer',
-          title: 'Candidate producer',
-          taskType: 'review',
-          instructions: { file: 'prompts/producer.md' },
-        },
+         {
+           nodeKey: 'producer',
+           title: 'Candidate producer',
+           taskType: 'review',
+           instructions: { file: 'prompts/producer.md' },
+           outcome: {
+             kind: 'agent', requireExplicitDisposition: true,
+             next: { when: 'The candidate is ready.' },
+             fail: { when: 'The candidate cannot be produced.' },
+           },
+         },
         {
           nodeKey: 'check',
           title: 'Candidate check',
@@ -413,16 +431,26 @@ describe('script workflow runtime', () => {
           outcome: prevExitOutcome(['candidate']),
         },
         {
-          nodeKey: 'audit_source',
-          title: 'Audit source',
-          taskType: 'review',
-          instructions: { file: 'prompts/audit.md' },
-        },
+           nodeKey: 'audit_source',
+           title: 'Audit source',
+           taskType: 'review',
+           instructions: { file: 'prompts/audit.md' },
+           outcome: {
+             kind: 'agent', requireExplicitDisposition: true,
+             next: { when: 'The audit source is ready.' },
+             fail: { when: 'The audit source cannot be produced.' },
+           },
+         },
         {
           nodeKey: 'audit',
           title: 'Audit evidence',
-          taskType: 'review',
-          instructions: { inline: '[assembled-audit-terminal] Finalize independent audit evidence.' },
+           taskType: 'review',
+           instructions: { inline: '[assembled-audit-terminal] Finalize independent audit evidence.' },
+           outcome: {
+             kind: 'agent', requireExplicitDisposition: true,
+             next: { when: 'The audit evidence is ready.' },
+             fail: { when: 'The audit evidence cannot be produced.' },
+           },
         },
       ],
       [
@@ -433,9 +461,11 @@ describe('script workflow runtime', () => {
         { name: 'request', kind: 'request', to: 'producer', inputRef: 'request' },
         { name: 'audit_request', kind: 'request', to: 'audit_source', inputRef: 'audit_request' },
       ],
-      [
-        { name: 'approved', kind: 'result', from: 'check' },
-        { name: 'audit', kind: 'result', from: 'audit' },
+       [
+         { name: 'producerResult', kind: 'checkpoint.producer', from: 'producer' },
+         { name: 'auditSourceResult', kind: 'checkpoint.audit-source', from: 'audit_source' },
+         { name: 'approved', kind: 'result', from: 'check' },
+         { name: 'audit', kind: 'result', from: 'audit' },
       ],
     );
     expect(decodeWorkflowManifest(packageManifest, 'saved')).toMatchObject({ ok: true });
@@ -480,7 +510,37 @@ describe('script workflow runtime', () => {
       markAuditTerminalStarted = resolve;
     });
     let holdAuditTerminal = true;
-    const loadEngine = (repository: SqliteTaskRepository = ctx.repository) => TaskEngine.loadAsync({
+    let engine!: TaskEngine;
+    const stageAgentNext = async (
+      client: DbClient,
+      nodeId: string,
+      result: string,
+    ): Promise<void> => {
+      const active = await client.get<{ turn_id: string }>(
+        `SELECT turn.id AS turn_id
+           FROM turns turn
+           JOIN workflow_activations activation
+             ON activation.workspace_id = turn.workspace_id
+            AND activation.execution_turn_id = turn.id
+          WHERE turn.workspace_id = ? AND activation.node_id = ?
+            AND activation.status IN ('queued', 'running')
+            AND turn.status IN ('running', 'waiting_user')
+          ORDER BY turn.sequence DESC, turn.id DESC
+          LIMIT 1`,
+        ['ws', nodeId],
+      );
+      if (!active) throw new Error(`no active workflow turn found for ${nodeId}`);
+      const staged = await engine.stageDispositionAsync(
+        active.turn_id,
+        { kind: 'workflow_next', change: 'updated', result },
+        `assembled-agent-next:${active.turn_id}`,
+      );
+      if (!staged.ok) throw new Error(`failed to stage ${nodeId} workflow NEXT: ${staged.reason}`);
+    };
+    const loadEngine = (
+      repository: SqliteTaskRepository = ctx.repository,
+      client: DbClient = ctx.client,
+    ) => TaskEngine.loadAsync({
       repository,
       workspaceId: 'ws',
       workspaceFolder: ctx.dir,
@@ -528,11 +588,21 @@ describe('script workflow runtime', () => {
         }
         yield { type: 'sessionStarted', sessionId: `assembled-session-${observedPrompts.length}` };
         yield { type: 'assistantDelta', messageId: `assembled-message-${observedPrompts.length}`, content: response };
+        const nodeId = prompt.includes('[assembled-producer-original]') || prompt.includes('revise candidate')
+          ? 'producer'
+          : prompt.includes('[assembled-audit-original]')
+            ? 'audit_source'
+            : prompt.includes('[assembled-audit-terminal]') || prompt.includes('Resume the frozen audit step after reload.')
+              ? 'audit'
+              : undefined;
+        if (nodeId && (nodeId !== 'audit' || !holdAuditTerminal)) {
+          await stageAgentNext(client, nodeId, response);
+        }
         yield { type: 'turnCompleted' };
       },
     });
 
-    let engine = await loadEngine();
+    engine = await loadEngine();
     ctx.setEngine(engine);
     const rootId = 'assembled-root';
     const rootTurnId = 'assembled-root-turn';
@@ -652,7 +722,7 @@ describe('script workflow runtime', () => {
     await reloadedClient.open(join(ctx.dir, 'muster.sqlite3'));
     cleanups.push(async () => reloadedClient.close().catch(() => undefined));
     const reloadedRepository = new SqliteTaskRepository(reloadedClient, 'ws');
-    engine = await loadEngine(reloadedRepository);
+     engine = await loadEngine(reloadedRepository, reloadedClient);
     ctx.setEngine(engine);
     const interruptedAudit = await reloadedClient.get<{
       activation_id: string;
@@ -821,7 +891,10 @@ describe('script workflow runtime', () => {
     const topology = {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consume' }],
+       outputs: [
+         { name: 'produceResult', semanticKind: 'checkpoint.produce', sourceNodeId: 'produce' },
+         { name: 'result', semanticKind: 'result', sourceNodeId: 'consume' },
+       ],
       nodes: [
         { nodeId: 'produce', backend: 'script', execution: { kind: 'script', interpreter: 'node', file: 'produce.js', args: [] }, outcome: exitOutcome() },
         { nodeId: 'consume', backend: 'script', execution: { kind: 'script', interpreter: 'node', file: 'consume.js', args: [] }, outcome: exitOutcome() },
@@ -1089,7 +1162,10 @@ describe('script workflow runtime', () => {
       name: 'script PREV empty stdout',
       topology: {
         kind: 'workflow', inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'check' }],
+         outputs: [
+           { name: 'producerResult', semanticKind: 'checkpoint.producer', sourceNodeId: 'producer' },
+           { name: 'result', semanticKind: 'result', sourceNodeId: 'check' },
+         ],
         nodes: [
           {
             nodeId: 'producer', backend: 'script',
@@ -1111,7 +1187,7 @@ describe('script workflow runtime', () => {
       name: 'script FAIL nine',
       topology: {
         kind: 'workflow', inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'fail' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'fail' }],
         nodes: [{
           nodeId: 'fail', title: 'Failing check', backend: 'script',
           execution: { kind: 'script', interpreter: 'node', file: 'fail.js', args: [] },
@@ -1225,7 +1301,12 @@ describe('script workflow runtime', () => {
       name: 'script PREV all join',
       topology: {
         kind: 'workflow', inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'check' }],
+         outputs: [
+           { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: 'p1' },
+           { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: 'p2' },
+           { name: 'p3Result', semanticKind: 'checkpoint.p3', sourceNodeId: 'p3' },
+           { name: 'result', semanticKind: 'result', sourceNodeId: 'check' },
+         ],
         nodes: [
           ...['p1', 'p2', 'p3'].map((nodeId) => ({
             nodeId, backend: 'script',
@@ -1310,7 +1391,7 @@ describe('script workflow runtime', () => {
       kind: 'defineWorkflowVersion', workspaceId: 'ws', definitionId, version: 1, name: definitionId,
       topology: {
         kind: 'workflow', inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'script' }],
+        outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'script' }],
         nodes: [{ nodeId: 'script', backend: 'script', execution: { kind: 'script', interpreter: 'node', file, args: [] }, outcome: exitOutcome() }],
         edges: [],
       },

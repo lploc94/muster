@@ -15,6 +15,9 @@ import {
   fingerprintStartEntryInputs,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
+  projectWorkflowOutputs,
+  validateTopologySemantics,
+  workflowOutputRole,
 } from './workflow-codec';
 import {
   WORKFLOW_FAIL_REASON_CODES,
@@ -49,7 +52,16 @@ export {
   formatWorkflowEntryAggregate,
   fingerprintWorkflowDefinition,
   maximumWorkflowEntryAggregateBytes,
+  projectWorkflowOutputs,
+  validateTopologySemantics,
+  workflowOutputRole,
 } from './workflow-codec';
+export {
+  decodeWorkflowCompositeSpec,
+  expandWorkflowComposite,
+  fingerprintWorkflowComposite,
+  reduceWorkflowPolicies,
+} from './workflow-composite-codec';
 export type {
   DefineWorkflowInput,
   DefineWorkflowResult,
@@ -63,6 +75,21 @@ export type {
   WorkflowPolicy,
   WorkflowTopology,
   WorkflowFailReasonCode,
+  WorkflowCompositeComponent,
+  WorkflowCompositeComponentAuthority,
+  WorkflowCompositeComponentProjection,
+  WorkflowCompositeConnection,
+  WorkflowCompositeExpansion,
+  WorkflowCompositeInlineManifest,
+  WorkflowCompositeInput,
+  WorkflowCompositeNodeProvenance,
+  WorkflowCompositeOutput,
+  WorkflowCompositeOutputProjection,
+  WorkflowCompositeSpec,
+  WorkflowCompositeWorkflowRef,
+  WorkflowOutputContract,
+  WorkflowOutputProjection,
+  WorkflowOutputRole,
 } from './workflow-types';
 export { WORKFLOW_FAIL_REASON_CODES } from './workflow-types';
 
@@ -180,7 +207,7 @@ export function makeOneNodeDefinition(overrides?: {
     topology: {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: nodeId }],
+      outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: nodeId }],
       nodes: [
         {
           nodeId,
@@ -223,7 +250,11 @@ export function makeGraphFanInDefinition(overrides?: {
   const topology: WorkflowTopology = {
     kind: 'workflow',
     inputs: [],
-    outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: consumer }],
+    outputs: [
+      { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: p1 },
+      { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: p2 },
+      { name: 'result', semanticKind: 'result', sourceNodeId: consumer },
+    ],
     nodes: [
       {
         nodeId: p1,

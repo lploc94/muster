@@ -712,7 +712,8 @@ type StoredWorkflowInputRow = {
 type StoredWorkflowOutputRow = {
   name: string;
   semantic_kind: string;
-  terminal_node_id: string;
+  /** Transitional SQL column is terminal_node_id until schema 8; semantic name is source_node_id. */
+  source_node_id: string;
   ordinal: number;
   expected_artifact_kind: string;
 };
@@ -804,7 +805,7 @@ async function readStoredWorkflowDefinition(
       [workspaceId, definitionId, version],
     ),
     db.all<StoredWorkflowOutputRow>(
-      `SELECT name, semantic_kind, terminal_node_id, ordinal, expected_artifact_kind
+      `SELECT name, semantic_kind, terminal_node_id AS source_node_id, ordinal, expected_artifact_kind
          FROM workflow_definition_outputs
         WHERE workspace_id = ? AND definition_id = ? AND definition_version = ?
         ORDER BY ordinal`,
@@ -927,7 +928,7 @@ async function readStoredWorkflowDefinition(
       outputs: outputRows.map((output) => ({
         name: output.name,
         semanticKind: output.semantic_kind,
-        terminalNodeId: output.terminal_node_id,
+        sourceNodeId: output.source_node_id,
       })),
       nodes,
       edges: edgeRows.map((edge) => ({
@@ -1993,13 +1994,13 @@ export class SqliteTaskRepository implements TaskRepository {
                 run.status AS run_status,
                 run.origin AS run_origin,
                 run.parent_run_id,
-               EXISTS (
-                 SELECT 1 FROM workflow_definition_outputs output
-                  WHERE output.workspace_id = run.workspace_id
-                    AND output.definition_id = run.definition_id
-                    AND output.definition_version = run.definition_version
-                    AND output.terminal_node_id = activation.node_id
-               ) AS is_terminal,
+                NOT EXISTS (
+                  SELECT 1 FROM workflow_definition_edges edge
+                   WHERE edge.workspace_id = run.workspace_id
+                     AND edge.definition_id = run.definition_id
+                     AND edge.definition_version = run.definition_version
+                     AND edge.source_node_id = activation.node_id
+                ) AS is_terminal,
               EXISTS (
                 SELECT 1
                   FROM workflow_dependency_gates gate_row
@@ -7559,7 +7560,7 @@ export class SqliteTaskRepository implements TaskRepository {
         definition.version,
         output.name,
         output.semanticKind,
-        output.terminalNodeId,
+         output.sourceNodeId,
         ordinal,
         'next_result',
       ],
@@ -8006,14 +8007,14 @@ export class SqliteTaskRepository implements TaskRepository {
         source_artifact_id?: string;
         source_artifact_revision?: number;
         source_semantic_kind?: string;
-        terminal_node_id?: string;
+         source_node_id?: string;
         artifact_payload_json?: string | null;
       }>(
         `SELECT run.run_id AS source_run_id,
                 artifact.artifact_id AS source_artifact_id,
                 artifact.revision AS source_artifact_revision,
                 output.semantic_kind AS source_semantic_kind,
-                output.terminal_node_id,
+                 output.terminal_node_id AS source_node_id,
                 artifact.payload_json AS artifact_payload_json
            FROM workflow_runs run
            JOIN workflow_definition_outputs output
@@ -8061,7 +8062,7 @@ export class SqliteTaskRepository implements TaskRepository {
         !Number.isInteger(referenced.source_artifact_revision) ||
         Number(referenced.source_artifact_revision) < 1 ||
         typeof referenced.source_semantic_kind !== 'string' ||
-        typeof referenced.terminal_node_id !== 'string' ||
+         typeof referenced.source_node_id !== 'string' ||
         typeof referenced.artifact_payload_json !== 'string'
       ) return invalidStart('workflow input reference unresolved');
       if (referenced.source_semantic_kind !== input.semanticKind) {

@@ -33,6 +33,8 @@ import {
   type WorkflowNodeOutcome,
   type WorkflowNodeSpec,
   type WorkflowOutputContract,
+  type WorkflowOutputProjection,
+  type WorkflowOutputRole,
   type WorkflowPolicy,
   type WorkflowScriptSource,
   type WorkflowTopology,
@@ -519,16 +521,16 @@ function decodeNormalizedInput(raw: unknown): WorkflowInputContract | undefined 
 }
 
 function decodeNormalizedOutput(raw: unknown): WorkflowOutputContract | undefined {
-  if (!isRecord(raw) || !onlyKeys(raw, ['name', 'semanticKind', 'terminalNodeId'])) return undefined;
+  if (!isRecord(raw) || !onlyKeys(raw, ['name', 'semanticKind', 'sourceNodeId'])) return undefined;
   if (
     !isStableId(raw.name) ||
     !isNonEmptyString(raw.semanticKind, MAX_ARTIFACT_KIND_LEN) ||
-    !isStableId(raw.terminalNodeId)
+    !isStableId(raw.sourceNodeId)
   ) return undefined;
   return {
     name: raw.name,
     semanticKind: raw.semanticKind,
-    terminalNodeId: raw.terminalNodeId,
+    sourceNodeId: raw.sourceNodeId,
   };
 }
 
@@ -550,7 +552,7 @@ function hasCycle(nodeIds: readonly string[], edges: readonly WorkflowDependency
   return nodeIds.some(visit);
 }
 
-function validateTopologySemantics(topology: WorkflowTopology): string | undefined {
+export function validateTopologySemantics(topology: WorkflowTopology): string | undefined {
   if (topology.nodes.length < 1 || topology.nodes.length > WORKFLOW_GRAPH_MAX_NODES) {
     return 'workflow requires 1..64 nodes';
   }
@@ -587,7 +589,18 @@ function validateTopologySemantics(topology: WorkflowTopology): string | undefin
   }
 
   const entryIds = new Set(nodeIds.filter((id) => inDegree.get(id) === 0));
-  const terminalIds = nodeIds.filter((id) => outDegree.get(id) === 0);
+  const outgoing = new Map<string, string[]>(nodeIds.map((id) => [id, []]));
+  for (const edge of topology.edges) outgoing.get(edge.fromNodeId)!.push(edge.toNodeId);
+  const reachable = new Set<string>();
+  const pending = [...entryIds];
+  while (pending.length > 0) {
+    const nodeId = pending.shift()!;
+    if (reachable.has(nodeId)) continue;
+    reachable.add(nodeId);
+    pending.push(...(outgoing.get(nodeId) ?? []));
+  }
+  if (reachable.size !== nodeIds.length) return 'unreachable node';
+
   const inputNames = new Set<string>();
   const publicSlots = new Set<string>();
   const publicInputCounts = new Map<string, number>();
@@ -606,15 +619,15 @@ function validateTopologySemantics(topology: WorkflowTopology): string | undefin
   }
 
   const outputNames = new Set<string>();
-  const outputTerminals = new Set<string>();
+  const outputSources = new Set<string>();
   for (const output of topology.outputs) {
     if (outputNames.has(output.name)) return 'duplicate workflow output name';
     outputNames.add(output.name);
-    if (!terminalIds.includes(output.terminalNodeId)) return 'workflow output must reference a terminal node';
-    if (outputTerminals.has(output.terminalNodeId)) return 'every terminal must be exported exactly once';
-    outputTerminals.add(output.terminalNodeId);
+    if (!nodeIdSet.has(output.sourceNodeId)) return 'workflow output must reference a known node';
+    if (outputSources.has(output.sourceNodeId)) return 'every node result must be exported exactly once';
+    outputSources.add(output.sourceNodeId);
   }
-  if (outputTerminals.size !== terminalIds.length) return 'unexported terminal: every terminal must be exported';
+  if (outputSources.size !== nodeIds.length) return 'unexported node: every node must be exported';
 
   for (const node of topology.nodes) {
     const outcome = node.outcome;
@@ -629,6 +642,27 @@ function validateTopologySemantics(topology: WorkflowTopology): string | undefin
     }
   }
   return undefined;
+}
+
+/** Derive the public role of an output from frozen topology, never author input. */
+export function workflowOutputRole(
+  topology: WorkflowTopology,
+  sourceNodeId: string,
+): WorkflowOutputRole | undefined {
+  if (!topology.nodes.some((node) => node.nodeId === sourceNodeId)) return undefined;
+  return topology.edges.some((edge) => edge.fromNodeId === sourceNodeId)
+    ? 'checkpoint'
+    : 'terminal';
+}
+
+/** Project all normalized outputs with their topology-derived terminal/checkpoint role. */
+export function projectWorkflowOutputs(
+  topology: WorkflowTopology,
+): WorkflowOutputProjection[] {
+  return topology.outputs.flatMap((output) => {
+    const role = workflowOutputRole(topology, output.sourceNodeId);
+    return role ? [{ ...output, role }] : [];
+  });
 }
 
 export function decodeTopology(raw: unknown): TopologyDecodeResult {
@@ -813,7 +847,7 @@ export function decodeWorkflowManifest(
     outputs.push({
       name: value.name,
       semanticKind: value.kind,
-      terminalNodeId: value.from,
+      sourceNodeId: value.from,
     });
   }
 
@@ -903,7 +937,7 @@ function encodeNodeJson(node: WorkflowNodeSpec): RecordValue {
   };
 }
 
-function canonicalTopologyValue(topology: WorkflowTopology): RecordValue {
+export function canonicalTopologyValue(topology: WorkflowTopology): RecordValue {
   return {
     kind: 'workflow',
     ...(topology.description !== undefined ? { description: topology.description } : {}),
@@ -916,7 +950,7 @@ function canonicalTopologyValue(topology: WorkflowTopology): RecordValue {
     outputs: topology.outputs.map((output) => ({
       name: output.name,
       semanticKind: output.semanticKind,
-      terminalNodeId: output.terminalNodeId,
+      sourceNodeId: output.sourceNodeId,
     })),
     nodes: topology.nodes.map(encodeNodeJson),
     edges: topology.edges.map((edge) => ({

@@ -362,9 +362,19 @@ export async function runScriptWorkflowUatFixture(
    const globalSaved = join(globalCatalog, 'native-qa-saved');
    const invalidSaved = join(workspaceCatalog, 'native-qa-invalid');
    const savedManifest = (description: string) => ({
-     ...canonicalManifest(
-       savedName,
-       [{ nodeKey: 'saved', taskType: 'review', instructions: { inline: 'Review the request.' } }],
+      ...canonicalManifest(
+        savedName,
+        [{
+          nodeKey: 'saved',
+          taskType: 'review',
+          instructions: { inline: 'Review the request.' },
+          outcome: {
+            kind: 'agent',
+            requireExplicitDisposition: true,
+            next: { when: 'The review is complete.' },
+            fail: { when: 'The review cannot be completed.' },
+          },
+        }],
        [],
        [],
        [{ name: 'result', kind: 'result', from: 'saved' }],
@@ -510,7 +520,10 @@ export async function runScriptWorkflowUatFixture(
          ],
          [{ from: 'produce', to: 'consume', inputRef: 'dep' }],
          [],
-         [{ name: 'result', kind: 'result', from: 'consume' }],
+       [
+         { name: 'produceResult', kind: 'checkpoint.produce', from: 'produce' },
+         { name: 'result', kind: 'result', from: 'consume' },
+       ],
        ),
      }, credential);
      assertQa(dataflowDefinition.kind === 'define_workflow', 'dataflow definition route failed');
@@ -693,6 +706,8 @@ export async function runScriptWorkflowUatFixture(
          ],
          [],
          [
+           { name: 'producerResult', kind: 'checkpoint.producer', from: 'producer' },
+           { name: 'auditSourceResult', kind: 'checkpoint.audit-source', from: 'audit_source' },
            { name: 'approved', kind: 'result', from: 'check' },
            { name: 'audit', kind: 'result', from: 'audit' },
          ],
@@ -768,7 +783,7 @@ export async function runScriptWorkflowUatFixture(
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'decision' }],
+        outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'decision' }],
         nodes: [{
           nodeId: 'decision',
           title: 'Native decision gate',

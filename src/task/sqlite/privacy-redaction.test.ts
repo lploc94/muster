@@ -223,16 +223,22 @@ describe('P5-W6 privacy canary allowlist', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-        nodes: [{
-          nodeId: 'entry',
+        outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
+         nodes: [{
+           nodeId: 'entry',
           title: 'Safe display title',
           instructions: {
             kind: 'inline',
             content: instructionBody,
-            sha256: createHash('sha256').update(instructionBody).digest('hex'),
-          },
-        }],
+             sha256: createHash('sha256').update(instructionBody).digest('hex'),
+           },
+           outcome: {
+             kind: 'agent',
+             requireExplicitDisposition: true,
+             next: { when: 'The private result is ready.' },
+             fail: { when: 'The private result cannot be produced.' },
+           },
+         }],
         edges: [],
       },
       createdAt: '2026-08-31T00:00:00.000Z',

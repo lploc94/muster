@@ -171,7 +171,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 - Commit: `fix(workflow): report fail-closed agent outcomes`
 
 ## Phase 3: Define All-Node Results and Closed Composite Assembly
-- Status: pending
+- Status: complete
 - Depends on: Phase 2
 - Goal: Give every node a stable semantic result name and normalize a strict, deterministic run-scoped assembly into one ordinary frozen graph before any persistence.
 - Current behavior: `WorkflowOutputContract.terminalNodeId` and `validateTopologySemantics` permit outputs only from terminal nodes and require each terminal exactly once. `start_workflow` and `WorkflowStartInput` know only a single definition; no component, connection, external-interface mapping, collision-proof flattening, or composite fingerprint exists.
@@ -201,11 +201,11 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
   - Reuse canonical node/edge/interface validators after expansion; component mapping validation may add context but cannot weaken existing graph/resource rules.
   - Update `docs/plans/workflow-definition-v2-design.md` to replace terminal-only outputs and nested invocation with the exact all-node/composite contract, status policy, and root-only boundary; retain the historical implementation plan unchanged.
 - Acceptance criteria:
-  - [ ] AC-1: Every valid canonical definition names every node result exactly once, with terminal versus checkpoint role derived correctly - proven by workflow and package contract tests.
-  - [ ] AC-2: Valid saved-plus-inline assemblies flatten deterministically into one canonical graph with exact semantic mappings - proven by `workflow-composite-codec.test.ts`.
-  - [ ] AC-3: Every unknown, incomplete, ambiguous, recursive, over-bound, cyclic, fan-out, or kind-mismatched assembly fails before persistence - proven by the negative composite matrix.
-  - [ ] AC-4: Composite fingerprints are stable for object-key reordering and distinct for component ref, order, mapping, inline content, output alias, or effective-policy changes - proven by fingerprint tests.
-  - [ ] AC-5: The effective composite policy is the numeric field-wise minimum of saved policies and inline defaults, remains fail-fast true, then is host-clamped without expansion; a false/corrupt component policy fails closed - proven by policy-reduction and host-clamp cases in `workflow-composite-codec.test.ts` and `m018-s08-disposition-claims.test.ts`.
+  - [x] AC-1: Every valid canonical definition names every node result exactly once, with terminal versus checkpoint role derived correctly - proven by workflow and package contract tests.
+  - [x] AC-2: Valid saved-plus-inline assemblies flatten deterministically into one canonical graph with exact semantic mappings - proven by `workflow-composite-codec.test.ts`.
+  - [x] AC-3: Every unknown, incomplete, ambiguous, recursive, over-bound, cyclic, fan-out, or kind-mismatched assembly fails before persistence - proven by the negative composite matrix.
+  - [x] AC-4: Composite fingerprints are stable for object-key reordering and distinct for component ref, order, mapping, inline content, output alias, or effective-policy changes - proven by fingerprint tests.
+  - [x] AC-5: The effective composite policy is the numeric field-wise minimum of saved policies and inline defaults, remains fail-fast true, then is host-clamped without expansion; a false/corrupt component policy fails closed - proven by policy-reduction and host-clamp cases in `workflow-composite-codec.test.ts` and `m018-s08-disposition-claims.test.ts`.
 - Focused verification:
   - `npx vitest run src/task/workflow.test.ts src/task/workflow-composite-codec.test.ts src/task/coordinator-tools.test.ts src/bridge/server.test.ts src/host/predefined-workflows.test.ts src/task/m018-s08-disposition-claims.test.ts`
 - Phase gates:
@@ -407,7 +407,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 |---|---|---|---|---|
  | 1 | complete | this phase commit | Focused 178/178; `npx tsc -p . --noEmit`; source boundary (34 checks) and repository boundary; 47 source-boundary fixtures; `git diff --check` | Plan review APPROVE; implementation review APPROVE (3 rounds, 2 fixes) |
  | 2 | complete | this phase commit | Focused Phase 2 suites: 17 files, 512 passed; `npx tsc -p . --noEmit`; `npm run compile`; source boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. The prescribed focused command's `repository.test.ts` retains one documented pre-existing `deleteTaskSubtree` constraint failure reproduced at baseline HEAD `9658d88`, outside Phase 2. | Codex implementation review APPROVE (9 rounds, session `codex-impl-review-20260903-006`); issues 16–22 fixed, with the baseline deletion defect disputed/deferred |
-| 3 | pending | N/A | pending | pending |
+ | 3 | complete | this phase commit | Focused Phase 3 suites: 7 files, 182 passed; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. | Codex implementation review APPROVE (3 rounds, session `codex-impl-review-20260903-007`); issues 1–5 fixed |
 | 4 | pending | N/A | pending | pending |
 | 5 | pending | N/A | pending | pending |
 | 6 | pending | N/A | pending | pending |

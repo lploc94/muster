@@ -49,18 +49,24 @@ function canonicalTopology(
   edges: WorkflowTopology['edges'],
   inputs: WorkflowTopology['inputs'] = [],
 ): WorkflowTopology {
-  const producers = new Set(edges.map((edge) => edge.fromNodeId));
+  const normalizedNodes = nodes.map((node) => node.outcome ? node : {
+    ...node,
+    outcome: {
+      kind: 'agent' as const,
+      requireExplicitDisposition: true as const,
+      next: { when: `The ${node.nodeId} result is ready.` },
+      fail: { when: `The ${node.nodeId} result cannot be produced.` },
+    },
+  });
   return {
     kind: 'workflow',
     inputs,
-    outputs: nodes
-      .filter((node) => !producers.has(node.nodeId))
-      .map((node) => ({
+    outputs: normalizedNodes.map((node) => ({
         name: `output_${node.nodeId}`,
         semanticKind: 'result',
-        terminalNodeId: node.nodeId,
+        sourceNodeId: node.nodeId,
       })),
-    nodes,
+    nodes: normalizedNodes,
     edges,
   };
 }
@@ -200,21 +206,34 @@ describe('Workflow shell materialization', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{
-            name: 'review', semanticKind: 'review', terminalNodeId: 'review',
-          }],
+          outputs: [
+            { name: 'research', semanticKind: 'research', sourceNodeId: 'research' },
+            { name: 'review', semanticKind: 'review', sourceNodeId: 'review' },
+          ],
           nodes: [
             {
               nodeId: 'research',
               taskType: 'research',
               title: entryTitle,
               instructions: inlineInstructions(entryInstructions),
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The research result is ready.' },
+                fail: { when: 'The research result cannot be produced.' },
+              },
             },
             {
               nodeId: 'review',
               taskType: 'review',
               title: dependencyTitle,
               instructions: inlineInstructions(dependencyInstructions),
+              outcome: {
+                kind: 'agent',
+                requireExplicitDisposition: true,
+                next: { when: 'The review result is ready.' },
+                fail: { when: 'The review result cannot be produced.' },
+              },
             },
           ],
           edges: [{

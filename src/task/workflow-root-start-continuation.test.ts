@@ -18,7 +18,7 @@ async function defineOneNode(harness: NamedWorkflowHarness): Promise<void> {
     topology: {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+      outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
       nodes: [{
         nodeId: 'entry',
         outcome: {

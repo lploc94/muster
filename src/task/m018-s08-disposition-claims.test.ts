@@ -111,7 +111,7 @@ async function bindWorkflowActivation(
     topology: {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'node' }],
+       outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'node' }],
       nodes: [{ nodeId: 'node', outcome: outcome ?? defaultOutcome }],
       edges: [],
     },
@@ -1709,7 +1709,10 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
+         outputs: [
+           { name: 'producerResult', semanticKind: 'result', sourceNodeId: 'producer' },
+           { name: 'result', semanticKind: 'result', sourceNodeId: 'consumer' },
+         ],
         nodes: [{
           nodeId: 'producer',
           outcome: {
@@ -2203,7 +2206,7 @@ describe('M018 universal durable disposition claims', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+           outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
           nodes: [{
             nodeId: 'entry',
             role: 'worker',
@@ -2233,7 +2236,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{
           nodeId: 'entry',
           role: 'worker',
@@ -2293,7 +2296,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'script' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'script' }],
         nodes: [{
           nodeId: 'script',
           backend: 'script',
@@ -2460,7 +2463,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', role: 'worker', backend: 'grok' }],
         edges: [],
       },
@@ -2518,7 +2521,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', role: 'worker', backend: 'grok' }],
         edges: [],
       },
@@ -2611,7 +2614,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
@@ -2653,7 +2656,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
@@ -2732,7 +2735,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow',
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },
@@ -2789,7 +2792,7 @@ describe('M018 universal durable disposition claims', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+         outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
           nodes: [{
             nodeId: 'entry',
             backend: 'grok',
@@ -2901,7 +2904,7 @@ describe('M018 universal durable disposition claims', () => {
       topology: {
         kind: 'workflow' as const,
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+       outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
         nodes: [{ nodeId: 'entry', role: 'worker' as const, backend: 'grok', outcome: { kind: 'agent', requireExplicitDisposition: true, next: { when: 'The result is ready.' }, fail: { when: 'The result cannot be produced.' } } }],
         edges: [],
       },

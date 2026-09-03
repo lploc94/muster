@@ -42,6 +42,7 @@ function canonicalManifest(): WorkflowManifestFixture {
       { name: 'request', kind: 'request', to: 'research', inputRef: 'request' },
     ],
     outputs: [
+      { name: 'researchEvidence', kind: 'evidence', from: 'research' },
       { name: 'review', kind: 'review', from: 'review' },
     ],
     nodes: [
@@ -369,6 +370,10 @@ describe('MusterBridgeServer auth', () => {
     expect(defineTool?.description).toContain('FAIL');
     expect(defineTool?.description).toContain('engine generates a stable workflowRef');
     expect(defineTool?.description).toContain('Never send internal');
+    expect(defineTool?.description).toContain('every node');
+    expect(defineTool?.description).toContain('checkpoint');
+    expect(defineTool?.description).not.toContain('every terminal node is exported exactly once');
+    expect(JSON.stringify(defineTool?.inputSchema)).toContain('NodeKey exporting this output');
     expect(defineTool?.inputSchema).toMatchObject({
       additionalProperties: false,
       oneOf: [

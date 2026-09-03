@@ -57,6 +57,7 @@ function canonicalManifest(): WorkflowManifestFixture {
       { name: 'request', kind: 'request', to: 'research', inputRef: 'request' },
     ],
     outputs: [
+      { name: 'researchEvidence', kind: 'evidence', from: 'research' },
       { name: 'review', kind: 'review', from: 'review' },
     ],
     nodes: [

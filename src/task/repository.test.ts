@@ -205,8 +205,10 @@ function canonicalStorageFixture(definitionId = 'wf-canonical-storage') {
       { name: 'leftRequest', semanticKind: 'request.left', entryNodeId: 'left', inputRef: 'left_request' },
     ],
     outputs: [
-      { name: 'publishedResult', semanticKind: 'result.published', terminalNodeId: 'publish' },
-      { name: 'checkedResult', semanticKind: 'result.checked', terminalNodeId: 'check' },
+      { name: 'rightSourceResult', semanticKind: 'checkpoint.right', sourceNodeId: 'right' },
+      { name: 'leftSourceResult', semanticKind: 'checkpoint.left', sourceNodeId: 'left' },
+      { name: 'publishedResult', semanticKind: 'result.published', sourceNodeId: 'publish' },
+      { name: 'checkedResult', semanticKind: 'result.checked', sourceNodeId: 'check' },
     ],
     nodes: [
       {
@@ -2850,9 +2852,11 @@ describe('SqliteTaskRepository', () => {
           WHERE workspace_id = ? AND definition_id = ? ORDER BY ordinal`,
         ['ws', fixture.definitionId],
       )).resolves.toEqual([
-        { name: 'publishedResult', semantic_kind: 'result.published', terminal_node_id: 'publish', ordinal: 0, expected_artifact_kind: 'next_result' },
-        { name: 'checkedResult', semantic_kind: 'result.checked', terminal_node_id: 'check', ordinal: 1, expected_artifact_kind: 'next_result' },
-      ]);
+         { name: 'rightSourceResult', semantic_kind: 'checkpoint.right', terminal_node_id: 'right', ordinal: 0, expected_artifact_kind: 'next_result' },
+         { name: 'leftSourceResult', semantic_kind: 'checkpoint.left', terminal_node_id: 'left', ordinal: 1, expected_artifact_kind: 'next_result' },
+         { name: 'publishedResult', semantic_kind: 'result.published', terminal_node_id: 'publish', ordinal: 2, expected_artifact_kind: 'next_result' },
+         { name: 'checkedResult', semantic_kind: 'result.checked', terminal_node_id: 'check', ordinal: 3, expected_artifact_kind: 'next_result' },
+       ]);
       await expect(client.all(
         `SELECT node_id, ordinal, title, instructions_kind, instructions_file,
                 instructions_content, instructions_sha256, execution_kind, script_interpreter,
@@ -3125,7 +3129,10 @@ describe('SqliteTaskRepository', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
+           outputs: [
+             { name: 'producerResult', semanticKind: 'checkpoint.producer', sourceNodeId: 'producer' },
+             { name: 'result', semanticKind: 'result', sourceNodeId: 'consumer' },
+           ],
           nodes: [
             {
               nodeId: 'producer',
@@ -3465,7 +3472,7 @@ describe('SqliteTaskRepository', () => {
         topology: {
           kind: 'workflow',
           inputs: [],
-          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+          outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
           nodes: [{
             nodeId: 'entry',
             instructions: {

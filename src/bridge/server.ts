@@ -127,7 +127,7 @@ const DEFINE_WORKFLOW_DESCRIPTION = [
   'title is display-only. Executable task content belongs only in optional instructions.inline for inline manifests; instructions.file is resolved only from a saved package.',
   'The engine generates a stable workflowRef from normalized immutable content. Object member order is irrelevant, while semantic array order and every normalized interface, instruction, outcome, and routing difference are significant.',
   'Never send internal fields such as workflowKey, definitionId, version, topology, entryContracts, policy, backend, model, role, capabilities, opId, task ids, artifact coordinates, revisions, or physical routing destinations.',
-  'Topology must be a bounded reachable acyclic converging graph with no fan-out. Public inputs target entry nodes only; every terminal node is exported exactly once; PREV targets use direct inbound inputRef names.',
+  'Topology must be a bounded reachable acyclic converging graph with no fan-out. Public inputs target entry nodes only; every node is exported exactly once, with terminal versus checkpoint role derived from topology; PREV targets use direct inbound inputRef names.',
 ].join('\n');
 
 const WORKFLOW_INSTRUCTIONS_SCHEMA = {
@@ -240,7 +240,7 @@ const WORKFLOW_MANIFEST_SCHEMA = {
         properties: {
           name: { ...PRESENTATION_ID, description: 'Public output name.' },
           kind: { type: 'string', minLength: 1, maxLength: WORKFLOW_INPUT_REF_MAX_LENGTH },
-          from: { ...PRESENTATION_ID, description: 'Terminal nodeKey exporting this output.' },
+          from: { ...PRESENTATION_ID, description: 'NodeKey exporting this output; terminal/checkpoint role is derived from topology.' },
         },
       },
     },

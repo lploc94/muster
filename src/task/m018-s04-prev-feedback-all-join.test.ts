@@ -43,7 +43,11 @@ const TSX_ARGV = ['--import', 'tsx'];
 const FAN_IN_TOPOLOGY = {
   kind: 'workflow' as const,
   inputs: [],
-  outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'consumer' }],
+  outputs: [
+    { name: 'p1Result', semanticKind: 'checkpoint.p1', sourceNodeId: 'p1' },
+    { name: 'p2Result', semanticKind: 'checkpoint.p2', sourceNodeId: 'p2' },
+    { name: 'result', semanticKind: 'result', sourceNodeId: 'consumer' },
+  ],
   nodes: [
     {
       nodeId: 'p1',
@@ -304,7 +308,11 @@ describe('M018 S04 PREV feedback ALL-join', () => {
           schema: 'muster.workflow/v2',
           name: 'fan-in',
           inputs: [],
-          outputs: [{ name: 'result', kind: 'result', from: 'consumer' }],
+           outputs: [
+             { name: 'p1Result', kind: 'checkpoint.p1', from: 'p1' },
+             { name: 'p2Result', kind: 'checkpoint.p2', from: 'p2' },
+             { name: 'result', kind: 'result', from: 'consumer' },
+           ],
           nodes: FAN_IN_TOPOLOGY.nodes.map((node) => ({
             nodeKey: node.nodeId,
             taskType: 'worker',
@@ -826,7 +834,11 @@ describe('M018 S04 PREV feedback ALL-join', () => {
       const topology = {
         kind: 'workflow' as const,
         inputs: [],
-        outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'c' }],
+        outputs: [
+          { name: 'aResult', semanticKind: 'checkpoint.a', sourceNodeId: 'a' },
+          { name: 'bResult', semanticKind: 'checkpoint.b', sourceNodeId: 'b' },
+          { name: 'result', semanticKind: 'result', sourceNodeId: 'c' },
+        ],
         nodes: [
           {
             nodeId: 'a',

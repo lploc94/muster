@@ -115,6 +115,8 @@ function fanInManifest(): TestManifest {
       { name: 'constraints', kind: 'constraints', to: 'research', inputRef: 'constraints' },
     ],
     outputs: [
+      { name: 'planDraft', kind: 'plan', from: 'plan' },
+      { name: 'researchEvidence', kind: 'evidence', from: 'research' },
       { name: 'verifiedPlan', kind: 'plan', from: 'verify' },
     ],
     nodes: [
@@ -177,7 +179,9 @@ function multiSinkManifest(): TestManifest {
       { name: 'rightRequest', kind: 'request', to: 'right', inputRef: 'request' },
     ],
     outputs: [
+      { name: 'leftDraft', kind: 'report', from: 'left' },
       { name: 'leftReport', kind: 'report', from: 'leftResult' },
+      { name: 'rightDraft', kind: 'report', from: 'right' },
       { name: 'rightReport', kind: 'report', from: 'rightResult' },
     ],
     nodes: [
@@ -269,7 +273,7 @@ describe('canonical workflow manifest contract', () => {
           name: 'request', semanticKind: 'request', entryNodeId: 'inspect', inputRef: 'request',
         }],
         outputs: [{
-          name: 'report', semanticKind: 'report', terminalNodeId: 'inspect',
+          name: 'report', semanticKind: 'report', sourceNodeId: 'inspect',
         }],
       },
       entryContracts: [{
@@ -488,7 +492,7 @@ describe('canonical workflow manifest contract', () => {
     expectInvalidManifest(duplicateInputName, /duplicate.*input/i);
 
     const duplicateOutputName = clone(multiSinkManifest());
-    duplicateOutputName.outputs[1]!.name = 'leftReport';
+    duplicateOutputName.outputs[2]!.name = 'leftReport';
     expectInvalidManifest(duplicateOutputName, /duplicate.*output/i);
 
     const duplicateSlot = clone(fanInManifest());
@@ -502,22 +506,37 @@ describe('canonical workflow manifest contract', () => {
     expectInvalidManifest(duplicatePublicSlot, /duplicate.*input|entry/i);
   });
 
-  it('rejects invalid entry/output contracts and requires every terminal exactly once', () => {
+  it('rejects invalid entry/output contracts and requires every node exactly once', () => {
     const downstreamInput = clone(fanInManifest());
     downstreamInput.inputs[0]!.to = 'verify';
     expectInvalidManifest(downstreamInput, /entry/i);
 
     const nonTerminalOutput = clone(fanInManifest());
-    nonTerminalOutput.outputs[0]!.from = 'plan';
-    expectInvalidManifest(nonTerminalOutput, /terminal/i);
+    nonTerminalOutput.outputs = nonTerminalOutput.outputs.filter((output) => output.from !== 'plan');
+    expectInvalidManifest(nonTerminalOutput, /every node|unexported/i);
+
+    const validCheckpoint = clone(fanInManifest());
+    validCheckpoint.outputs[0]!.from = 'plan';
+    expect(decodeWorkflowManifest(validCheckpoint, 'inline')).toMatchObject({
+      ok: true,
+      topology: {
+        outputs: expect.arrayContaining([
+          {
+            name: validCheckpoint.outputs[0]!.name,
+            semanticKind: 'plan',
+            sourceNodeId: 'plan',
+          },
+        ]),
+      },
+    });
 
     const missingTerminal = clone(multiSinkManifest());
     missingTerminal.outputs.pop();
     expectInvalidManifest(missingTerminal, /terminal.*export|unexported/i);
 
     const duplicateTerminal = clone(multiSinkManifest());
-    duplicateTerminal.outputs[1]!.from = 'leftResult';
-    expectInvalidManifest(duplicateTerminal, /terminal.*once|duplicate.*terminal/i);
+    duplicateTerminal.outputs[1]!.from = 'left';
+    expectInvalidManifest(duplicateTerminal, /node.*once|duplicate.*node|output/i);
 
     const unknownOutput = clone(oneNodeManifest());
     unknownOutput.outputs[0]!.from = 'missing';

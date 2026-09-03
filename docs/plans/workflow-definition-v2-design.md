@@ -242,7 +242,8 @@ artifact kind. Semantic kind and transport kind are deliberately separate.
 
 ### 8.2 Outputs
 
-Each output names one terminal node result:
+Each output names one node result. The source may be a terminal node or a
+nonterminal checkpoint:
 
 ```json
 {
@@ -254,13 +255,78 @@ Each output names one terminal node result:
 
 - `name` is the stable name used by downstream callers.
 - `kind` is the semantic artifact kind.
-- `from` must identify a terminal node.
+- `from` must identify exactly one node in the same topology.
 
 The node still commits an ordinary `next_result` transport artifact. The output
 contract annotates what that artifact means; it does not change NEXT settlement.
 
-Every terminal node must be exported exactly once in v2. This keeps multi-sink
-workflows honest and prevents unadvertised terminal results.
+Every node must be exported exactly once in v2. A terminal source is a
+completion output; a nonterminal source is a stable checkpoint. A checkpoint
+does not add an edge, make a node terminal, or alter NEXT/PREV/FAIL routing.
+The public name and semantic kind are the only caller-visible authority; task,
+gate, turn, artifact, and revision identities remain engine-owned.
+
+The normalized authority uses `sourceNodeId` for this field. `role` is derived
+from the frozen topology (`terminal` when the source has no outgoing edge,
+otherwise `checkpoint`) whenever an interface is projected. Authors cannot
+provide or override that role.
+
+### 8.3 Run-scoped composite assembly
+
+A composite is a closed start request, not a reusable definition or package. Its
+normalized form is:
+
+```json
+{
+  "components": [
+    { "key": "draft", "workflow": "workflow-ref@3" },
+    { "key": "check", "manifest": { "schema": "muster.workflow/v2", "...": "one node" } }
+  ],
+  "connections": [
+    { "from": { "component": "draft", "output": "result" },
+      "to": { "component": "check", "input": "draft" } }
+  ],
+  "inputs": [
+    { "name": "request", "to": { "component": "draft", "input": "request" } }
+  ],
+  "outputs": [
+    { "name": "checked", "from": { "component": "check", "output": "result" } }
+  ]
+}
+```
+
+The exact structural rules are:
+
+- `components` is an ordered nonempty array. Each component has one unique,
+  bounded stable `key` and exactly one source: an immutable versioned workflow
+  reference or an inline canonical manifest containing exactly one node.
+- A component reference is already authorized/frozen host authority. A mutable
+  `predefinedWorkflowRef`, a recursive composite, an unversioned reference, and
+  any author-supplied definition/runtime coordinates are invalid.
+- `connections` use only `{ from: { component, output }, to: { component,
+  input } }`. `inputs` and `outputs` use unique bounded public names and one
+  component slot each. Mapping objects do not repeat semantic kinds; kinds are
+  read from the referenced component authority and must match exactly.
+- Every component input is satisfied exactly once by one connection or one
+  composite input. Every component output is exported exactly once by one
+  composite output, even when it also feeds another component. There is no
+  automatic source selection, implicit input, converter, subtype, fan-out, or
+  conditional join.
+- Component-local node IDs are rewritten to deterministic collision-proof
+  internal IDs. The normalized authority retains safe `(componentKey,
+  localNodeKey)` metadata for projections and failure reports, never physical
+  task or artifact coordinates.
+- Expansion rewrites edges and interface mappings into one ordinary topology,
+  then reuses the canonical graph validators for bounds, reachability,
+  acyclicity, no fan-out, entry-only external inputs, and complete all-node
+  output coverage. Expansion happens before any persistence and creates no
+  `workflow_definitions` row.
+
+The composite status remains the ordinary run status: `running` until all
+terminal branches settle, `succeeded` only when every terminal completion path
+settles successfully, and `failed`/`cancelled` when the existing fail-fast or
+cancellation rules close the run. Checkpoints may be available while a run is
+still progressing, but their existence never changes terminal completion.
 
 Composition uses named interfaces:
 
@@ -614,8 +680,9 @@ enforces:
 - existing node, edge, graph-size, acyclicity, reachability, and no-fan-out rules;
 - unique destination `inputRef` per consumer;
 - workflow inputs bind only derived entry nodes;
-- workflow outputs reference terminal nodes;
-- every terminal is exported exactly once;
+- workflow outputs reference known nodes;
+- every node is exported exactly once, with terminal/checkpoint role derived from
+  topology;
 - exact semantic-kind equality for composition;
 - agent outcomes appear only on agent nodes;
 - exit outcomes appear only on execute nodes;
@@ -646,6 +713,13 @@ proof.
 The coordinator does not echo or reconstruct a saved package's topology. This
 makes a saved workflow an actual frozen strategy rather than prose interpreted
 differently on each use.
+
+Both definition and start authority are root-only. Only an open top-level root
+coordinator outside a workflow activation may define or start a workflow.
+Workflow nodes may use ordinary child-task delegation when their task profile
+allows it, but there is no workflow-to-workflow invocation, child workflow run,
+or hidden orchestration branch. A composite is assembled by the owning root as
+one run-scoped graph and is never published as a reusable definition or package.
 
 `start_workflow` accepts public input names rather than node coordinates:
 
@@ -704,6 +778,12 @@ The normalized internal definition freezes:
 - agent or exit outcome policy;
 - resolved task profiles and executable provenance; and
 - effective host-clamped resource policy.
+
+For a run-scoped composite, the normalized authority additionally freezes the
+ordered component keys and immutable source fingerprints, the exact interface
+mappings, collision-proof flattened topology, component/local provenance, and
+the pre-host reduced policy. These values are part of the composite fingerprint
+and cannot be reconstructed from mutable catalog sources after the run starts.
 
 V2 durable start inputs preserve a named prior-output reference until atomic
 repository resolution. They do not collapse it to the legacy run-level terminal
@@ -784,7 +864,10 @@ gate fill from the selected terminal artifact rather than the legacy aggregate.
 
 - Workflow v2 is strict JSON; Markdown is a referenced instruction asset.
 - Edges plus `inputRef` define dependency semantics; physical gates stay internal.
-- Named inputs and outputs provide a stable composition interface.
+- Named inputs and all-node outputs provide a stable composition interface;
+  terminal outputs complete a run and nonterminal outputs are checkpoints.
+- Run-scoped composites flatten immutable saved references and inline one-node
+  manifests into one ordinary graph; they are never reusable definitions.
 - Node decision gates are authored as `outcome` contracts.
 - Agent routes carry separate NEXT, PREV, and FAIL conditions.
 - Execute routes use deterministic zero/nonzero conditions.
@@ -795,6 +878,8 @@ gate fill from the selected terminal artifact rather than the legacy aggregate.
 - Missing disposition never triggers PREV automatically.
 - PREV is reserved for an actual decision that direct producer work needs revision.
 - No separate workflow runtime is introduced.
+- Workflow orchestration is root-only; workflow activations cannot invoke another
+  workflow or create a child workflow run.
 
 ## References
 

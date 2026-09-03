@@ -62,12 +62,43 @@ const CANONICAL_TOPOLOGY: WorkflowTopology = {
     { name: 'researchOne', semanticKind: 'research-seed', entryNodeId: 'r1', inputRef: 'research_one' },
     { name: 'researchTwo', semanticKind: 'research-seed', entryNodeId: 'r2', inputRef: 'research_two' },
   ],
-  outputs: [{ name: 'verified', semanticKind: 'verified-result', terminalNodeId: 'verifier' }],
+  outputs: [
+    { name: 'researchOneResult', semanticKind: 'checkpoint.research-one', sourceNodeId: 'r1' },
+    { name: 'researchTwoResult', semanticKind: 'checkpoint.research-two', sourceNodeId: 'r2' },
+    { name: 'plannerResult', semanticKind: 'checkpoint.planner', sourceNodeId: 'planner' },
+    { name: 'verified', semanticKind: 'verified-result', sourceNodeId: 'verifier' },
+  ],
   nodes: [
-    { nodeId: 'r1', role: 'worker' },
-    { nodeId: 'r2', role: 'worker' },
-    { nodeId: 'planner', role: 'coordinator' },
-    { nodeId: 'verifier', role: 'coordinator' },
+    {
+      nodeId: 'r1', role: 'worker',
+      outcome: {
+        kind: 'agent', requireExplicitDisposition: true,
+        next: { when: 'Research one is ready.' }, fail: { when: 'Research one cannot be produced.' },
+      },
+    },
+    {
+      nodeId: 'r2', role: 'worker',
+      outcome: {
+        kind: 'agent', requireExplicitDisposition: true,
+        next: { when: 'Research two is ready.' }, fail: { when: 'Research two cannot be produced.' },
+      },
+    },
+    {
+      nodeId: 'planner', role: 'coordinator',
+      outcome: {
+        kind: 'agent', requireExplicitDisposition: true,
+        next: { when: 'The plan is ready.' }, fail: { when: 'The plan cannot be produced.' },
+      },
+    },
+    {
+      nodeId: 'verifier', role: 'coordinator',
+      outcome: {
+        kind: 'agent', requireExplicitDisposition: true,
+        next: { when: 'The result is verified.' },
+        prev: [{ when: 'The plan needs correction.', targets: ['from_planner'], feedback: 'required' }],
+        fail: { when: 'The result cannot be verified.' },
+      },
+    },
   ],
   edges: [
     { fromNodeId: 'r1', toNodeId: 'planner', inputRef: 'from_r1' },
@@ -406,13 +437,44 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
             { name: 'researchOne', kind: 'research-seed', to: 'r1', inputRef: 'research_one' },
             { name: 'researchTwo', kind: 'research-seed', to: 'r2', inputRef: 'research_two' },
           ],
-          outputs: [{ name: 'verified', kind: 'verified-result', from: 'verifier' }],
-          nodes: [
-            { nodeKey: 'r1', taskType: 'research' },
-            { nodeKey: 'r2', taskType: 'research' },
-            { nodeKey: 'planner', taskType: 'plan' },
-            { nodeKey: 'verifier', taskType: 'verify' },
-          ],
+           outputs: [
+             { name: 'researchOneResult', kind: 'checkpoint.research-one', from: 'r1' },
+             { name: 'researchTwoResult', kind: 'checkpoint.research-two', from: 'r2' },
+             { name: 'plannerResult', kind: 'checkpoint.planner', from: 'planner' },
+             { name: 'verified', kind: 'verified-result', from: 'verifier' },
+           ],
+           nodes: [
+             {
+               nodeKey: 'r1', taskType: 'research',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Research one is ready.' }, fail: { when: 'Research one cannot be produced.' },
+               },
+             },
+             {
+               nodeKey: 'r2', taskType: 'research',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'Research two is ready.' }, fail: { when: 'Research two cannot be produced.' },
+               },
+             },
+             {
+               nodeKey: 'planner', taskType: 'plan',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'The plan is ready.' }, fail: { when: 'The plan cannot be produced.' },
+               },
+             },
+             {
+               nodeKey: 'verifier', taskType: 'verify',
+               outcome: {
+                 kind: 'agent', requireExplicitDisposition: true,
+                 next: { when: 'The result is verified.' },
+                 prev: [{ when: 'The plan needs correction.', targets: ['from_planner'], feedback: 'required' }],
+                 fail: { when: 'The result cannot be verified.' },
+               },
+             },
+           ],
           edges: [
             { from: 'r1', to: 'planner', inputRef: 'from_r1' },
             { from: 'r2', to: 'planner', inputRef: 'from_r2' },

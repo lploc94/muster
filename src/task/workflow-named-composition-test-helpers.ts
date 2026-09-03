@@ -150,8 +150,16 @@ export async function defineOneNodeProducer(
     topology: {
       kind: 'workflow',
       inputs: [],
-      outputs: [{ name: outputName, semanticKind, terminalNodeId: 'entry' }],
-      nodes: [{ nodeId: 'entry' }],
+      outputs: [{ name: outputName, semanticKind, sourceNodeId: 'entry' }],
+      nodes: [{
+        nodeId: 'entry',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The producer result is ready.' },
+          fail: { when: 'The producer cannot complete.' },
+        },
+      }],
       edges: [],
     },
   });
@@ -172,8 +180,16 @@ export async function defineOneNodeConsumer(
         entryNodeId: 'entry',
         inputRef: declared.inputRef ?? declared.name,
       })),
-      outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
-      nodes: [{ nodeId: 'entry' }],
+      outputs: [{ name: 'result', semanticKind: 'result', sourceNodeId: 'entry' }],
+      nodes: [{
+        nodeId: 'entry',
+        outcome: {
+          kind: 'agent',
+          requireExplicitDisposition: true,
+          next: { when: 'The consumer result is ready.' },
+          fail: { when: 'The consumer cannot complete.' },
+        },
+      }],
       edges: [],
     },
   });
