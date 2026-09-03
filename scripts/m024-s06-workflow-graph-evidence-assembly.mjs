@@ -23,7 +23,6 @@ const DIAGNOSTIC_CODES = new Set([
   'workflow_graph_topology_undecodable',
   'workflow_graph_nodes_truncated',
   'workflow_graph_edges_truncated',
-  'workflow_graph_child_runs_truncated',
 ]);
 
 function boundedReason(error) {
@@ -103,7 +102,6 @@ export function validateWorkflowGraphEvidence(evidence, options = {}) {
       'reusedEdgeCount',
       'reuseNodeCount',
       'reuseEdgeCount',
-      'childRunCount',
       'feedbackRoundCount',
     ]) {
       if (!isCount(round[field])) failures.push(`roundTrip.${field} must be a non-negative integer`);
@@ -214,7 +212,6 @@ export function assembleWorkflowGraphEvidence(result, generatedAt = new Date().t
       reuseNodeCount: graph.reuseNodeCount,
       reuseEdgeCount: graph.reuseEdgeCount,
       nodeStatuses: graph.nodeStatuses,
-      childRunCount: graph.childRunCount,
       feedbackRoundCount: graph.feedbackRoundCount,
       diagnostics: graph.diagnostics,
     },

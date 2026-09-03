@@ -1,8 +1,8 @@
 # Muster Bridge MCP Server
 
 This document is the authoritative design for the extension-owned MCP server
-`muster_bridge`. The bridge exposes workflow orchestration and thin IDE integration;
-it does not expose the legacy delegate-task protocol.
+`muster_bridge`. The bridge exposes workflow orchestration, the bounded ordinary-child
+delegation operations used by workflow coordinators, and thin IDE integration.
 
 ## 1. Public protocol
 
@@ -10,6 +10,9 @@ The public MCP catalog is exactly:
 
 | Tool | Purpose |
 |------|---------|
+| `create_task` | Create one ordinary draft child task from a configured profile |
+| `delegate_task` | Create, release, and optionally wait on one ordinary child task |
+| `wait_for_tasks` | Wait on an exact set of already delegated direct child tasks |
 | `list_task_types` | Refresh semantic workflow-node profiles and diagnostics |
 | `inspect_workflow_run` | Inspect semantic durable state for an owned workflow run |
 | `get_host_context` | Refresh trusted host, self, profile, and role context |
@@ -18,14 +21,13 @@ The public MCP catalog is exactly:
 | `workflow_next` | Publish the current node result to its forward route |
 | `workflow_prev` | Request correction from one or all direct producers |
 | `workflow_fail` | Fail-fast close the current workflow run |
-| `invoke_child_workflow` | Stage an authorized child-workflow `NEXT` route |
 | `upsert_presentation` | Open or revise a user-facing Markdown plan, spec, or document |
 
 The workflow protocol in `TASK-MANAGEMENT.md` §20 defines the routing and durable
 state semantics. A live activation settles through one mutually exclusive route:
-explicit `workflow_next`, contextual `workflow_prev`, `workflow_fail`, the
-specialized child-workflow `NEXT` route, or an implicit host-generated `NEXT` from
-the final assistant message when the model ends without a disposition.
+explicit `workflow_next`, contextual `workflow_prev`, `workflow_fail`, or an implicit
+host-generated `NEXT` from the final assistant message when the model ends without a
+disposition.
 
 The public boundary is semantic. Models provide definition-local node keys, configured
 `taskType` values, named semantic workflow interfaces, dependency `inputRef` values,
@@ -139,7 +141,7 @@ normalized semantic and frozen content. Object member order is not semantic, whi
 declared array order is preserved. Changing an interface name or kind, declared order,
 outcome text, instruction digest, script digest, resolved profile, or effective policy
 changes the fingerprint. Models must retain the returned reference and pass it to
-`start_workflow` or `invoke_child_workflow` rather than inventing a storage key. The
+root-only `start_workflow` rather than inventing a storage key. The
 complete generated ID and positive `@version` suffix are required; bare IDs and
 caller-named versioned keys are rejected.
 
@@ -189,19 +191,21 @@ actions. `tools/list` intersects that grant with the exact public catalog:
 
 - every task may receive the host-context tool;
 - coordinators may receive presentation tools;
-- `create_child` authorizes task-profile listing and workflow definition/start;
+- `create_child` authorizes task-profile listing for coordinators and workflow
+  definition/start only for an open top-level root outside a workflow activation;
 - `read_subtree` authorizes bounded `inspect_workflow_run` reads;
 - a live workflow activation receives `workflow_next` and `workflow_fail`;
-- `workflow_prev` is available only when the activation has direct dependencies;
-- `invoke_child_workflow` requires its root/terminal coordinator and trust guards.
+- `workflow_prev` is available only when the activation has direct dependencies.
 
-The engine revalidates durable activation state during execution. Credential claims
-alone cannot authorize a contextual workflow disposition.
+The engine revalidates durable activation state during execution. For public workflow
+definition and start mutations, the repository repeats the root task, live caller turn,
+and absence-of-any-activation checks under the same SQLite write transaction before
+operation replay, claim, or persistence. Credential claims and an earlier host read
+alone cannot authorize a mutation.
 
-`inspect_workflow_run` accepts a `runRef` returned by `start_workflow` or another
-authorized workflow route. The repository requires that run to belong to the
-credential's root task. Its bounded result contains workflow status, semantic node
-state, recoverable activation state, feedback progress, child state, and integrity
+`inspect_workflow_run` accepts a `runRef` returned by `start_workflow`. The repository
+requires that run to belong to the credential's root task. Its bounded result contains workflow status, semantic node
+state, recoverable activation state, feedback progress, and integrity
 diagnostic codes. A succeeded materialized node includes an opaque `taskRef`; together
 with the response `runRef` and node name, that is the exact source execution accepted by
 `start_workflow` reuse. It never returns policy budgets, gate/activation/round/
@@ -219,27 +223,22 @@ status/reason and the committed terminal `workflow_next` body when one exists. R
 drains the same resolver, so a terminal result cannot be lost or resumed twice.
 Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid or
 unauthorized starts return ordinary tool errors and do not suspend the caller. A live
-workflow activation must use `invoke_child_workflow` rather than `start_workflow`.
+workflow activation cannot define or start another workflow; it may still delegate
+ordinary child tasks when its frozen task profile grants that capability.
+Task-facing projections hide inert task rows attached to, or descended from, pre-cutover
+child workflow runs without hiding ordinary delegated children or canonical top-level
+workflow tasks. The schema-7 cleanup boundary then purges obsolete `child_return` state:
+the retired activation, its bounded retry lineage, and only the child-owned continuation,
+return-gate, repair, claim, operation, transcript, and routed rows are removed in one
+SQLite transaction before terminal-run safety is evaluated. The ownership query is
+workspace-qualified and delimiter-safe; shared/unscoped operations, ordinary delegated
+tasks, canonical active workflow rows, cross-run pins, and the bounded `run_closure`
+record are preserved. A malformed or ambiguous lineage aborts the whole cleanup rather
+than broadening deletion. This is a narrow cleanup of already-open schema-7 stores, not
+a migration or a child-workflow execution/recovery path. The later schema-8 cutover is
+still reset-only.
 The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
-
-`invoke_child_workflow` accepts a returned workflow reference and semantic bindings from
-the current activation's named inputs. The repository resolves each source to an
-authorized immutable artifact revision before staging the child route. Artifact IDs
-and revisions, operation IDs, and idempotency keys are never model inputs.
-
-```json
-{
-  "workflow": "workflow-8f4c2a1b3d5e7f90123456789abcdef0@1",
-  "inputs": [
-    { "name": "request", "fromInput": "research" }
-  ]
-}
-```
-
-`name` is the child definition's public input name. `fromInput` is an `inputRef` on the
-current live parent activation. Child node IDs and destination input coordinates are
-never accepted.
 
 `upsert_presentation` accepts `title`, `markdown`, optional display metadata, and an
 optional `presentationRef` returned by an earlier call when refreshing that document.

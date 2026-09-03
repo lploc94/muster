@@ -2500,7 +2500,7 @@ describe('M018 S01 one-node workflow activation', () => {
         result: { changed: true, definitionId: firstDefinitionId, version: 1 },
       });
 
-      const editContext = { ...context, turnId: `${turnId}-definition-edit` };
+      const editContext = context;
       const revisedRouted = dispatch(
         'define_workflow',
         {

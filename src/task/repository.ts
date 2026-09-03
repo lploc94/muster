@@ -21,7 +21,6 @@ import {
   defineWorkflowLedgerKey,
   defineWorkflowReplay,
   formatWorkflowEntryAggregate,
-  fingerprintChildInvocation,
   fingerprintWorkflowDefinition,
   startWorkflowConflict,
   startWorkflowCreated,
@@ -54,21 +53,12 @@ import {
   outgoingEdge,
   consumerInputRefsInDefinitionOrder,
   terminalNodeIds,
-  maximumWorkflowEntryAggregateBytes,
-  deriveChildInvocationFenceId,
-  deriveChildReturnFenceId,
-  deriveChildContinuationId,
-  deriveCallerReturnGateId,
-  deriveCallerResumeTurnId,
-  deriveCallerReturnMessageId,
   deriveWorkflowStartContinuationId,
   deriveWorkflowStartResumeTurnId,
   deriveWorkflowStartResumeMessageId,
   deriveWorkflowDecisionRepairTurnId,
   deriveWorkflowDecisionRepairMessageId,
-  deriveChildStartIdempotencyKey,
   stableId,
-  validateInvokeChildEntryBindings,
   workflowNodeTaskGoal,
   workflowRunGoalFromTask,
   type DefineWorkflowResult,
@@ -123,6 +113,7 @@ import {
 import type { RunResult, SqlStatement, SqlValue } from './sqlite/rpc';
 import {
   CHANGE_FEED_RETAIN_REVISIONS,
+  terminalWorkflowRunSafetyPredicate,
   terminalWorkflowPayloadReclamationSafetyPredicate,
 } from './sqlite/schema';
 import {
@@ -211,7 +202,6 @@ export type GraphCommandKind =
   | 'workflowNextGraphTask'
   | 'workflowPrevGraphTask'
   | 'workflowFailGraphTask'
-  | 'invokeChildGraphTask'
   | 'askParent'
   | 'answerChildQuestion'
   | 'consumeCancelRequest';
@@ -245,6 +235,14 @@ export interface GraphCommandPayload {
 }
 
 export type GraphCommand = GraphCommandPayload & { kind: GraphCommandKind };
+
+type PublicWorkflowOperation = {
+  ledgerKey: string;
+  fingerprint: string;
+  rootTaskId: string;
+  callerTaskId: string;
+  callerTurnId: string;
+};
 
 export type RepositoryCommand =
   | GraphCommand
@@ -476,10 +474,7 @@ export type RepositoryCommand =
       entryContracts?: unknown;
       policy?: WorkflowPolicy;
       ownerRootTaskId?: string;
-      publicOperation?: {
-        ledgerKey: string;
-        fingerprint: string;
-      };
+      publicOperation?: PublicWorkflowOperation;
       createdAt: string;
     }
   | {
@@ -502,10 +497,7 @@ export type RepositoryCommand =
       callerTurnId?: string;
       resumeCallerOnCompletion?: boolean;
       effectivePolicy?: WorkflowPolicy;
-      publicOperation?: {
-        ledgerKey: string;
-        fingerprint: string;
-      };
+      publicOperation?: PublicWorkflowOperation;
     }
   | {
       /** Close every running workflow whose frozen absolute deadline has elapsed. */
@@ -603,7 +595,6 @@ export function isGraphCommand(command: RepositoryCommand): command is GraphComm
     command.kind === 'failGraphTask' || command.kind === 'workflowNextGraphTask' ||
     command.kind === 'workflowPrevGraphTask' ||
     command.kind === 'workflowFailGraphTask' ||
-    command.kind === 'invokeChildGraphTask' ||
     command.kind === 'askParent' ||
     command.kind === 'answerChildQuestion' || command.kind === 'consumeCancelRequest';
 }
@@ -976,14 +967,17 @@ async function readWorkflowTurnDefinitionAuthority(
     fingerprint: string | null;
     run_id: string;
     activation_id: string;
+    activation_kind: string;
     activation_status: string;
     run_status: string;
     deadline_at: string | null;
+    origin: string;
+    parent_run_id: string | null;
   }>(
     `SELECT run.definition_id, run.definition_version, definition.fingerprint,
-            activation.run_id, activation.activation_id,
+            activation.run_id, activation.activation_id, activation.kind AS activation_kind,
             activation.status AS activation_status, run.status AS run_status,
-            run.deadline_at
+            run.deadline_at, run.origin, run.parent_run_id
        FROM workflow_activations activation
        JOIN workflow_runs run
          ON run.workspace_id = activation.workspace_id
@@ -1003,6 +997,9 @@ async function readWorkflowTurnDefinitionAuthority(
     typeof row.fingerprint !== 'string' ||
     typeof row.run_id !== 'string' ||
     typeof row.activation_id !== 'string' ||
+    !isActiveWorkflowActivationKind(row.activation_kind) ||
+    row.origin !== 'top_level' ||
+    row.parent_run_id !== null ||
     !['queued', 'running', 'failed', 'interrupted', 'consumed', 'cancelled'].includes(row.activation_status) ||
     typeof row.run_status !== 'string' ||
     (row.deadline_at !== null && typeof row.deadline_at !== 'string')
@@ -1042,7 +1039,6 @@ type WorkflowBudgetPrecondition = {
   runId: string;
   feedbackRoundsReserved: number;
   workflowTurnsReserved: number;
-  childrenReserved: number;
   taskTurnCounts: Array<{ taskId: string; count: number }>;
 };
 
@@ -1368,6 +1364,7 @@ export interface TaskRepository {
   getWorkspace(): Promise<RepositoryWorkspace | undefined>;
   listWorkspaceLocations(): Promise<readonly RepositoryWorkspaceLocation[]>;
   getTask(taskId: string): Promise<MusterTask | undefined>;
+  isTurnWorkflowBound(turnId: string): Promise<boolean>;
   /**
    * Batched task hydration by id for external feed reconciliation.
    * One SQL query for the whole set — never N+1 getTask RPCs.
@@ -1959,9 +1956,11 @@ export class SqliteTaskRepository implements TaskRepository {
       run_id: string;
       activation_id: string;
       node_id: string;
-      activation_kind: NonNullable<TaskTurn['workflowActivation']>['kind'];
+      activation_kind: string;
       activation_status: NonNullable<TaskTurn['workflowActivation']>['activationStatus'];
       run_status: NonNullable<TaskTurn['workflowActivation']>['runStatus'];
+      run_origin: string;
+      parent_run_id: string | null;
       is_terminal: number;
       has_direct_dependencies: number;
       has_open_feedback_round: number;
@@ -1980,7 +1979,9 @@ export class SqliteTaskRepository implements TaskRepository {
               activation.node_id,
                activation.kind AS activation_kind,
                activation.status AS activation_status,
-               run.status AS run_status,
+                run.status AS run_status,
+                run.origin AS run_origin,
+                run.parent_run_id,
                EXISTS (
                  SELECT 1 FROM workflow_definition_outputs output
                   WHERE output.workspace_id = run.workspace_id
@@ -2006,13 +2007,7 @@ export class SqliteTaskRepository implements TaskRepository {
                    AND round_row.run_id = activation.run_id
                    AND round_row.status = 'open'
               ) AS has_open_feedback_round,
-               EXISTS (
-                SELECT 1 FROM workflow_continuations continuation
-                 WHERE continuation.workspace_id = activation.workspace_id
-                   AND continuation.run_id = activation.run_id
-                   AND continuation.kind = 'child_wait'
-                    AND continuation.status = 'pending'
-               ) AS has_pending_continuation,
+               0 AS has_pending_continuation,
                CASE
                  WHEN activation.kind = 'feedback_request' THEN 1
                  WHEN activation.kind = 'feedback_resume'
@@ -2039,12 +2034,22 @@ export class SqliteTaskRepository implements TaskRepository {
            ON repair.workspace_id = activation.workspace_id
           AND repair.run_id = activation.run_id
           AND repair.activation_id = activation.activation_id
-        WHERE activation.workspace_id = ?
-          AND activation.execution_turn_id IN (${placeholders(ids.length)})`,
+          WHERE activation.workspace_id = ?
+            AND activation.execution_turn_id IN (${placeholders(ids.length)})`,
       [this.workspaceId, ...ids],
     );
+    const retiredActivationTurnIds = new Set(
+      activations
+        .filter((activation) =>
+          activation.run_origin !== 'top_level'
+          || activation.parent_run_id !== null
+          || !isActiveWorkflowActivationKind(activation.activation_kind))
+        .map((activation) => activation.execution_turn_id),
+    );
     const activationByTurn = new Map(
-      activations.map((activation) => [activation.execution_turn_id, activation]),
+      activations
+        .filter((activation) => !retiredActivationTurnIds.has(activation.execution_turn_id))
+        .map((activation) => [activation.execution_turn_id, activation]),
     );
     const authorityWaits = await this.db.all<{
       turn_id: string;
@@ -2062,7 +2067,15 @@ export class SqliteTaskRepository implements TaskRepository {
                 SELECT 1 FROM workflow_continuations continuation
                  WHERE continuation.workspace_id = candidate.workspace_id
                    AND continuation.caller_task_id = candidate.task_id
+                   AND continuation.kind = 'start_wait'
                    AND continuation.status IN ('pending', 'resolved')
+                   AND EXISTS (
+                     SELECT 1 FROM workflow_runs continuation_run
+                      WHERE continuation_run.workspace_id = continuation.workspace_id
+                        AND continuation_run.run_id = continuation.run_id
+                        AND continuation_run.origin = 'top_level'
+                        AND continuation_run.parent_run_id IS NULL
+                   )
               ) AS has_pending_continuation
          FROM turns candidate
         WHERE candidate.workspace_id = ?
@@ -2072,7 +2085,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const authorityWaitByTurn = new Map(
       authorityWaits.map((wait) => [wait.turn_id, wait]),
     );
-    return rows.map((row) => {
+    return rows.filter((row) => !retiredActivationTurnIds.has(row.id)).map((row) => {
       const turn = decodeTurn(row, byTurn.get(row.id) ?? []);
       const activation = activationByTurn.get(row.id);
       const wait = authorityWaitByTurn.get(row.id);
@@ -2104,7 +2117,7 @@ export class SqliteTaskRepository implements TaskRepository {
                 runId: activation.run_id,
                 activationId: activation.activation_id,
                 nodeId: activation.node_id,
-              kind: activation.activation_kind,
+              kind: activation.activation_kind as NonNullable<TaskTurn['workflowActivation']>['kind'],
               runStatus: activation.run_status,
               activationStatus: activation.activation_status,
               isTerminalNode: activation.is_terminal === 1,
@@ -2129,15 +2142,30 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   async getTask(taskId: string): Promise<MusterTask | undefined> {
-    const row = await this.db.get<TaskRow>(taskSelect('WHERE workspace_id = ? AND id = ?'), [this.workspaceId, taskId]);
+    const row = await this.db.get<TaskRow>(
+      taskSelect(`WHERE workspace_id = ? AND id = ? AND ${taskIsVisibleInActiveSurfacesSql()}`),
+      [this.workspaceId, taskId],
+    );
     return row ? (await this.hydrateTasks([row]))[0] : undefined;
+  }
+
+  async isTurnWorkflowBound(turnId: string): Promise<boolean> {
+    const row = await this.db.get<{ workflow_bound: number }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM workflow_activations
+          WHERE workspace_id = ? AND execution_turn_id = ?
+       ) AS workflow_bound`,
+      [this.workspaceId, turnId],
+    );
+    return row?.workflow_bound === 1;
   }
 
   async listTasksByIds(taskIds: readonly string[]): Promise<readonly MusterTask[]> {
     if (taskIds.length === 0) return [];
     const uniqueIds = [...new Set(taskIds)];
     const rows = await this.db.all<TaskRow>(
-      `${taskSelect(`WHERE workspace_id = ? AND id IN (${placeholders(uniqueIds.length)})`)}
+      `${taskSelect(`WHERE workspace_id = ? AND id IN (${placeholders(uniqueIds.length)})
+          AND ${taskIsVisibleInActiveSurfacesSql()}`)}
        ORDER BY created_at, id`,
       [this.workspaceId, ...uniqueIds],
     );
@@ -2146,14 +2174,18 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listTasks(workspaceId: string): Promise<readonly MusterTask[]> {
     if (workspaceId !== this.workspaceId) return [];
-    const rows = await this.db.all<TaskRow>(`${taskSelect('WHERE workspace_id = ?')} ORDER BY created_at, id`, [workspaceId]);
+    const rows = await this.db.all<TaskRow>(
+      `${taskSelect(`WHERE workspace_id = ? AND ${taskIsVisibleInActiveSurfacesSql()}`)} ORDER BY created_at, id`,
+      [workspaceId],
+    );
     return this.hydrateTasks(rows);
   }
 
   async listRootTasks(workspaceId: string, page: RepositoryPageRequest = {}): Promise<RepositoryPage<MusterTask>> {
     if (workspaceId !== this.workspaceId) return { items: [] };
     const rows = await this.db.all<TaskRow>(
-      `${taskSelect('WHERE workspace_id = ? AND parent_id IS NULL')} ORDER BY created_at, id LIMIT ?`,
+      `${taskSelect(`WHERE workspace_id = ? AND parent_id IS NULL
+          AND ${taskIsVisibleInActiveSurfacesSql()}`)} ORDER BY created_at, id LIMIT ?`,
       [workspaceId, normalizeLimit(page.limit)],
     );
     return { items: await this.hydrateTasks(rows) };
@@ -2171,6 +2203,7 @@ export class SqliteTaskRepository implements TaskRepository {
               t.model, t.revision, t.created_at, t.updated_at, t.payload_json
          FROM tasks t JOIN subtree s ON s.id = t.id
         WHERE t.workspace_id = ?
+           AND ${taskIsVisibleInActiveSurfacesSql('t')}
         ORDER BY t.created_at, t.id`,
       [this.workspaceId, rootTaskId, this.workspaceId, this.workspaceId],
     );
@@ -2179,7 +2212,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listTurns(taskId: string): Promise<readonly TaskTurn[]> {
     const rows = await this.db.all<TurnRow>(
-      `${turnSelect('WHERE workspace_id = ? AND task_id = ?')} ORDER BY sequence, created_at, id`,
+      `${turnSelect(`WHERE workspace_id = ? AND task_id = ?
+          AND ${turnIsVisibleInActiveSurfacesSql()}`)} ORDER BY sequence, created_at, id`,
       [this.workspaceId, taskId],
     );
     return this.hydrateTurns(rows);
@@ -2188,7 +2222,8 @@ export class SqliteTaskRepository implements TaskRepository {
   async listTurnsForTasks(taskIds: readonly string[]): Promise<readonly TaskTurn[]> {
     if (taskIds.length === 0) return [];
     const rows = await this.db.all<TurnRow>(
-      `${turnSelect(`WHERE workspace_id = ? AND task_id IN (${placeholders(taskIds.length)})`)} ORDER BY task_id, sequence, created_at, id`,
+      `${turnSelect(`WHERE workspace_id = ? AND task_id IN (${placeholders(taskIds.length)})
+          AND ${turnIsVisibleInActiveSurfacesSql()}`)} ORDER BY task_id, sequence, created_at, id`,
       [this.workspaceId, ...taskIds],
     );
     return this.hydrateTurns(rows);
@@ -2204,13 +2239,14 @@ export class SqliteTaskRepository implements TaskRepository {
            NOT EXISTS (
              SELECT 1 FROM turns newer
               WHERE newer.workspace_id = turns.workspace_id
-                AND newer.task_id = turns.task_id
-                AND newer.status IN ('succeeded', 'failed', 'interrupted', 'cancelled')
-                AND (newer.sequence > turns.sequence OR
+                 AND newer.task_id = turns.task_id
+                 AND newer.status IN ('succeeded', 'failed', 'interrupted', 'cancelled')
+                 AND ${turnIsVisibleInActiveSurfacesSql('newer')}
+                 AND (newer.sequence > turns.sequence OR
                      (newer.sequence = turns.sequence AND newer.created_at > turns.created_at) OR
                      (newer.sequence = turns.sequence AND newer.created_at = turns.created_at AND newer.id > turns.id))
            ))
-        )`)} ORDER BY task_id, sequence, created_at, id`,
+        ) AND ${turnIsVisibleInActiveSurfacesSql()}`)} ORDER BY task_id, sequence, created_at, id`,
       [this.workspaceId, ...taskIds],
     );
     return this.hydrateTurns(rows);
@@ -2232,12 +2268,13 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<number> {
     const statusFilter =
       statuses && statuses.length > 0
-        ? ` AND status IN (${placeholders(statuses.length)})`
+        ? ` AND counted_turn.status IN (${placeholders(statuses.length)})`
         : '';
     const row = await this.db.get<{ count: number }>(
-      `SELECT COUNT(*) AS count FROM turns
-         WHERE workspace_id = ? AND task_id = ?
-           AND COALESCE(json_extract(payload_json, '$.executionEpoch'), 1) = ?${statusFilter}`,
+      `SELECT COUNT(*) AS count FROM turns counted_turn
+         WHERE counted_turn.workspace_id = ? AND counted_turn.task_id = ?
+           AND COALESCE(json_extract(counted_turn.payload_json, '$.executionEpoch'), 1) = ?
+           AND ${turnIsVisibleInActiveSurfacesSql('counted_turn')}${statusFilter}`,
       [this.workspaceId, taskId, executionEpoch, ...(statuses ?? [])],
     );
     return row?.count ?? 0;
@@ -2245,7 +2282,9 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async getMaxTurnSequence(taskId: string): Promise<number> {
     const row = await this.db.get<{ max_seq: number | null }>(
-      `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT MAX(sequence) AS max_seq FROM turns
+        WHERE workspace_id = ? AND task_id = ?
+          AND ${turnIsVisibleInActiveSurfacesSql()}`,
       [this.workspaceId, taskId],
     );
     return row?.max_seq ?? 0;
@@ -2258,6 +2297,7 @@ export class SqliteTaskRepository implements TaskRepository {
       `WITH RECURSIVE chain(id, depth, retry_of) AS (
          SELECT id, 0, json_extract(payload_json, '$.retryOf')
            FROM turns WHERE workspace_id = ? AND id = ?
+             AND ${turnIsVisibleInActiveSurfacesSql()}
          UNION ALL
          SELECT t.id, chain.depth + 1, json_extract(t.payload_json, '$.retryOf')
            FROM chain
@@ -2281,12 +2321,13 @@ export class SqliteTaskRepository implements TaskRepository {
           AND trigger = 'engine'
           AND sequence > ?
           AND id NOT GLOB '*-attention'
-          AND EXISTS (
-            SELECT 1 FROM turn_inputs ti
-             WHERE ti.workspace_id = turns.workspace_id
-               AND ti.turn_id = turns.id
-               AND ti.kind = 'child_results'
-          )`)}
+           AND EXISTS (
+             SELECT 1 FROM turn_inputs ti
+              WHERE ti.workspace_id = turns.workspace_id
+                AND ti.turn_id = turns.id
+                AND ti.kind = 'child_results'
+          )
+          AND ${turnIsVisibleInActiveSurfacesSql()}`)}
        ORDER BY sequence, created_at, id
        LIMIT ?`,
       [this.workspaceId, taskId, afterSequence, bounded],
@@ -2296,7 +2337,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async getTurn(turnId: string): Promise<TaskTurn | undefined> {
     const row = await this.db.get<TurnRow>(
-      turnSelect('WHERE workspace_id = ? AND id = ?'),
+      turnSelect(`WHERE workspace_id = ? AND id = ?
+        AND ${turnIsVisibleInActiveSurfacesSql()}`),
       [this.workspaceId, turnId],
     );
     return row ? (await this.hydrateTurns([row]))[0] : undefined;
@@ -2304,7 +2346,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listQueuedTurns(taskId: string): Promise<readonly TaskTurn[]> {
     const rows = await this.db.all<TurnRow>(
-      `${turnSelect("WHERE workspace_id = ? AND task_id = ? AND status = 'queued'")} ORDER BY sequence, created_at, id`,
+      `${turnSelect(`WHERE workspace_id = ? AND task_id = ? AND status = 'queued'
+          AND ${turnIsVisibleInActiveSurfacesSql()}`)} ORDER BY sequence, created_at, id`,
       [this.workspaceId, taskId],
     );
     return this.hydrateTurns(rows);
@@ -2312,7 +2355,8 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listMessages(taskId: string): Promise<readonly TaskMessage[]> {
     const rows = await this.db.all<MessageRow>(
-      `${messageSelect('WHERE workspace_id = ? AND task_id = ?')} ORDER BY created_at, id`,
+      `${messageSelect(`WHERE workspace_id = ? AND task_id = ?
+          AND ${messageIsVisibleInActiveSurfacesSql()}`)} ORDER BY created_at, id`,
       [this.workspaceId, taskId],
     );
     return rows.map(decodeMessage);
@@ -2321,7 +2365,8 @@ export class SqliteTaskRepository implements TaskRepository {
   async listMessagesByIds(ids: readonly string[]): Promise<readonly TaskMessage[]> {
     if (ids.length === 0) return [];
     const rows = await this.db.all<MessageRow>(
-      `${messageSelect(`WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})`)}
+      `${messageSelect(`WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+          AND ${messageIsVisibleInActiveSurfacesSql()}`)}
        ORDER BY created_at, id`,
       [this.workspaceId, ...ids],
     );
@@ -2331,7 +2376,9 @@ export class SqliteTaskRepository implements TaskRepository {
   async listToolCalls(taskId: string): Promise<readonly PersistedToolCall[]> {
     const rows = await this.db.all<ToolRow>(
       `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
-         FROM tool_calls WHERE workspace_id = ? AND task_id = ? ORDER BY turn_id, ordering, id`,
+         FROM tool_calls WHERE workspace_id = ? AND task_id = ?
+           AND ${turnOwnedRowIsVisibleInActiveSurfacesSql('tool_calls')}
+         ORDER BY turn_id, ordering, id`,
       [this.workspaceId, taskId],
     );
     return rows.map(decodeToolCall);
@@ -2342,8 +2389,9 @@ export class SqliteTaskRepository implements TaskRepository {
     const rows = await this.db.all<ToolRow>(
       `SELECT id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at
          FROM tool_calls
-        WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
-        ORDER BY turn_id, ordering, id`,
+         WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+           AND ${turnOwnedRowIsVisibleInActiveSurfacesSql('tool_calls')}
+         ORDER BY turn_id, ordering, id`,
       [this.workspaceId, ...ids],
     );
     return rows.map(decodeToolCall);
@@ -2352,7 +2400,9 @@ export class SqliteTaskRepository implements TaskRepository {
   async listReasoning(taskId: string): Promise<readonly PersistedReasoning[]> {
     const rows = await this.db.all<ReasoningRow>(
       `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
-         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ? ORDER BY turn_id, ordering, id`,
+         FROM reasoning_segments WHERE workspace_id = ? AND task_id = ?
+           AND ${turnOwnedRowIsVisibleInActiveSurfacesSql('reasoning_segments')}
+         ORDER BY turn_id, ordering, id`,
       [this.workspaceId, taskId],
     );
     return rows.map(decodeReasoning);
@@ -2364,6 +2414,7 @@ export class SqliteTaskRepository implements TaskRepository {
       `SELECT id, task_id, turn_id, ordering, content, created_at, updated_at
          FROM reasoning_segments
          WHERE workspace_id = ? AND id IN (${placeholders(ids.length)})
+           AND ${turnOwnedRowIsVisibleInActiveSurfacesSql('reasoning_segments')}
          ORDER BY turn_id, ordering, id`,
       [this.workspaceId, ...ids],
     );
@@ -2372,7 +2423,13 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async getOperation(ledgerKey: string): Promise<OperationLedgerEntry | undefined> {
     const row = await this.db.get<OperationRow>(
-      'SELECT ledger_key, fingerprint, result_json FROM operations WHERE workspace_id = ? AND ledger_key = ?',
+      `SELECT operation_row.ledger_key, operation_row.fingerprint, operation_row.result_json
+         FROM operations operation_row
+        WHERE operation_row.workspace_id = ? AND operation_row.ledger_key = ?
+          AND ${operationLedgerIsVisibleInActiveSurfacesSql(
+            'operation_row.workspace_id',
+            'operation_row.ledger_key',
+          )}`,
       [this.workspaceId, ledgerKey],
     );
     return row ? decodeOperation(row) : undefined;
@@ -2380,11 +2437,23 @@ export class SqliteTaskRepository implements TaskRepository {
 
   async listOperationsForTurns(turnIds: readonly string[]): Promise<readonly RepositoryOperationEntry[]> {
     if (turnIds.length === 0) return [];
-    const predicates = turnIds.map(() => 'ledger_key GLOB ?').join(' OR ');
     const rows = await this.db.all<OperationRow>(
-      `SELECT ledger_key, fingerprint, result_json FROM operations
-        WHERE workspace_id = ? AND (${predicates}) ORDER BY ledger_key`,
-      [this.workspaceId, ...turnIds.map((turnId) => `${escapeGlob(turnId)}:*`)],
+      `SELECT operation_row.ledger_key, operation_row.fingerprint, operation_row.result_json
+         FROM operations operation_row
+        WHERE operation_row.workspace_id = ?
+          AND EXISTS (
+            SELECT 1 FROM turns operation_turn
+             WHERE operation_turn.workspace_id = operation_row.workspace_id
+               AND operation_turn.id IN (${placeholders(turnIds.length)})
+               AND ${operationLedgerBelongsToTurnSql(
+                 'operation_row.workspace_id',
+                 'operation_row.ledger_key',
+                 'operation_turn',
+               )}
+               AND ${turnIsVisibleInActiveSurfacesSql('operation_turn')}
+          )
+        ORDER BY operation_row.ledger_key`,
+      [this.workspaceId, ...turnIds],
     );
     return rows.map((row) => ({ ledgerKey: row.ledger_key, entry: decodeOperation(row) }));
   }
@@ -2392,7 +2461,14 @@ export class SqliteTaskRepository implements TaskRepository {
   async getCancelRequest(turnId: string): Promise<CancelRequest | undefined> {
     const row = await this.db.get<CancelRow>(
       `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
-         FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?`,
+         FROM turn_cancel_requests
+        WHERE workspace_id = ? AND turn_id = ?
+          AND EXISTS (
+            SELECT 1 FROM turns cancel_turn
+             WHERE cancel_turn.workspace_id = turn_cancel_requests.workspace_id
+               AND cancel_turn.id = turn_cancel_requests.turn_id
+               AND ${turnIsVisibleInActiveSurfacesSql('cancel_turn')}
+          )`,
       [this.workspaceId, turnId],
     );
     return row ? decodeCancelRequest(row) : undefined;
@@ -2404,8 +2480,14 @@ export class SqliteTaskRepository implements TaskRepository {
     if (turnIds.length === 0) return [];
     const rows = await this.db.all<CancelRow>(
       `SELECT turn_id, kind, op_id, requested_by, requested_at, payload_json
-         FROM turn_cancel_requests
+       FROM turn_cancel_requests
         WHERE workspace_id = ? AND turn_id IN (${placeholders(turnIds.length)})
+          AND EXISTS (
+            SELECT 1 FROM turns cancel_turn
+             WHERE cancel_turn.workspace_id = turn_cancel_requests.workspace_id
+               AND cancel_turn.id = turn_cancel_requests.turn_id
+               AND ${turnIsVisibleInActiveSurfacesSql('cancel_turn')}
+          )
         ORDER BY turn_id`,
       [this.workspaceId, ...turnIds],
     );
@@ -2415,7 +2497,14 @@ export class SqliteTaskRepository implements TaskRepository {
   async getRuntimeClaim(turnId: string): Promise<RuntimeClaim | undefined> {
     const row = await this.db.get<RuntimeClaimRow>(
       `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
-         FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?`,
+         FROM runtime_claims
+        WHERE workspace_id = ? AND turn_id = ?
+          AND EXISTS (
+            SELECT 1 FROM turns claimed_turn
+             WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+               AND claimed_turn.id = runtime_claims.turn_id
+               AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+          )`,
       [this.workspaceId, turnId],
     );
     return row ? decodeRuntimeClaim(row) : undefined;
@@ -2425,8 +2514,14 @@ export class SqliteTaskRepository implements TaskRepository {
     if (turnIds.length === 0) return [];
     const rows = await this.db.all<RuntimeClaimRow>(
       `SELECT turn_id, owner_id, claimed_at, heartbeat_at, expires_at
-         FROM runtime_claims
+       FROM runtime_claims
         WHERE workspace_id = ? AND turn_id IN (${placeholders(turnIds.length)})
+          AND EXISTS (
+            SELECT 1 FROM turns claimed_turn
+             WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+               AND claimed_turn.id = runtime_claims.turn_id
+               AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+          )
         ORDER BY turn_id`,
       [this.workspaceId, ...turnIds],
     );
@@ -2801,11 +2896,13 @@ export class SqliteTaskRepository implements TaskRepository {
          JOIN workflow_runs run
            ON run.workspace_id = claim.workspace_id
           AND run.run_id = claim.run_id
-        WHERE claim.workspace_id = ?
+         WHERE claim.workspace_id = ?
           AND claim.owner_task_id = ?
           AND claim.caller_task_id = ?
           AND claim.definition_id = ?
-          AND claim.idempotency_key = ?
+           AND claim.idempotency_key = ?
+           AND run.origin = 'top_level'
+           AND run.parent_run_id IS NULL
         ORDER BY claim.created_at, claim.definition_version
         LIMIT 1`,
       [
@@ -2861,10 +2958,13 @@ export class SqliteTaskRepository implements TaskRepository {
           AND definition_node.definition_id = run.definition_id
           AND definition_node.definition_version = run.definition_version
           AND definition_node.node_id = activation.node_id
-        WHERE activation.workspace_id = ?
-          AND activation.execution_turn_id = ?
-          AND activation.status IN ('queued', 'running')
-          AND run.status = 'running'
+          WHERE activation.workspace_id = ?
+            AND activation.execution_turn_id = ?
+            AND ${activeWorkflowActivationKindSql('activation')}
+            AND activation.status IN ('queued', 'running')
+           AND run.status = 'running'
+           AND run.origin = 'top_level'
+           AND run.parent_run_id IS NULL
         LIMIT 1`,
       [this.workspaceId, turnId],
     );
@@ -2898,7 +2998,7 @@ export class SqliteTaskRepository implements TaskRepository {
              JOIN workflow_dependency_gates gate
                ON gate.workspace_id = activation.workspace_id
               AND gate.run_id = activation.run_id
-              AND gate.gate_id = COALESCE(activation.source_gate_id, activation.return_gate_id)
+               AND gate.gate_id = activation.source_gate_id
              JOIN workflow_gate_bindings binding
                ON binding.workspace_id = gate.workspace_id
               AND binding.run_id = gate.run_id
@@ -2913,8 +3013,9 @@ export class SqliteTaskRepository implements TaskRepository {
               AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
               AND artifact.artifact_id = fill.artifact_id
               AND artifact.revision = fill.artifact_revision
-            WHERE activation.workspace_id = ?
-              AND activation.execution_turn_id = ?
+             WHERE activation.workspace_id = ?
+               AND activation.execution_turn_id = ?
+               AND ${activeWorkflowActivationKindSql('activation')}
 
            UNION ALL
 
@@ -3058,8 +3159,10 @@ export class SqliteTaskRepository implements TaskRepository {
           AND claim.owner_task_id = ?
           AND claim.caller_task_id = ?
           AND claim.definition_id = ?
-          AND claim.definition_version = ?
-          AND claim.idempotency_key = ?`,
+           AND claim.definition_version = ?
+           AND claim.idempotency_key = ?
+           AND run.origin = 'top_level'
+           AND run.parent_run_id IS NULL`,
       [
         this.workspaceId,
         input.ownerRootTaskId,
@@ -3182,14 +3285,16 @@ export class SqliteTaskRepository implements TaskRepository {
            ON repair.workspace_id = activation.workspace_id
           AND repair.run_id = activation.run_id
           AND repair.activation_id = activation.activation_id
-        WHERE activation.workspace_id = ?
-          AND activation.run_id = ?
-          AND activation.activation_id = (
+         WHERE activation.workspace_id = ?
+           AND activation.run_id = ?
+           AND ${activeWorkflowActivationKindSql('activation')}
+           AND activation.activation_id = (
             SELECT candidate.activation_id
               FROM workflow_activations candidate
-             WHERE candidate.workspace_id = activation.workspace_id
-               AND candidate.run_id = activation.run_id
-               AND candidate.node_id = activation.node_id
+              WHERE candidate.workspace_id = activation.workspace_id
+                AND candidate.run_id = activation.run_id
+                AND candidate.node_id = activation.node_id
+                AND ${activeWorkflowActivationKindSql('candidate')}
              ORDER BY CASE candidate.status
                         WHEN 'running' THEN 0
                         WHEN 'queued' THEN 1
@@ -3240,7 +3345,8 @@ export class SqliteTaskRepository implements TaskRepository {
           AND definition_node.definition_id = run.definition_id
           AND definition_node.definition_version = run.definition_version
           AND definition_node.node_id = node.node_id
-        WHERE node.workspace_id = ? AND node.task_id = ?`,
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, taskId],
     );
     if (!node || typeof node.run_id !== 'string' || typeof node.node_id !== 'string') {
@@ -3250,9 +3356,7 @@ export class SqliteTaskRepository implements TaskRepository {
       run_id: string;
       definition_id: string;
       definition_version: number;
-       status: WorkflowRunStatus;
-      origin: string;
-      parent_run_id: string | null;
+      status: WorkflowRunStatus;
       max_feedback_rounds: number;
       max_turns_per_task: number;
       max_workflow_turns: number;
@@ -3264,12 +3368,13 @@ export class SqliteTaskRepository implements TaskRepository {
       deadline_at: string | null;
       terminal_reason_code: string | null;
     }>(
-      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+      `SELECT run_id, definition_id, definition_version, status,
               max_feedback_rounds, max_turns_per_task, max_workflow_turns,
               max_children, max_depth, max_concurrency, max_aggregate_bytes,
               started_at, deadline_at, terminal_reason_code
          FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
+        WHERE workspace_id = ? AND run_id = ?
+          AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, node.run_id],
     );
     if (!run) {
@@ -3290,14 +3395,12 @@ export class SqliteTaskRepository implements TaskRepository {
       source_gate_id: string | null;
       feedback_round_id: string | null;
       feedback_target_node_id: string | null;
-      continuation_id: string | null;
-      return_gate_id: string | null;
     }>(
       `SELECT activation_id, kind, status, primary_turn_id, execution_turn_id,
-              source_gate_id, feedback_round_id, feedback_target_node_id,
-              continuation_id, return_gate_id
+              source_gate_id, feedback_round_id, feedback_target_node_id
          FROM workflow_activations
         WHERE workspace_id = ? AND run_id = ? AND node_id = ?
+          AND ${activeWorkflowActivationKindSql('workflow_activations')}
           AND status IN ('queued', 'running', 'failed', 'interrupted')
         ORDER BY CASE status
                    WHEN 'running' THEN 0
@@ -3340,9 +3443,10 @@ export class SqliteTaskRepository implements TaskRepository {
               SELECT 1 FROM workflow_activations activation
                WHERE activation.workspace_id = round_row.workspace_id
                  AND activation.run_id = round_row.run_id
-                 AND activation.node_id = ?
-                 AND activation.feedback_round_id = round_row.round_id
-                 AND activation.status IN ('queued', 'running', 'failed', 'interrupted')
+                  AND activation.node_id = ?
+                  AND activation.feedback_round_id = round_row.round_id
+                  AND ${activeWorkflowActivationKindSql('activation')}
+                  AND activation.status IN ('queued', 'running', 'failed', 'interrupted')
             )
           )
         ORDER BY round_row.created_at, round_row.round_id
@@ -3354,18 +3458,15 @@ export class SqliteTaskRepository implements TaskRepository {
       continuation_id: string;
       status: string;
       kind: string;
-      child_run_id: string | null;
       outcome: string | null;
       reason_code: string | null;
     }>(
-      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
+      `SELECT continuation_id, status, kind, outcome, reason_code
          FROM workflow_continuations
-        WHERE workspace_id = ?
-          AND (run_id = ? OR child_run_id = ?
-            OR (caller_run_id = ? AND caller_task_id = ?))
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
         ORDER BY created_at, continuation_id
         LIMIT 65`,
-      [this.workspaceId, node.run_id, node.run_id, node.run_id, taskId],
+      [this.workspaceId, node.run_id],
     );
 
     const liveState = await this.db.get<{
@@ -3373,7 +3474,6 @@ export class SqliteTaskRepository implements TaskRepository {
       live_round: number;
       live_activation: number;
       live_continuation: number;
-      live_return_gate: number;
     }>(
       `SELECT
          EXISTS (SELECT 1 FROM workflow_dependency_gates
@@ -3381,20 +3481,17 @@ export class SqliteTaskRepository implements TaskRepository {
          EXISTS (SELECT 1 FROM workflow_feedback_rounds
                   WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
          EXISTS (SELECT 1 FROM workflow_activations
-                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+                   WHERE workspace_id = ? AND run_id = ?
+                     AND ${activeWorkflowActivationKindSql('workflow_activations')}
+                     AND status IN ('queued', 'running')) AS live_activation,
          EXISTS (SELECT 1 FROM workflow_continuations
-                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ?)
-                    AND status IN ('pending', 'resolved')) AS live_continuation,
-         EXISTS (SELECT 1 FROM workflow_return_gates
-                  WHERE workspace_id = ?
-                    AND (continuation_run_id = ? OR child_run_id = ?)
-                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+                  WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
+                    AND status IN ('pending', 'resolved')) AS live_continuation`,
       [
         this.workspaceId, node.run_id,
         this.workspaceId, node.run_id,
         this.workspaceId, node.run_id,
-        this.workspaceId, node.run_id, node.run_id,
-        this.workspaceId, node.run_id, node.run_id,
+        this.workspaceId, node.run_id,
       ],
     );
 
@@ -3411,7 +3508,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
     if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
     if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
-    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
     const terminalReason = run.terminal_reason_code;
     if (terminalReason !== null && !/^[a-z0-9_]{1,64}$/.test(terminalReason)) {
       diagnostics.push({ code: 'invalid_terminal_reason' });
@@ -3452,7 +3548,6 @@ export class SqliteTaskRepository implements TaskRepository {
         maxConcurrency: Number(run.max_concurrency) || 0,
         maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
       },
-      origin: run.origin,
       nodeId: node.node_id,
       ...(title ? { title } : {}),
       ...(decisionGate ? { decisionGate } : {}),
@@ -3470,7 +3565,6 @@ export class SqliteTaskRepository implements TaskRepository {
         continuationId: continuation.continuation_id,
         status: continuation.status,
         kind: continuation.kind,
-        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
         ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
         ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
       })),
@@ -3480,9 +3574,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (run.deadline_at) projection.deadlineAt = run.deadline_at;
     if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
       projection.terminalReason = terminalReason;
-    }
-    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
-      projection.parentRunId = run.parent_run_id;
     }
     if (activeGateRow) projection.activeGate = activeGateRow;
     if (activationRow) {
@@ -3497,8 +3588,6 @@ export class SqliteTaskRepository implements TaskRepository {
         ...(activationRow.feedback_target_node_id
           ? { feedbackTargetNodeId: activationRow.feedback_target_node_id }
           : {}),
-        ...(activationRow.continuation_id ? { continuationId: activationRow.continuation_id } : {}),
-        ...(activationRow.return_gate_id ? { returnGateId: activationRow.return_gate_id } : {}),
       };
     }
     return projection;
@@ -3534,15 +3623,16 @@ export class SqliteTaskRepository implements TaskRepository {
          FROM workflow_nodes node
          JOIN workflow_runs run
            ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
-        WHERE node.workspace_id = ? AND node.task_id = ?`,
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, taskId],
     );
     const run = nodeRun ?? await this.db.get<WorkflowGraphRunRow>(
       `SELECT run.run_id, NULL AS node_id, run.definition_id, run.definition_version, run.status
          FROM workflow_runs run
-        WHERE run.workspace_id = ?
-          AND run.owner_root_task_id = ?
-          AND run.parent_run_id IS NULL
+         WHERE run.workspace_id = ?
+           AND run.owner_root_task_id = ?
+           AND run.origin = 'top_level' AND run.parent_run_id IS NULL
         ORDER BY CASE WHEN run.status = 'running' THEN 0 ELSE 1 END,
                  run.updated_at DESC,
                  run.run_id DESC
@@ -3557,7 +3647,7 @@ export class SqliteTaskRepository implements TaskRepository {
       run.definition_version,
     );
 
-    const [nodeRows, edgeRows, gateRead, roundRows, childRows, decisionRows] = await Promise.all([
+    const [nodeRows, edgeRows, gateRead, roundRows, decisionRows] = await Promise.all([
       this.db.all<{
         node_id: string;
         status: WorkflowNodeStatus;
@@ -3568,6 +3658,7 @@ export class SqliteTaskRepository implements TaskRepository {
                   SELECT turn.status FROM turns turn
                    WHERE turn.workspace_id = node.workspace_id
                      AND turn.task_id = node.task_id
+                     AND ${turnIsVisibleInActiveSurfacesSql('turn')}
                    ORDER BY CASE turn.status
                               WHEN 'running' THEN 0
                               WHEN 'waiting_user' THEN 1
@@ -3607,11 +3698,6 @@ export class SqliteTaskRepository implements TaskRepository {
           ORDER BY round.created_at, round.round_id LIMIT 33`,
         [this.workspaceId, run.run_id],
       ),
-       this.db.all<{ run_id: string; status: WorkflowRunStatus }>(
-        `SELECT run_id, status FROM workflow_runs
-          WHERE workspace_id = ? AND parent_run_id = ? ORDER BY created_at, run_id LIMIT 65`,
-         [this.workspaceId, run.run_id],
-       ),
       this.readWorkflowDecisionProjectionRows(run.run_id),
     ]);
 
@@ -3622,7 +3708,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_graph_nodes_truncated' });
     if (edgeRows.length > 128) diagnostics.push({ code: 'workflow_graph_edges_truncated' });
     if (gateRead.truncated) diagnostics.push({ code: 'workflow_graph_gates_truncated' });
-    if (childRows.length > 64) diagnostics.push({ code: 'workflow_graph_child_runs_truncated' });
 
     const gateByConsumer = new Map(gateRead.gates.map((gate) => [gate.consumerNodeId, gate]));
     const definitionNodeById = new Map(
@@ -3690,7 +3775,6 @@ export class SqliteTaskRepository implements TaskRepository {
         required: Number(round.required) || 0,
         responded: Number(round.responded) || 0,
       })),
-      childRuns: childRows.slice(0, 64).map((child) => ({ status: child.status })),
       reuse: {
         nodeCount: reusedNodeIds.size,
         edgeCount: edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId)).length,
@@ -3703,8 +3787,12 @@ export class SqliteTaskRepository implements TaskRepository {
     if (taskIds.length === 0) return new Map();
     const placeholders = taskIds.map(() => '?').join(',');
     const rows = await this.db.all<{ task_id: string; status: string }>(
-      `SELECT task_id, status FROM workflow_nodes
-         WHERE workspace_id = ? AND task_id IN (${placeholders}) AND task_id IS NOT NULL`,
+      `SELECT node.task_id, node.status FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id IN (${placeholders})
+          AND node.task_id IS NOT NULL
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, ...taskIds],
     );
     const map = new Map<string, string>();
@@ -3733,7 +3821,7 @@ export class SqliteTaskRepository implements TaskRepository {
             WHERE workspace_id = ?
               AND owner_root_task_id IN (${placeholders})
               AND owner_root_task_id IS NOT NULL
-              AND parent_run_id IS NULL
+              AND origin = 'top_level' AND parent_run_id IS NULL
          ) ranked
         WHERE rank = 1`,
       [this.workspaceId, ...taskIds],
@@ -3751,7 +3839,9 @@ export class SqliteTaskRepository implements TaskRepository {
     if (runIds.length === 0) return [];
     const placeholders = runIds.map(() => '?').join(',');
     const rows = await this.db.all<{ owner_root_task_id: string | null }>(
-      `SELECT owner_root_task_id FROM workflow_runs WHERE workspace_id = ? AND run_id IN (${placeholders})`,
+      `SELECT owner_root_task_id FROM workflow_runs
+        WHERE workspace_id = ? AND run_id IN (${placeholders})
+          AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, ...runIds],
     );
     const changes: ChangeRecord[] = [];
@@ -3829,8 +3919,6 @@ export class SqliteTaskRepository implements TaskRepository {
       definition_id: string;
       definition_version: number;
       status: string;
-      origin: string;
-      parent_run_id: string | null;
       max_feedback_rounds: number;
       max_turns_per_task: number;
       max_workflow_turns: number;
@@ -3845,14 +3933,15 @@ export class SqliteTaskRepository implements TaskRepository {
       terminal_result_artifact_id: string | null;
       terminal_result_artifact_revision: number | null;
     }>(
-      `SELECT run_id, definition_id, definition_version, status, origin, parent_run_id,
+      `SELECT run_id, definition_id, definition_version, status,
               max_feedback_rounds, max_turns_per_task, max_workflow_turns,
               max_children, max_depth, max_concurrency, max_aggregate_bytes,
               started_at, deadline_at, terminal_reason_code,
               terminal_result_run_id, terminal_result_artifact_id,
               terminal_result_artifact_revision
          FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ? AND owner_root_task_id = ?`,
+        WHERE workspace_id = ? AND run_id = ? AND owner_root_task_id = ?
+          AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, runId, ownerRootTaskId],
     );
     if (!run) return undefined;
@@ -3880,14 +3969,12 @@ export class SqliteTaskRepository implements TaskRepository {
       source_gate_id: string | null;
       feedback_round_id: string | null;
       feedback_target_node_id: string | null;
-      continuation_id: string | null;
-      return_gate_id: string | null;
     }>(
       `SELECT node_id, activation_id, kind, status, primary_turn_id, execution_turn_id,
-              source_gate_id, feedback_round_id, feedback_target_node_id,
-              continuation_id, return_gate_id
+              source_gate_id, feedback_round_id, feedback_target_node_id
          FROM workflow_activations
         WHERE workspace_id = ? AND run_id = ?
+          AND ${activeWorkflowActivationKindSql('workflow_activations')}
           AND status IN ('queued', 'running', 'failed', 'interrupted')
         ORDER BY CASE status
                    WHEN 'running' THEN 0
@@ -3931,23 +4018,21 @@ export class SqliteTaskRepository implements TaskRepository {
       continuation_id: string;
       status: string;
       kind: string;
-      child_run_id: string | null;
       outcome: string | null;
       reason_code: string | null;
     }>(
-      `SELECT continuation_id, status, kind, child_run_id, outcome, reason_code
+      `SELECT continuation_id, status, kind, outcome, reason_code
          FROM workflow_continuations
-        WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
+        WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
         ORDER BY created_at, continuation_id
         LIMIT 65`,
-      [this.workspaceId, runId, runId, runId],
+      [this.workspaceId, runId],
     );
     const liveState = await this.db.get<{
       live_gate: number;
       live_round: number;
       live_activation: number;
       live_continuation: number;
-      live_return_gate: number;
     }>(
       `SELECT
          EXISTS (SELECT 1 FROM workflow_dependency_gates
@@ -3955,19 +4040,17 @@ export class SqliteTaskRepository implements TaskRepository {
          EXISTS (SELECT 1 FROM workflow_feedback_rounds
                   WHERE workspace_id = ? AND run_id = ? AND status IN ('open', 'satisfied')) AS live_round,
          EXISTS (SELECT 1 FROM workflow_activations
-                  WHERE workspace_id = ? AND run_id = ? AND status IN ('queued', 'running')) AS live_activation,
+                   WHERE workspace_id = ? AND run_id = ?
+                     AND ${activeWorkflowActivationKindSql('workflow_activations')}
+                     AND status IN ('queued', 'running')) AS live_activation,
          EXISTS (SELECT 1 FROM workflow_continuations
-                  WHERE workspace_id = ? AND (run_id = ? OR child_run_id = ? OR caller_run_id = ?)
-                    AND status IN ('pending', 'resolved')) AS live_continuation,
-         EXISTS (SELECT 1 FROM workflow_return_gates
-                  WHERE workspace_id = ? AND (continuation_run_id = ? OR child_run_id = ?)
-                    AND status IN ('open', 'satisfied')) AS live_return_gate`,
+                  WHERE workspace_id = ? AND run_id = ? AND kind = 'start_wait'
+                    AND status IN ('pending', 'resolved')) AS live_continuation`,
       [
         this.workspaceId, runId,
         this.workspaceId, runId,
         this.workspaceId, runId,
-        this.workspaceId, runId, runId, runId,
-        this.workspaceId, runId, runId,
+        this.workspaceId, runId,
       ],
     );
 
@@ -3982,7 +4065,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (terminal && liveState?.live_round === 1) diagnostics.push({ code: 'terminal_run_has_live_round' });
     if (terminal && liveState?.live_activation === 1) diagnostics.push({ code: 'terminal_run_has_live_activation' });
     if (terminal && liveState?.live_continuation === 1) diagnostics.push({ code: 'terminal_run_has_live_continuation' });
-    if (terminal && liveState?.live_return_gate === 1) diagnostics.push({ code: 'terminal_run_has_live_return_gate' });
     if (
       terminal
       && nodeRows.some((node) => node.status === 'pending' || node.status === 'active')
@@ -4024,7 +4106,6 @@ export class SqliteTaskRepository implements TaskRepository {
         maxConcurrency: Number(run.max_concurrency) || 0,
         maxAggregateBytes: Number(run.max_aggregate_bytes) || 0,
       },
-      origin: run.origin,
       nodes: nodeRows.slice(0, 64).map((node) => ({
         nodeId: node.node_id,
         status: node.status,
@@ -4043,8 +4124,6 @@ export class SqliteTaskRepository implements TaskRepository {
         ...(activation.feedback_target_node_id
           ? { feedbackTargetNodeId: activation.feedback_target_node_id }
           : {}),
-        ...(activation.continuation_id ? { continuationId: activation.continuation_id } : {}),
-        ...(activation.return_gate_id ? { returnGateId: activation.return_gate_id } : {}),
       })),
       feedbackRounds: roundRows.slice(0, 32).map((round) => ({
         roundId: round.round_id,
@@ -4058,7 +4137,6 @@ export class SqliteTaskRepository implements TaskRepository {
         continuationId: continuation.continuation_id,
         status: continuation.status,
         kind: continuation.kind,
-        ...(continuation.child_run_id ? { childRunId: continuation.child_run_id } : {}),
         ...(continuation.outcome ? { outcome: continuation.outcome } : {}),
         ...(continuation.reason_code ? { reasonCode: continuation.reason_code } : {}),
       })),
@@ -4068,9 +4146,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (run.deadline_at) projection.deadlineAt = run.deadline_at;
     if (terminalReason && /^[a-z0-9_]{1,64}$/.test(terminalReason)) {
       projection.terminalReason = terminalReason;
-    }
-    if (typeof run.parent_run_id === 'string' && run.parent_run_id.length > 0) {
-      projection.parentRunId = run.parent_run_id;
     }
     if (terminalResultValid) {
       projection.terminalResult = {
@@ -4112,7 +4187,8 @@ export class SqliteTaskRepository implements TaskRepository {
           AND artifact.run_id = run.terminal_result_run_id
           AND artifact.artifact_id = run.terminal_result_artifact_id
           AND artifact.revision = run.terminal_result_artifact_revision
-        WHERE run.workspace_id = ? AND run.run_id = ? AND run.owner_root_task_id = ?`,
+        WHERE run.workspace_id = ? AND run.run_id = ? AND run.owner_root_task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, runId, ownerRootTaskId],
     );
     if (
@@ -4263,9 +4339,10 @@ export class SqliteTaskRepository implements TaskRepository {
     ];
     const results = await this.writeIfFirstChanged(
       {
-        sql: `UPDATE tasks
-                 SET goal = ?, updated_at = ?, revision = revision + 1
-               WHERE workspace_id = ? AND id = ?${revisionPredicate}`,
+      sql: `UPDATE tasks
+         SET goal = ?, updated_at = ?, revision = revision + 1
+               WHERE workspace_id = ? AND id = ?${revisionPredicate}
+                 AND ${taskIsVisibleInActiveSurfacesSql('tasks')}`,
         params,
       },
       [],
@@ -4292,6 +4369,10 @@ export class SqliteTaskRepository implements TaskRepository {
     const insertTasks = new Set(command.insertTaskIds ?? []);
     const insertTurns = new Set(command.insertTurnIds ?? []);
     const insertMessages = new Set(command.insertMessageIds ?? []);
+    let graphActiveSurfaceGuardIndex: number | null = null;
+    let graphOperationClaimIndex: number | null = null;
+    let graphOperationDeleteGuardIndex: number | null = null;
+    let graphTaskRevisionGuardIndex: number | null = null;
     let graphTurnShellGuardIndex: number | null = null;
 
     if (command.dispositionClaim) {
@@ -4343,7 +4424,7 @@ export class SqliteTaskRepository implements TaskRepository {
             ledgerKey: command.operation.ledgerKey,
             entry: command.operation.entry,
             createdAt: command.operation.createdAt,
-          });
+          }, command.dispositionClaim.turnId);
           if (claimed.conflict) return claimed;
         }
         return {
@@ -4354,9 +4435,51 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     }
 
+    const graphAffectedTurnIds = [...new Set([
+      ...command.turns.map((turn) => turn.id),
+      ...(command.expectedTurns ?? []).map((turn) => turn.id),
+      ...(command.deleteTurnIds ?? []),
+      ...(command.dispositionClaim ? [command.dispositionClaim.turnId] : []),
+      ...(command.cancelRequests ?? []).map((entry) => entry.turnId),
+      ...(command.deleteCancelRequestTurnIds ?? []),
+      ...(command.deleteRuntimeClaimTurnIds ?? []),
+      ...(command.expectedRuntimeClaims ?? []).map((entry) => entry.turnId),
+      ...(command.expectedCancelRequests ?? []).map((entry) => entry.turnId),
+      ...(command.deleteSessionClaimTurnIds ?? []),
+      ...(command.deleteResourceClaimTurnIds ?? []),
+      ...(command.messages ?? []).flatMap((message) => message.turnId ? [message.turnId] : []),
+    ])];
+    if (graphAffectedTurnIds.length > 0) {
+      graphActiveSurfaceGuardIndex = statements.length;
+      statements.push(existingTurnVisibilityGuardStatement(
+        this.workspaceId,
+        graphAffectedTurnIds,
+      ));
+      abortIfUnchangedAt.push(graphActiveSurfaceGuardIndex);
+    }
     if (command.operation) {
+      graphOperationClaimIndex = statements.length;
       statements.push(graphOperationClaimStatement(this.workspaceId, command.operation));
-      abortIfUnchangedAt.push(0);
+      abortIfUnchangedAt.push(graphOperationClaimIndex);
+    }
+    if (command.deleteOperationKeys && command.deleteOperationKeys.length > 0) {
+      const operationKeys = [...new Set(command.deleteOperationKeys)];
+      graphOperationDeleteGuardIndex = statements.length;
+      statements.push({
+        sql: `UPDATE workspaces SET last_opened_at = last_opened_at
+               WHERE id = ?
+                 AND NOT EXISTS (
+                   SELECT 1 FROM operations operation_row
+                    WHERE operation_row.workspace_id = ?
+                      AND operation_row.ledger_key IN (${placeholders(operationKeys.length)})
+                      AND NOT (${operationLedgerIsVisibleInActiveSurfacesSql(
+                        'operation_row.workspace_id',
+                        'operation_row.ledger_key',
+                      )})
+                 )`,
+        params: [this.workspaceId, this.workspaceId, ...operationKeys],
+      });
+      abortIfUnchangedAt.push(graphOperationDeleteGuardIndex);
     }
     if (command.dispositionClaim) {
       statements.push(
@@ -4369,9 +4492,9 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     // revision/feed statements are appended after mutation assembly below.
     if (command.expectedTasks.length > 0) {
-      const index = statements.length;
+      graphTaskRevisionGuardIndex = statements.length;
       statements.push(taskRevisionGuardStatement(this.workspaceId, command.expectedTasks));
-      abortIfUnchangedAt.push(index);
+      abortIfUnchangedAt.push(graphTaskRevisionGuardIndex);
     }
     // Task revision and live-turn epoch/status are independent fences. Graph
     // commands commonly carry both (notably cancel consumption); checking only
@@ -4461,9 +4584,19 @@ export class SqliteTaskRepository implements TaskRepository {
          WHERE workspace_id = ? AND id = ?
            AND NOT EXISTS (
              SELECT 1 FROM tasks t
-               JOIN workflow_nodes n ON n.workspace_id = t.workspace_id AND n.task_id = t.id
               WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM subtree)
-                AND n.status = 'pending' AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
+                AND (
+                  NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+                  OR ${taskOwnsRetiredWorkflowStateSql('t')}
+                  OR (
+                    EXISTS (
+                      SELECT 1 FROM workflow_nodes n
+                       WHERE n.workspace_id = t.workspace_id AND n.task_id = t.id
+                         AND n.status = 'pending'
+                    )
+                    AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
+                  )
+                )
            )`;
       const guardParams: SqlValue[] = [
         ...command.deleteTaskIds,
@@ -4481,14 +4614,18 @@ export class SqliteTaskRepository implements TaskRepository {
     // user messages.
     for (const messageId of command.deleteMessageIds ?? []) {
       statements.push({
-        sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ?',
+        sql: `DELETE FROM messages
+               WHERE workspace_id = ? AND id = ?
+                 AND ${messageIsVisibleInActiveSurfacesSql()}`,
         params: [this.workspaceId, messageId],
       });
       changes.push({ kind: 'message', id: messageId, change: 'delete' });
     }
     for (const turnId of command.deleteTurnIds ?? []) {
       statements.push({
-        sql: 'DELETE FROM turns WHERE workspace_id = ? AND id = ?',
+        sql: `DELETE FROM turns
+               WHERE workspace_id = ? AND id = ?
+                 AND ${turnIsVisibleInActiveSurfacesSql()}`,
         params: [this.workspaceId, turnId],
       });
       changes.push({ kind: 'turn', id: turnId, change: 'delete' });
@@ -4550,7 +4687,7 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'turn', id: turn.id, taskId: turn.taskId, change: insertTurns.has(turn.id) ? 'insert' : 'update' });
     }
     for (const turn of command.turns) {
-      statements.push({ sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] });
+      statements.push(turnInputDeleteStatement(this.workspaceId, turn.id));
       for (const input of turn.inputs) {
         statements.push(turnInputStatement(this.workspaceId, turn.id, turn.inputs.indexOf(input), input));
       }
@@ -4564,23 +4701,71 @@ export class SqliteTaskRepository implements TaskRepository {
       changes.push({ kind: 'cancel_request', id: entry.turnId, change: 'upsert' });
     }
     for (const turnId of command.deleteCancelRequestTurnIds ?? []) {
-      statements.push({ sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      statements.push({
+        sql: `DELETE FROM turn_cancel_requests
+               WHERE workspace_id = ? AND turn_id = ?
+                 AND EXISTS (
+                   SELECT 1 FROM turns cancel_turn
+                    WHERE cancel_turn.workspace_id = turn_cancel_requests.workspace_id
+                      AND cancel_turn.id = turn_cancel_requests.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('cancel_turn')}
+                 )`,
+        params: [this.workspaceId, turnId],
+      });
       changes.push({ kind: 'cancel_request', id: turnId, change: 'delete' });
     }
     for (const turnId of command.deleteRuntimeClaimTurnIds ?? []) {
-      statements.push({ sql: 'DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      statements.push({
+        sql: `DELETE FROM runtime_claims
+               WHERE workspace_id = ? AND turn_id = ?
+                 AND EXISTS (
+                   SELECT 1 FROM turns claimed_turn
+                    WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+                      AND claimed_turn.id = runtime_claims.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+                 )`,
+        params: [this.workspaceId, turnId],
+      });
       changes.push({ kind: 'runtime_claim', id: turnId, change: 'delete' });
     }
     for (const ledgerKey of command.deleteOperationKeys ?? []) {
-      statements.push({ sql: 'DELETE FROM operations WHERE workspace_id = ? AND ledger_key = ?', params: [this.workspaceId, ledgerKey] });
+      statements.push({
+        sql: `DELETE FROM operations
+               WHERE workspace_id = ? AND ledger_key = ?
+                 AND ${operationLedgerIsVisibleInActiveSurfacesSql(
+                   'operations.workspace_id',
+                   'operations.ledger_key',
+                 )}`,
+        params: [this.workspaceId, ledgerKey],
+      });
       changes.push({ kind: 'operation', id: ledgerKey, change: 'delete' });
     }
     for (const turnId of command.deleteSessionClaimTurnIds ?? []) {
-      statements.push({ sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      statements.push({
+        sql: `DELETE FROM session_claims
+               WHERE workspace_id = ? AND turn_id = ?
+                 AND EXISTS (
+                   SELECT 1 FROM turns claimed_turn
+                    WHERE claimed_turn.workspace_id = session_claims.workspace_id
+                      AND claimed_turn.id = session_claims.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+                 )`,
+        params: [this.workspaceId, turnId],
+      });
       changes.push({ kind: 'runtime_claim', id: `${turnId}:session`, change: 'release' });
     }
     for (const turnId of command.deleteResourceClaimTurnIds ?? []) {
-      statements.push({ sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turnId] });
+      statements.push({
+        sql: `DELETE FROM resource_claims
+               WHERE workspace_id = ? AND turn_id = ?
+                 AND EXISTS (
+                   SELECT 1 FROM turns claimed_turn
+                    WHERE claimed_turn.workspace_id = resource_claims.workspace_id
+                      AND claimed_turn.id = resource_claims.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+                 )`,
+        params: [this.workspaceId, turnId],
+      });
       changes.push({ kind: 'runtime_claim', id: `${turnId}:resource`, change: 'release' });
     }
     if (command.operation) {
@@ -4601,11 +4786,37 @@ export class SqliteTaskRepository implements TaskRepository {
       ));
     }
 
+    const purgeScope = (command.deleteTaskIds && command.deleteTaskIds.length > 0)
+      || (command.deleteTurnIds && command.deleteTurnIds.length > 0)
+      ? {
+          kind: 'targets' as const,
+          turnIds: command.deleteTurnIds ?? [],
+          taskIds: command.deleteTaskIds ?? [],
+        }
+      : undefined;
     let results: readonly import('./sqlite/rpc').RunResult[];
     try {
-      results = await this.db.transaction(statements, {
-        abortIfUnchangedAt: abortIfUnchangedAt.length > 0 ? abortIfUnchangedAt : undefined,
-      });
+      if (!purgeScope) {
+        results = await this.db.transaction(statements, {
+          abortIfUnchangedAt: abortIfUnchangedAt.length > 0 ? abortIfUnchangedAt : undefined,
+        });
+      } else {
+        const purge = retiredChildReturnPurgeStatements(this.workspaceId, purgeScope);
+        const preparation = purge.setup.slice(0, purge.mutationStartIndex);
+        const mutations = purge.setup.slice(purge.mutationStartIndex);
+        const resultOffset = preparation.length + mutations.length;
+        const rawResults = await this.db.transaction(
+          [...preparation, ...mutations, ...statements, ...purge.cleanup],
+          {
+            abortIfUnchangedAt: abortIfUnchangedAt.length > 0
+              ? abortIfUnchangedAt.map((index) => index + resultOffset)
+              : undefined,
+          },
+        );
+        // Keep all graph guard indexes relative to the original statement list;
+        // purge-local preparation/mutations are transaction plumbing only.
+        results = rawResults.slice(resultOffset, resultOffset + statements.length);
+      }
     } catch (error) {
       // Do not leak SQL/row payloads through the repository boundary. The
       // caller can retry a stale graph or surface a stable validation reason.
@@ -4628,7 +4839,7 @@ export class SqliteTaskRepository implements TaskRepository {
                 ledgerKey: command.operation.ledgerKey,
                 entry: command.operation.entry,
                 createdAt: command.operation.createdAt,
-              });
+              }, command.dispositionClaim.turnId);
               if (claimed.conflict) return claimed;
             }
             return {
@@ -4651,7 +4862,23 @@ export class SqliteTaskRepository implements TaskRepository {
       throw error;
     }
 
-    if (command.operation && results[0]?.changes === 0) {
+    if (
+      graphActiveSurfaceGuardIndex !== null
+      && (results[graphActiveSurfaceGuardIndex]?.changes ?? 0) === 0
+    ) {
+      return { ok: true, changed: false, reason: 'retired workflow state' };
+    }
+    if (
+      graphOperationDeleteGuardIndex !== null
+      && (results[graphOperationDeleteGuardIndex]?.changes ?? 0) === 0
+    ) {
+      return { ok: true, changed: false, reason: 'retired workflow state' };
+    }
+    if (
+      command.operation
+      && graphOperationClaimIndex !== null
+      && (results[graphOperationClaimIndex]?.changes ?? 0) === 0
+    ) {
       const existing = await this.getOperation(command.operation.ledgerKey);
       if (existing && existing.fingerprint === command.operation.entry.fingerprint) {
         return { ok: true, changed: false, operation: existing };
@@ -4662,7 +4889,7 @@ export class SqliteTaskRepository implements TaskRepository {
       return { ok: true, changed: false, reason: 'task changed; retry' };
     }
     for (const index of abortIfUnchangedAt) {
-      if (index === 0 && command.operation) continue;
+      if (graphOperationClaimIndex !== null && index === graphOperationClaimIndex) continue;
       if (results[index]?.changes === 0) {
         if (graphTurnShellGuardIndex !== null && index === graphTurnShellGuardIndex) {
           return { ok: true, changed: false, reason: 'workflow shell pending' };
@@ -4673,8 +4900,10 @@ export class SqliteTaskRepository implements TaskRepository {
         return { ok: true, changed: false, reason: 'graph ownership fence changed; retry' };
       }
     }
-    const guardIndex = (command.operation ? 1 : 0) + (command.dispositionClaim ? 1 : 0);
-    if (command.expectedTasks.length > 0 && results[guardIndex]?.changes === 0) {
+    if (
+      graphTaskRevisionGuardIndex !== null
+      && (results[graphTaskRevisionGuardIndex]?.changes ?? 0) === 0
+    ) {
       return { ok: true, changed: false, reason: 'task changed; retry' };
     }
     return {
@@ -4698,6 +4927,11 @@ export class SqliteTaskRepository implements TaskRepository {
             JOIN candidate ON child.parent_id = candidate.id
            WHERE child.workspace_id = ?
         )`;
+    const candidateParams: SqlValue[] = [
+      this.workspaceId,
+      command.rootTaskId,
+      this.workspaceId,
+    ];
     const blockedShell = await this.db.get(
       `WITH RECURSIVE candidate(id) AS (
           SELECT id FROM tasks WHERE workspace_id = ? AND id = ?
@@ -4715,18 +4949,21 @@ export class SqliteTaskRepository implements TaskRepository {
     if (blockedShell) {
       return { ok: true, changed: false, reason: 'workflow shell pending' };
     }
-    const candidateParams: SqlValue[] = [
-      this.workspaceId,
-      command.rootTaskId,
-      this.workspaceId,
-    ];
     const candidateIds = 'SELECT id FROM candidate';
     const guard: SqlStatement = {
       sql: `${candidateCte}
         UPDATE tasks SET updated_at = updated_at
          WHERE workspace_id = ?
-           AND id IN (${candidateIds})
-           AND NOT EXISTS (
+            AND id IN (${candidateIds})
+            AND NOT EXISTS (
+               SELECT 1 FROM tasks t
+                WHERE t.workspace_id = ? AND t.id IN (${candidateIds})
+                  AND (
+                    NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+                    OR ${taskOwnsRetiredWorkflowStateSql('t')}
+                  )
+            )
+            AND NOT EXISTS (
              SELECT 1 FROM tasks t
                JOIN workflow_nodes n ON n.workspace_id = t.workspace_id AND n.task_id = t.id
               WHERE t.workspace_id = ?
@@ -4734,7 +4971,7 @@ export class SqliteTaskRepository implements TaskRepository {
                 AND n.status = 'pending'
                 AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
            )`,
-      params: [...candidateParams, this.workspaceId, this.workspaceId],
+      params: [...candidateParams, this.workspaceId, this.workspaceId, this.workspaceId],
     };
     const deleteWorkflowArtifactSources: SqlStatement = {
       sql: `${candidateCte}
@@ -4762,9 +4999,25 @@ export class SqliteTaskRepository implements TaskRepository {
       [deleteWorkflowArtifactSources, detachWorkflowNodes, deleteTasks],
       { kind: 'task', id: command.rootTaskId, change: 'delete_subtree' },
       new Date().toISOString(),
+      {
+        purgeScope: { kind: 'tasks', taskIds: [command.rootTaskId] },
+        purgePlacement: 'before_guard',
+      },
     );
     const changed = (results[0]?.changes ?? 0) > 0;
     if (!changed) {
+      const stillRetired = await this.db.get(
+        `${candidateCte}
+         SELECT 1 FROM tasks t
+           WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM candidate)
+             AND (
+               NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+               OR ${taskOwnsRetiredWorkflowStateSql('t')}
+             )
+          LIMIT 1`,
+        [...candidateParams, this.workspaceId],
+      );
+      if (stillRetired) return { ok: true, changed: false, reason: 'retired workflow task' };
       // Guard may have failed due to pending shell inserted concurrently after the early check.
       // Re-check to provide the specific reason; otherwise treat as not found / no-op.
       const stillBlocked = await this.db.get(
@@ -4820,8 +5073,10 @@ export class SqliteTaskRepository implements TaskRepository {
                        AND queued.task_id = task.id
                        AND queued.status = 'queued'
                   )
-               OR json_extract(task.payload_json, '$.workflowShell') IS NOT NULL
-               OR EXISTS (
+                 OR json_extract(task.payload_json, '$.workflowShell') IS NOT NULL
+                 OR NOT (${taskIsVisibleInActiveSurfacesSql('task')})
+                 OR ${taskOwnsRetiredWorkflowStateSql('task')}
+                OR EXISTS (
                     SELECT 1 FROM workflow_nodes n
                      WHERE n.workspace_id = task.workspace_id
                        AND n.task_id = task.id
@@ -4903,6 +5158,10 @@ export class SqliteTaskRepository implements TaskRepository {
       [detachWorkflowNodes, deleteTasks],
       change,
       new Date().toISOString(),
+      {
+        purgeScope: { kind: 'terminal_reclamation' },
+        purgePlacement: 'before_guard',
+      },
     );
     const changed = (results[0]?.changes ?? 0) > 0;
     return {
@@ -4923,17 +5182,47 @@ export class SqliteTaskRepository implements TaskRepository {
     rest: readonly SqlStatement[],
     change: ChangeRecord | readonly ChangeRecord[],
     at: string,
+    options: {
+      purgeScope?: RetiredChildReturnPurgeScope;
+      purgePlacement?: RetiredChildReturnPurgePlacement;
+    } = {},
   ): Promise<readonly import('./sqlite/rpc').RunResult[]> {
-    return this.db.transaction([
-      first,
-      ...conditionalRevisionStatements(
-        this.workspaceId,
-        change,
-        at,
-        this.changeFeedRetainRevisions,
-      ),
-      ...rest,
-    ], { abortIfFirstUnchanged: true });
+    if (!options.purgeScope) {
+      return this.db.transaction([
+        first,
+        ...conditionalRevisionStatements(
+          this.workspaceId,
+          change,
+          at,
+          this.changeFeedRetainRevisions,
+        ),
+        ...rest,
+      ], { abortIfFirstUnchanged: true });
+    }
+
+    const purge = retiredChildReturnPurgeStatements(this.workspaceId, options.purgeScope);
+    const preparation = purge.setup.slice(0, purge.mutationStartIndex);
+    const mutations = purge.setup.slice(purge.mutationStartIndex);
+    const revision = conditionalRevisionStatements(
+      this.workspaceId,
+      change,
+      at,
+      this.changeFeedRetainRevisions,
+    );
+    const placement = options.purgePlacement ?? 'before_guard';
+    const guardOffset = placement === 'before_guard'
+      ? preparation.length + mutations.length
+      : preparation.length;
+    const logicalStatements = placement === 'before_guard'
+      ? [...mutations, first, ...revision, ...rest, ...purge.cleanup]
+      : [first, ...revision, ...mutations, ...rest, ...purge.cleanup];
+    const results = await this.db.transaction(
+      [...preparation, ...logicalStatements],
+      { abortIfUnchangedAt: [guardOffset] },
+    );
+    // Keep the historical result contract: callers see their guard at index 0,
+    // regardless of the transaction-local purge prefix.
+    return results.slice(guardOffset);
   }
 
   async execute(command: RepositoryCommand): Promise<RepositoryCommandResult> {
@@ -4958,7 +5247,6 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'workflowNextGraphTask':
       case 'workflowPrevGraphTask':
       case 'workflowFailGraphTask':
-      case 'invokeChildGraphTask':
       case 'askParent':
       case 'answerChildQuestion':
       case 'consumeCancelRequest':
@@ -5067,22 +5355,58 @@ export class SqliteTaskRepository implements TaskRepository {
                   )
                   UPDATE tasks SET updated_at = updated_at
                    WHERE workspace_id = ? AND id = ?
-                     AND NOT EXISTS (
+                      AND NOT EXISTS (
+                         SELECT 1 FROM tasks t
+                          WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM subtree)
+                            AND (
+                              NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+                              OR ${taskOwnsRetiredWorkflowStateSql('t')}
+                            )
+                      )
+                      AND NOT EXISTS (
                        SELECT 1 FROM tasks t
                          JOIN workflow_nodes n ON n.workspace_id = t.workspace_id AND n.task_id = t.id
                         WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM subtree)
                           AND n.status = 'pending' AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
                      )`,
-            params: [this.workspaceId, command.taskId, this.workspaceId, this.workspaceId, command.taskId, this.workspaceId],
+            params: [
+              this.workspaceId,
+              command.taskId,
+              this.workspaceId,
+              this.workspaceId,
+              command.taskId,
+              this.workspaceId,
+              this.workspaceId,
+            ],
           },
           [
             detachWorkflowNodeTasksStatement(this.workspaceId, [command.taskId]),
             { sql: 'DELETE FROM tasks WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.taskId] },
           ],
           { kind: 'task', id: command.taskId, change: 'delete' }, new Date().toISOString(),
+          {
+            purgeScope: { kind: 'tasks', taskIds: [command.taskId] },
+            purgePlacement: 'before_guard',
+          },
         );
         const changed = (results[0]?.changes ?? 0) > 0;
         if (!changed) {
+          const stillRetired = await this.db.get(
+            `WITH RECURSIVE subtree(id) AS (
+               SELECT id FROM tasks WHERE workspace_id = ? AND id = ?
+               UNION
+               SELECT child.id FROM tasks child JOIN subtree parent ON child.parent_id = parent.id WHERE child.workspace_id = ?
+             )
+             SELECT 1 FROM tasks t
+              WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM subtree)
+                AND (
+                  NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+                  OR ${taskOwnsRetiredWorkflowStateSql('t')}
+                )
+              LIMIT 1`,
+            [this.workspaceId, command.taskId, this.workspaceId, this.workspaceId],
+          );
+          if (stillRetired) return { ok: true, changed: false, reason: 'retired workflow task' };
           const stillBlocked = await this.db.get(
             `WITH RECURSIVE subtree(id) AS (
                SELECT id FROM tasks WHERE workspace_id = ? AND id = ?
@@ -5121,7 +5445,26 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'deleteTurn': {
         const taskId = await this.lookupTurnTaskId(command.turnId);
         const results = await this.writeIfFirstChanged(
-          { sql: 'DELETE FROM turns WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.turnId] }, [],
+          {
+            // The purge candidate relation is prepared before this guard. A
+            // retired child-return turn is therefore still an eligible delete
+            // target even though the ordinary active-surface predicate hides it;
+            // an unrelated retired/hidden turn remains fail-closed.
+            sql: `UPDATE turns
+                    SET payload_json = payload_json
+                   WHERE workspace_id = ? AND id = ?
+                     AND (
+                       ${turnIsVisibleInActiveSurfacesSql()}
+                       OR id IN (SELECT turn_id FROM temp.muster_purge_legacy_turns)
+                     )`,
+            params: [this.workspaceId, command.turnId],
+          },
+          [{
+            sql: `DELETE FROM turns
+                   WHERE workspace_id = ? AND id = ?
+                     AND ${turnIsVisibleInActiveSurfacesSql()}`,
+            params: [this.workspaceId, command.turnId],
+          }],
           {
             kind: 'turn',
             id: command.turnId,
@@ -5131,6 +5474,10 @@ export class SqliteTaskRepository implements TaskRepository {
             change: 'delete_cascade',
           },
           new Date().toISOString(),
+          {
+            purgeScope: { kind: 'turns', turnIds: [command.turnId] },
+            purgePlacement: 'after_guard',
+          },
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
@@ -5141,12 +5488,22 @@ export class SqliteTaskRepository implements TaskRepository {
       case 'clearQueuedTurnHold':
         return this.clearQueuedTurnHold(command);
       case 'appendMessage': {
-        const results = await this.write([messageStatement(this.workspaceId, command.message, false)], [{ kind: 'message', id: command.message.id, taskId: command.message.taskId, change: 'insert' }], command.message.createdAt);
+        const results = await this.writeIfFirstChanged(
+          messageStatement(this.workspaceId, command.message, false),
+          [],
+          { kind: 'message', id: command.message.id, taskId: command.message.taskId, change: 'insert' },
+          command.message.createdAt,
+        );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
       case 'upsertMessage': {
-        await this.write([messageStatement(this.workspaceId, command.message, true, command.updatedAt)], [{ kind: 'message', id: command.message.id, taskId: command.message.taskId, change: 'upsert' }], command.updatedAt ?? command.message.createdAt);
-        return { ok: true, changed: true };
+        const results = await this.writeIfFirstChanged(
+          messageStatement(this.workspaceId, command.message, true, command.updatedAt),
+          [],
+          { kind: 'message', id: command.message.id, taskId: command.message.taskId, change: 'upsert' },
+          command.updatedAt ?? command.message.createdAt,
+        );
+        return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
       case 'deleteMessage': {
         // Capture task_id before delete so feed metadata stays scoped for peers.
@@ -5155,7 +5512,12 @@ export class SqliteTaskRepository implements TaskRepository {
           [this.workspaceId, command.messageId],
         );
         const results = await this.writeIfFirstChanged(
-          { sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ?', params: [this.workspaceId, command.messageId] }, [],
+          {
+            sql: `DELETE FROM messages
+                   WHERE workspace_id = ? AND id = ?
+                     AND ${messageIsVisibleInActiveSurfacesSql()}`,
+            params: [this.workspaceId, command.messageId],
+          }, [],
           {
             kind: 'message',
             id: command.messageId,
@@ -5185,12 +5547,47 @@ export class SqliteTaskRepository implements TaskRepository {
           changes.push({ kind: 'reasoning', id: reasoning.id, taskId: command.taskId, change: 'upsert' });
         }
         if (statements.length === 0) return { ok: true, changed: false };
-        await this.write(statements, changes, newestTranscriptTime(command));
-        return { ok: true, changed: true };
+        const turnIds = [...new Set([
+          ...(command.messages ?? []).flatMap((message) => message.turnId ? [message.turnId] : []),
+          ...(command.toolCalls ?? []).map((tool) => tool.turnId),
+          ...(command.reasoning ?? []).map((reasoning) => reasoning.turnId),
+        ])];
+        if (turnIds.length === 0) {
+          await this.write(statements, changes, newestTranscriptTime(command));
+          return { ok: true, changed: true };
+        }
+        const results = await this.writeIfFirstChanged(
+          {
+            sql: `UPDATE tasks SET updated_at = updated_at
+                   WHERE workspace_id = ? AND id = ?
+                     AND (
+                       SELECT COUNT(*) FROM turns transcript_turn
+                        WHERE transcript_turn.workspace_id = tasks.workspace_id
+                          AND transcript_turn.task_id = tasks.id
+                          AND transcript_turn.id IN (${placeholders(turnIds.length)})
+                          AND ${turnIsVisibleInActiveSurfacesSql('transcript_turn')}
+                     ) = ?`,
+            params: [this.workspaceId, command.taskId, ...turnIds, turnIds.length],
+          },
+          statements,
+          changes,
+          newestTranscriptTime(command),
+        );
+        return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
       }
       case 'putOperation': {
-        await this.write([operationStatement(this.workspaceId, command)], [{ kind: 'operation', id: command.ledgerKey, change: 'upsert' }], command.createdAt);
-        return { ok: true, changed: true };
+        const results = await this.writeIfFirstChanged(
+          operationStatement(this.workspaceId, command),
+          [],
+          { kind: 'operation', id: command.ledgerKey, change: 'upsert' },
+          command.createdAt,
+        );
+        const changed = (results[0]?.changes ?? 0) > 0;
+        return {
+          ok: true,
+          changed,
+          ...(changed ? {} : { reason: 'retired workflow state' }),
+        };
       }
       case 'defineWorkflowVersion':
         return this.defineWorkflowVersion(command);
@@ -5206,7 +5603,22 @@ export class SqliteTaskRepository implements TaskRepository {
         return this.claimOperation(command);
       case 'deleteOperationsForTurn': {
         const results = await this.writeIfFirstChanged(
-          { sql: `DELETE FROM operations WHERE workspace_id = ? AND ledger_key GLOB ?`, params: [this.workspaceId, `${escapeGlob(command.turnId)}:*`] }, [],
+          {
+            sql: `DELETE FROM operations
+                   WHERE workspace_id = ?
+                      AND EXISTS (
+                        SELECT 1 FROM turns operation_turn
+                         WHERE operation_turn.workspace_id = operations.workspace_id
+                           AND operation_turn.id = ?
+                           AND ${operationLedgerBelongsToTurnSql(
+                             'operations.workspace_id',
+                             'operations.ledger_key',
+                             'operation_turn',
+                           )}
+                           AND ${turnIsVisibleInActiveSurfacesSql('operation_turn')}
+                      )`,
+            params: [this.workspaceId, command.turnId],
+          }, [],
           { kind: 'operation', id: command.turnId, change: 'delete' }, new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
@@ -5226,7 +5638,17 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       case 'deleteCancelRequest': {
         const results = await this.writeIfFirstChanged(
-          { sql: 'DELETE FROM turn_cancel_requests WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] }, [],
+          {
+            sql: `DELETE FROM turn_cancel_requests
+                   WHERE workspace_id = ? AND turn_id = ?
+                     AND EXISTS (
+                       SELECT 1 FROM turns cancel_turn
+                        WHERE cancel_turn.workspace_id = turn_cancel_requests.workspace_id
+                          AND cancel_turn.id = turn_cancel_requests.turn_id
+                          AND ${turnIsVisibleInActiveSurfacesSql('cancel_turn')}
+                     )`,
+            params: [this.workspaceId, command.turnId],
+          }, [],
           { kind: 'cancel_request', id: command.turnId, change: 'delete' }, new Date().toISOString(),
         );
         return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
@@ -5384,6 +5806,7 @@ export class SqliteTaskRepository implements TaskRepository {
                  AND workflow_nodes.task_id = tasks.id
                  AND workflow_nodes.status = 'pending'
             )
+            AND ${taskIsVisibleInActiveSurfacesSql('tasks')}
             AND json_extract(tasks.payload_json, '$.workflowShell') IS NULL`,
       params: [task.id, this.workspaceId, task.parentId, task.role, task.lifecycle, task.releaseState,
         task.goal, task.backend, task.model ?? null, task.revision, task.createdAt, task.updatedAt,
@@ -5421,10 +5844,32 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed: true };
   }
 
-  private async queuedTurnWithPendingMessages(taskId: string, turnId: string): Promise<
+  private async queuedTurnWithPendingMessages(
+    taskId: string,
+    turnId: string,
+    options: { includeRetired?: boolean } = {},
+  ): Promise<
     { ok: true; turn: TaskTurn; messageIds: string[] } | { ok: false; reason: string }
   > {
-    const turn = (await this.listTurns(taskId)).find((candidate) => candidate.id === turnId);
+    let turn: TaskTurn | undefined;
+    if (options.includeRetired) {
+      const row = await this.db.get<TurnRow>(
+        turnSelect('WHERE workspace_id = ? AND task_id = ? AND id = ?'),
+        [this.workspaceId, taskId, turnId],
+      );
+      if (row) {
+        const inputRows = await this.db.all<TurnInputRow>(
+          `SELECT turn_id, ordering, kind, payload_json
+             FROM turn_inputs
+            WHERE workspace_id = ? AND turn_id = ?
+            ORDER BY ordering`,
+          [this.workspaceId, turnId],
+        );
+        turn = decodeTurn(row, inputRows.map(decodeTurnInput));
+      }
+    } else {
+      turn = (await this.listTurns(taskId)).find((candidate) => candidate.id === turnId);
+    }
     if (!turn) {
       const anyTask = await this.db.get<{ task_id: string }>(
         'SELECT task_id FROM turns WHERE workspace_id = ? AND id = ?', [this.workspaceId, turnId],
@@ -5436,7 +5881,15 @@ export class SqliteTaskRepository implements TaskRepository {
       .filter((input): input is Extract<TurnInput, { kind: 'message' }> => input.kind === 'message')
       .map((input) => input.messageId);
     if (messageIds.length === 0) return { ok: false, reason: 'message not found' };
-    const messages = new Map((await this.listMessages(taskId)).map((message) => [message.id, message]));
+    const messages = new Map(
+      (options.includeRetired
+        ? (await this.db.all<MessageRow>(
+            messageSelect('WHERE workspace_id = ? AND task_id = ?'),
+            [this.workspaceId, taskId],
+          )).map(decodeMessage)
+        : await this.listMessages(taskId)
+      ).map((message) => [message.id, message]),
+    );
     for (const messageId of messageIds) {
       const message = messages.get(messageId);
       if (!message || message.role !== 'user' || message.state !== 'pending') {
@@ -5459,8 +5912,9 @@ export class SqliteTaskRepository implements TaskRepository {
              WHERE workspace_id = ? AND id = ? AND task_id = ? AND role = 'user' AND state = 'pending'
                AND EXISTS (
                  SELECT 1 FROM turns
-                  WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
-               )`,
+                   WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
+                     AND ${turnIsVisibleInActiveSurfacesSql()}
+                )`,
         params: [command.content, this.workspaceId, messageId, command.taskId,
           this.workspaceId, command.turnId, command.taskId],
       }, [],
@@ -5477,12 +5931,21 @@ export class SqliteTaskRepository implements TaskRepository {
   private async deleteQueuedTurnAndMessages(
     command: Extract<RepositoryCommand, { kind: 'deleteQueuedTurnAndMessages' }>,
   ): Promise<RepositoryCommandResult> {
-    const prepared = await this.queuedTurnWithPendingMessages(command.taskId, command.turnId);
+    const prepared = await this.queuedTurnWithPendingMessages(
+      command.taskId,
+      command.turnId,
+      { includeRetired: true },
+    );
     if (!prepared.ok) return { ok: true, changed: false, reason: prepared.reason };
     const results = await this.writeIfFirstChanged(
       {
-        sql: `DELETE FROM turns
+        sql: `UPDATE turns
+                 SET payload_json = payload_json
                WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
+                 AND (
+                   ${turnIsVisibleInActiveSurfacesSql()}
+                   OR id IN (SELECT turn_id FROM temp.muster_purge_legacy_turns)
+                 )
                  AND NOT EXISTS (
                    SELECT 1 FROM turn_inputs i
                     LEFT JOIN messages m ON m.workspace_id = i.workspace_id
@@ -5492,15 +5955,27 @@ export class SqliteTaskRepository implements TaskRepository {
                  )`,
         params: [this.workspaceId, command.turnId, command.taskId, this.workspaceId, command.turnId, command.taskId],
       },
-      prepared.messageIds.map((messageId) => ({
-        sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ? AND task_id = ? AND role = ? AND state = ?',
-        params: [this.workspaceId, messageId, command.taskId, 'user', 'pending'],
-      })),
+      [
+        {
+          sql: `DELETE FROM turns
+                 WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
+                   AND ${turnIsVisibleInActiveSurfacesSql()}`,
+          params: [this.workspaceId, command.turnId, command.taskId],
+        },
+        ...prepared.messageIds.map((messageId) => ({
+          sql: 'DELETE FROM messages WHERE workspace_id = ? AND id = ? AND task_id = ? AND role = ? AND state = ?',
+          params: [this.workspaceId, messageId, command.taskId, 'user', 'pending'],
+        })),
+      ],
       [
         { kind: 'turn', id: command.turnId, taskId: command.taskId, change: 'delete' },
         ...prepared.messageIds.map((messageId) => ({ kind: 'message' as const, id: messageId, taskId: command.taskId, change: 'delete' })),
       ],
       new Date().toISOString(),
+      {
+        purgeScope: { kind: 'turns', turnIds: [command.turnId] },
+        purgePlacement: 'after_guard',
+      },
     );
     return {
       ok: true,
@@ -5518,7 +5993,8 @@ export class SqliteTaskRepository implements TaskRepository {
       {
         sql: `UPDATE turns SET payload_json = json_remove(payload_json, '$.holdAutoPromote')
                WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
-                 AND COALESCE(json_extract(payload_json, '$.holdAutoPromote'), 0) = 1`,
+                 AND COALESCE(json_extract(payload_json, '$.holdAutoPromote'), 0) = 1
+                 AND ${turnIsVisibleInActiveSurfacesSql()}`,
         params: [this.workspaceId, command.turnId, command.taskId],
       }, [],
       { kind: 'turn', id: command.turnId, taskId: command.taskId, change: 'clear_hold' },
@@ -5677,6 +6153,7 @@ export class SqliteTaskRepository implements TaskRepository {
                      SET workflow_turns_reserved = workflow_turns_reserved + 1,
                          updated_at = ?
                    WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND origin = 'top_level' AND parent_run_id IS NULL
                      AND workflow_turns_reserved < max_workflow_turns`,
             params: [command.turn.createdAt, this.workspaceId, authority.runId],
           }]
@@ -5861,15 +6338,19 @@ export class SqliteTaskRepository implements TaskRepository {
              WHERE activation.workspace_id = tasks.workspace_id
                AND activation.run_id = ?
                AND activation.activation_id = ?
-               AND activation.execution_turn_id = ?
-               AND activation.status = ?
-               AND node.task_id = tasks.id
-               AND run.status = 'running'
-               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+                AND activation.execution_turn_id = ?
+                AND activation.status = ?
+                AND ${activeWorkflowActivationKindSql('activation')}
+                 AND node.task_id = tasks.id
+                AND run.status = 'running'
+                AND run.origin = 'top_level'
+                AND run.parent_run_id IS NULL
+                AND (run.deadline_at IS NULL OR run.deadline_at > ?)
                AND run.workflow_turns_reserved < run.max_workflow_turns
-               AND (SELECT COUNT(*) FROM turns task_turn
-                      WHERE task_turn.workspace_id = tasks.workspace_id
-                        AND task_turn.task_id = tasks.id) < run.max_turns_per_task
+                AND (SELECT COUNT(*) FROM turns task_turn
+                       WHERE task_turn.workspace_id = tasks.workspace_id
+                         AND task_turn.task_id = tasks.id
+                         AND ${turnIsVisibleInActiveSurfacesSql('task_turn')}) < run.max_turns_per_task
           )`
       : `NOT EXISTS (
             SELECT 1
@@ -5878,8 +6359,10 @@ export class SqliteTaskRepository implements TaskRepository {
                 ON run.workspace_id = node.workspace_id
                AND run.run_id = node.run_id
              WHERE node.workspace_id = tasks.workspace_id
-               AND node.task_id = tasks.id
-               AND run.status = 'running'
+                AND node.task_id = tasks.id
+                AND run.status = 'running'
+                AND run.origin = 'top_level'
+                AND run.parent_run_id IS NULL
           )`;
     const workflowGuardParams: SqlValue[] = recovery?.workflow
       ? [
@@ -5902,15 +6385,17 @@ export class SqliteTaskRepository implements TaskRepository {
               WHERE live_turn.workspace_id = tasks.workspace_id
                 AND live_turn.task_id = tasks.id
                 AND live_turn.status IN ('queued', 'running', 'waiting_user')
+                AND ${turnIsVisibleInActiveSurfacesSql('live_turn')}
            )
-         AND (SELECT COUNT(*) FROM turns task_turn
-                WHERE task_turn.workspace_id = tasks.workspace_id
-                  AND task_turn.task_id = tasks.id) < ?`
+          AND (SELECT COUNT(*) FROM turns task_turn
+                 WHERE task_turn.workspace_id = tasks.workspace_id
+                   AND task_turn.task_id = tasks.id
+                   AND ${turnIsVisibleInActiveSurfacesSql('task_turn')}) < ?`
       : '';
     const recoveryGuardParams: SqlValue[] = recovery
       ? [recovery.failedTurnId, recovery.expectedFailedStatus, recovery.maxTurnsPerTask]
       : [];
-    const fence = appendTurnFence(
+    const expectedTurnFence = appendTurnFence(
       `UPDATE tasks SET updated_at = updated_at
         WHERE workspace_id = ? AND id = ? AND revision = ?
           AND ${workflowGuard}
@@ -5924,6 +6409,17 @@ export class SqliteTaskRepository implements TaskRepository {
       ],
       this.workspaceId,
       command.expectedTurns,
+    );
+    const fence = appendExistingTurnVisibilityFence(
+      expectedTurnFence.sql,
+      expectedTurnFence.params,
+      this.workspaceId,
+      [
+        ...command.turns.map((turn) => turn.id),
+        ...command.expectedTurns.map((turn) => turn.id),
+        ...(command.cancelRequests ?? []).map((entry) => entry.turnId),
+        ...(recovery ? [recovery.failedTurnId, recovery.turn.id] : []),
+      ],
     );
     const rest: SqlStatement[] = [
       {
@@ -5943,6 +6439,7 @@ export class SqliteTaskRepository implements TaskRepository {
                      SET workflow_turns_reserved = workflow_turns_reserved + 1,
                          updated_at = ?
                    WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND origin = 'top_level' AND parent_run_id IS NULL
                      AND workflow_turns_reserved < max_workflow_turns`,
             params: [command.task.updatedAt, this.workspaceId, recovery.workflow.runId],
           }]
@@ -5958,8 +6455,16 @@ export class SqliteTaskRepository implements TaskRepository {
         ? [{
             sql: `UPDATE workflow_activations
                      SET status = 'queued', execution_turn_id = ?, updated_at = ?
-                   WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
-                     AND execution_turn_id = ? AND status = ?`,
+                    WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                       AND execution_turn_id = ? AND status = ?
+                       AND ${activeWorkflowActivationKindSql('workflow_activations')}
+                      AND EXISTS (
+                        SELECT 1 FROM workflow_runs run
+                         WHERE run.workspace_id = workflow_activations.workspace_id
+                           AND run.run_id = workflow_activations.run_id
+                           AND run.origin = 'top_level'
+                           AND run.parent_run_id IS NULL
+                      )`,
             params: [
               recovery.turn.id,
               command.task.updatedAt,
@@ -6108,9 +6613,12 @@ export class SqliteTaskRepository implements TaskRepository {
                WHERE turn.workspace_id = ? AND turn.id = ? AND turn.task_id = ?
                  AND turn.status IN ('running', 'waiting_user')
                  AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
-                 AND activation.status IN ('queued', 'running')
-                 AND run.status = 'running'
-                 AND definition_node.outcome_kind = 'agent'
+                  AND activation.status IN ('queued', 'running')
+                  AND ${activeWorkflowActivationKindSql('activation')}
+                   AND run.status = 'running'
+                  AND run.origin = 'top_level'
+                  AND run.parent_run_id IS NULL
+                  AND definition_node.outcome_kind = 'agent'
                  AND NOT EXISTS (
                    SELECT 1 FROM turn_disposition_claims claim
                     WHERE claim.workspace_id = turn.workspace_id
@@ -6167,9 +6675,12 @@ export class SqliteTaskRepository implements TaskRepository {
           AND definition_node.definition_id = run.definition_id
           AND definition_node.definition_version = run.definition_version
           AND definition_node.node_id = activation.node_id
-        WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
-          AND activation.status IN ('queued', 'running')
-          AND run.status = 'running'
+          WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
+            AND activation.status IN ('queued', 'running')
+            AND ${activeWorkflowActivationKindSql('activation')}
+            AND run.status = 'running'
+           AND run.origin = 'top_level'
+           AND run.parent_run_id IS NULL
         LIMIT 1`,
       [this.workspaceId, turnId],
     );
@@ -6253,7 +6764,13 @@ export class SqliteTaskRepository implements TaskRepository {
     const row = await this.db.get<{ op_id: string; fingerprint: string; status: string }>(
       `SELECT op_id, fingerprint, status
          FROM turn_disposition_claims
-        WHERE workspace_id = ? AND turn_id = ?`,
+        WHERE workspace_id = ? AND turn_id = ?
+          AND EXISTS (
+            SELECT 1 FROM turns disposition_turn
+             WHERE disposition_turn.workspace_id = turn_disposition_claims.workspace_id
+               AND disposition_turn.id = turn_disposition_claims.turn_id
+               AND ${turnIsVisibleInActiveSurfacesSql('disposition_turn')}
+          )`,
       [this.workspaceId, turnId],
     );
     return row
@@ -6307,12 +6824,23 @@ export class SqliteTaskRepository implements TaskRepository {
       ...(command.cancelRequests ?? []).map((entry) => ({ kind: 'cancel_request' as const, id: entry.turnId, change: 'put' })),
       ...workflowClosure.changes,
     ];
-    const lifecycleGuard = appendTurnFence(
+    const expectedTurnFence = appendTurnFence(
       `UPDATE tasks SET updated_at = updated_at
-         WHERE workspace_id = ? AND id = ? AND revision = ?`,
+         WHERE workspace_id = ? AND id = ? AND revision = ?
+           AND ${taskIsVisibleInActiveSurfacesSql('tasks')}`,
       [this.workspaceId, command.taskId, command.expectedTaskRevision],
       this.workspaceId,
       command.expectedTurns,
+    );
+    const lifecycleGuard = appendExistingTurnVisibilityFence(
+      expectedTurnFence.sql,
+      expectedTurnFence.params,
+      this.workspaceId,
+      [
+        ...command.turns.map((turn) => turn.id),
+        ...(command.expectedTurns ?? []).map((turn) => turn.id),
+        ...(command.cancelRequests ?? []).map((entry) => entry.turnId),
+      ],
     );
     const results = await this.writeIfFirstChanged(
       { sql: lifecycleGuard.sql, params: lifecycleGuard.params },
@@ -6372,7 +6900,22 @@ export class SqliteTaskRepository implements TaskRepository {
       ...workflowClosure.changes,
     ];
     const cascadeGuard = taskRevisionGuardStatement(this.workspaceId, command.expectedTasks);
-    const fencedCascade = appendTurnFence(cascadeGuard.sql, cascadeGuard.params ?? [], this.workspaceId, command.expectedTurns);
+    const expectedTurnFence = appendTurnFence(
+      cascadeGuard.sql,
+      cascadeGuard.params ?? [],
+      this.workspaceId,
+      command.expectedTurns,
+    );
+    const fencedCascade = appendExistingTurnVisibilityFence(
+      expectedTurnFence.sql,
+      expectedTurnFence.params,
+      this.workspaceId,
+      [
+        ...command.turns.map((turn) => turn.id),
+        ...(command.expectedTurns ?? []).map((turn) => turn.id),
+        ...(command.cancelRequests ?? []).map((entry) => entry.turnId),
+      ],
+    );
     const results = await this.writeIfFirstChanged(
       { sql: fencedCascade.sql, params: fencedCascade.params },
       rest,
@@ -6407,8 +6950,15 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'task' as const, id: mutation.taskId, change: 'prerequisite_terminal' },
       ...(mutation.turn ? [{ kind: 'turn' as const, id: mutation.turn.id, taskId: mutation.turn.taskId, change: 'prerequisite_terminal' }] : []),
     ]);
+    const revisionGuard = taskRevisionGuardStatement(this.workspaceId, command.expectedTasks);
+    const turnGuard = appendExistingTurnVisibilityFence(
+      revisionGuard.sql,
+      revisionGuard.params ?? [],
+      this.workspaceId,
+      command.mutations.flatMap((mutation) => mutation.turn ? [mutation.turn.id] : []),
+    );
     const results = await this.writeIfFirstChanged(
-      taskRevisionGuardStatement(this.workspaceId, command.expectedTasks),
+      { sql: turnGuard.sql, params: turnGuard.params },
       rest,
       changes,
       command.mutations[0]!.task.updatedAt,
@@ -6430,8 +6980,16 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'task', id: command.task.id, change },
       ...(command.turn ? [{ kind: 'turn' as const, id: command.turn.id, taskId: command.turn.taskId, change }] : []),
     ];
+    const turnGuard = appendExistingTurnVisibilityFence(
+      `UPDATE tasks SET updated_at = updated_at
+        WHERE workspace_id = ? AND id = ? AND revision = ?
+          AND ${taskIsVisibleInActiveSurfacesSql('tasks')}`,
+      [this.workspaceId, command.taskId, command.expectedTaskRevision],
+      this.workspaceId,
+      command.turn ? [command.turn.id] : [],
+    );
     const results = await this.writeIfFirstChanged(
-      { sql: 'UPDATE tasks SET updated_at = updated_at WHERE workspace_id = ? AND id = ? AND revision = ?', params: [this.workspaceId, command.taskId, command.expectedTaskRevision] },
+      { sql: turnGuard.sql, params: turnGuard.params },
       rest,
       changes,
       command.task.updatedAt,
@@ -6452,13 +7010,28 @@ export class SqliteTaskRepository implements TaskRepository {
       { kind: 'turn', id: command.turn.id, taskId: command.task.id, change: 'reload_reconcile' },
       ...command.heldTurns.map((turn) => ({ kind: 'turn' as const, id: turn.id, taskId: turn.taskId, change: 'hold_follow_up' })),
     ];
+    const orphanGuard = appendExistingTurnVisibilityFence(
+      `UPDATE tasks SET updated_at = updated_at
+        WHERE workspace_id = ? AND id = ? AND revision = ?
+          AND EXISTS (
+            SELECT 1 FROM turns orphan_turn
+             WHERE orphan_turn.workspace_id = ? AND orphan_turn.id = ?
+               AND orphan_turn.status = ?
+               AND ${turnIsVisibleInActiveSurfacesSql('orphan_turn')}
+          )`,
+      [
+        this.workspaceId,
+        command.taskId,
+        command.expectedTaskRevision,
+        this.workspaceId,
+        command.turn.id,
+        command.expectedTurnStatus,
+      ],
+      this.workspaceId,
+      [command.turn.id, ...command.heldTurns.map((turn) => turn.id)],
+    );
     const results = await this.writeIfFirstChanged(
-      {
-        sql: `UPDATE tasks SET updated_at = updated_at
-               WHERE workspace_id = ? AND id = ? AND revision = ?
-                 AND EXISTS (SELECT 1 FROM turns WHERE workspace_id = ? AND id = ? AND status = ?)`,
-        params: [this.workspaceId, command.taskId, command.expectedTaskRevision, this.workspaceId, command.turn.id, command.expectedTurnStatus],
-      },
+      { sql: orphanGuard.sql, params: orphanGuard.params },
       rest,
       changes,
       command.turn.finishedAt ?? command.turn.createdAt,
@@ -6543,9 +7116,19 @@ export class SqliteTaskRepository implements TaskRepository {
          WHERE workspace_id = ? AND id = ?
            AND NOT EXISTS (
              SELECT 1 FROM tasks t
-               JOIN workflow_nodes n ON n.workspace_id = t.workspace_id AND n.task_id = t.id
               WHERE t.workspace_id = ? AND t.id IN (SELECT id FROM subtree)
-                AND n.status = 'pending' AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
+                AND (
+                  NOT (${taskIsVisibleInActiveSurfacesSql('t')})
+                  OR ${taskOwnsRetiredWorkflowStateSql('t')}
+                  OR (
+                    EXISTS (
+                      SELECT 1 FROM workflow_nodes n
+                       WHERE n.workspace_id = t.workspace_id AND n.task_id = t.id
+                         AND n.status = 'pending'
+                    )
+                    AND json_extract(t.payload_json, '$.workflowShell') IS NOT NULL
+                  )
+                )
            )`;
       const guardParams: SqlValue[] = [
         ...command.deletedTaskIds,
@@ -6557,14 +7140,39 @@ export class SqliteTaskRepository implements TaskRepository {
       statements.push({ sql: guardSql, params: guardParams });
       abortIfUnchangedAt.push(statements.length - 1);
     }
-    statements.push(taskRevisionGuardStatement(this.workspaceId, command.expectedTaskRevisions));
+    const revisionGuard = taskRevisionGuardStatement(this.workspaceId, command.expectedTaskRevisions);
+    const turnGuard = appendExistingTurnVisibilityFence(
+      revisionGuard.sql,
+      revisionGuard.params ?? [],
+      this.workspaceId,
+      [
+        ...command.turns.map((turn) => turn.id),
+        ...command.messages.flatMap((message) => message.turnId ? [message.turnId] : []),
+      ],
+    );
+    statements.push({ sql: turnGuard.sql, params: turnGuard.params });
     abortIfUnchangedAt.push(statements.length - 1);
     statements.push(...rest);
     statements.push(...revisionStatements(this.workspaceId, changes, command.tasks[0]?.updatedAt ?? new Date().toISOString(), this.changeFeedRetainRevisions));
     // Use direct transaction to honor both guards atomically
+    const purgeScope = command.deletedTaskIds && command.deletedTaskIds.length > 0
+      ? { kind: 'tasks' as const, taskIds: command.deletedTaskIds }
+      : undefined;
     let results: readonly import('./sqlite/rpc').RunResult[];
     try {
-      results = await this.db.transaction(statements, { abortIfUnchangedAt });
+      if (!purgeScope) {
+        results = await this.db.transaction(statements, { abortIfUnchangedAt });
+      } else {
+        const purge = retiredChildReturnPurgeStatements(this.workspaceId, purgeScope);
+        const preparation = purge.setup.slice(0, purge.mutationStartIndex);
+        const mutations = purge.setup.slice(purge.mutationStartIndex);
+        const resultOffset = preparation.length + mutations.length;
+        const rawResults = await this.db.transaction(
+          [...preparation, ...mutations, ...statements, ...purge.cleanup],
+          { abortIfUnchangedAt: abortIfUnchangedAt.map((index) => index + resultOffset) },
+        );
+        results = rawResults.slice(resultOffset, resultOffset + statements.length);
+      }
     } catch (error) {
       const detail = (error as any)?.detail ?? (error as any);
       const code = detail?.code ?? (error as any).code;
@@ -6585,6 +7193,65 @@ export class SqliteTaskRepository implements TaskRepository {
     return { ok: true, changed: hasChanges };
   }
 
+  private async rejectUnauthorizedPublicWorkflowMutation(
+    action: 'define_workflow' | 'start_workflow',
+    ownerRootTaskId: string | undefined,
+    publicOperation: PublicWorkflowOperation | undefined,
+    commandCallerTaskId?: string,
+    commandCallerTurnId?: string,
+  ): Promise<RepositoryCommandResult | undefined> {
+    if (!publicOperation) return undefined;
+    const reason = `${action} is not authorized for the current caller`;
+    const rejected = (): RepositoryCommandResult => ({
+      ok: false,
+      changed: false,
+      reason,
+      operation: {
+        fingerprint: publicOperation.fingerprint,
+        result: { ok: false, error: reason },
+      },
+    });
+    if (
+      !ownerRootTaskId ||
+      publicOperation.rootTaskId !== ownerRootTaskId ||
+      publicOperation.callerTaskId !== ownerRootTaskId ||
+      (commandCallerTaskId !== undefined && commandCallerTaskId !== publicOperation.callerTaskId) ||
+      (commandCallerTurnId !== undefined && commandCallerTurnId !== publicOperation.callerTurnId) ||
+      !publicOperation.ledgerKey.startsWith(`${publicOperation.callerTurnId}:`)
+    ) return rejected();
+    try {
+      const [caller, turn, activation] = await Promise.all([
+        this.getTask(publicOperation.callerTaskId),
+        this.db.get<{ task_id: string; status: string }>(
+          `SELECT task_id, status FROM turns
+            WHERE workspace_id = ? AND id = ?`,
+          [this.workspaceId, publicOperation.callerTurnId],
+        ),
+        this.db.get<{ present: number }>(
+          `SELECT 1 AS present FROM workflow_activations
+            WHERE workspace_id = ? AND execution_turn_id = ?
+            LIMIT 1`,
+          [this.workspaceId, publicOperation.callerTurnId],
+        ),
+      ]);
+      if (
+        !caller ||
+        caller.id !== ownerRootTaskId ||
+        (caller.parentId !== null && caller.parentId !== undefined) ||
+        caller.role !== 'coordinator' ||
+        caller.lifecycle !== 'open' ||
+        !caller.capabilities.includes('create_child') ||
+        !turn ||
+        turn.task_id !== caller.id ||
+        (turn.status !== 'running' && turn.status !== 'waiting_user') ||
+        activation !== undefined
+      ) return rejected();
+    } catch {
+      return rejected();
+    }
+    return undefined;
+  }
+
   /**
    * Persist an immutable one-node workflow definition.
    * First statement claims (definitionId,version)/fingerprint on the operations ledger;
@@ -6596,6 +7263,12 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.workspaceId !== this.workspaceId) {
       throw new Error('workspace mismatch');
     }
+    const unauthorized = await this.rejectUnauthorizedPublicWorkflowMutation(
+      'define_workflow',
+      command.ownerRootTaskId,
+      command.publicOperation,
+    );
+    if (unauthorized) return unauthorized;
     const validated = validateDefineWorkflow({
       definitionId: command.definitionId,
       version: command.version,
@@ -7085,6 +7758,14 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.workspaceId !== this.workspaceId) {
       throw new Error('workspace mismatch');
     }
+    const unauthorized = await this.rejectUnauthorizedPublicWorkflowMutation(
+      'start_workflow',
+      command.ownerRootTaskId,
+      command.publicOperation,
+      command.callerTaskId,
+      command.callerTurnId,
+    );
+    if (unauthorized) return unauthorized;
 
     const invalidStart = (
       reason:
@@ -7252,9 +7933,11 @@ export class SqliteTaskRepository implements TaskRepository {
             AND producing_turn.id = source.producing_turn_id
             AND producing_turn.task_id = source.producer_task_id
             AND producing_turn.status = 'succeeded'
-          WHERE run.workspace_id = ? AND run.run_id = ?
-            AND run.owner_root_task_id = ?
-            AND run.status = 'succeeded'
+           WHERE run.workspace_id = ? AND run.run_id = ?
+             AND run.owner_root_task_id = ?
+             AND run.status = 'succeeded'
+             AND run.origin = 'top_level'
+             AND run.parent_run_id IS NULL
           ORDER BY artifact.revision DESC
           LIMIT 1`,
         [input.output, this.workspaceId, input.fromRun, validated.ownerRootTaskId],
@@ -7316,11 +7999,16 @@ export class SqliteTaskRepository implements TaskRepository {
         validated.callerTurnId,
       );
       const activeContinuation = await this.db.get<{ continuation_id?: string }>(
-        `SELECT continuation_id
-           FROM workflow_continuations
-          WHERE workspace_id = ? AND kind = 'start_wait' AND caller_task_id = ?
-            AND status IN ('pending', 'resolved')
-          ORDER BY created_at, continuation_id
+        `SELECT continuation.continuation_id
+           FROM workflow_continuations continuation
+           JOIN workflow_runs run
+             ON run.workspace_id = continuation.workspace_id
+            AND run.run_id = continuation.run_id
+          WHERE continuation.workspace_id = ? AND continuation.kind = 'start_wait'
+            AND continuation.caller_task_id = ?
+            AND run.origin = 'top_level' AND run.parent_run_id IS NULL
+            AND continuation.status IN ('pending', 'resolved')
+          ORDER BY continuation.created_at, continuation.continuation_id
           LIMIT 1`,
         [this.workspaceId, validated.callerTaskId],
       );
@@ -7352,6 +8040,15 @@ export class SqliteTaskRepository implements TaskRepository {
             result: { ok: false, error: conflict.reason },
           },
         };
+      }
+
+      const replayRun = await this.db.get<{ origin: string; parent_run_id: string | null }>(
+        `SELECT origin, parent_run_id FROM workflow_runs
+          WHERE workspace_id = ? AND run_id = ?`,
+        [this.workspaceId, identities.runId],
+      );
+      if (!replayRun || replayRun.origin !== 'top_level' || replayRun.parent_run_id !== null) {
+        return invalidStart('invalid start');
       }
 
       let continuationChanged = false;
@@ -7938,6 +8635,7 @@ export class SqliteTaskRepository implements TaskRepository {
 
   private async claimOperation(
     command: Extract<RepositoryCommand, { kind: 'claimOperation' }>,
+    visibleTurnId?: string,
   ): Promise<RepositoryCommandResult> {
     // `changes()` is evaluated immediately after the INSERT/DO NOTHING. This
     // makes both revision and change_log conditional, so a replay is a true
@@ -7945,9 +8643,34 @@ export class SqliteTaskRepository implements TaskRepository {
     const results = await this.db.transaction([
       {
         sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
-              VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+              SELECT operation_input.workspace_id, operation_input.ledger_key,
+                     operation_input.fingerprint, operation_input.result_json,
+                     operation_input.created_at
+                FROM (
+                  SELECT ? AS workspace_id, ? AS ledger_key, ? AS fingerprint,
+                         ? AS result_json, ? AS created_at
+                ) operation_input
+               WHERE ${operationLedgerIsVisibleInActiveSurfacesSql(
+                 'operation_input.workspace_id',
+                 'operation_input.ledger_key',
+               )}
+                 ${visibleTurnId === undefined
+                   ? ''
+                   : `AND EXISTS (
+                        SELECT 1 FROM turns operation_turn
+                         WHERE operation_turn.workspace_id = operation_input.workspace_id
+                           AND operation_turn.id = ?
+                           AND ${operationLedgerBelongsToTurnSql(
+                             'operation_input.workspace_id',
+                             'operation_input.ledger_key',
+                             'operation_turn',
+                           )}
+                           AND ${turnIsVisibleInActiveSurfacesSql('operation_turn')}
+                      )`}
+              ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
         params: [this.workspaceId, command.ledgerKey, command.entry.fingerprint,
-          encodePayload({ result: command.entry.result }), command.createdAt],
+          encodePayload({ result: command.entry.result }), command.createdAt,
+          ...(visibleTurnId === undefined ? [] : [visibleTurnId])],
       },
       ...conditionalRevisionStatements(
         this.workspaceId,
@@ -7958,10 +8681,31 @@ export class SqliteTaskRepository implements TaskRepository {
     ]);
     const inserted = (results[0]?.changes ?? 0) > 0;
     const row = await this.db.get<OperationRow>(
-      'SELECT ledger_key, fingerprint, result_json FROM operations WHERE workspace_id = ? AND ledger_key = ?',
-      [this.workspaceId, command.ledgerKey],
+      `SELECT operation_row.ledger_key, operation_row.fingerprint, operation_row.result_json
+         FROM operations operation_row
+        WHERE operation_row.workspace_id = ? AND operation_row.ledger_key = ?
+          AND ${operationLedgerIsVisibleInActiveSurfacesSql(
+            'operation_row.workspace_id',
+            'operation_row.ledger_key',
+          )}
+           ${visibleTurnId === undefined
+             ? ''
+             : `AND EXISTS (
+                  SELECT 1 FROM turns operation_turn
+                   WHERE operation_turn.workspace_id = operation_row.workspace_id
+                     AND operation_turn.id = ?
+                     AND ${operationLedgerBelongsToTurnSql(
+                       'operation_row.workspace_id',
+                       'operation_row.ledger_key',
+                       'operation_turn',
+                     )}
+                     AND ${turnIsVisibleInActiveSurfacesSql('operation_turn')}
+                )`}`,
+      [this.workspaceId, command.ledgerKey, ...(visibleTurnId === undefined ? [] : [visibleTurnId])],
     );
-    if (!row) throw new Error('operation claim disappeared after transaction');
+    if (!row) {
+      return { ok: true, changed: false, reason: 'retired workflow state' };
+    }
     const operation = decodeOperation(row);
     if (operation.fingerprint !== command.entry.fingerprint) {
       return { ok: true, changed: false, conflict: true, reason: 'operation fingerprint conflict', operation };
@@ -7978,6 +8722,16 @@ export class SqliteTaskRepository implements TaskRepository {
                 (workspace_id, turn_id, owner_id, claimed_at, heartbeat_at, expires_at)
               SELECT ?, id, ?, ?, ?, ? FROM turns
                WHERE workspace_id = ? AND id = ?
+                 AND NOT EXISTS (
+                   SELECT 1
+                     FROM workflow_activations retired_activation
+                     JOIN workflow_runs retired_run
+                       ON retired_run.workspace_id = retired_activation.workspace_id
+                      AND retired_run.run_id = retired_activation.run_id
+                     WHERE retired_activation.workspace_id = turns.workspace_id
+                       AND ${workflowActivationOwnsTurnSql('turns', 'retired_activation')}
+                       AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+                 )
               ON CONFLICT(workspace_id, turn_id) DO UPDATE SET
                 owner_id = excluded.owner_id,
                 claimed_at = CASE WHEN runtime_claims.owner_id = excluded.owner_id
@@ -8005,7 +8759,13 @@ export class SqliteTaskRepository implements TaskRepository {
         sql: `UPDATE runtime_claims
                  SET heartbeat_at = ?, expires_at = ?
                WHERE workspace_id = ? AND turn_id = ? AND owner_id = ?
-                 AND expires_at > ?`,
+                 AND expires_at > ?
+                 AND EXISTS (
+                   SELECT 1 FROM turns claimed_turn
+                    WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+                      AND claimed_turn.id = runtime_claims.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+                 )`,
         params: [command.heartbeatAt, command.expiresAt, this.workspaceId, command.turnId,
           command.ownerId, command.heartbeatAt],
       },
@@ -8024,7 +8784,17 @@ export class SqliteTaskRepository implements TaskRepository {
     const params: SqlValue[] = [this.workspaceId, command.turnId,
       ...(command.ownerId === undefined ? [] : [command.ownerId])];
     const results = await this.writeIfFirstChanged(
-      { sql: `DELETE FROM runtime_claims WHERE workspace_id = ? AND turn_id = ?${ownerPredicate}`, params },
+      {
+        sql: `DELETE FROM runtime_claims
+               WHERE workspace_id = ? AND turn_id = ?${ownerPredicate}
+                 AND EXISTS (
+                   SELECT 1 FROM turns claimed_turn
+                    WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+                      AND claimed_turn.id = runtime_claims.turn_id
+                      AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+                 )`,
+        params,
+      },
       [],
       { kind: 'runtime_claim', id: command.turnId, change: 'release' },
       new Date().toISOString(),
@@ -8053,7 +8823,7 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const at = turn.finishedAt ?? turn.startedAt ?? turn.createdAt;
     const inputStatements: SqlStatement[] = [];
-    if (upsert) inputStatements.push({ sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] });
+    if (upsert) inputStatements.push(turnInputDeleteStatement(this.workspaceId, turn.id));
     for (const [ordering, input] of turn.inputs.entries()) inputStatements.push(turnInputStatement(this.workspaceId, turn.id, ordering, input));
     if (upsert) {
       const guarded: SqlStatement = {
@@ -8069,7 +8839,7 @@ export class SqliteTaskRepository implements TaskRepository {
                   WHERE workspace_id = ? AND id = ?
                     AND json_extract(payload_json, '$.workflowShell') IS NOT NULL
                )
-              ON CONFLICT(workspace_id, id) DO UPDATE SET
+               ON CONFLICT(workspace_id, id) DO UPDATE SET
                 task_id=excluded.task_id, sequence=excluded.sequence, status=excluded.status,
                 trigger=excluded.trigger, created_at=excluded.created_at, started_at=excluded.started_at,
                 settled_at=excluded.settled_at, payload_json=excluded.payload_json
@@ -8079,12 +8849,13 @@ export class SqliteTaskRepository implements TaskRepository {
                    AND workflow_nodes.task_id = excluded.task_id
                    AND workflow_nodes.status = 'pending'
               )
-              AND NOT EXISTS (
-                SELECT 1 FROM tasks
-                 WHERE tasks.workspace_id = excluded.workspace_id
-                   AND tasks.id = excluded.task_id
-                   AND json_extract(tasks.payload_json, '$.workflowShell') IS NOT NULL
-              )`,
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks
+                  WHERE tasks.workspace_id = excluded.workspace_id
+                    AND tasks.id = excluded.task_id
+                    AND json_extract(tasks.payload_json, '$.workflowShell') IS NOT NULL
+               )
+               AND ${turnIsVisibleInActiveSurfacesSql('turns')}`,
         params: [
           turn.id, this.workspaceId, turn.taskId, turn.sequence, turn.status, turn.trigger, turn.createdAt,
           turn.startedAt ?? null, turn.finishedAt ?? null, turnPayload(turn),
@@ -8162,7 +8933,7 @@ export class SqliteTaskRepository implements TaskRepository {
   private async promote(turnId: string, startedAt: string): Promise<RepositoryCommandResult> {
     const taskId = await this.lookupTurnTaskId(turnId);
     const results = await this.writeIfFirstChanged(
-      { sql: `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ? AND status = 'queued' AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.workspace_id = turns.workspace_id AND tasks.id = turns.task_id AND json_extract(tasks.payload_json, '$.workflowShell') IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM workflow_nodes WHERE workspace_id = turns.workspace_id AND task_id = turns.task_id AND status = 'pending')`, params: [startedAt, this.workspaceId, turnId] }, [],
+      { sql: `UPDATE turns SET status = 'running', started_at = ? WHERE workspace_id = ? AND id = ? AND status = 'queued' AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.workspace_id = turns.workspace_id AND tasks.id = turns.task_id AND json_extract(tasks.payload_json, '$.workflowShell') IS NOT NULL) AND NOT EXISTS (SELECT 1 FROM workflow_nodes WHERE workspace_id = turns.workspace_id AND task_id = turns.task_id AND status = 'pending') AND ${turnIsVisibleInActiveSurfacesSql()}`, params: [startedAt, this.workspaceId, turnId] }, [],
       { kind: 'turn', id: turnId, ...(taskId ? { taskId } : {}), change: 'promote' }, startedAt,
     );
     return { ok: true, changed: (results[0]?.changes ?? 0) > 0, ...((results[0]?.changes ?? 0) === 0 ? { reason: 'turn is no longer eligible' } : {}) };
@@ -8235,7 +9006,7 @@ export class SqliteTaskRepository implements TaskRepository {
       { sql: 'DELETE FROM task_prerequisites WHERE workspace_id = ? AND task_id = ?', params: [this.workspaceId, command.task.id] },
       ...command.task.prerequisites.map((prerequisite) => prerequisiteStatement(this.workspaceId, command.task.id, prerequisite)),
       turnStatement(this.workspaceId, command.turn, true),
-      { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turn.id] },
+      turnInputDeleteStatement(this.workspaceId, command.turn.id),
       ...command.turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, command.turn.id, ordering, input)),
       ...command.messages.map((message) => messageStatement(this.workspaceId, message, true)),
       ...(claims && command.sessionId
@@ -8282,7 +9053,17 @@ export class SqliteTaskRepository implements TaskRepository {
     const results = await this.writeIfFirstChanged(
       {
         sql: `UPDATE turns SET status = ?, settled_at = ?, payload_json = ${payloadExpression}
-               WHERE workspace_id = ? AND id = ? AND status IN ('running', 'waiting_user')`, params,
+               WHERE workspace_id = ? AND id = ? AND status IN ('running', 'waiting_user')
+                 AND NOT EXISTS (
+                   SELECT 1
+                     FROM workflow_activations retired_activation
+                     JOIN workflow_runs retired_run
+                       ON retired_run.workspace_id = retired_activation.workspace_id
+                      AND retired_run.run_id = retired_activation.run_id
+                    WHERE retired_activation.workspace_id = turns.workspace_id
+                      AND ${workflowActivationOwnsTurnSql('turns', 'retired_activation')}
+                      AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+                 )`, params,
       }, [
       { sql: 'DELETE FROM session_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
       { sql: 'DELETE FROM resource_claims WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, command.turnId] },
@@ -8356,9 +9137,12 @@ export class SqliteTaskRepository implements TaskRepository {
            ON repair.workspace_id = activation.workspace_id
           AND repair.run_id = activation.run_id
           AND repair.activation_id = activation.activation_id
-        WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
-          AND activation.status IN ('queued', 'running')
-          AND run.status = 'running'
+          WHERE activation.workspace_id = ? AND activation.execution_turn_id = ?
+            AND activation.status IN ('queued', 'running')
+            AND ${activeWorkflowActivationKindSql('activation')}
+            AND run.status = 'running'
+           AND run.origin = 'top_level'
+           AND run.parent_run_id IS NULL
         LIMIT 1`,
       [this.workspaceId, command.turn.id],
     );
@@ -8571,8 +9355,9 @@ export class SqliteTaskRepository implements TaskRepository {
         {
           sql: `UPDATE workflow_activations
                   SET status = 'queued', execution_turn_id = ?, updated_at = ?
-                WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
-                  AND execution_turn_id = ? AND status = ?`,
+                 WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
+                   AND execution_turn_id = ? AND status = ?
+                   AND ${activeWorkflowActivationKindSql('workflow_activations')}`,
           params: [
             nextTurnId,
             at,
@@ -8601,6 +9386,14 @@ export class SqliteTaskRepository implements TaskRepository {
   ): Promise<RepositoryCommandResult> {
     if (command.expectedStatuses.length === 0) {
       return { ok: true, changed: false, reason: 'expected live status required' };
+    }
+    const settlementAuthority = await readWorkflowTurnDefinitionAuthority(
+      this.db,
+      this.workspaceId,
+      command.turn.id,
+    );
+    if (settlementAuthority.kind === 'invalid') {
+      return { ok: true, changed: false, reason: 'workflow definition is invalid' };
     }
     if (command.turn.status === 'succeeded' && !command.turn.disposition) {
       const durableTurn = await this.getTurn(command.turn.id);
@@ -8653,14 +9446,7 @@ export class SqliteTaskRepository implements TaskRepository {
       authority: Extract<WorkflowTurnDefinitionAuthority, { kind: 'valid' }>;
     } | undefined;
     if (relatedRetry) {
-      const authority = await readWorkflowTurnDefinitionAuthority(
-        this.db,
-        this.workspaceId,
-        command.turn.id,
-      );
-      if (authority.kind === 'invalid') {
-        return { ok: true, changed: false, reason: 'workflow definition is invalid' };
-      }
+      const authority = settlementAuthority;
       if (
         authority.kind === 'ordinary'
         && await this.lookupWorkflowNodeForTask(command.task.id)
@@ -8698,46 +9484,21 @@ export class SqliteTaskRepository implements TaskRepository {
     const failClosure = decisionOwnsSettlement
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowFailFromSettle(command);
-    // M018 S06: child invocation is mutually exclusive with feedback/next/prev.
-    const childInvocation = decisionOwnsSettlement || failClosure.statements.length > 0
-      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
-      : await this.planWorkflowChildInvocation(command);
-    if (childInvocation.conflictReason) {
-      return {
-        ok: true,
-        changed: false,
-        conflict: true,
-        reason: childInvocation.conflictReason,
-      };
-    }
     const feedbackResponse = (
       decisionOwnsSettlement || failClosure.statements.length > 0
-      || childInvocation.statements.length > 0
     )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowFeedbackResponse(command);
     const prevRequest = (
       decisionOwnsSettlement || failClosure.statements.length > 0
-      || childInvocation.statements.length > 0
       || feedbackResponse.statements.length > 0
     )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowPrevRequest(command);
-    // M018 S06: terminal child NEXT returns to the caller before ordinary forward NEXT.
-    const childReturn = (
-      decisionOwnsSettlement || failClosure.statements.length > 0
-      || childInvocation.statements.length > 0
-      || feedbackResponse.statements.length > 0
-      || prevRequest.statements.length > 0
-    )
-      ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
-      : await this.planWorkflowChildReturn(command);
     const nextContribution = (
       decisionOwnsSettlement || failClosure.statements.length > 0
-      || childInvocation.statements.length > 0
       || feedbackResponse.statements.length > 0
       || prevRequest.statements.length > 0
-      || childReturn.statements.length > 0
     )
       ? { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] }
       : await this.planWorkflowNextContribution(command);
@@ -8745,16 +9506,13 @@ export class SqliteTaskRepository implements TaskRepository {
       decision,
       feedbackResponse,
       prevRequest,
-      childReturn,
       nextContribution,
     ];
     const routePlans: WorkflowEffectPlan[] = [
       decision,
       failClosure,
-      childInvocation,
       feedbackResponse,
       prevRequest,
-      childReturn,
       nextContribution,
     ];
     const settlementGatePreconditions = budgetedRoutePlans.flatMap(
@@ -8787,19 +9545,15 @@ export class SqliteTaskRepository implements TaskRepository {
       statements: [
         ...decision.statements,
         ...failClosure.statements,
-        ...childInvocation.statements,
         ...feedbackResponse.statements,
         ...prevRequest.statements,
-        ...childReturn.statements,
         ...nextContribution.statements,
       ],
       changes: [
         ...decision.changes,
         ...failClosure.changes,
-        ...childInvocation.changes,
         ...feedbackResponse.changes,
         ...prevRequest.changes,
-        ...childReturn.changes,
         ...nextContribution.changes,
       ],
     };
@@ -8834,7 +9588,7 @@ export class SqliteTaskRepository implements TaskRepository {
       ),
       ...relatedTurns.flatMap((turn) => [
         turnStatement(this.workspaceId, turn, true),
-        { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [this.workspaceId, turn.id] },
+        turnInputDeleteStatement(this.workspaceId, turn.id),
         ...turn.inputs.map((input, ordering) => turnInputStatement(this.workspaceId, turn.id, ordering, input)),
       ]),
       ...command.messages.map((message) => messageStatement(this.workspaceId, message, true)),
@@ -8893,16 +9647,27 @@ export class SqliteTaskRepository implements TaskRepository {
     const uniqueChanges = [
       ...new Map(changes.map((entry) => [`${entry.kind}:${entry.id}`, entry])).values(),
     ];
+    const settlementGuard = guardedSettleTurnStatement(this.workspaceId, command, {
+      gates: settlementGatePreconditions,
+      budgets: settlementBudgetPreconditions,
+      closures: settlementClosurePreconditions,
+      retryAuthority: workflowRetry?.authority,
+      decision: decision.precondition,
+    });
+    const activeSettlementGuard = appendExistingTurnVisibilityFence(
+      settlementGuard.sql,
+      settlementGuard.params ?? [],
+      this.workspaceId,
+      [
+        command.turn.id,
+        ...relatedTurns.map((turn) => turn.id),
+        ...command.messages.flatMap((message) => message.turnId ? [message.turnId] : []),
+      ],
+    );
     let results: readonly import('./sqlite/rpc').RunResult[];
     try {
       results = await this.writeIfFirstChanged(
-        guardedSettleTurnStatement(this.workspaceId, command, {
-          gates: settlementGatePreconditions,
-          budgets: settlementBudgetPreconditions,
-          closures: settlementClosurePreconditions,
-          retryAuthority: workflowRetry?.authority,
-          decision: decision.precondition,
-        }),
+        { sql: activeSettlementGuard.sql, params: activeSettlementGuard.params },
         rest,
         uniqueChanges,
         command.turn.finishedAt ?? new Date().toISOString(),
@@ -9114,8 +9879,11 @@ export class SqliteTaskRepository implements TaskRepository {
     const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
 
     const producerNode = await this.db.get<{ run_id: string; node_id: string }>(
-      `SELECT run_id, node_id FROM workflow_nodes
-        WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT node.run_id, node.node_id FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, command.task.id],
     );
     if (!producerNode || typeof producerNode.run_id !== 'string' || typeof producerNode.node_id !== 'string') {
@@ -9126,7 +9894,6 @@ export class SqliteTaskRepository implements TaskRepository {
     if (
       !disposition ||
       disposition.kind !== 'workflow_next' ||
-      disposition.route !== undefined ||
       command.turn.status !== 'succeeded'
     ) return empty;
 
@@ -9138,7 +9905,8 @@ export class SqliteTaskRepository implements TaskRepository {
       max_aggregate_bytes: number;
     }>(
       `SELECT run_id, definition_id, definition_version, status, max_aggregate_bytes FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
+        WHERE workspace_id = ? AND run_id = ?
+          AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, producerNode.run_id],
     );
     if (!run || run.status !== 'running' || typeof run.definition_id !== 'string') {
@@ -9330,7 +10098,8 @@ export class SqliteTaskRepository implements TaskRepository {
                  SET status = 'succeeded',
                      terminal_result_run_id = ?, terminal_result_artifact_id = ?,
                      terminal_result_artifact_revision = ?, updated_at = ?
-               WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                 AND origin = 'top_level' AND parent_run_id IS NULL`,
         params: [
           producerNode.run_id,
           terminalArtifactId,
@@ -9695,8 +10464,9 @@ export class SqliteTaskRepository implements TaskRepository {
                  )
                  AND EXISTS (
                    SELECT 1 FROM workflow_runs
-                    WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                      AND terminal_reason_code IS NULL
+                     WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                       AND origin = 'top_level' AND parent_run_id IS NULL
+                       AND terminal_reason_code IS NULL
                   )`,
         params: [
           this.workspaceId,
@@ -10021,8 +10791,13 @@ export class SqliteTaskRepository implements TaskRepository {
     }
 
     const requesterNode = await this.db.get<{ run_id: string; node_id: string }>(
-      `SELECT run_id, node_id FROM workflow_nodes
-        WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT node.run_id, node.node_id
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id
+          AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, command.task.id],
     );
     if (!requesterNode || typeof requesterNode.run_id !== 'string' || typeof requesterNode.node_id !== 'string') {
@@ -10036,7 +10811,8 @@ export class SqliteTaskRepository implements TaskRepository {
       status: string;
     }>(
       `SELECT run_id, definition_id, definition_version, status FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
+        WHERE workspace_id = ? AND run_id = ?
+          AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, requesterNode.run_id],
     );
     if (!run || run.status !== 'running' || typeof run.definition_id !== 'string') {
@@ -10208,7 +10984,8 @@ export class SqliteTaskRepository implements TaskRepository {
               inherited_feedback_round_id, inherited_feedback_target_node_id
          FROM workflow_activations
         WHERE workspace_id = ? AND run_id = ? AND node_id = ?
-          AND execution_turn_id = ? AND status IN ('queued', 'running')`,
+          AND execution_turn_id = ? AND status IN ('queued', 'running')
+          AND ${activeWorkflowActivationKindSql('workflow_activations')}`,
       [this.workspaceId, requesterNode.run_id, requesterNode.node_id, command.turn.id],
     );
     if (!requesterActivation) {
@@ -10559,15 +11336,19 @@ export class SqliteTaskRepository implements TaskRepository {
     if (
       !disposition ||
       disposition.kind !== 'workflow_next' ||
-      disposition.route !== undefined ||
       command.turn.status !== 'succeeded'
     ) {
       return empty;
     }
 
     const targetNode = await this.db.get<{ run_id: string; node_id: string }>(
-      `SELECT run_id, node_id FROM workflow_nodes
-        WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT node.run_id, node.node_id
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id
+          AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, command.task.id],
     );
     if (!targetNode || typeof targetNode.run_id !== 'string' || typeof targetNode.node_id !== 'string') {
@@ -10579,7 +11360,8 @@ export class SqliteTaskRepository implements TaskRepository {
       max_aggregate_bytes: number;
     }>(
       `SELECT definition_id, definition_version, max_aggregate_bytes
-         FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+         FROM workflow_runs WHERE workspace_id = ? AND run_id = ?
+           AND origin = 'top_level' AND parent_run_id IS NULL`,
       [this.workspaceId, targetNode.run_id],
     );
     if (!run) return empty;
@@ -10609,7 +11391,8 @@ export class SqliteTaskRepository implements TaskRepository {
           AND resume_round.run_id = activation.run_id
           AND resume_round.round_id = activation.feedback_round_id
         WHERE activation.workspace_id = ? AND activation.run_id = ?
-          AND activation.node_id = ? AND activation.execution_turn_id = ?`,
+          AND activation.node_id = ? AND activation.execution_turn_id = ?
+          AND ${activeWorkflowActivationKindSql('activation')}`,
       [this.workspaceId, targetNode.run_id, targetNode.node_id, command.turn.id],
     );
     if (!responseActivation) return empty;
@@ -10937,8 +11720,9 @@ export class SqliteTaskRepository implements TaskRepository {
                )
                AND EXISTS (
                  SELECT 1 FROM workflow_runs
-                  WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                    AND terminal_reason_code IS NULL
+                   WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND origin = 'top_level' AND parent_run_id IS NULL
+                     AND terminal_reason_code IS NULL
                 )`,
       params: [
         this.workspaceId,
@@ -11216,1216 +12000,6 @@ export class SqliteTaskRepository implements TaskRepository {
    * run_timeout termination each close the run via planWorkflowFailClosure.
    */
 
-  /**
-   * M018 S06: on successful settle with a child-workflow NEXT route, atomically start
-   * a child run (origin='child', parent_run_id=caller), pin exact entry bindings,
-   * record one pending continuation + caller return gate, and fence child_invocation.
-   * Invalid/missing/foreign bindings abort with zero child rows.
-   */
-  private async planWorkflowChildInvocation(
-    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<WorkflowEffectPlan> {
-    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
-    const staged = command.turn.disposition;
-    if (!staged || staged.kind !== 'workflow_next' || staged.route?.kind !== 'child_workflow') {
-      return empty;
-    }
-    const disposition = staged.route;
-
-    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
-    const callerNode = await this.lookupWorkflowNodeForTask(command.task.id);
-    const durableCallerTask = callerNode ? await this.getTask(command.task.id) : undefined;
-    const callerRun = callerNode ? await this.db.get<{
-      definition_id: string;
-      definition_version: number;
-      owner_root_task_id: string | null;
-      max_children: number;
-      children_reserved: number;
-      feedback_rounds_reserved: number;
-      workflow_turns_reserved: number;
-    }>(
-      `SELECT definition_id, definition_version, owner_root_task_id,
-              max_children, children_reserved, feedback_rounds_reserved,
-              workflow_turns_reserved
-         FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
-      [this.workspaceId, callerNode.runId],
-    ) : undefined;
-    if (
-      !callerNode ||
-      !durableCallerTask ||
-      !callerRun ||
-      typeof callerRun.owner_root_task_id !== 'string'
-    ) return empty;
-    const childExecutionCwd = durableCallerTask.cwd;
-    const callerAuthority = await this.db.get<{ is_terminal: number }>(
-      `SELECT EXISTS (
-                SELECT 1 FROM workflow_definition_outputs output
-                 WHERE output.workspace_id = run.workspace_id
-                   AND output.definition_id = run.definition_id
-                   AND output.definition_version = run.definition_version
-                   AND output.terminal_node_id = ?
-              ) AS is_terminal
-         FROM workflow_runs run
-        WHERE run.workspace_id = ? AND run.run_id = ?
-           AND run.status = 'running'`,
-      [callerNode.nodeId, this.workspaceId, callerNode.runId],
-    );
-    if (callerAuthority?.is_terminal !== 1) return empty;
-    const openRound = await this.db.get<{ round_id: string }>(
-      `SELECT round_id FROM workflow_feedback_rounds
-        WHERE workspace_id = ? AND run_id = ? AND status = 'open'
-        LIMIT 1`,
-      [this.workspaceId, callerNode.runId],
-    );
-    if (openRound) return empty;
-
-    const pendingContinuation = await this.db.get<{
-      continuation_id: string;
-      invocation_key: string | null;
-      invocation_fingerprint: string | null;
-    }>(
-      `SELECT continuation_id, invocation_key, invocation_fingerprint
-         FROM workflow_continuations
-        WHERE workspace_id = ? AND run_id = ? AND kind = 'child_wait'
-          AND status = 'pending'
-        LIMIT 1`,
-      [this.workspaceId, callerNode.runId],
-    );
-    const callerRunId = callerNode.runId;
-    const callerScopeId = callerRunId;
-    const ownerRootTaskId = callerRun.owner_root_task_id;
-
-    const bindingCheck = validateInvokeChildEntryBindings(disposition.entryBindings);
-    if (!bindingCheck.ok) return empty;
-
-    const childIdempotencyKey = deriveChildStartIdempotencyKey({
-      callerRunId: callerScopeId,
-      callerTurnId: command.turn.id,
-      childDefinitionId: disposition.childDefinitionId,
-      childDefinitionVersion: disposition.childDefinitionVersion,
-      childIdempotencyKey: disposition.childIdempotencyKey,
-    });
-    const fenceId = deriveChildInvocationFenceId(
-      callerScopeId,
-      disposition.childDefinitionId,
-      disposition.childDefinitionVersion,
-      childIdempotencyKey,
-    );
-    const childDefinition = await readStoredWorkflowDefinition(
-      this.db,
-      this.workspaceId,
-      disposition.childDefinitionId,
-      disposition.childDefinitionVersion,
-    );
-    if (!childDefinition) return empty;
-    if (
-      childDefinition.scope.kind === 'root' &&
-      childDefinition.scope.ownerRootTaskId !== ownerRootTaskId
-    ) return empty;
-    let childEffectivePolicy = childDefinition.policy;
-    if (disposition.effectivePolicy) {
-      const numericPolicyKeys: Array<Exclude<keyof WorkflowPolicy, 'failWorkflow'>> = [
-        'maxFeedbackRoundsPerRun',
-        'maxTurnsPerTask',
-        'maxWorkflowTurnsPerRun',
-        'runTimeoutMs',
-        'maxDepth',
-        'maxTaskCount',
-        'maxConcurrency',
-        'maxInputsPerGate',
-        'maxArtifactBytes',
-        'maxAggregateBytes',
-      ];
-      if (
-        disposition.effectivePolicy.failWorkflow !== childEffectivePolicy.failWorkflow ||
-        numericPolicyKeys.some((key) =>
-          disposition.effectivePolicy![key] > childEffectivePolicy[key])
-      ) return empty;
-      const effectiveDefinition = validateDefineWorkflow({
-        ...childDefinition,
-        policy: disposition.effectivePolicy,
-      });
-      if (!effectiveDefinition.ok) {
-        const aggregateBoundExceeded = entryNodeIds(childDefinition.topology).some(
-          (entryNodeId) =>
-            maximumWorkflowEntryAggregateBytes(
-              childDefinition.entryContracts.filter(
-                (contract) => contract.entryNodeId === entryNodeId,
-              ),
-              disposition.effectivePolicy!.maxArtifactBytes,
-            ) > disposition.effectivePolicy!.maxAggregateBytes,
-        );
-        if (aggregateBoundExceeded && callerRunId) {
-          return this.planWorkflowFailClosure({
-            runId: callerRunId,
-            reasonCode: 'aggregate_too_large',
-            at: finishedAt,
-            sourceTaskId: command.task.id,
-            sourceTurnId: command.turn.id,
-          });
-        }
-        return empty;
-      }
-      childEffectivePolicy = effectiveDefinition.definition.policy;
-    }
-    const childTopology = childDefinition.topology;
-
-    const childEntryNodeIds = entryNodeIds(childTopology);
-    const allChildNodeIds = childTopology.nodes.map((n) => n.nodeId);
-    const primaryEntry = childEntryNodeIds[0];
-    if (!primaryEntry) return empty;
-
-    const childContractByKey = new Map(
-      childDefinition.entryContracts.map((contract) => [
-        `${contract.entryNodeId}\0${contract.inputRef}`,
-        contract,
-      ] as const),
-    );
-    const bindingByName = new Map(
-      disposition.entryBindings.map((binding) => [binding.name, binding] as const),
-    );
-    if (
-      bindingByName.size !== disposition.entryBindings.length ||
-      bindingByName.size !== childTopology.inputs.length
-    ) return empty;
-
-    const callerActivation = await this.db.get<{
-      source_gate_id: string | null;
-      return_gate_id: string | null;
-      primary_turn_id: string;
-    }>(
-      `SELECT source_gate_id, return_gate_id, primary_turn_id
-         FROM workflow_activations
-        WHERE workspace_id = ? AND run_id = ? AND node_id = ?
-          AND execution_turn_id = ?
-        LIMIT 1`,
-      [this.workspaceId, callerRunId, callerNode.nodeId, command.turn.id],
-    );
-    if (!callerActivation) return empty;
-    let callerInputGateId = callerActivation.source_gate_id ?? callerActivation.return_gate_id;
-    if (!callerInputGateId) {
-      const primary = await this.db.get<{ gate_id: string | null }>(
-        `SELECT COALESCE(source_gate_id, return_gate_id) AS gate_id
-           FROM workflow_activations
-          WHERE workspace_id = ? AND run_id = ? AND primary_turn_id = ?
-          LIMIT 1`,
-        [this.workspaceId, callerRunId, callerActivation.primary_turn_id],
-      );
-      callerInputGateId = primary?.gate_id ?? null;
-    }
-    if (!callerInputGateId) return empty;
-
-    const pinnedFills: Array<{
-      name: string;
-      fromInputRef: string;
-      childEntryNodeId: string;
-      inputRef: string;
-      semanticKind: string;
-      sourceArtifactRunId: string;
-      sourceArtifactId: string;
-      sourceArtifactRevision: number;
-      value: string;
-    }> = [];
-
-    for (const declared of childTopology.inputs) {
-      const binding = bindingByName.get(declared.name);
-      const contract = childContractByKey.get(`${declared.entryNodeId}\0${declared.inputRef}`);
-      if (!binding || !contract || contract.expectedArtifactKind !== 'workflow_input') return empty;
-      const art = await this.db.get<{
-        artifact_run_id: string;
-        artifact_id: string;
-        revision: number;
-        payload_json: string;
-        kind: string;
-      }>(
-        `SELECT COALESCE(fill.artifact_run_id, fill.run_id) AS artifact_run_id,
-                artifact.artifact_id, artifact.revision, artifact.payload_json, artifact.kind
-           FROM workflow_gate_fills fill
-           JOIN workflow_gate_bindings gate_binding
-             ON gate_binding.workspace_id = fill.workspace_id
-            AND gate_binding.run_id = fill.run_id
-            AND gate_binding.gate_id = fill.gate_id
-            AND gate_binding.input_ref = fill.input_ref
-           JOIN workflow_artifacts artifact
-             ON artifact.workspace_id = fill.workspace_id
-            AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
-            AND artifact.artifact_id = fill.artifact_id
-            AND artifact.revision = fill.artifact_revision
-            AND artifact.kind = gate_binding.required_kind
-           JOIN workflow_artifact_sources source
-             ON source.workspace_id = artifact.workspace_id
-            AND source.run_id = artifact.run_id
-            AND source.artifact_id = artifact.artifact_id
-            AND source.artifact_revision = artifact.revision
-          WHERE fill.workspace_id = ? AND fill.run_id = ? AND fill.gate_id = ?
-            AND fill.input_ref = ?
-          LIMIT 1`,
-        [this.workspaceId, callerRunId, callerInputGateId, binding.fromInputRef],
-      );
-      if (!art || !Number.isInteger(art.revision) || art.revision < 1) return empty;
-      let payload: unknown;
-      try {
-        payload = JSON.parse(art.payload_json);
-      } catch {
-        return empty;
-      }
-      const record = payload && typeof payload === 'object'
-        ? payload as Record<string, unknown>
-        : undefined;
-      const value = typeof record?.value === 'string'
-        ? record.value
-        : typeof record?.result === 'string'
-          ? record.result
-          : undefined;
-      if (
-        value === undefined ||
-        Buffer.byteLength(value, 'utf8') > childEffectivePolicy.maxArtifactBytes
-      ) return empty;
-      pinnedFills.push({
-        name: declared.name,
-        fromInputRef: binding.fromInputRef,
-        childEntryNodeId: declared.entryNodeId,
-        inputRef: declared.inputRef,
-        semanticKind: declared.semanticKind,
-        sourceArtifactRunId: art.artifact_run_id,
-        sourceArtifactId: art.artifact_id,
-        sourceArtifactRevision: art.revision,
-        value,
-      });
-    }
-
-    const pinnedFillByKey = new Map(
-      pinnedFills.map((pin) => [`${pin.childEntryNodeId}\0${pin.inputRef}`, pin] as const),
-    );
-    const aggregateByEntry = new Map<string, string>();
-    for (const entryNodeId of childEntryNodeIds) {
-      const contracts = childDefinition.entryContracts.filter(
-        (contract) => contract.entryNodeId === entryNodeId,
-      );
-      const values: Array<{ inputRef: string; value: string }> = [];
-      for (const contract of contracts) {
-        const pin = pinnedFillByKey.get(`${entryNodeId}\0${contract.inputRef}`);
-        if (!pin) return empty;
-        values.push({
-          inputRef: contract.inputRef,
-          value: pin.value,
-        });
-      }
-      const aggregate = formatWorkflowEntryAggregate(values);
-      if (
-        values.some((value) =>
-          Buffer.byteLength(value.value, 'utf8') > childEffectivePolicy.maxArtifactBytes)
-        ||
-        Buffer.byteLength(aggregate, 'utf8') >
-        childEffectivePolicy.maxAggregateBytes
-      ) {
-        if (callerRunId) {
-          return this.planWorkflowFailClosure({
-            runId: callerRunId,
-            reasonCode: 'aggregate_too_large',
-            at: finishedAt,
-            sourceTaskId: command.task.id,
-            sourceTurnId: command.turn.id,
-          });
-        }
-        return empty;
-      }
-      aggregateByEntry.set(entryNodeId, aggregate);
-    }
-
-    const validated = validateStartWorkflow({
-      definitionId: disposition.childDefinitionId,
-      version: disposition.childDefinitionVersion,
-      startIdempotencyKey: childIdempotencyKey,
-      createdAt: finishedAt,
-      entryNodeId: primaryEntry,
-      entryNodeIds: childEntryNodeIds,
-      allNodeIds: allChildNodeIds,
-      goal: childDefinition.name,
-      backend: command.task.backend,
-      inputs: pinnedFills.map((pin) => ({ name: pin.name, value: pin.value })),
-      inputContracts: childTopology.inputs,
-      entryContracts: childDefinition.entryContracts,
-      policy: childEffectivePolicy,
-      ownerRootTaskId,
-      callerTaskId: command.task.id,
-      callerTurnId: command.turn.id,
-    });
-    if (!validated.ok) return empty;
-
-    const { identities } = validated;
-    if (identities.entries.length > childEffectivePolicy.maxWorkflowTurnsPerRun) {
-      return callerRunId
-        ? this.planWorkflowFailClosure({
-            runId: callerRunId,
-            reasonCode: 'turn_budget_exhausted',
-            at: finishedAt,
-            sourceTaskId: command.task.id,
-            sourceTurnId: command.turn.id,
-          })
-        : empty;
-    }
-    if (callerRun && callerRun.children_reserved >= callerRun.max_children) {
-      return this.planWorkflowFailClosure({
-        runId: callerRunId!,
-        reasonCode: 'turn_budget_exhausted',
-        at: finishedAt,
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
-    }
-    const childRunId = identities.runId;
-    const continuationId = deriveChildContinuationId(callerScopeId, childRunId);
-    const returnGateId = deriveCallerReturnGateId(callerScopeId, childRunId);
-    const continuationRunId = callerRunId ?? childRunId;
-    const childCreatedAtMs = Date.parse(finishedAt);
-    if (!Number.isFinite(childCreatedAtMs)) return empty;
-    const childDeadlineAt = new Date(
-      childCreatedAtMs + childEffectivePolicy.runTimeoutMs,
-    ).toISOString();
-    const invocationFingerprint = fingerprintChildInvocation({
-      callerScopeId,
-      childDefinitionId: disposition.childDefinitionId,
-      childDefinitionVersion: disposition.childDefinitionVersion,
-      childIdempotencyKey,
-      entryBindings: pinnedFills,
-      effectivePolicy: childEffectivePolicy,
-    });
-    if (pendingContinuation) {
-      if (pendingContinuation.invocation_key !== childIdempotencyKey) return empty;
-      if (pendingContinuation.invocation_fingerprint !== invocationFingerprint) {
-        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
-      }
-      return empty;
-    }
-    const existingInvocation = await this.db.get<{ invocation_fingerprint: string | null }>(
-      `SELECT invocation_fingerprint FROM workflow_continuations
-        WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?`,
-      [this.workspaceId, continuationRunId, continuationId],
-    );
-    if (existingInvocation) {
-      if (existingInvocation.invocation_fingerprint !== invocationFingerprint) {
-        return { ...empty, conflictReason: 'child invocation fingerprint conflict' };
-      }
-      return empty;
-    }
-    const existingFenceRunId = callerRunId ?? childRunId;
-    const existingFence = await this.db.get<{ message_id: string }>(
-      `SELECT message_id FROM workflow_routed_messages
-        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
-      [this.workspaceId, existingFenceRunId, fenceId],
-    );
-    if (existingFence) return empty;
-
-    const statements: SqlStatement[] = [];
-    const changes: ChangeRecord[] = [];
-
-    if (callerRunId) {
-      statements.push({
-        sql: `UPDATE workflow_runs
-                 SET children_reserved = children_reserved + 1, updated_at = ?
-               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                 AND children_reserved < max_children`,
-        params: [finishedAt, this.workspaceId, callerRunId],
-      });
-    }
-
-    const fenceBody = JSON.stringify({
-      kind: 'child_invocation',
-      callerRunId: callerRunId ?? null,
-      callerNodeId: callerNode?.nodeId ?? null,
-      callerTurnId: command.turn.id,
-      childRunId,
-      childDefinitionId: disposition.childDefinitionId,
-      childDefinitionVersion: disposition.childDefinitionVersion,
-      childIdempotencyKey,
-      continuationId,
-      returnGateId,
-    });
-    statements.push({
-      sql: `INSERT INTO workflow_runs (
-              workspace_id, run_id, definition_id, definition_version, status, origin,
-              parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
-              continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
-               max_workflow_turns, max_children, max_depth, max_concurrency,
-               max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
-               children_reserved, started_at, deadline_at, created_at, updated_at
-             ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(workspace_id, run_id) DO NOTHING`,
-      params: [
-        this.workspaceId,
-        childRunId,
-        disposition.childDefinitionId,
-        disposition.childDefinitionVersion,
-        'running',
-        'child',
-        callerRunId ?? null,
-        ownerRootTaskId,
-        command.task.id,
-        command.turn.id,
-        continuationId,
-        JSON.stringify(childEffectivePolicy),
-        childEffectivePolicy.maxFeedbackRoundsPerRun,
-        childEffectivePolicy.maxTurnsPerTask,
-        childEffectivePolicy.maxWorkflowTurnsPerRun,
-        childEffectivePolicy.maxTaskCount,
-        childEffectivePolicy.maxDepth,
-        childEffectivePolicy.maxConcurrency,
-        childEffectivePolicy.maxAggregateBytes,
-        0,
-        identities.entries.length,
-        0,
-        finishedAt,
-        childDeadlineAt,
-        finishedAt,
-        finishedAt,
-      ],
-    });
-    statements.push({
-      sql: `INSERT INTO workflow_routed_messages (
-              workspace_id, run_id, message_id, source_node_id, destination_node_id,
-              kind, body_json, created_at
-            ) VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
-      params: [
-        this.workspaceId,
-        existingFenceRunId,
-        fenceId,
-        callerNode?.nodeId ?? 'caller',
-        callerNode?.nodeId ?? 'caller',
-        'child_invocation',
-        fenceBody,
-        finishedAt,
-      ],
-    });
-
-    const childNodeById = new Map(childTopology.nodes.map((node) => [node.nodeId, node] as const));
-    const childEntryByNode = new Map(identities.entries.map((entry) => [entry.nodeId, entry] as const));
-    for (const nodeGate of identities.nodeGates) {
-      const isEntry = childEntryNodeIds.includes(nodeGate.nodeId);
-      const entry = childEntryByNode.get(nodeGate.nodeId);
-      statements.push({
-        sql: `INSERT INTO workflow_dependency_gates (
-                workspace_id, run_id, gate_id, consumer_node_id, status,
-                activation_id, reserved_turn_id, aggregate_message_id
-              ) VALUES (?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          childRunId,
-          nodeGate.gateId,
-          nodeGate.nodeId,
-          isEntry ? 'satisfied' : 'open',
-          isEntry && entry ? entry.activationId : null,
-          isEntry && entry ? entry.activationTurnId : null,
-          isEntry && entry ? entry.messageId : null,
-        ],
-      });
-    }
-
-    for (const edge of childTopology.edges) {
-        const consumerGate = identities.nodeGates.find((g) => g.nodeId === edge.toNodeId);
-        if (!consumerGate) continue;
-        statements.push({
-          sql: `INSERT INTO workflow_gate_bindings (
-                  workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
-                ) VALUES (?,?,?,?,?,?)
-                ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
-          params: [
-            this.workspaceId,
-            childRunId,
-            consumerGate.gateId,
-            edge.inputRef,
-            edge.fromNodeId,
-            edge.expectedArtifactKind ?? 'next_result',
-          ],
-        });
-    }
-
-    for (const entry of identities.entries) {
-      const node = childNodeById.get(entry.nodeId);
-      const task = {
-        id: entry.taskId,
-        role: node?.role ?? 'worker',
-        lifecycle: 'open' as const,
-        releaseState: 'released' as const,
-         goal: workflowNodeTaskGoal(node ?? { nodeId: entry.nodeId }, validated.goal),
-        parentId: command.task.id,
-        prerequisites: [],
-        backend: node?.backend ?? validated.backend,
-        ...(node?.model ? { model: node.model } : {}),
-        ...(node?.taskType ? { taskType: node.taskType } : {}),
-        ...(node?.execution ? { execution: node.execution } : {}),
-        capabilities: (node?.capabilities ?? []) as MusterTask['capabilities'],
-        executionPolicy: {
-          maxTurns: childEffectivePolicy.maxTurnsPerTask,
-          maxAutomaticRetries: 1,
-          runTimeoutOverrideMs: childEffectivePolicy.runTimeoutMs,
-        },
-        ...(childExecutionCwd !== undefined ? { cwd: childExecutionCwd } : {}),
-        revision: 0,
-        createdAt: finishedAt,
-        updatedAt: finishedAt,
-      };
-      const turn = {
-        id: entry.activationTurnId,
-        taskId: entry.taskId,
-        sequence: 0,
-        trigger: 'engine' as const,
-        status: 'queued' as const,
-        inputs: [{ kind: 'message' as const, messageId: entry.messageId }],
-        ...(node?.instructions?.content !== undefined
-          ? { workflowInstructions: node.instructions.content }
-          : {}),
-        createdAt: finishedAt,
-      };
-      const message = {
-        id: entry.messageId,
-        taskId: entry.taskId,
-        role: 'system' as const,
-        content: aggregateByEntry.get(entry.nodeId) ?? '[workflow-entry]',
-        state: 'assigned' as const,
-        turnId: entry.activationTurnId,
-        createdAt: finishedAt,
-      };
-      statements.push(taskStatement(this.workspaceId, task as any, false));
-      statements.push(turnStatement(this.workspaceId, turn as any, false));
-      statements.push(messageStatement(this.workspaceId, message as any, false));
-      statements.push(
-        turnInputStatement(this.workspaceId, turn.id, 0, {
-          kind: 'message',
-          messageId: entry.messageId,
-        }),
-      );
-      statements.push({
-        sql: `INSERT INTO workflow_nodes (
-                workspace_id, run_id, node_id, task_id, status
-              ) VALUES (?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          childRunId,
-          entry.nodeId,
-          entry.taskId,
-          'active',
-        ],
-      });
-      statements.push({
-        sql: `INSERT INTO workflow_activations (
-                workspace_id, run_id, activation_id, node_id, kind, status,
-                source_gate_id, feedback_round_id, feedback_target_node_id,
-                continuation_id, return_gate_id, inherited_feedback_round_id,
-                inherited_feedback_target_node_id, primary_turn_id, message_id,
-                execution_turn_id, created_at, updated_at
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          childRunId,
-          entry.activationId,
-          entry.nodeId,
-          'entry_start',
-          'queued',
-          entry.gateId,
-          null,
-          null,
-          null,
-          null,
-          null,
-          null,
-          entry.activationTurnId,
-          entry.messageId,
-          entry.activationTurnId,
-          finishedAt,
-          finishedAt,
-        ],
-      });
-      changes.push(
-        { kind: 'task', id: entry.taskId, change: 'insert' },
-        { kind: 'turn', id: entry.activationTurnId, taskId: entry.taskId, change: 'insert' },
-        { kind: 'message', id: entry.messageId, taskId: entry.taskId, change: 'complete' },
-      );
-    }
-
-    for (const nodeGate of identities.nodeGates) {
-      if (childEntryNodeIds.includes(nodeGate.nodeId)) continue;
-      const node = childNodeById.get(nodeGate.nodeId);
-      const activation = deriveNodeActivationIdentities(childRunId, nodeGate.nodeId);
-      const task = {
-        id: activation.taskId,
-        role: node?.role ?? 'worker',
-        lifecycle: 'open' as const,
-        releaseState: 'released' as const,
-        goal: workflowNodeTaskGoal(node ?? { nodeId: nodeGate.nodeId }, validated.goal),
-        parentId: command.task.id,
-        prerequisites: [],
-        backend: node?.backend ?? validated.backend,
-        ...(node?.model ? { model: node.model } : {}),
-        ...(node?.taskType ? { taskType: node.taskType } : {}),
-        ...(node?.execution ? { execution: node.execution } : {}),
-        capabilities: (node?.capabilities ?? []) as MusterTask['capabilities'],
-        executionPolicy: {
-          maxTurns: childEffectivePolicy.maxTurnsPerTask,
-          maxAutomaticRetries: 1,
-          runTimeoutOverrideMs: childEffectivePolicy.runTimeoutMs,
-        },
-        ...(childExecutionCwd !== undefined ? { cwd: childExecutionCwd } : {}),
-        workflowShell: { runId: childRunId, nodeId: nodeGate.nodeId, gateId: nodeGate.gateId },
-        revision: 0,
-        createdAt: finishedAt,
-        updatedAt: finishedAt,
-      };
-      statements.push(taskStatement(this.workspaceId, task as any, false));
-      statements.push({
-        sql: `INSERT INTO workflow_nodes (
-                workspace_id, run_id, node_id, task_id, status
-              ) VALUES (?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, node_id) DO NOTHING`,
-        params: [this.workspaceId, childRunId, nodeGate.nodeId, activation.taskId, 'pending'],
-      });
-      changes.push({ kind: 'task', id: activation.taskId, change: 'insert' });
-    }
-
-    for (const pin of pinnedFills) {
-      const entryGate = childEntryByNode.get(pin.childEntryNodeId)?.gateId;
-      if (!entryGate) return empty;
-      const contract = childContractByKey.get(`${pin.childEntryNodeId}\0${pin.inputRef}`);
-      if (!contract) return empty;
-      const childArtifact = identities.entryArtifacts.find(
-        (artifact) => artifact.entryNodeId === pin.childEntryNodeId && artifact.inputRef === pin.inputRef,
-      );
-      if (!childArtifact) return empty;
-      statements.push({
-        sql: `INSERT INTO workflow_artifacts (
-                workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-                revision, kind, payload_json, created_at
-              ) VALUES (?,?,?,?,?,?,?,?,?)
-              ON CONFLICT DO NOTHING`,
-        params: [
-          this.workspaceId, childRunId, childArtifact.artifactId, null, pin.inputRef,
-          1, contract.expectedArtifactKind,
-          encodePayload({ value: pin.value, semanticKind: pin.semanticKind }),
-          finishedAt,
-        ],
-      });
-      statements.push({
-        sql: `INSERT INTO workflow_artifact_sources (
-                workspace_id, run_id, artifact_id, artifact_revision, source_kind,
-                producer_run_id, producer_node_id, producer_task_id, producing_turn_id,
-                producing_activation_id, caller_task_id, caller_turn_id,
-                engine_start_operation_key, source_artifact_run_id,
-                source_artifact_id, source_artifact_revision
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
-        params: [
-          this.workspaceId, childRunId, childArtifact.artifactId, 1, 'workflow_artifact',
-          null, null, null, null, null, null, null, null,
-          pin.sourceArtifactRunId, pin.sourceArtifactId, pin.sourceArtifactRevision,
-        ],
-      });
-      statements.push({
-        sql: `INSERT INTO workflow_gate_bindings (
-                workspace_id, run_id, gate_id, input_ref, producer_node_id, required_kind
-              ) VALUES (?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id, input_ref) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          childRunId,
-          entryGate,
-          pin.inputRef,
-          null,
-          contract.expectedArtifactKind,
-        ],
-      });
-      statements.push({
-        sql: `INSERT INTO workflow_gate_fills (
-                workspace_id, run_id, gate_id, input_ref, artifact_run_id,
-                artifact_id, artifact_revision, filled_at
-              ) VALUES (?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, gate_id, input_ref)
-              DO NOTHING`,
-        params: [
-          this.workspaceId,
-          childRunId,
-          entryGate,
-          pin.inputRef,
-          null,
-          childArtifact.artifactId,
-          1,
-          finishedAt,
-        ],
-      });
-    }
-
-    statements.push({
-      sql: `INSERT INTO workflow_continuations (
-              workspace_id, run_id, continuation_id, invocation_key, invocation_fingerprint,
-              caller_task_id, caller_turn_id, caller_run_id, caller_node_id,
-              child_run_id, return_gate_id, kind, status, payload_json, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(workspace_id, run_id, continuation_id) DO NOTHING`,
-      params: [
-        this.workspaceId,
-        continuationRunId,
-        continuationId,
-        childIdempotencyKey,
-        invocationFingerprint,
-        command.task.id,
-        command.turn.id,
-        callerRunId ?? null,
-        callerNode?.nodeId ?? null,
-        childRunId,
-        returnGateId,
-        'child_wait',
-        'pending',
-        JSON.stringify({
-          childRunId,
-          returnGateId,
-          callerNodeId: callerNode?.nodeId,
-          callerTaskId: command.task.id,
-          childDefinitionId: disposition.childDefinitionId,
-          childDefinitionVersion: disposition.childDefinitionVersion,
-        }),
-        finishedAt,
-        finishedAt,
-      ],
-    });
-    statements.push({
-      sql: `INSERT INTO workflow_return_gates (
-              workspace_id, return_gate_id, continuation_run_id, continuation_id,
-              caller_task_id, caller_turn_id, caller_run_id, caller_node_id,
-              child_run_id, status, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,'open',?,?)
-            ON CONFLICT(workspace_id, return_gate_id) DO NOTHING`,
-      params: [
-        this.workspaceId,
-        returnGateId,
-        continuationRunId,
-        continuationId,
-        command.task.id,
-        command.turn.id,
-        callerRunId ?? null,
-        callerNode?.nodeId ?? null,
-        childRunId,
-        finishedAt,
-        finishedAt,
-      ],
-    });
-
-    return {
-      statements,
-      changes,
-      ...(callerRunId && callerRun
-        ? {
-            settlementBudgetPreconditions: [{
-              runId: callerRunId,
-              feedbackRoundsReserved: callerRun.feedback_rounds_reserved,
-              workflowTurnsReserved: callerRun.workflow_turns_reserved,
-              childrenReserved: callerRun.children_reserved,
-              taskTurnCounts: [],
-            }],
-          }
-        : {}),
-    };
-  }
-
-  /**
-   * M018 S06: terminal child-node NEXT with a pending parent continuation resolves
-   * that continuation once (child_return fence), fills the caller return gate, and
-   * queues exactly one caller resume turn. Never seals child lifecycle.
-   */
-  private async planWorkflowChildReturn(
-    command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
-  ): Promise<WorkflowEffectPlan> {
-    const empty = { statements: [] as SqlStatement[], changes: [] as ChangeRecord[] };
-    const disposition = command.turn.disposition;
-    if (!disposition || disposition.kind !== 'workflow_next' || disposition.route !== undefined) {
-      return empty;
-    }
-
-    const finishedAt = command.turn.finishedAt ?? new Date().toISOString();
-    const childNode = await this.lookupWorkflowNodeForTask(command.task.id);
-    if (!childNode) return empty;
-
-    const childRun = await this.db.get<{
-      origin: string;
-      parent_run_id: string | null;
-      definition_id: string;
-      definition_version: number;
-      status: string;
-      max_aggregate_bytes: number;
-    }>(
-      `SELECT origin, parent_run_id, definition_id, definition_version, status, max_aggregate_bytes
-         FROM workflow_runs
-        WHERE workspace_id = ? AND run_id = ?`,
-      [this.workspaceId, childNode.runId],
-    );
-    if (!childRun || childRun.origin !== 'child') {
-      return empty;
-    }
-    if (childRun.status !== 'running') return empty;
-
-    const definition = await readStoredWorkflowDefinition(
-      this.db,
-      this.workspaceId,
-      childRun.definition_id,
-      childRun.definition_version,
-    );
-    if (!definition) return empty;
-    const topology = definition.topology;
-    if (outgoingEdge(topology, childNode.nodeId)) {
-      return empty;
-    }
-    const terminalIds = terminalNodeIds(topology);
-    if (!terminalIds.includes(childNode.nodeId)) return empty;
-
-    const continuation = await this.db.get<{
-      run_id: string;
-      continuation_id: string;
-      status: string;
-      caller_task_id: string | null;
-      caller_run_id: string | null;
-      caller_node_id: string | null;
-      return_gate_id: string | null;
-    }>(
-      `SELECT run_id, continuation_id, status, caller_task_id, caller_run_id,
-              caller_node_id, return_gate_id
-         FROM workflow_continuations
-        WHERE workspace_id = ? AND child_run_id = ? AND status = 'pending'
-        ORDER BY created_at ASC
-        LIMIT 1`,
-      [this.workspaceId, childNode.runId],
-    );
-    if (!continuation) return empty;
-    const callerRunId = continuation.caller_run_id ?? undefined;
-    const callerScopeId = callerRunId ?? stableId('wfcaller', continuation.caller_task_id ?? 'missing');
-    const routeRunId = callerRunId ?? childNode.runId;
-
-    const returnFenceId = deriveChildReturnFenceId(childNode.runId);
-    const existingFence = await this.db.get<{ message_id: string }>(
-      `SELECT message_id FROM workflow_routed_messages
-        WHERE workspace_id = ? AND run_id = ? AND message_id = ?`,
-      [this.workspaceId, routeRunId, returnFenceId],
-    );
-    if (existingFence) return empty;
-
-    const returnGateId =
-      continuation.return_gate_id ?? deriveCallerReturnGateId(callerScopeId, childNode.runId);
-    const resumeTurnId = deriveCallerResumeTurnId(callerScopeId, childNode.runId);
-    const resumeMessageId = deriveCallerReturnMessageId(callerScopeId, childNode.runId);
-    const callerTaskId = continuation.caller_task_id ?? undefined;
-    if (!callerTaskId) return empty;
-    const callerAggregatePolicyRun = callerRunId
-      ? await this.db.get<{
-          max_aggregate_bytes: number;
-          definition_id: string;
-          definition_version: number;
-        }>(
-          `SELECT max_aggregate_bytes, definition_id, definition_version FROM workflow_runs
-            WHERE workspace_id = ? AND run_id = ?`,
-          [this.workspaceId, callerRunId],
-        )
-      : undefined;
-    if (callerRunId && (
-      !callerAggregatePolicyRun ||
-      !Number.isInteger(callerAggregatePolicyRun.max_aggregate_bytes)
-    )) {
-      return empty;
-    }
-    let callerWorkflowInstructions: string | undefined;
-    if (callerRunId) {
-      if (!continuation.caller_node_id) return empty;
-      const callerDefinition = await readStoredWorkflowDefinition(
-        this.db,
-        this.workspaceId,
-        callerAggregatePolicyRun!.definition_id,
-        callerAggregatePolicyRun!.definition_version,
-      );
-      if (!callerDefinition) return empty;
-      const callerSpec = callerDefinition.topology.nodes.find(
-        (node) => node.nodeId === continuation.caller_node_id,
-      );
-      if (!callerSpec) return empty;
-      callerWorkflowInstructions = callerSpec.instructions?.content;
-    }
-    const resultBody = workflowResultFromSettlement(
-      command,
-      (disposition as any).result,
-      (disposition as any).execution?.kind === 'script',
-    );
-    const terminalCompletion = await this.workflowTerminalCompletion(
-      childNode.runId,
-      terminalIds,
-      childNode.nodeId,
-      resultBody,
-    );
-    if (!terminalCompletion.complete) return empty;
-    if (terminalCompletion.missingArtifact) {
-      return this.planWorkflowFailClosure({
-        runId: childNode.runId,
-        reasonCode: 'invalid_route',
-        reasonText: 'terminal result artifact missing',
-        at: finishedAt,
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
-    }
-    const returnResult = terminalCompletion.result;
-    if (
-      returnResult !== undefined &&
-      Buffer.byteLength(returnResult, 'utf8') > childRun.max_aggregate_bytes
-    ) {
-      return this.planWorkflowFailClosure({
-        runId: childNode.runId,
-        reasonCode: 'aggregate_too_large',
-        at: finishedAt,
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
-    }
-    const returnContent = `[workflow-child-return] childRunId=${childNode.runId} change=${(disposition as any).change}\n${returnResult ?? ''}`;
-    const returnLimit = callerAggregatePolicyRun?.max_aggregate_bytes ?? childRun.max_aggregate_bytes;
-    if (Buffer.byteLength(returnContent, 'utf8') > returnLimit) {
-      return this.planWorkflowFailClosure({
-        runId: childNode.runId,
-        reasonCode: 'aggregate_too_large',
-        at: finishedAt,
-        sourceTaskId: command.task.id,
-        sourceTurnId: command.turn.id,
-      });
-    }
-
-    const statements: SqlStatement[] = [];
-    const changes: ChangeRecord[] = [];
-
-    statements.push({
-      sql: `UPDATE workflow_continuations
-              SET status = 'resolved',
-                  outcome = 'succeeded',
-                  result_artifact_run_id = ?,
-                  result_artifact_id = ?,
-                  result_artifact_revision = 1,
-                  producing_turn_id = ?,
-                  resolved_at = ?,
-                  updated_at = ?,
-                  payload_json = json_set(
-                    COALESCE(payload_json, '{}'),
-                    '$.resolvedAt', ?,
-                    '$.resolvedByTurnId', ?,
-                    '$.resolvedByNodeId', ?
-                  )
-            WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
-              AND status = 'pending'`,
-      params: [
-        childNode.runId,
-        stableChildReturnArtifactId(callerScopeId, childNode.runId),
-        command.turn.id,
-        finishedAt,
-        finishedAt,
-        finishedAt,
-        command.turn.id,
-        childNode.nodeId,
-        this.workspaceId,
-        continuation.run_id,
-        continuation.continuation_id,
-      ],
-    });
-    statements.push({
-      sql: `UPDATE workflow_nodes
-               SET status = 'succeeded'
-             WHERE workspace_id = ? AND run_id = ? AND status = 'active'`,
-      params: [this.workspaceId, childNode.runId],
-    });
-    statements.push({
-      sql: `UPDATE workflow_runs
-               SET status = 'succeeded',
-                   terminal_result_run_id = ?, terminal_result_artifact_id = ?,
-                   terminal_result_artifact_revision = 1, updated_at = ?
-             WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
-      params: [
-        childNode.runId,
-        stableChildReturnArtifactId(callerScopeId, childNode.runId),
-        finishedAt,
-        this.workspaceId,
-        childNode.runId,
-      ],
-    });
-
-    const fenceBody = JSON.stringify({
-      kind: 'child_return',
-      childRunId: childNode.runId,
-      parentRunId: callerRunId ?? null,
-      continuationId: continuation.continuation_id,
-      returnGateId,
-      resumeTurnId,
-      resumeMessageId,
-      sourceTurnId: command.turn.id,
-      change: (disposition as any).change,
-    });
-    statements.push({
-      sql: `INSERT INTO workflow_routed_messages (
-              workspace_id, run_id, message_id, source_node_id, destination_node_id,
-              kind, body_json, created_at
-            ) VALUES (?,?,?,?,?,?,?,?)
-            ON CONFLICT(workspace_id, run_id, message_id) DO NOTHING`,
-      params: [
-        this.workspaceId,
-        routeRunId,
-        returnFenceId,
-        childNode.nodeId,
-        continuation.caller_node_id ?? 'caller',
-        'child_return',
-        fenceBody,
-        finishedAt,
-      ],
-    });
-
-    const returnArtifactId = stableChildReturnArtifactId(callerScopeId, childNode.runId);
-    const returnPayload = JSON.stringify({
-      kind: 'child_return',
-      childRunId: childNode.runId,
-      change: (disposition as any).change,
-      result: returnResult ?? null,
-      sourceTurnId: command.turn.id,
-    });
-    statements.push({
-      sql: `INSERT INTO workflow_artifacts (
-              workspace_id, run_id, artifact_id, producer_node_id, logical_name,
-              revision, kind, payload_json, created_at
-            ) VALUES (?,?,?,?,?,?,?,?,?)
-            ON CONFLICT DO NOTHING`,
-      params: [
-        this.workspaceId,
-        childNode.runId,
-        returnArtifactId,
-        childNode.nodeId,
-        'child_return',
-        1,
-        'child_return',
-        returnPayload,
-        finishedAt,
-      ],
-    });
-    statements.push(workflowNodeArtifactSourceStatement({
-      workspaceId: this.workspaceId,
-      runId: childNode.runId,
-      artifactId: returnArtifactId,
-      artifactRevision: 1,
-      nodeId: childNode.nodeId,
-      taskId: command.task.id,
-      turnId: command.turn.id,
-    }));
-    const maxSeq = await this.db.get<{ max_seq: number | null }>(
-      `SELECT MAX(sequence) AS max_seq FROM turns WHERE workspace_id = ? AND task_id = ?`,
-      [this.workspaceId, callerTaskId],
-    );
-    const nextSeq = (maxSeq?.max_seq ?? -1) + 1;
-    const resumeTurn = {
-      id: resumeTurnId,
-      taskId: callerTaskId,
-      sequence: nextSeq,
-      trigger: 'engine' as const,
-      status: 'queued' as const,
-      inputs: [{ kind: 'message' as const, messageId: resumeMessageId }],
-      ...(callerWorkflowInstructions !== undefined
-        ? { workflowInstructions: callerWorkflowInstructions }
-        : {}),
-      createdAt: finishedAt,
-    };
-    const resumeMessage = {
-      id: resumeMessageId,
-      taskId: callerTaskId,
-      role: 'system' as const,
-      content: returnContent,
-      state: 'assigned' as const,
-      turnId: resumeTurnId,
-      createdAt: finishedAt,
-    };
-    statements.push(turnStatement(this.workspaceId, resumeTurn as any, false));
-    statements.push(messageStatement(this.workspaceId, resumeMessage as any, false));
-    statements.push(
-      turnInputStatement(this.workspaceId, resumeTurnId, 0, {
-        kind: 'message',
-        messageId: resumeMessageId,
-      }),
-    );
-    const returnActivationId = callerRunId && continuation.caller_node_id
-      ? stableId('wfact', `${continuation.continuation_id}:return`)
-      : undefined;
-    if (returnActivationId && callerRunId && continuation.caller_node_id) {
-      statements.push({
-        sql: `INSERT INTO workflow_activations (
-                workspace_id, run_id, activation_id, node_id, kind, status,
-                source_gate_id, feedback_round_id, feedback_target_node_id,
-                continuation_id, return_gate_id, inherited_feedback_round_id,
-                inherited_feedback_target_node_id, primary_turn_id, message_id,
-                execution_turn_id, created_at, updated_at
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-              ON CONFLICT(workspace_id, run_id, activation_id) DO NOTHING`,
-        params: [
-          this.workspaceId,
-          callerRunId,
-          returnActivationId,
-          continuation.caller_node_id,
-          'child_return',
-          'queued',
-          null,
-          null,
-          null,
-          continuation.continuation_id,
-          returnGateId,
-          null,
-          null,
-          resumeTurnId,
-          resumeMessageId,
-          resumeTurnId,
-          finishedAt,
-          finishedAt,
-        ],
-      });
-    }
-    statements.push({
-      sql: `UPDATE workflow_return_gates
-               SET status = 'satisfied', result_run_id = ?, result_artifact_id = ?,
-                   result_artifact_revision = 1, return_activation_run_id = ?,
-                   return_activation_id = ?, return_message_id = ?, execution_turn_id = ?,
-                   updated_at = ?
-             WHERE workspace_id = ? AND return_gate_id = ? AND status = 'open'`,
-      params: [
-        childNode.runId,
-        returnArtifactId,
-        returnActivationId ? callerRunId ?? null : null,
-        returnActivationId ?? null,
-        resumeMessageId,
-        resumeTurnId,
-        finishedAt,
-        this.workspaceId,
-        returnGateId,
-      ],
-    });
-    changes.push(
-      { kind: 'turn', id: resumeTurnId, taskId: callerTaskId, change: 'insert' },
-      { kind: 'message', id: resumeMessageId, taskId: callerTaskId, change: 'complete' },
-      { kind: 'task', id: callerTaskId, change: 'effect' },
-    );
-    const taskClosure = await this.planWorkflowTaskLifecycleClosure({
-      runIds: [childNode.runId],
-      lifecycle: 'succeeded',
-      at: finishedAt,
-    });
-    statements.push(...taskClosure.statements);
-    changes.push(...taskClosure.changes);
-
-    return {
-      statements,
-      changes,
-      ...(callerRunId
-        ? { turnReservations: [{ runId: callerRunId, taskId: callerTaskId, count: 1 }] }
-        : {}),
-    };
-  }
-
   private async planWorkflowFailFromSettle(
     command: Extract<RepositoryCommand, { kind: 'settleTurnAndApplyEffects' }>,
   ): Promise<WorkflowEffectPlan> {
@@ -12463,7 +12037,8 @@ export class SqliteTaskRepository implements TaskRepository {
           `SELECT CAST(json_extract(policy_json, '$.maxArtifactBytes') AS INTEGER)
                     AS max_artifact_bytes
              FROM workflow_runs
-            WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+             WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+               AND origin = 'top_level' AND parent_run_id IS NULL`,
           [this.workspaceId, node.runId],
         );
         if (
@@ -12542,12 +12117,12 @@ export class SqliteTaskRepository implements TaskRepository {
         max_workflow_turns: number;
         feedback_rounds_reserved: number;
         workflow_turns_reserved: number;
-        children_reserved: number;
       }>(
-        `SELECT status, max_feedback_rounds, max_turns_per_task, max_workflow_turns,
-                feedback_rounds_reserved, workflow_turns_reserved, children_reserved
+      `SELECT status, max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+                feedback_rounds_reserved, workflow_turns_reserved
            FROM workflow_runs
-          WHERE workspace_id = ? AND run_id = ?`,
+          WHERE workspace_id = ? AND run_id = ?
+            AND origin = 'top_level' AND parent_run_id IS NULL`,
         [this.workspaceId, runId],
       );
       if (!run || run.status !== 'running') continue;
@@ -12557,7 +12132,9 @@ export class SqliteTaskRepository implements TaskRepository {
       for (const reservation of turnsByTask.values()) {
         if (reservation.runId !== runId) continue;
         const count = await this.db.get<{ count: number }>(
-          `SELECT COUNT(*) AS count FROM turns WHERE workspace_id = ? AND task_id = ?`,
+          `SELECT COUNT(*) AS count FROM turns counted_turn
+            WHERE counted_turn.workspace_id = ? AND counted_turn.task_id = ?
+              AND ${turnIsVisibleInActiveSurfacesSql('counted_turn')}`,
           [this.workspaceId, reservation.taskId],
         );
         taskTurnCounts.push({ taskId: reservation.taskId, count: count?.count ?? 0 });
@@ -12566,7 +12143,6 @@ export class SqliteTaskRepository implements TaskRepository {
         runId,
         feedbackRoundsReserved: run.feedback_rounds_reserved,
         workflowTurnsReserved: run.workflow_turns_reserved,
-        childrenReserved: run.children_reserved,
         taskTurnCounts,
       });
       if (run.feedback_rounds_reserved + feedbackRounds > run.max_feedback_rounds) {
@@ -12611,8 +12187,9 @@ export class SqliteTaskRepository implements TaskRepository {
                  SET feedback_rounds_reserved = feedback_rounds_reserved + ?,
                      workflow_turns_reserved = workflow_turns_reserved + ?,
                      updated_at = ?
-               WHERE workspace_id = ? AND run_id = ? AND status = 'running'
-                 AND feedback_rounds_reserved + ? <= max_feedback_rounds
+                WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                  AND origin = 'top_level' AND parent_run_id IS NULL
+                  AND feedback_rounds_reserved + ? <= max_feedback_rounds
                  AND workflow_turns_reserved + ? <= max_workflow_turns`,
         params: [
           feedbackRounds,
@@ -12632,8 +12209,13 @@ export class SqliteTaskRepository implements TaskRepository {
     taskId: string,
   ): Promise<{ runId: string; nodeId: string } | undefined> {
     const row = await this.db.get<{ run_id: string; node_id: string }>(
-      `SELECT run_id, node_id FROM workflow_nodes
-        WHERE workspace_id = ? AND task_id = ?`,
+      `SELECT node.run_id, node.node_id
+         FROM workflow_nodes node
+         JOIN workflow_runs run
+           ON run.workspace_id = node.workspace_id
+          AND run.run_id = node.run_id
+        WHERE node.workspace_id = ? AND node.task_id = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, taskId],
     );
     if (!row || typeof row.run_id !== 'string' || typeof row.node_id !== 'string') {
@@ -12648,6 +12230,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const expired = await this.db.all<{ run_id: string }>(
       `SELECT run_id FROM workflow_runs
         WHERE workspace_id = ? AND status = 'running'
+          AND origin = 'top_level' AND parent_run_id IS NULL
           AND deadline_at IS NOT NULL AND deadline_at <= ?
         ORDER BY deadline_at, run_id`,
       [this.workspaceId, command.now],
@@ -12707,46 +12290,20 @@ export class SqliteTaskRepository implements TaskRepository {
           AND continuation.kind = 'start_wait'
           AND continuation.status = 'pending'
           AND run.status IN ('succeeded', 'failed', 'cancelled')
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL
         ORDER BY continuation.created_at, continuation.continuation_id
         LIMIT 1`,
       [this.workspaceId],
     );
     if (!row) return { ok: true, changed: false };
 
-    if (
-      !row.caller_task_id ||
-      !row.caller_turn_id ||
-      row.caller_lifecycle !== 'open'
-    ) {
-      const results = await this.writeIfFirstChanged(
-        {
-          sql: `UPDATE workflow_continuations
-                   SET status = 'cancelled', outcome = 'cancelled',
-                       reason_code = 'caller_unavailable', resolved_at = ?, updated_at = ?
-                 WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
-                   AND kind = 'start_wait' AND status = 'pending'`,
-          params: [
-            command.now,
-            command.now,
-            this.workspaceId,
-            row.run_id,
-            row.continuation_id,
-          ],
-        },
-        [],
-        {
-          kind: 'task',
-          id: row.caller_task_id ?? row.run_id,
-          ...(row.caller_task_id ? { taskId: row.caller_task_id } : {}),
-          change: 'effect',
-        },
-        command.now,
-      );
-      return { ok: true, changed: (results[0]?.changes ?? 0) > 0 };
-    }
-
-    const resumeTurnId = deriveWorkflowStartResumeTurnId(row.run_id, row.caller_turn_id);
-    const resumeMessageId = deriveWorkflowStartResumeMessageId(row.run_id, row.caller_turn_id);
+    const hasCaller = row.caller_task_id !== null && row.caller_turn_id !== null;
+    const resumeTurnId = hasCaller
+      ? deriveWorkflowStartResumeTurnId(row.run_id, row.caller_turn_id!)
+      : '';
+    const resumeMessageId = hasCaller
+      ? deriveWorkflowStartResumeMessageId(row.run_id, row.caller_turn_id!)
+      : '';
     const completion: Record<string, unknown> = {
       runRef: row.run_id,
       status: row.run_status,
@@ -12769,38 +12326,115 @@ export class SqliteTaskRepository implements TaskRepository {
       'The workflow started in the prior turn is now terminal. Continue the caller task from this result:',
       JSON.stringify(completion),
     ].join('\n');
-    const sequence = (await this.getMaxTurnSequence(row.caller_task_id)) + 1;
-    const turn: TaskTurn = {
-      id: resumeTurnId,
-      taskId: row.caller_task_id,
-      sequence,
-      trigger: 'engine',
-      status: 'queued',
-      workflowResume: {
-        kind: 'start_workflow',
-        runId: row.run_id,
-        continuationId: row.continuation_id,
-      },
-      inputs: [{ kind: 'message', messageId: resumeMessageId }],
-      createdAt: command.now,
-    };
-    const message: TaskMessage = {
-      id: resumeMessageId,
-      taskId: row.caller_task_id,
-      role: 'system',
-      content,
-      state: 'assigned',
-      turnId: resumeTurnId,
-      createdAt: command.now,
-    };
+    const turn = hasCaller
+      ? {
+          id: resumeTurnId,
+          taskId: row.caller_task_id!,
+          sequence: (await this.getMaxTurnSequence(row.caller_task_id!)) + 1,
+          trigger: 'engine' as const,
+          status: 'queued' as const,
+          workflowResume: {
+            kind: 'start_workflow' as const,
+            runId: row.run_id,
+            continuationId: row.continuation_id,
+          },
+          inputs: [{ kind: 'message' as const, messageId: resumeMessageId }],
+          createdAt: command.now,
+        } satisfies TaskTurn
+      : undefined;
+    const message = hasCaller
+      ? {
+          id: resumeMessageId,
+          taskId: row.caller_task_id!,
+          role: 'system' as const,
+          content,
+          state: 'assigned' as const,
+          turnId: resumeTurnId,
+          createdAt: command.now,
+        } satisfies TaskMessage
+      : undefined;
     const terminalResultValid =
       row.terminal_result_run_id !== null &&
       row.terminal_result_artifact_id !== null &&
       Number.isInteger(row.terminal_result_artifact_revision) &&
       Number(row.terminal_result_artifact_revision) > 0;
-    const results = await this.writeIfFirstChanged(
+    const callerAvailableSql = `continuation.caller_task_id IS NOT NULL
+      AND continuation.caller_turn_id IS NOT NULL
+      AND EXISTS (
+        SELECT 1 FROM tasks caller_at_write
+         WHERE caller_at_write.workspace_id = continuation.workspace_id
+           AND caller_at_write.id = continuation.caller_task_id
+           AND caller_at_write.lifecycle = 'open'
+      )`;
+    const terminalRunSql = `EXISTS (
+      SELECT 1 FROM workflow_runs terminal_run
+       WHERE terminal_run.workspace_id = continuation.workspace_id
+         AND terminal_run.run_id = continuation.run_id
+         AND terminal_run.status = ?
+         AND terminal_run.origin = 'top_level'
+         AND terminal_run.parent_run_id IS NULL
+    )`;
+    const cancellationChange: ChangeRecord = {
+      kind: 'task',
+      id: row.caller_task_id ?? row.run_id,
+      ...(row.caller_task_id ? { taskId: row.caller_task_id } : {}),
+      change: 'effect',
+    };
+    const resolutionChanges: ChangeRecord[] = turn && message
+      ? [
+          { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
+          { kind: 'message', id: message.id, taskId: message.taskId, change: 'complete' },
+          { kind: 'task', id: message.taskId, taskId: message.taskId, change: 'effect' },
+        ]
+      : [];
+    const resolutionMarker = 'muster_start_continuation_resolution';
+    const statements: SqlStatement[] = [
+      { sql: `DROP TABLE IF EXISTS temp.${resolutionMarker}`, params: [] },
       {
-        sql: `UPDATE workflow_continuations
+        sql: `CREATE TEMP TABLE ${resolutionMarker} (
+                branch TEXT PRIMARY KEY CHECK (branch IN ('cancelled', 'resolved'))
+              )`,
+        params: [],
+      },
+    ];
+    const cancellationIndex = statements.length;
+    statements.push(
+      {
+        sql: `UPDATE workflow_continuations AS continuation
+                 SET status = 'cancelled', outcome = 'cancelled',
+                     reason_code = 'caller_unavailable', resolved_at = ?, updated_at = ?
+               WHERE continuation.workspace_id = ?
+                 AND continuation.run_id = ?
+                 AND continuation.continuation_id = ?
+                 AND continuation.kind = 'start_wait'
+                 AND continuation.status = 'pending'
+                 AND ${terminalRunSql}
+                 AND NOT (${callerAvailableSql})`,
+        params: [
+          command.now,
+          command.now,
+          this.workspaceId,
+          row.run_id,
+          row.continuation_id,
+          row.run_status,
+        ],
+      },
+      {
+        sql: `INSERT INTO ${resolutionMarker} (branch)
+              SELECT 'cancelled' WHERE changes() > 0`,
+        params: [],
+      },
+      ...conditionalRevisionStatements(
+        this.workspaceId,
+        cancellationChange,
+        command.now,
+        this.changeFeedRetainRevisions,
+      ),
+    );
+    const resolutionIndex = statements.length;
+    statements.push(
+      {
+        sql: `UPDATE workflow_continuations AS continuation
                  SET status = 'resolved', outcome = ?, reason_code = ?,
                      result_artifact_run_id = ?, result_artifact_id = ?,
                      result_artifact_revision = ?, producing_turn_id = ?,
@@ -12809,14 +12443,13 @@ export class SqliteTaskRepository implements TaskRepository {
                        COALESCE(payload_json, '{}'),
                        '$.completion', json(?), '$.resumeTurnId', ?, '$.resumeMessageId', ?
                      )
-               WHERE workspace_id = ? AND run_id = ? AND continuation_id = ?
-                 AND kind = 'start_wait' AND status = 'pending'
-                 AND EXISTS (
-                   SELECT 1 FROM workflow_runs run
-                    WHERE run.workspace_id = workflow_continuations.workspace_id
-                      AND run.run_id = workflow_continuations.run_id
-                      AND run.status = ?
-                 )`,
+               WHERE continuation.workspace_id = ?
+                 AND continuation.run_id = ?
+                 AND continuation.continuation_id = ?
+                 AND continuation.kind = 'start_wait'
+                 AND continuation.status = 'pending'
+                 AND ${terminalRunSql}
+                 AND ${callerAvailableSql}`,
         params: [
           row.run_status,
           row.terminal_reason_code,
@@ -12835,23 +12468,93 @@ export class SqliteTaskRepository implements TaskRepository {
           row.run_status,
         ],
       },
-      [
-        turnStatement(this.workspaceId, turn, false),
-        messageStatement(this.workspaceId, message, false),
-        turnInputStatement(this.workspaceId, turn.id, 0, turn.inputs[0]!),
-      ],
-      [
-        { kind: 'turn', id: turn.id, taskId: turn.taskId, change: 'insert' },
-        { kind: 'message', id: message.id, taskId: message.taskId, change: 'complete' },
-        { kind: 'task', id: row.caller_task_id, change: 'effect' },
-      ],
-      command.now,
+      {
+        sql: `INSERT INTO ${resolutionMarker} (branch)
+              SELECT 'resolved' WHERE changes() > 0`,
+        params: [],
+      },
+      ...conditionalRevisionStatements(
+        this.workspaceId,
+        resolutionChanges,
+        command.now,
+        this.changeFeedRetainRevisions,
+      ),
     );
-    const changed = (results[0]?.changes ?? 0) > 0;
+    if (turn && message) {
+      statements.push(
+        {
+          sql: `INSERT INTO turns
+                (id, workspace_id, task_id, sequence, status, trigger, created_at, started_at, settled_at, payload_json)
+                SELECT ?,?,?,?,?,?,?,?,?,?
+                 WHERE EXISTS (
+                   SELECT 1 FROM ${resolutionMarker} marker WHERE marker.branch = 'resolved'
+                 )`,
+          params: turnStatement(this.workspaceId, turn, false).params,
+        },
+        {
+          sql: `INSERT INTO messages
+                (id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json)
+                SELECT ?,?,?,?,?,?,?,?,?,?,?
+                 WHERE EXISTS (
+                   SELECT 1 FROM ${resolutionMarker} marker WHERE marker.branch = 'resolved'
+                 )
+                   AND EXISTS (
+                   SELECT 1 FROM turns message_turn
+                    WHERE message_turn.workspace_id = ?
+                      AND message_turn.id = ?
+                      AND message_turn.task_id = ?
+                      AND ${turnIsVisibleInActiveSurfacesSql('message_turn')}
+                 )`,
+          params: [
+            message.id,
+            this.workspaceId,
+            message.taskId,
+            message.turnId ?? null,
+            message.role,
+            message.state,
+            null,
+            message.content,
+            message.createdAt,
+            null,
+            messagePayload(message),
+            this.workspaceId,
+            message.turnId!,
+            message.taskId,
+          ],
+        },
+        {
+          sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
+                SELECT ?,?,?,?,?
+                 WHERE EXISTS (
+                   SELECT 1 FROM ${resolutionMarker} marker WHERE marker.branch = 'resolved'
+                 )
+                   AND EXISTS (
+                   SELECT 1 FROM turns input_turn
+                    WHERE input_turn.workspace_id = ?
+                      AND input_turn.id = ?
+                      AND ${turnIsVisibleInActiveSurfacesSql('input_turn')}
+                 )`,
+          params: [
+            this.workspaceId,
+            turn.id,
+            0,
+            turn.inputs[0]!.kind,
+            encodePayload(turn.inputs[0]!),
+            this.workspaceId,
+            turn.id,
+          ],
+        },
+      );
+    }
+    statements.push({ sql: `DROP TABLE IF EXISTS temp.${resolutionMarker}`, params: [] });
+    const results = await this.db.transaction(statements);
+    const cancellationChanged = (results[cancellationIndex]?.changes ?? 0) > 0;
+    const resolutionChanged = (results[resolutionIndex]?.changes ?? 0) > 0;
+    const changed = cancellationChanged || resolutionChanged;
     return {
       ok: true,
       changed,
-      ...(changed ? { turnId: resumeTurnId, messageId: resumeMessageId } : {}),
+      ...(resolutionChanged ? { turnId: resumeTurnId, messageId: resumeMessageId } : {}),
     };
   }
 
@@ -12902,8 +12605,10 @@ export class SqliteTaskRepository implements TaskRepository {
          JOIN workflow_runs run
            ON run.workspace_id = activation.workspace_id
           AND run.run_id = activation.run_id
-        WHERE activation.workspace_id = ? AND activation.run_id = ?
-          AND activation.activation_id = ? AND activation.execution_turn_id = ?`,
+         WHERE activation.workspace_id = ? AND activation.run_id = ?
+            AND activation.activation_id = ? AND activation.execution_turn_id = ?
+            AND ${activeWorkflowActivationKindSql('activation')}
+            AND run.origin = 'top_level' AND run.parent_run_id IS NULL`,
       [this.workspaceId, command.runId, command.activationId, command.failedTurnId],
     );
     if (!recoveryContext) {
@@ -12952,20 +12657,25 @@ export class SqliteTaskRepository implements TaskRepository {
                 ON source_turn.workspace_id = activation.workspace_id
                AND source_turn.id = activation.execution_turn_id
                AND source_turn.task_id = node.task_id
-             WHERE activation.workspace_id = ? AND activation.run_id = ?
-               AND activation.activation_id = ? AND activation.execution_turn_id = ?
-               AND activation.status = ? AND source_turn.status = ?
-               AND run.status = 'running'
-               AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+              WHERE activation.workspace_id = ? AND activation.run_id = ?
+                AND activation.activation_id = ? AND activation.execution_turn_id = ?
+                 AND activation.status = ? AND source_turn.status = ?
+                 AND ${activeWorkflowActivationKindSql('activation')}
+                 AND run.status = 'running'
+                AND run.origin = 'top_level'
+                AND run.parent_run_id IS NULL
+                AND (run.deadline_at IS NULL OR run.deadline_at > ?)
                 AND (SELECT COUNT(*) FROM turns task_turn
                        WHERE task_turn.workspace_id = source_turn.workspace_id
-                         AND task_turn.task_id = source_turn.task_id) < run.max_turns_per_task
+                         AND task_turn.task_id = source_turn.task_id
+                         AND ${turnIsVisibleInActiveSurfacesSql('task_turn')}) < run.max_turns_per_task
                 AND run.workflow_turns_reserved < run.max_workflow_turns
                 AND NOT EXISTS (
                   SELECT 1 FROM turns competing
                    WHERE competing.workspace_id = source_turn.workspace_id
                      AND competing.task_id = source_turn.task_id
                      AND competing.status IN ('queued', 'running', 'waiting_user')
+                     AND ${turnIsVisibleInActiveSurfacesSql('competing')}
                 )
                 AND NOT EXISTS (
                   SELECT 1 FROM workflow_decision_repairs repair
@@ -13009,6 +12719,7 @@ export class SqliteTaskRepository implements TaskRepository {
                      SET workflow_turns_reserved = workflow_turns_reserved + 1,
                          updated_at = ?
                    WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                     AND origin = 'top_level' AND parent_run_id IS NULL
                      AND workflow_turns_reserved < max_workflow_turns`,
             params: [command.createdAt, this.workspaceId, command.runId],
           },
@@ -13027,7 +12738,8 @@ export class SqliteTaskRepository implements TaskRepository {
             sql: `UPDATE workflow_activations
                      SET status = 'queued', execution_turn_id = ?, updated_at = ?
                    WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
-                     AND execution_turn_id = ? AND status = ?`,
+                      AND execution_turn_id = ? AND status = ?
+                      AND ${activeWorkflowActivationKindSql('workflow_activations')}`,
             params: [
               turn.id,
               command.createdAt,
@@ -13115,8 +12827,16 @@ export class SqliteTaskRepository implements TaskRepository {
          FROM workflow_nodes node
          JOIN workflow_runs run
            ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
-        WHERE node.workspace_id = ? AND node.task_id IN (${taskPlaceholders})
-          AND run.status = 'running'`,
+          WHERE node.workspace_id = ? AND node.task_id IN (${taskPlaceholders})
+            AND run.status = 'running'
+            AND run.origin = 'top_level'
+            AND run.parent_run_id IS NULL
+            AND EXISTS (
+              SELECT 1 FROM workflow_activations active_activation
+               WHERE active_activation.workspace_id = run.workspace_id
+                 AND active_activation.run_id = run.run_id
+                 AND ${activeWorkflowActivationKindSql('active_activation')}
+            )`,
       [this.workspaceId, ...input.taskIds],
     );
     return this.planWorkflowRecursiveClosure({
@@ -13201,10 +12921,7 @@ export class SqliteTaskRepository implements TaskRepository {
     };
   }
 
-  /**
-   * M018 §20.11: one transaction plan closes the complete caller/child run component,
-   * its waits and activations, and every continuation boundary exactly once.
-   */
+  /** Closes the exact run and its owned workflow state exactly once. */
   private async planWorkflowFailClosure(input: {
     runId: string;
     reasonCode: WorkflowFailReasonCode;
@@ -13237,46 +12954,21 @@ export class SqliteTaskRepository implements TaskRepository {
     const seedPlaceholders = seedRunIds.map(() => '?').join(',');
     const runs = await this.db.all<{
       run_id: string;
-      parent_run_id: string | null;
       owner_root_task_id: string | null;
       caller_task_id: string | null;
     }>(
-      `WITH RECURSIVE
-         ancestors(run_id) AS (
-           SELECT run_id
-             FROM workflow_runs
-            WHERE workspace_id = ? AND run_id IN (${seedPlaceholders}) AND status = 'running'
-           UNION
-           SELECT parent.run_id
-             FROM ancestors current
-             JOIN workflow_runs child
-               ON child.workspace_id = ? AND child.run_id = current.run_id
-             JOIN workflow_runs parent
-               ON parent.workspace_id = child.workspace_id AND parent.run_id = child.parent_run_id
-            WHERE parent.status = 'running'
-         ),
-         related(run_id) AS (
-           SELECT run_id FROM ancestors
-           UNION
-           SELECT child.run_id
-             FROM related current
-             JOIN workflow_runs child
-               ON child.workspace_id = ? AND child.parent_run_id = current.run_id
-            WHERE child.status = 'running'
-         )
-       SELECT run.run_id, run.parent_run_id, run.owner_root_task_id, run.caller_task_id
-         FROM workflow_runs run
-         JOIN related ON related.run_id = run.run_id
-        WHERE run.workspace_id = ? AND run.status = 'running'
-        ORDER BY run.created_at, run.run_id`,
-      [this.workspaceId, ...seedRunIds, this.workspaceId, this.workspaceId, this.workspaceId],
+      `SELECT run_id, owner_root_task_id, caller_task_id
+         FROM workflow_runs
+         WHERE workspace_id = ? AND run_id IN (${seedPlaceholders}) AND status = 'running'
+           AND origin = 'top_level' AND parent_run_id IS NULL
+        ORDER BY created_at, run_id`,
+      [this.workspaceId, ...seedRunIds],
     );
     if (runs.length === 0) return empty;
 
     const terminalStatus = workflowRunTerminalStatusForReason(input.reasonCode);
     const attentionCode = workflowRunAttentionCode(terminalStatus);
     const runIds = runs.map((run) => run.run_id);
-    const runIdSet = new Set(runIds);
     const runPlaceholders = runIds.map(() => '?').join(',');
     const statements: SqlStatement[] = [];
     const changes: ChangeRecord[] = [];
@@ -13323,6 +13015,7 @@ export class SqliteTaskRepository implements TaskRepository {
       {
         sql: `UPDATE workflow_activations SET status = ?, updated_at = ?
                WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
+                 AND ${activeWorkflowActivationKindSql('workflow_activations')}
                  AND status IN ('queued', 'running', 'failed', 'interrupted')`,
         params: [terminalStatus, input.at, this.workspaceId, ...runIds],
       },
@@ -13336,42 +13029,15 @@ export class SqliteTaskRepository implements TaskRepository {
         sql: `UPDATE workflow_decision_repairs
                  SET next_repair_turn_id = NULL, updated_at = ?
                WHERE workspace_id = ? AND run_id IN (${runPlaceholders})
-                 AND status = 'open'`,
+                  AND status = 'open'
+                  AND EXISTS (
+                    SELECT 1 FROM workflow_activations active_activation
+                     WHERE active_activation.workspace_id = workflow_decision_repairs.workspace_id
+                       AND active_activation.run_id = workflow_decision_repairs.run_id
+                       AND active_activation.activation_id = workflow_decision_repairs.activation_id
+                       AND ${activeWorkflowActivationKindSql('active_activation')}
+                  )`,
         params: [input.at, this.workspaceId, ...runIds],
-      },
-      {
-        sql: `UPDATE workflow_continuations
-                 SET status = ?, outcome = ?, reason_code = ?,
-                     result_artifact_run_id = NULL, result_artifact_id = NULL,
-                     result_artifact_revision = NULL, producing_turn_id = NULL,
-                     resolved_at = ?, updated_at = ?,
-                     payload_json = json_set(
-                       COALESCE(payload_json, '{}'),
-                       '$.failedAt', ?, '$.reasonCode', ?, '$.terminalStatus', ?
-                     )
-               WHERE workspace_id = ? AND status IN ('pending', 'resolved')
-                 AND (child_run_id IN (${runPlaceholders}) OR caller_run_id IN (${runPlaceholders}))`,
-        params: [
-          terminalStatus,
-          terminalStatus,
-          input.reasonCode,
-          input.at,
-          input.at,
-          input.at,
-          input.reasonCode,
-          terminalStatus,
-          this.workspaceId,
-          ...runIds,
-          ...runIds,
-        ],
-      },
-      {
-        sql: `UPDATE workflow_return_gates
-                 SET status = ?, result_run_id = NULL, result_artifact_id = NULL,
-                     result_artifact_revision = NULL, updated_at = ?
-               WHERE workspace_id = ? AND status IN ('open', 'satisfied')
-                 AND (child_run_id IN (${runPlaceholders}) OR caller_run_id IN (${runPlaceholders}))`,
-        params: [terminalStatus, input.at, this.workspaceId, ...runIds, ...runIds],
       },
     );
 
@@ -13379,7 +13045,8 @@ export class SqliteTaskRepository implements TaskRepository {
       statements.push({
         sql: `UPDATE workflow_runs
                 SET status = ?, terminal_reason_code = ?, closure_id = ?, updated_at = ?
-              WHERE workspace_id = ? AND run_id = ? AND status = 'running'`,
+              WHERE workspace_id = ? AND run_id = ? AND status = 'running'
+                AND origin = 'top_level' AND parent_run_id IS NULL`,
         params: [
           terminalStatus,
           input.reasonCode,
@@ -13405,8 +13072,9 @@ export class SqliteTaskRepository implements TaskRepository {
          FROM turns turn
          JOIN workflow_nodes node
            ON node.workspace_id = turn.workspace_id AND node.task_id = turn.task_id
-        WHERE turn.workspace_id = ? AND node.run_id IN (${runPlaceholders})
-          AND turn.status IN ('queued', 'running', 'waiting_user')`,
+         WHERE turn.workspace_id = ? AND node.run_id IN (${runPlaceholders})
+           AND turn.status IN ('queued', 'running', 'waiting_user')
+           AND ${turnIsVisibleInActiveSurfacesSql('turn')}`,
       [this.workspaceId, ...runIds],
     );
     const closureOpId = deriveRunClosureFenceId(runIds[0]!, terminalStatus);
@@ -13415,7 +13083,8 @@ export class SqliteTaskRepository implements TaskRepository {
       if (turn.status === 'queued') {
         statements.push({
           sql: `UPDATE turns SET status = 'cancelled', settled_at = ?
-                 WHERE workspace_id = ? AND id = ? AND status = 'queued'`,
+                 WHERE workspace_id = ? AND id = ? AND status = 'queued'
+                   AND ${turnIsVisibleInActiveSurfacesSql()}`,
           params: [input.at, this.workspaceId, turn.id],
         });
         changes.push({ kind: 'turn', id: turn.id, taskId: turn.task_id, change: 'effect' });
@@ -13436,14 +13105,14 @@ export class SqliteTaskRepository implements TaskRepository {
       }
     }
 
-    const outerRun = runs.find((run) => !run.parent_run_id || !runIdSet.has(run.parent_run_id)) ?? runs[0]!;
-    let attentionTaskId = outerRun.owner_root_task_id ?? outerRun.caller_task_id ?? undefined;
+    const run = runs[0]!;
+    let attentionTaskId = run.owner_root_task_id ?? run.caller_task_id ?? undefined;
     if (!attentionTaskId) {
       const node = await this.db.get<{ task_id: string }>(
         `SELECT task_id FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? AND task_id IS NOT NULL
           ORDER BY node_id LIMIT 1`,
-        [this.workspaceId, outerRun.run_id],
+        [this.workspaceId, run.run_id],
       );
       attentionTaskId = node?.task_id ?? input.sourceTaskId;
     }
@@ -13504,29 +13173,76 @@ export class SqliteTaskRepository implements TaskRepository {
 
 
   private async reclaimTerminalWorkflowMetadata(): Promise<RepositoryCommandResult> {
-    // Keep workflow_runs and their claims durable. Deleting a run cascades its
-    // start claim while the operation ledger remains, breaking idempotent replay
-    // (or leaving a replay result that points at a missing run). Routed message
-    // bodies are terminal transport payload only; no production reader consumes
-    // them after routing, so they are the safe reclaimable portion.
-    const result = await this.db.run(
-      `UPDATE workflow_routed_messages
-          SET body_json = '{"retentionStripped":true}'
-        WHERE workspace_id = ?
-          AND body_json <> '{"retentionStripped":true}'
-          AND run_id IN (
-            SELECT workflow_runs.run_id
-              FROM workflow_runs
-             WHERE workflow_runs.workspace_id = ?
-               AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
-                ${terminalWorkflowPayloadReclamationSafetyPredicate('workflow_runs')}
-          )`,
-      [this.workspaceId, this.workspaceId],
-    );
-    const strippedWorkflowMessageBodies = result.changes ?? 0;
+    // Routed bodies are terminal transport payload only, while the narrow
+    // child-return purge removes obsolete schema-7 ownership rows in the same
+    // worker transaction. Canonical run_closure remains byte exact.
+    const purge = retiredChildReturnPurgeStatements(this.workspaceId, {
+      kind: 'terminal_reclamation',
+    });
+    const stripStatement: SqlStatement = {
+      sql: `UPDATE workflow_routed_messages
+               SET body_json = '{"retentionStripped":true}'
+             WHERE workspace_id = ?
+               AND body_json <> '{"retentionStripped":true}'
+               AND kind NOT IN ('child_return', 'run_closure')
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_continuations retained_continuation
+                  WHERE retained_continuation.workspace_id = workflow_routed_messages.workspace_id
+                    AND retained_continuation.run_id = workflow_routed_messages.run_id
+                    AND retained_continuation.continuation_id = workflow_routed_messages.continuation_id
+                    AND retained_continuation.kind <> 'start_wait'
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks retained_source_task
+                  WHERE retained_source_task.workspace_id = workflow_routed_messages.workspace_id
+                    AND retained_source_task.id = workflow_routed_messages.source_task_id
+                    AND NOT (${taskIsVisibleInActiveSurfacesSql('retained_source_task')})
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM turns retained_source_turn
+                  WHERE retained_source_turn.workspace_id = workflow_routed_messages.workspace_id
+                    AND retained_source_turn.id = workflow_routed_messages.source_turn_id
+                    AND NOT (${turnIsVisibleInActiveSurfacesSql('retained_source_turn')})
+               )
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM workflow_activations retained_activation
+                   JOIN workflow_runs retained_run
+                     ON retained_run.workspace_id = retained_activation.workspace_id
+                    AND retained_run.run_id = retained_activation.run_id
+                  WHERE retained_activation.workspace_id = workflow_routed_messages.workspace_id
+                    AND retained_activation.run_id = workflow_routed_messages.run_id
+                    AND retained_activation.message_id = workflow_routed_messages.message_id
+                    AND ${retiredWorkflowActivationSql('retained_activation', 'retained_run')}
+               )
+               AND run_id IN (
+                 SELECT workflow_runs.run_id
+                   FROM workflow_runs
+                  WHERE workflow_runs.workspace_id = ?
+                    AND workflow_runs.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+                    AND workflow_runs.origin = 'top_level'
+                    AND workflow_runs.parent_run_id IS NULL
+                    ${terminalWorkflowPayloadReclamationSafetyPredicate('workflow_runs')}
+               )`,
+      params: [this.workspaceId, this.workspaceId],
+    };
+    const stripIndex = purge.setup.length;
+    const results = await this.db.transaction([
+      ...purge.setup,
+      stripStatement,
+      ...purge.cleanup,
+    ]);
+    const strippedWorkflowMessageBodies = results[stripIndex]?.changes ?? 0;
+    const transientGuardResultIndexes = new Set(purge.transientGuardResultIndexes);
+    const purgeChanged = results
+      .slice(purge.mutationStartIndex, stripIndex)
+      .some((entry, offset) => (
+        !transientGuardResultIndexes.has(purge.mutationStartIndex + offset)
+        && (entry.changes ?? 0) > 0
+      ));
     return {
       ok: true,
-      changed: strippedWorkflowMessageBodies > 0,
+      changed: strippedWorkflowMessageBodies > 0 || purgeChanged,
       strippedWorkflowMessageBodies,
     };
   }
@@ -13991,6 +13707,1806 @@ function taskSelect(where: string): string {
             FROM tasks t ${where}`;
 }
 
+const ACTIVE_WORKFLOW_ACTIVATION_KINDS = [
+  'entry_start',
+  'dependency_gate',
+  'feedback_request',
+  'feedback_resume',
+] as const;
+
+const ACTIVE_WORKFLOW_ACTIVATION_KINDS_SQL = ACTIVE_WORKFLOW_ACTIVATION_KINDS
+  .map((kind) => `'${kind}'`)
+  .join(', ');
+
+function isActiveWorkflowActivationKind(
+  value: unknown,
+): value is NonNullable<TaskTurn['workflowActivation']>['kind'] {
+  return typeof value === 'string'
+    && (ACTIVE_WORKFLOW_ACTIVATION_KINDS as readonly string[]).includes(value);
+}
+
+function activeWorkflowActivationKindSql(alias = 'activation'): string {
+  return `${alias}.kind IN (${ACTIVE_WORKFLOW_ACTIVATION_KINDS_SQL})`;
+}
+
+function retiredWorkflowActivationSql(activationAlias: string, runAlias: string): string {
+  return `(${runAlias}.origin <> 'top_level'
+    OR ${runAlias}.parent_run_id IS NOT NULL
+    OR NOT (${activeWorkflowActivationKindSql(activationAlias)}))`;
+}
+
+const RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH = 64;
+
+type RetiredChildReturnPurgeScope =
+  | { kind: 'terminal_reclamation' }
+  | { kind: 'turns'; turnIds: readonly string[] }
+  | { kind: 'tasks'; taskIds: readonly string[] }
+  | { kind: 'targets'; turnIds: readonly string[]; taskIds: readonly string[] };
+
+interface RetiredChildReturnPurgeStatements {
+  setup: SqlStatement[];
+  cleanup: SqlStatement[];
+  mutationStartIndex: number;
+  transientGuardResultIndexes: readonly number[];
+}
+
+type RetiredChildReturnPurgePlacement = 'before_guard' | 'after_guard';
+
+/**
+ * Builds the bounded cleanup relation used to retire pre-cutover child-return
+ * state.  The relation is deliberately temporary and transaction-local: no
+ * legacy row is read by an execution/recovery path, and a failed validation or
+ * delete rolls the complete relation and its mutations back with the caller's
+ * transaction.
+ */
+function retiredChildReturnPurgeStatements(
+  workspaceId: string,
+  scope: RetiredChildReturnPurgeScope,
+): RetiredChildReturnPurgeStatements {
+  const setup: SqlStatement[] = [
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_messages', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_turns', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_runs', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_activations', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_validation', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_terminal_run_guards', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_target_turns', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_target_tasks', params: [] },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_legacy_validation (
+              valid INTEGER NOT NULL CHECK (valid = 1)
+            )`,
+      params: [],
+    },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_legacy_activations (
+               workspace_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               activation_id TEXT NOT NULL,
+               node_id TEXT NOT NULL,
+               primary_turn_id TEXT NOT NULL,
+               execution_turn_id TEXT NOT NULL,
+               continuation_id TEXT NOT NULL,
+               return_gate_id TEXT NOT NULL,
+               message_id TEXT NOT NULL,
+              PRIMARY KEY (workspace_id, run_id, activation_id)
+            )`,
+      params: [],
+    },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_legacy_runs (
+               workspace_id TEXT NOT NULL,
+               run_id TEXT NOT NULL,
+               depth INTEGER NOT NULL CHECK (depth BETWEEN 0 AND ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}),
+               PRIMARY KEY (workspace_id, run_id)
+             )`,
+      params: [],
+    },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_legacy_turns (
+               workspace_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
+               task_id TEXT NOT NULL,
+               depth INTEGER NOT NULL CHECK (depth BETWEEN 0 AND ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}),
+               PRIMARY KEY (workspace_id, turn_id)
+             )`,
+      params: [],
+    },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_legacy_messages (
+              workspace_id TEXT NOT NULL,
+              message_id TEXT NOT NULL,
+              PRIMARY KEY (workspace_id, message_id)
+            )`,
+      params: [],
+    },
+    {
+      sql: `CREATE TEMP TABLE muster_purge_terminal_run_guards (
+              workspace_id TEXT NOT NULL,
+              run_id TEXT NOT NULL,
+              gate_id TEXT NOT NULL,
+              original_status TEXT NOT NULL,
+              PRIMARY KEY (workspace_id, run_id)
+            )`,
+      params: [],
+    },
+  ];
+
+  if (scope.kind === 'turns' || scope.kind === 'targets') {
+      setup.push(
+      {
+        sql: `CREATE TEMP TABLE muster_purge_target_turns (
+                turn_id TEXT NOT NULL PRIMARY KEY
+              )`,
+        params: [],
+      },
+      ...[...new Set(scope.turnIds)].map((turnId) => ({
+        sql: 'INSERT INTO muster_purge_target_turns (turn_id) VALUES (?)',
+        params: [turnId] as SqlValue[],
+      })),
+    );
+  }
+  if (scope.kind === 'tasks' || scope.kind === 'targets') {
+    setup.push(
+      {
+        sql: `CREATE TEMP TABLE muster_purge_target_tasks (
+                task_id TEXT NOT NULL PRIMARY KEY
+              )`,
+        params: [],
+      },
+        ...[...new Set(scope.taskIds)].map((taskId) => ({
+        sql: 'INSERT INTO muster_purge_target_tasks (task_id) VALUES (?)',
+        params: [taskId] as SqlValue[],
+      })),
+      {
+        sql: `INSERT OR IGNORE INTO muster_purge_target_tasks (task_id)
+              WITH RECURSIVE subtree(task_id) AS (
+                SELECT task_id FROM temp.muster_purge_target_tasks
+                UNION
+                SELECT child.id
+                  FROM subtree parent
+                  JOIN tasks child
+                    ON child.workspace_id = ?
+                   AND child.parent_id = parent.task_id
+              )
+              SELECT task_id FROM subtree`,
+        params: [workspaceId],
+      },
+      );
+  }
+
+  const targetTurnScope = `EXISTS (
+    WITH RECURSIVE target_lineage(turn_id, retry_of, depth, path) AS (
+      SELECT target.turn_id,
+             json_extract(target_row.payload_json, '$.retryOf'),
+             0,
+             json_array(target.turn_id)
+        FROM temp.muster_purge_target_turns target
+        JOIN turns target_row
+          ON target_row.workspace_id = activation.workspace_id
+         AND target_row.id = target.turn_id
+      UNION ALL
+      SELECT predecessor.id,
+             json_extract(predecessor.payload_json, '$.retryOf'),
+             target_lineage.depth + 1,
+             json_insert(target_lineage.path, '$[#]', predecessor.id)
+        FROM target_lineage
+        JOIN turns predecessor
+          ON predecessor.workspace_id = activation.workspace_id
+         AND predecessor.id = target_lineage.retry_of
+       WHERE target_lineage.retry_of IS NOT NULL
+         AND target_lineage.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+         AND NOT EXISTS (
+           SELECT 1 FROM json_each(target_lineage.path) seen
+            WHERE seen.value = predecessor.id
+         )
+    )
+    SELECT 1 FROM target_lineage
+     WHERE target_lineage.turn_id = activation.primary_turn_id
+        OR target_lineage.turn_id = activation.execution_turn_id
+  )`;
+  const targetTaskScope = `EXISTS (
+    SELECT 1
+      FROM turns activation_turn
+     WHERE activation_turn.workspace_id = activation.workspace_id
+       AND activation_turn.id IN (activation.primary_turn_id, activation.execution_turn_id)
+       AND activation_turn.task_id IN (SELECT task_id FROM temp.muster_purge_target_tasks)
+  )`;
+  const activationScope = scope.kind === 'terminal_reclamation'
+    ? `AND run_row.status IN ('succeeded', 'failed', 'cancelled', 'skipped')`
+    : scope.kind === 'turns'
+    ? `AND run_row.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+       AND ${targetTurnScope}`
+    : scope.kind === 'tasks'
+    ? `AND run_row.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+       AND ${targetTaskScope}`
+    : `AND run_row.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+       AND (${targetTurnScope} OR ${targetTaskScope})`;
+
+  const activationScopeParams: SqlValue[] = [];
+  setup.push({
+    // Do not apply the terminal payload predicate until the retired relation is
+    // removed: its child-run/continuation/return-gate guards intentionally see
+    // the very legacy rows this transaction is retiring. The predicate remains
+    // authoritative on the post-purge reclamation statement and on the pinned
+    // turn-delete trigger.
+      sql: `INSERT INTO muster_purge_legacy_activations (
+            workspace_id, run_id, activation_id, node_id, primary_turn_id, execution_turn_id,
+            continuation_id, return_gate_id, message_id
+          )
+          SELECT activation.workspace_id, activation.run_id, activation.activation_id,
+                 activation.node_id,
+                 activation.primary_turn_id, activation.execution_turn_id,
+                 activation.continuation_id, activation.return_gate_id, activation.message_id
+            FROM workflow_activations activation
+            JOIN workflow_runs run_row
+              ON run_row.workspace_id = activation.workspace_id
+             AND run_row.run_id = activation.run_id
+           WHERE activation.workspace_id = ?
+             AND activation.kind = 'child_return'
+             ${activationScope}`,
+    params: [workspaceId, ...activationScopeParams],
+  });
+
+  setup.push(
+    {
+      sql: `WITH RECURSIVE reachable(workspace_id, run_id, depth, path) AS (
+              SELECT retired_activation.workspace_id,
+                     retired_activation.run_id,
+                     0,
+                     json_array(retired_activation.run_id)
+                FROM temp.muster_purge_legacy_activations retired_activation
+                JOIN workflow_runs retired_run
+                  ON retired_run.workspace_id = retired_activation.workspace_id
+                 AND retired_run.run_id = retired_activation.run_id
+               WHERE retired_run.origin = 'child'
+                 AND retired_run.parent_run_id IS NOT NULL
+              UNION
+              SELECT continuation.workspace_id,
+                     continuation.child_run_id,
+                     0,
+                     json_array(continuation.child_run_id)
+                FROM workflow_continuations continuation
+                JOIN temp.muster_purge_legacy_activations retired_activation
+                  ON retired_activation.workspace_id = continuation.workspace_id
+                 AND retired_activation.run_id = continuation.run_id
+                 AND retired_activation.continuation_id = continuation.continuation_id
+               WHERE continuation.child_run_id IS NOT NULL
+              UNION
+              SELECT return_gate.workspace_id,
+                     return_gate.child_run_id,
+                     0,
+                     json_array(return_gate.child_run_id)
+                FROM workflow_return_gates return_gate
+                JOIN temp.muster_purge_legacy_activations retired_activation
+                  ON retired_activation.workspace_id = return_gate.workspace_id
+                 AND retired_activation.return_gate_id = return_gate.return_gate_id
+               WHERE return_gate.child_run_id IS NOT NULL
+              UNION ALL
+              SELECT continuation.workspace_id,
+                     continuation.child_run_id,
+                     reachable.depth + 1,
+                     json_insert(reachable.path, '$[#]', continuation.child_run_id)
+                FROM reachable
+                JOIN workflow_continuations continuation
+                  ON continuation.workspace_id = reachable.workspace_id
+                 AND continuation.run_id = reachable.run_id
+               WHERE continuation.child_run_id IS NOT NULL
+                 AND reachable.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(reachable.path) seen
+                    WHERE seen.value = continuation.child_run_id
+                 )
+              UNION ALL
+              SELECT return_gate.workspace_id,
+                     return_gate.child_run_id,
+                     reachable.depth + 1,
+                     json_insert(reachable.path, '$[#]', return_gate.child_run_id)
+                FROM reachable
+                JOIN workflow_return_gates return_gate
+                  ON return_gate.workspace_id = reachable.workspace_id
+                 AND return_gate.continuation_run_id = reachable.run_id
+               WHERE return_gate.child_run_id IS NOT NULL
+                 AND reachable.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(reachable.path) seen
+                    WHERE seen.value = return_gate.child_run_id
+                 )
+            )
+             INSERT OR IGNORE INTO muster_purge_legacy_runs (workspace_id, run_id, depth)
+             SELECT run_row.workspace_id, run_row.run_id, MIN(reachable.depth)
+               FROM reachable
+               JOIN workflow_runs run_row
+                ON run_row.workspace_id = reachable.workspace_id
+               AND run_row.run_id = reachable.run_id
+              WHERE run_row.origin = 'child'
+                AND run_row.parent_run_id IS NOT NULL
+                AND run_row.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_runs nested_run
+                  WHERE nested_run.workspace_id = run_row.workspace_id
+                    AND nested_run.parent_run_id = run_row.run_id
+                    AND NOT EXISTS (
+                      SELECT 1 FROM reachable nested_reachable
+                       WHERE nested_reachable.workspace_id = nested_run.workspace_id
+                         AND nested_reachable.run_id = nested_run.run_id
+                    )
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_continuations external_continuation
+                  WHERE external_continuation.workspace_id = run_row.workspace_id
+                    AND (external_continuation.run_id = run_row.run_id
+                      OR external_continuation.child_run_id = run_row.run_id)
+                    AND external_continuation.status IN ('pending', 'resolved')
+                    AND NOT EXISTS (
+                      SELECT 1
+                        FROM temp.muster_purge_legacy_activations retired_activation
+                       WHERE retired_activation.workspace_id = external_continuation.workspace_id
+                         AND retired_activation.run_id = external_continuation.run_id
+                         AND retired_activation.continuation_id = external_continuation.continuation_id
+                    )
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_return_gates external_gate
+                   WHERE external_gate.workspace_id = run_row.workspace_id
+                    AND (external_gate.continuation_run_id = run_row.run_id
+                      OR external_gate.child_run_id = run_row.run_id
+                      OR external_gate.result_run_id = run_row.run_id)
+                    AND external_gate.status IN ('open', 'satisfied')
+                    AND NOT EXISTS (
+                      SELECT 1
+                        FROM temp.muster_purge_legacy_activations retired_activation
+                       WHERE retired_activation.workspace_id = external_gate.workspace_id
+                         AND external_gate.return_gate_id = retired_activation.return_gate_id
+                    )
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_nodes reused_node
+                  WHERE reused_node.workspace_id = run_row.workspace_id
+                    AND reused_node.source_run_id = run_row.run_id
+                    AND reused_node.run_id <> run_row.run_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_artifact_sources external_source
+                  WHERE external_source.workspace_id = run_row.workspace_id
+                    AND (
+                      external_source.producer_run_id = run_row.run_id
+                      OR external_source.source_artifact_run_id = run_row.run_id
+                    )
+                    AND external_source.run_id <> run_row.run_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_gate_fills external_fill
+                  WHERE external_fill.workspace_id = run_row.workspace_id
+                    AND external_fill.artifact_run_id = run_row.run_id
+                    AND external_fill.run_id <> run_row.run_id
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM workflow_activations other_activation
+                  WHERE other_activation.workspace_id = run_row.workspace_id
+                    AND other_activation.run_id = run_row.run_id
+                AND NOT EXISTS (
+                      SELECT 1
+                        FROM temp.muster_purge_legacy_activations retired_activation
+                       WHERE retired_activation.workspace_id = other_activation.workspace_id
+                         AND retired_activation.run_id = other_activation.run_id
+                         AND retired_activation.activation_id = other_activation.activation_id
+                    )
+                   AND other_activation.status IN ('queued', 'running')
+               )`,
+      params: [],
+    },
+    {
+      sql: `WITH RECURSIVE seeds(workspace_id, turn_id, task_id, depth, path) AS (
+             SELECT activation.workspace_id,
+                      activation.primary_turn_id,
+                      turn_row.task_id,
+                      0,
+                      json_array(activation.primary_turn_id)
+                FROM temp.muster_purge_legacy_activations activation
+                JOIN turns turn_row
+                  ON turn_row.workspace_id = activation.workspace_id
+                 AND turn_row.id = activation.primary_turn_id
+              UNION ALL
+             SELECT activation.workspace_id,
+                      activation.execution_turn_id,
+                      turn_row.task_id,
+                      0,
+                      json_array(activation.execution_turn_id)
+                FROM temp.muster_purge_legacy_activations activation
+                JOIN turns turn_row
+                  ON turn_row.workspace_id = activation.workspace_id
+                 AND turn_row.id = activation.execution_turn_id
+            ),
+            lineage(workspace_id, turn_id, task_id, depth, path) AS (
+              SELECT workspace_id, turn_id, task_id, depth, path FROM seeds
+              UNION ALL
+              SELECT candidate.workspace_id,
+                     candidate.id,
+                      candidate.task_id,
+                      lineage.depth + 1,
+                      json_insert(lineage.path, '$[#]', candidate.id)
+                 FROM lineage
+                 JOIN turns candidate
+                   ON candidate.workspace_id = lineage.workspace_id
+                  AND json_valid(candidate.payload_json) = 1
+                  AND json_type(candidate.payload_json, '$.retryOf') = 'text'
+                  AND json_extract(candidate.payload_json, '$.retryOf') = lineage.turn_id
+               WHERE lineage.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(lineage.path) seen
+                    WHERE seen.value = candidate.id
+                 )
+            )
+             INSERT OR IGNORE INTO muster_purge_legacy_turns (workspace_id, turn_id, task_id, depth)
+             SELECT workspace_id, turn_id, task_id, MIN(depth)
+               FROM lineage
+              GROUP BY workspace_id, turn_id, task_id`,
+      params: [],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO muster_purge_legacy_messages (workspace_id, message_id)
+            SELECT message.workspace_id, message.id
+              FROM messages message
+             WHERE message.workspace_id = ?
+               AND (
+                 EXISTS (
+                   SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                    WHERE retired_turn.workspace_id = message.workspace_id
+                      AND retired_turn.turn_id = message.turn_id
+                 )
+                 OR EXISTS (
+                   SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+                    WHERE retired_activation.workspace_id = message.workspace_id
+                      AND retired_activation.message_id = message.id
+                 )
+               )`,
+      params: [workspaceId],
+    },
+  );
+
+  const hasTargetTaskScope = scope.kind === 'tasks' || scope.kind === 'targets';
+  const targetTaskMembershipSql = (taskExpression: string): string => hasTargetTaskScope
+    ? `EXISTS (
+         SELECT 1 FROM temp.muster_purge_target_tasks target_task
+          WHERE target_task.task_id = ${taskExpression}
+       )`
+    : '0';
+  const retiredTurnMembershipSql = (
+    workspaceExpression: string,
+    turnExpression: string,
+    taskExpression?: string,
+  ): string => `EXISTS (
+    SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+     WHERE retired_turn.workspace_id = ${workspaceExpression}
+       AND retired_turn.turn_id = ${turnExpression}
+       ${taskExpression ? `AND retired_turn.task_id = ${taskExpression}` : ''}
+  )`;
+  const retiredRunMembershipSql = (
+    workspaceExpression: string,
+    runExpression: string,
+  ): string => `EXISTS (
+    SELECT 1 FROM temp.muster_purge_legacy_runs retired_run
+     WHERE retired_run.workspace_id = ${workspaceExpression}
+       AND retired_run.run_id = ${runExpression}
+  )`;
+  const artifactExternalPinSql = (sourceAlias: string): string => `(
+    EXISTS (
+      SELECT 1 FROM workflow_nodes pinned_node
+       WHERE pinned_node.workspace_id = ${sourceAlias}.workspace_id
+         AND pinned_node.source_run_id = ${sourceAlias}.run_id
+         AND pinned_node.source_artifact_id = ${sourceAlias}.artifact_id
+         AND pinned_node.source_artifact_revision = ${sourceAlias}.artifact_revision
+         AND pinned_node.run_id <> ${sourceAlias}.run_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM workflow_gate_fills pinned_fill
+       WHERE pinned_fill.workspace_id = ${sourceAlias}.workspace_id
+         AND COALESCE(pinned_fill.artifact_run_id, pinned_fill.run_id) = ${sourceAlias}.run_id
+         AND pinned_fill.artifact_id = ${sourceAlias}.artifact_id
+         AND pinned_fill.artifact_revision = ${sourceAlias}.artifact_revision
+         AND pinned_fill.run_id <> ${sourceAlias}.run_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM workflow_artifact_sources derived_source
+       WHERE derived_source.workspace_id = ${sourceAlias}.workspace_id
+         AND derived_source.source_kind = 'workflow_artifact'
+         AND derived_source.source_artifact_run_id = ${sourceAlias}.run_id
+         AND derived_source.source_artifact_id = ${sourceAlias}.artifact_id
+         AND derived_source.source_artifact_revision = ${sourceAlias}.artifact_revision
+         AND derived_source.run_id <> ${sourceAlias}.run_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM workflow_return_gates pinned_gate
+       WHERE pinned_gate.workspace_id = ${sourceAlias}.workspace_id
+         AND pinned_gate.result_run_id = ${sourceAlias}.run_id
+         AND pinned_gate.result_artifact_id = ${sourceAlias}.artifact_id
+         AND pinned_gate.result_artifact_revision = ${sourceAlias}.artifact_revision
+         AND pinned_gate.continuation_run_id <> ${sourceAlias}.run_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM workflow_feedback_targets pinned_target
+       WHERE pinned_target.workspace_id = ${sourceAlias}.workspace_id
+         AND (
+           (
+             pinned_target.base_artifact_run_id = ${sourceAlias}.run_id
+             AND pinned_target.base_artifact_id = ${sourceAlias}.artifact_id
+             AND pinned_target.base_artifact_revision = ${sourceAlias}.artifact_revision
+           )
+           OR (
+             pinned_target.response_artifact_run_id = ${sourceAlias}.run_id
+             AND pinned_target.response_artifact_id = ${sourceAlias}.artifact_id
+             AND pinned_target.response_artifact_revision = ${sourceAlias}.artifact_revision
+           )
+         )
+         AND pinned_target.run_id <> ${sourceAlias}.run_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM workflow_routed_messages pinned_route
+       WHERE pinned_route.workspace_id = ${sourceAlias}.workspace_id
+         AND pinned_route.artifact_run_id = ${sourceAlias}.run_id
+         AND pinned_route.artifact_id = ${sourceAlias}.artifact_id
+         AND pinned_route.artifact_revision = ${sourceAlias}.artifact_revision
+         AND pinned_route.run_id <> ${sourceAlias}.run_id
+    )
+  )`;
+  const artifactSourceCandidateSql = `(
+    ${retiredTurnMembershipSql(
+      'artifact_source.workspace_id',
+      'artifact_source.producing_turn_id',
+      'artifact_source.producer_task_id',
+    )}
+    OR ${retiredTurnMembershipSql(
+      'artifact_source.workspace_id',
+      'artifact_source.caller_turn_id',
+      'artifact_source.caller_task_id',
+    )}
+    OR EXISTS (
+      SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+       WHERE retired_activation.workspace_id = artifact_source.workspace_id
+         AND retired_activation.run_id = artifact_source.producer_run_id
+         AND retired_activation.activation_id = artifact_source.producing_activation_id
+    )
+    OR ${retiredRunMembershipSql('artifact_source.workspace_id', 'artifact_source.producer_run_id')}
+    OR ${retiredRunMembershipSql('artifact_source.workspace_id', 'artifact_source.source_artifact_run_id')}
+    OR ${targetTaskMembershipSql('artifact_source.producer_task_id')}
+    OR ${targetTaskMembershipSql('artifact_source.caller_task_id')}
+  )`;
+  const artifactSourceOwnedSql = `(
+    NOT ${artifactExternalPinSql('artifact_source')}
+    AND (
+      EXISTS (
+        SELECT 1
+          FROM temp.muster_purge_legacy_activations retired_activation
+          JOIN workflow_nodes producer_node
+            ON producer_node.workspace_id = retired_activation.workspace_id
+           AND producer_node.run_id = retired_activation.run_id
+           AND producer_node.node_id = retired_activation.node_id
+          JOIN turns producing_turn
+            ON producing_turn.workspace_id = retired_activation.workspace_id
+           AND producing_turn.id = artifact_source.producing_turn_id
+         WHERE artifact_source.source_kind = 'workflow_node'
+           AND retired_activation.workspace_id = artifact_source.workspace_id
+           AND retired_activation.run_id = artifact_source.run_id
+           AND retired_activation.run_id = artifact_source.producer_run_id
+           AND retired_activation.activation_id = artifact_source.producing_activation_id
+           AND retired_activation.node_id = artifact_source.producer_node_id
+           AND producer_node.task_id = artifact_source.producer_task_id
+           AND producing_turn.task_id = artifact_source.producer_task_id
+           AND ${retiredTurnMembershipSql(
+             'producing_turn.workspace_id',
+             'producing_turn.id',
+             'producing_turn.task_id',
+           )}
+           AND ${workflowActivationOwnsTurnSql('producing_turn', 'retired_activation')}
+      )
+      OR EXISTS (
+        SELECT 1
+          FROM temp.muster_purge_legacy_activations retired_activation
+          JOIN turns caller_turn
+            ON caller_turn.workspace_id = retired_activation.workspace_id
+           AND caller_turn.id = artifact_source.caller_turn_id
+           AND caller_turn.task_id = artifact_source.caller_task_id
+         WHERE artifact_source.source_kind = 'caller_turn'
+           AND retired_activation.workspace_id = artifact_source.workspace_id
+           AND retired_activation.run_id = artifact_source.run_id
+           AND ${retiredTurnMembershipSql(
+             'caller_turn.workspace_id',
+             'caller_turn.id',
+             'caller_turn.task_id',
+           )}
+            AND ${workflowActivationOwnsTurnSql('caller_turn', 'retired_activation')}
+       )
+       OR (
+         artifact_source.source_kind = 'workflow_artifact'
+         AND ${retiredRunMembershipSql('artifact_source.workspace_id', 'artifact_source.run_id')}
+         AND ${retiredRunMembershipSql(
+           'artifact_source.workspace_id',
+           'artifact_source.source_artifact_run_id',
+         )}
+       )
+       OR EXISTS (
+         SELECT 1
+           FROM temp.muster_purge_legacy_activations retired_activation
+          WHERE retired_activation.workspace_id = artifact_source.workspace_id
+            AND retired_activation.run_id = artifact_source.run_id
+            AND (
+              ${targetTaskMembershipSql('artifact_source.producer_task_id')}
+              OR ${targetTaskMembershipSql('artifact_source.caller_task_id')}
+            )
+       )
+     )
+   )`;
+  const startClaimCandidateSql = `(
+    ${retiredTurnMembershipSql(
+      'start_claim.workspace_id',
+      'start_claim.caller_turn_id',
+      'start_claim.caller_task_id',
+    )}
+    OR ${retiredRunMembershipSql('start_claim.workspace_id', 'start_claim.run_id')}
+    OR ${targetTaskMembershipSql('start_claim.owner_task_id')}
+    OR ${targetTaskMembershipSql('start_claim.caller_task_id')}
+  )`;
+  const startClaimOwnedSql = `EXISTS (
+    SELECT 1
+      FROM temp.muster_purge_legacy_activations retired_activation
+      JOIN turns caller_turn
+        ON caller_turn.workspace_id = retired_activation.workspace_id
+       AND caller_turn.id = start_claim.caller_turn_id
+       AND caller_turn.task_id = start_claim.caller_task_id
+      JOIN workflow_runs claimed_run
+        ON claimed_run.workspace_id = start_claim.workspace_id
+       AND claimed_run.run_id = start_claim.run_id
+     WHERE retired_activation.workspace_id = start_claim.workspace_id
+       AND (
+         retired_activation.run_id = start_claim.run_id
+         OR ${retiredRunMembershipSql('start_claim.workspace_id', 'start_claim.run_id')}
+       )
+       AND ${retiredTurnMembershipSql(
+         'caller_turn.workspace_id',
+         'caller_turn.id',
+         'caller_turn.task_id',
+       )}
+        AND ${workflowActivationOwnsTurnSql('caller_turn', 'retired_activation')}
+        AND (
+          start_claim.owner_task_id = COALESCE(claimed_run.owner_root_task_id, start_claim.caller_task_id)
+        )
+   )`;
+  const routedMessageCandidateSql = `(
+    routed_message.kind <> 'run_closure'
+    AND (
+      ${retiredRunMembershipSql('routed_message.workspace_id', 'routed_message.run_id')}
+      OR EXISTS (
+        SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+         WHERE retired_activation.workspace_id = routed_message.workspace_id
+           AND retired_activation.run_id = routed_message.run_id
+           AND (
+             retired_activation.message_id = routed_message.message_id
+             OR retired_activation.continuation_id = routed_message.continuation_id
+           )
+      )
+      OR ${retiredTurnMembershipSql('routed_message.workspace_id', 'routed_message.source_turn_id')}
+      OR ${targetTaskMembershipSql('routed_message.source_task_id')}
+      OR ${targetTaskMembershipSql('routed_message.destination_task_id')}
+    )
+  )`;
+  const routedMessageOwnedSql = `(
+    routed_message.kind <> 'run_closure'
+    AND (
+      ${retiredRunMembershipSql('routed_message.workspace_id', 'routed_message.run_id')}
+      OR EXISTS (
+        SELECT 1
+          FROM temp.muster_purge_legacy_activations retired_activation
+         WHERE retired_activation.workspace_id = routed_message.workspace_id
+           AND retired_activation.run_id = routed_message.run_id
+           AND (
+             retired_activation.message_id = routed_message.message_id
+             OR retired_activation.continuation_id = routed_message.continuation_id
+           )
+      )
+    )
+    AND (
+      routed_message.source_turn_id IS NULL
+      OR ${retiredTurnMembershipSql(
+        'routed_message.workspace_id',
+        'routed_message.source_turn_id',
+        'routed_message.source_task_id',
+      )}
+    )
+    AND (
+      routed_message.artifact_run_id IS NULL
+      OR routed_message.artifact_run_id = routed_message.run_id
+      OR ${retiredRunMembershipSql(
+        'routed_message.workspace_id',
+        'routed_message.artifact_run_id',
+      )}
+    )
+    AND (
+      routed_message.continuation_id IS NULL
+      OR EXISTS (
+        SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+         WHERE retired_activation.workspace_id = routed_message.workspace_id
+           AND retired_activation.run_id = routed_message.run_id
+           AND retired_activation.continuation_id = routed_message.continuation_id
+      )
+      OR EXISTS (
+        SELECT 1 FROM workflow_continuations owned_continuation
+         WHERE owned_continuation.workspace_id = routed_message.workspace_id
+           AND owned_continuation.run_id = routed_message.run_id
+           AND owned_continuation.continuation_id = routed_message.continuation_id
+           AND ${retiredRunMembershipSql(
+             'owned_continuation.workspace_id',
+             'owned_continuation.run_id',
+           )}
+      )
+    )
+  )`;
+  const returnGateCandidateSql = `(
+    ${retiredTurnMembershipSql(
+      'return_gate.workspace_id',
+      'return_gate.caller_turn_id',
+      'return_gate.caller_task_id',
+    )}
+    OR ${retiredTurnMembershipSql(
+      'return_gate.workspace_id',
+      'return_gate.execution_turn_id',
+    )}
+    OR ${retiredRunMembershipSql('return_gate.workspace_id', 'return_gate.continuation_run_id')}
+    OR ${retiredRunMembershipSql('return_gate.workspace_id', 'return_gate.child_run_id')}
+    OR ${retiredRunMembershipSql('return_gate.workspace_id', 'return_gate.result_run_id')}
+    OR EXISTS (
+      SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+       WHERE retired_activation.workspace_id = return_gate.workspace_id
+         AND (
+           retired_activation.return_gate_id = return_gate.return_gate_id
+           OR (
+             retired_activation.run_id = return_gate.continuation_run_id
+             AND retired_activation.continuation_id = return_gate.continuation_id
+           )
+           OR (
+             retired_activation.run_id = return_gate.return_activation_run_id
+             AND retired_activation.activation_id = return_gate.return_activation_id
+           )
+         )
+    )
+    OR ${targetTaskMembershipSql('return_gate.caller_task_id')}
+  )`;
+  const returnGateOwnershipSql = (
+    gateAlias: string,
+    activationCorrelation = '',
+  ): string => `EXISTS (
+    SELECT 1
+      FROM temp.muster_purge_legacy_activations candidate_activation
+      JOIN workflow_nodes activation_node
+        ON activation_node.workspace_id = candidate_activation.workspace_id
+       AND activation_node.run_id = candidate_activation.run_id
+       AND activation_node.node_id = candidate_activation.node_id
+       AND activation_node.task_id IS NOT NULL
+      JOIN turns primary_turn
+        ON primary_turn.workspace_id = candidate_activation.workspace_id
+       AND primary_turn.id = candidate_activation.primary_turn_id
+       AND primary_turn.task_id = activation_node.task_id
+      JOIN turns execution_turn
+        ON execution_turn.workspace_id = candidate_activation.workspace_id
+       AND execution_turn.id = candidate_activation.execution_turn_id
+       AND execution_turn.task_id = activation_node.task_id
+      JOIN messages activation_message
+        ON activation_message.workspace_id = candidate_activation.workspace_id
+       AND activation_message.id = candidate_activation.message_id
+       AND activation_message.task_id = activation_node.task_id
+       AND activation_message.turn_id IN (
+         candidate_activation.primary_turn_id,
+         candidate_activation.execution_turn_id
+       )
+      JOIN workflow_continuations owned_continuation
+        ON owned_continuation.workspace_id = candidate_activation.workspace_id
+       AND owned_continuation.run_id = candidate_activation.run_id
+       AND owned_continuation.continuation_id = candidate_activation.continuation_id
+       AND owned_continuation.kind = 'child_wait'
+       AND owned_continuation.return_gate_id = candidate_activation.return_gate_id
+       AND owned_continuation.child_run_id IS NOT NULL
+      JOIN workflow_runs child_run
+        ON child_run.workspace_id = owned_continuation.workspace_id
+       AND child_run.run_id = owned_continuation.child_run_id
+       AND child_run.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+      JOIN turns caller_turn
+        ON caller_turn.workspace_id = ${gateAlias}.workspace_id
+       AND caller_turn.id = ${gateAlias}.caller_turn_id
+       AND caller_turn.task_id = ${gateAlias}.caller_task_id
+     WHERE candidate_activation.workspace_id = ${gateAlias}.workspace_id
+       AND candidate_activation.return_gate_id = ${gateAlias}.return_gate_id
+       ${activationCorrelation}
+       AND ${gateAlias}.continuation_run_id = candidate_activation.run_id
+       AND ${gateAlias}.continuation_id = candidate_activation.continuation_id
+       AND ${gateAlias}.caller_task_id = owned_continuation.caller_task_id
+       AND ${gateAlias}.caller_turn_id = owned_continuation.caller_turn_id
+       AND ${gateAlias}.caller_run_id = owned_continuation.caller_run_id
+       AND ${gateAlias}.caller_node_id = owned_continuation.caller_node_id
+       AND ${gateAlias}.caller_run_id = candidate_activation.run_id
+       AND ${gateAlias}.caller_node_id = candidate_activation.node_id
+       AND EXISTS (
+         SELECT 1 FROM workflow_nodes caller_node
+          WHERE caller_node.workspace_id = ${gateAlias}.workspace_id
+            AND caller_node.run_id = ${gateAlias}.caller_run_id
+            AND caller_node.node_id = ${gateAlias}.caller_node_id
+            AND caller_node.task_id = ${gateAlias}.caller_task_id
+       )
+       AND ${gateAlias}.child_run_id = owned_continuation.child_run_id
+       AND ${gateAlias}.return_activation_run_id = candidate_activation.run_id
+       AND ${gateAlias}.return_activation_id = candidate_activation.activation_id
+       AND ${gateAlias}.return_message_id = candidate_activation.message_id
+       AND ${gateAlias}.execution_turn_id = candidate_activation.execution_turn_id
+       AND (
+         ${gateAlias}.result_run_id IS NULL
+         OR (
+           ${gateAlias}.result_run_id = owned_continuation.child_run_id
+           AND EXISTS (
+             SELECT 1 FROM workflow_artifacts result_artifact
+              WHERE result_artifact.workspace_id = ${gateAlias}.workspace_id
+                AND result_artifact.run_id = ${gateAlias}.result_run_id
+                AND result_artifact.artifact_id = ${gateAlias}.result_artifact_id
+                AND result_artifact.revision = ${gateAlias}.result_artifact_revision
+                AND result_artifact.kind = 'child_return'
+           )
+         )
+       )
+  )`;
+  const returnGateOwnedSql = returnGateOwnershipSql('return_gate');
+  const operationCandidateSql = `EXISTS (
+    SELECT 1
+      FROM temp.muster_purge_legacy_turns retired_candidate
+      JOIN turns retired_turn
+        ON retired_turn.workspace_id = retired_candidate.workspace_id
+       AND retired_turn.id = retired_candidate.turn_id
+     WHERE retired_candidate.workspace_id = operations.workspace_id
+       AND ${operationLedgerBelongsToTurnSql(
+         'operations.workspace_id',
+         'operations.ledger_key',
+         'retired_turn',
+       )}
+  )`;
+  const operationOwnedSql = `EXISTS (
+    SELECT 1
+      FROM temp.muster_purge_legacy_turns retired_candidate
+      JOIN turns retired_turn
+        ON retired_turn.workspace_id = retired_candidate.workspace_id
+       AND retired_turn.id = retired_candidate.turn_id
+     WHERE retired_candidate.workspace_id = operations.workspace_id
+       AND ${operationLedgerBelongsToTurnSql(
+         'operations.workspace_id',
+         'operations.ledger_key',
+         'retired_turn',
+       )}
+       AND NOT EXISTS (
+         SELECT 1 FROM turns external_turn
+          WHERE external_turn.workspace_id = operations.workspace_id
+            AND NOT EXISTS (
+              SELECT 1 FROM temp.muster_purge_legacy_turns retired_external_turn
+               WHERE retired_external_turn.workspace_id = external_turn.workspace_id
+                 AND retired_external_turn.turn_id = external_turn.id
+            )
+            AND ${operationLedgerBelongsToTurnSql(
+              'operations.workspace_id',
+              'operations.ledger_key',
+              'external_turn',
+            )}
+       )
+  )`;
+
+  // Every row which intersects the retired relation must be provably owned by
+  // that relation.  These checks deliberately run before mutationStartIndex so
+  // a CHECK failure rolls back the complete caller transaction rather than
+  // leaving a partially reclaimed graph behind.
+  setup.push(
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_artifact_sources artifact_source
+             WHERE artifact_source.workspace_id = ?
+               AND ${artifactSourceCandidateSql}
+               AND NOT (${artifactSourceOwnedSql})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_start_claims start_claim
+             WHERE start_claim.workspace_id = ?
+               AND ${startClaimCandidateSql}
+               AND NOT (${startClaimOwnedSql})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_routed_messages routed_message
+             WHERE routed_message.workspace_id = ?
+               AND ${routedMessageCandidateSql}
+               AND NOT (${routedMessageOwnedSql})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_return_gates return_gate
+             WHERE return_gate.workspace_id = ?
+               AND ${returnGateCandidateSql}
+               AND NOT (${returnGateOwnedSql})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM operations
+             WHERE operations.workspace_id = ?
+               AND ${operationCandidateSql}
+               AND NOT (${operationOwnedSql})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_routed_messages external_route
+             WHERE external_route.workspace_id = ?
+               AND external_route.kind <> 'run_closure'
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+                  WHERE retired_activation.workspace_id = external_route.workspace_id
+                    AND (
+                      retired_activation.continuation_id = external_route.continuation_id
+                      OR retired_activation.return_gate_id = external_route.gate_id
+                      OR retired_activation.message_id = external_route.message_id
+                    )
+               )
+               AND NOT (${routedMessageOwnedSql.replaceAll('routed_message', 'external_route')})
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+  );
+
+  setup.push(
+    // A malformed/cyclic retry graph is an integrity failure, not permission to
+    // widen the candidate set. The CHECK-backed validation relation makes the
+    // worker roll back before any destructive statement runs.
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM temp.muster_purge_legacy_activations activation
+              WHERE activation.node_id = ''
+                 OR activation.primary_turn_id = ''
+                 OR activation.execution_turn_id = ''
+                 OR activation.message_id = ''
+                 OR activation.continuation_id = ''
+                 OR activation.return_gate_id = ''
+                OR NOT EXISTS (
+                     SELECT 1 FROM workflow_runs run_row
+                      WHERE run_row.workspace_id = activation.workspace_id
+                        AND run_row.run_id = activation.run_id
+                   )
+                OR NOT EXISTS (
+                     SELECT 1 FROM turns primary_turn
+                      WHERE primary_turn.workspace_id = activation.workspace_id
+                        AND primary_turn.id = activation.primary_turn_id
+                   )
+                OR NOT EXISTS (
+                     SELECT 1 FROM turns execution_turn
+                      WHERE execution_turn.workspace_id = activation.workspace_id
+                        AND execution_turn.id = activation.execution_turn_id
+                   )
+             LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM temp.muster_purge_legacy_turns retired_turn
+              JOIN turns turn_row
+                ON turn_row.workspace_id = retired_turn.workspace_id
+               AND turn_row.id = retired_turn.turn_id
+             WHERE json_valid(turn_row.payload_json) <> 1
+                OR NOT EXISTS (
+                     SELECT 1
+                       FROM temp.muster_purge_legacy_activations activation
+                       JOIN turns seed_turn
+                         ON seed_turn.workspace_id = activation.workspace_id
+                        AND seed_turn.id IN (activation.primary_turn_id, activation.execution_turn_id)
+                      WHERE activation.workspace_id = retired_turn.workspace_id
+                        AND seed_turn.task_id = turn_row.task_id
+                   )
+                OR (
+                  json_type(turn_row.payload_json, '$.retryOf') IS NOT NULL
+                  AND json_type(turn_row.payload_json, '$.retryOf') <> 'text'
+                )
+                OR (
+                  json_type(turn_row.payload_json, '$.retryOf') = 'text'
+                  AND (
+                    trim(json_extract(turn_row.payload_json, '$.retryOf')) = ''
+                    OR NOT EXISTS (
+                      SELECT 1 FROM turns predecessor
+                       WHERE predecessor.workspace_id = turn_row.workspace_id
+                         AND predecessor.id = json_extract(turn_row.payload_json, '$.retryOf')
+                    )
+                   )
+                 )
+                OR EXISTS (
+                     SELECT 1 FROM turns predecessor
+                      WHERE predecessor.workspace_id = turn_row.workspace_id
+                        AND predecessor.id = json_extract(turn_row.payload_json, '$.retryOf')
+                        AND predecessor.task_id <> turn_row.task_id
+                   )
+              LIMIT 1`,
+      params: [],
+    },
+    {
+      // Every copied activation identity must resolve to one coherent legacy
+      // child-return graph. The caller turn may predate the retired activation,
+      // but continuation, gate, node, resume-turn, and message identities must
+      // agree exactly.
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM temp.muster_purge_legacy_activations activation
+             WHERE NOT EXISTS (
+               SELECT 1
+                 FROM workflow_return_gates validation_gate
+                WHERE validation_gate.workspace_id = activation.workspace_id
+                  AND validation_gate.return_gate_id = activation.return_gate_id
+                  AND ${returnGateOwnershipSql(
+                    'validation_gate',
+                    `AND candidate_activation.workspace_id = activation.workspace_id
+                      AND candidate_activation.run_id = activation.run_id
+                      AND candidate_activation.activation_id = activation.activation_id`,
+                  )}
+             )
+             LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            WITH RECURSIVE chain(workspace_id, turn_id, retry_of, depth, path) AS (
+              SELECT retired_turn.workspace_id,
+                     retired_turn.turn_id,
+                     json_extract(turn_row.payload_json, '$.retryOf'),
+                     0,
+                     json_array(retired_turn.turn_id)
+                FROM temp.muster_purge_legacy_turns retired_turn
+                JOIN turns turn_row
+                  ON turn_row.workspace_id = retired_turn.workspace_id
+                 AND turn_row.id = retired_turn.turn_id
+              UNION ALL
+              SELECT predecessor.workspace_id,
+                     predecessor.id,
+                     json_extract(predecessor.payload_json, '$.retryOf'),
+                     chain.depth + 1,
+                     json_insert(chain.path, '$[#]', predecessor.id)
+                FROM chain
+                JOIN turns predecessor
+                  ON predecessor.workspace_id = chain.workspace_id
+                 AND predecessor.id = chain.retry_of
+               WHERE chain.retry_of IS NOT NULL
+                 AND chain.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(chain.path) seen
+                    WHERE seen.value = predecessor.id
+                 )
+            )
+            SELECT 0
+              FROM chain
+             WHERE chain.retry_of IS NOT NULL
+               AND (
+                 chain.depth >= ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 OR EXISTS (
+                   SELECT 1 FROM turns predecessor
+                    WHERE predecessor.workspace_id = chain.workspace_id
+                      AND predecessor.id = chain.retry_of
+                      AND EXISTS (
+                        SELECT 1 FROM json_each(chain.path) seen
+                         WHERE seen.value = predecessor.id
+                      )
+                 )
+               )
+       LIMIT 1`,
+      params: [],
+    },
+    {
+      // The candidate lineage is intentionally bounded.  Check the next edge
+      // beyond that bound explicitly; otherwise a 65th descendant would simply
+      // disappear from the temporary relation and the purge would silently
+      // widen from an exact lineage to a partial delete.
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            WITH RECURSIVE forward(workspace_id, turn_id, depth, path) AS (
+              SELECT retired_turn.workspace_id,
+                     retired_turn.turn_id,
+                     0,
+                     json_array(retired_turn.turn_id)
+                FROM temp.muster_purge_legacy_turns retired_turn
+              UNION ALL
+              SELECT child.workspace_id,
+                     child.id,
+                     forward.depth + 1,
+                     json_insert(forward.path, '$[#]', child.id)
+                FROM forward
+                JOIN turns child
+                  ON child.workspace_id = forward.workspace_id
+                 AND json_valid(child.payload_json) = 1
+                 AND json_type(child.payload_json, '$.retryOf') = 'text'
+                 AND json_extract(child.payload_json, '$.retryOf') = forward.turn_id
+               WHERE forward.depth < ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+                 AND NOT EXISTS (
+                   SELECT 1 FROM json_each(forward.path) seen
+                    WHERE seen.value = child.id
+                 )
+            )
+            SELECT 0
+              FROM forward
+             WHERE forward.depth = ${RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH}
+               AND EXISTS (
+                 SELECT 1 FROM turns overflow
+                  WHERE overflow.workspace_id = forward.workspace_id
+                    AND json_valid(overflow.payload_json) = 1
+                    AND json_type(overflow.payload_json, '$.retryOf') = 'text'
+                    AND json_extract(overflow.payload_json, '$.retryOf') = forward.turn_id
+               )
+             LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM temp.muster_purge_legacy_turns retired_candidate
+              JOIN turns retired_turn
+                ON retired_turn.workspace_id = retired_candidate.workspace_id
+               AND retired_turn.id = retired_candidate.turn_id
+             WHERE EXISTS (
+               SELECT 1
+                 FROM workflow_activations other_activation
+                 JOIN workflow_runs other_run
+                   ON other_run.workspace_id = other_activation.workspace_id
+                  AND other_run.run_id = other_activation.run_id
+                WHERE other_activation.workspace_id = retired_turn.workspace_id
+                  AND NOT EXISTS (
+                    SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+                     WHERE retired_activation.workspace_id = other_activation.workspace_id
+                       AND retired_activation.run_id = other_activation.run_id
+                       AND retired_activation.activation_id = other_activation.activation_id
+                  )
+                  AND (
+                    other_activation.kind IN (${ACTIVE_WORKFLOW_ACTIVATION_KINDS_SQL})
+                    OR other_activation.kind = 'child_return'
+                  )
+                  AND ${workflowActivationOwnsTurnSql('retired_turn', 'other_activation')}
+             )
+             LIMIT 1`,
+      params: [],
+    },
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM temp.muster_purge_legacy_messages retired_message
+             WHERE EXISTS (
+               SELECT 1 FROM messages other_message
+                WHERE other_message.workspace_id = retired_message.workspace_id
+                  AND other_message.id = retired_message.message_id
+                  AND other_message.turn_id IS NOT NULL
+                  AND NOT EXISTS (
+                    SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                     WHERE retired_turn.workspace_id = other_message.workspace_id
+                       AND retired_turn.turn_id = other_message.turn_id
+                  )
+             )
+                OR EXISTS (
+                  SELECT 1 FROM turn_inputs input_row
+                   WHERE input_row.workspace_id = retired_message.workspace_id
+                     AND json_extract(input_row.payload_json, '$.messageId') = retired_message.message_id
+                     AND NOT EXISTS (
+                       SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                        WHERE retired_turn.workspace_id = input_row.workspace_id
+                          AND retired_turn.turn_id = input_row.turn_id
+                     )
+                )
+                OR EXISTS (
+                  SELECT 1 FROM workflow_activations other_activation
+                   WHERE other_activation.workspace_id = retired_message.workspace_id
+                     AND other_activation.message_id = retired_message.message_id
+                     AND NOT EXISTS (
+                       SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+                        WHERE retired_activation.workspace_id = other_activation.workspace_id
+                          AND retired_activation.run_id = other_activation.run_id
+                          AND retired_activation.activation_id = other_activation.activation_id
+                     )
+                )
+                OR EXISTS (
+                  SELECT 1 FROM workflow_return_gates other_gate
+                   WHERE other_gate.workspace_id = retired_message.workspace_id
+                     AND other_gate.return_message_id = retired_message.message_id
+                     AND NOT EXISTS (
+                       SELECT 1
+                         FROM temp.muster_purge_legacy_activations retired_activation
+                        WHERE retired_activation.workspace_id = other_gate.workspace_id
+                          AND other_gate.return_gate_id = retired_activation.return_gate_id
+                     )
+                )
+                OR EXISTS (
+                  SELECT 1 FROM workflow_dependency_gates other_gate
+                   WHERE other_gate.workspace_id = retired_message.workspace_id
+                     AND other_gate.aggregate_message_id = retired_message.message_id
+                )
+                OR EXISTS (
+                  SELECT 1 FROM workflow_feedback_targets target
+                   WHERE target.workspace_id = retired_message.workspace_id
+                     AND target.request_message_id = retired_message.message_id
+                )
+                 OR EXISTS (
+                   SELECT 1 FROM send_receipts receipt
+                    WHERE receipt.workspace_id = retired_message.workspace_id
+                      AND receipt.message_id = retired_message.message_id
+                  )
+              LIMIT 1`,
+      params: [],
+    },
+    {
+      // A return gate cascades from its caller turn.  Do not let a turn purge
+      // silently remove a gate that is not one of the retired child-return
+      // records selected above; fail closed before the trigger can run.
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_return_gates external_gate
+              JOIN temp.muster_purge_legacy_turns retired_turn
+                ON retired_turn.workspace_id = external_gate.workspace_id
+               AND retired_turn.turn_id = external_gate.caller_turn_id
+             WHERE NOT EXISTS (
+               SELECT 1
+                 FROM temp.muster_purge_legacy_activations retired_activation
+                WHERE retired_activation.workspace_id = external_gate.workspace_id
+                  AND retired_activation.return_gate_id = external_gate.return_gate_id
+             )
+             LIMIT 1`,
+      params: [],
+    },
+    {
+      // Canonical closure data is immutable history, not retired child-return
+      // metadata. Since workflow_routed_messages has an ON DELETE CASCADE on
+      // workflow_runs, reject the candidate before any turn or run mutation can
+      // fire the trigger and erase that closure indirectly.
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_routed_messages canonical_closure
+              JOIN temp.muster_purge_legacy_runs retired_run
+                ON retired_run.workspace_id = canonical_closure.workspace_id
+               AND retired_run.run_id = canonical_closure.run_id
+             WHERE canonical_closure.kind = 'run_closure'
+             LIMIT 1`,
+      params: [],
+    },
+  );
+
+  // The terminal-history trigger can run once for each row in a multi-row turn
+  // delete. Deleting the first legacy turn may cascade its activation, which
+  // would otherwise let a later trigger invocation see no active relation and
+  // prune the top-level parent run. Record one existing dependency gate for
+  // every terminal run that the trigger could select; the mutation phase opens
+  // that gate temporarily, then restores the exact status before any explicit
+  // nested-run deletion. This keeps the trigger's full safety predicate
+  // authoritative without adding durable schema or leaving a marker behind.
+  const terminalTriggerRunCandidateSql = `(
+    EXISTS (
+      SELECT 1
+        FROM workflow_nodes trigger_node
+        JOIN temp.muster_purge_legacy_turns trigger_turn
+          ON trigger_turn.workspace_id = trigger_node.workspace_id
+         AND trigger_turn.task_id = trigger_node.task_id
+       WHERE trigger_node.workspace_id = candidate_run.workspace_id
+         AND trigger_node.run_id = candidate_run.run_id
+    )
+    OR EXISTS (
+      SELECT 1
+        FROM workflow_artifact_sources trigger_source
+        JOIN temp.muster_purge_legacy_turns trigger_turn
+          ON trigger_turn.workspace_id = trigger_source.workspace_id
+         AND (
+           trigger_turn.turn_id = trigger_source.producing_turn_id
+           OR trigger_turn.turn_id = trigger_source.caller_turn_id
+         )
+       WHERE trigger_source.workspace_id = candidate_run.workspace_id
+         AND trigger_source.run_id = candidate_run.run_id
+    )
+  )`;
+  setup.push(
+    {
+      sql: `INSERT INTO muster_purge_legacy_validation (valid)
+            SELECT 0
+              FROM workflow_runs candidate_run
+             WHERE candidate_run.workspace_id = ?
+               AND candidate_run.status IN ('succeeded', 'failed', 'cancelled')
+               AND ${terminalTriggerRunCandidateSql}
+               AND NOT EXISTS (
+                 SELECT 1
+                   FROM workflow_dependency_gates guard_gate
+                  WHERE guard_gate.workspace_id = candidate_run.workspace_id
+                    AND guard_gate.run_id = candidate_run.run_id
+               )
+             LIMIT 1`,
+      params: [workspaceId],
+    },
+    {
+      sql: `INSERT INTO muster_purge_terminal_run_guards (
+              workspace_id, run_id, gate_id, original_status
+            )
+            SELECT candidate_run.workspace_id,
+                   candidate_run.run_id,
+                   guard_gate.gate_id,
+                   guard_gate.status
+              FROM workflow_runs candidate_run
+              JOIN workflow_dependency_gates guard_gate
+                ON guard_gate.workspace_id = candidate_run.workspace_id
+               AND guard_gate.run_id = candidate_run.run_id
+             WHERE candidate_run.workspace_id = ?
+               AND candidate_run.status IN ('succeeded', 'failed', 'cancelled')
+               AND ${terminalTriggerRunCandidateSql}
+               AND guard_gate.gate_id = (
+                 SELECT gate_choice.gate_id
+                   FROM workflow_dependency_gates gate_choice
+                  WHERE gate_choice.workspace_id = candidate_run.workspace_id
+                    AND gate_choice.run_id = candidate_run.run_id
+                  ORDER BY gate_choice.gate_id
+                  LIMIT 1
+               )`,
+      params: [workspaceId],
+    },
+  );
+
+  // Keep the relation-bearing rows in place while turn DELETE triggers run.
+  // Their terminal guard must still see the retired relation and therefore must
+  // not prune a top-level parent as a side effect of this cleanup.
+  const mutationStartIndex = setup.length;
+  const transientGuardResultIndexes: number[] = [];
+  setup.push({
+    sql: `UPDATE workflow_activations
+             SET status = 'queued'
+           WHERE workspace_id = ?
+             AND EXISTS (
+               SELECT 1 FROM temp.muster_purge_legacy_activations retired_activation
+                WHERE retired_activation.workspace_id = workflow_activations.workspace_id
+                  AND retired_activation.run_id = workflow_activations.run_id
+                  AND retired_activation.activation_id = workflow_activations.activation_id
+             )
+             AND status <> 'queued'`,
+    params: [workspaceId],
+  });
+  transientGuardResultIndexes.push(setup.length);
+  setup.push({
+    sql: `UPDATE workflow_dependency_gates
+             SET status = 'open'
+           WHERE workspace_id = ?
+             AND EXISTS (
+               SELECT 1
+                 FROM temp.muster_purge_terminal_run_guards guard_row
+                WHERE guard_row.workspace_id = workflow_dependency_gates.workspace_id
+                  AND guard_row.run_id = workflow_dependency_gates.run_id
+                  AND guard_row.gate_id = workflow_dependency_gates.gate_id
+             )
+             AND status <> 'open'`,
+    params: [workspaceId],
+  });
+
+  setup.push(
+    // Remove turn-owned rows before deleting turns. FK cascades are allowed to
+    // make these idempotent, but explicit statements keep ownership auditable.
+    {
+      sql: `DELETE FROM workflow_return_gates AS return_gate
+             WHERE workspace_id = ?
+                AND EXISTS (
+                  SELECT 1
+                    FROM temp.muster_purge_legacy_activations retired_activation
+                    WHERE retired_activation.workspace_id = return_gate.workspace_id
+                      AND retired_activation.return_gate_id = return_gate.return_gate_id
+                )
+                AND ${returnGateOwnedSql}`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_continuations
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1
+                   FROM temp.muster_purge_legacy_activations retired_activation
+                  WHERE retired_activation.workspace_id = workflow_continuations.workspace_id
+                    AND retired_activation.run_id = workflow_continuations.run_id
+                    AND retired_activation.continuation_id = workflow_continuations.continuation_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_decision_repairs
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1
+                   FROM temp.muster_purge_legacy_activations retired_activation
+                  WHERE retired_activation.workspace_id = workflow_decision_repairs.workspace_id
+                    AND retired_activation.run_id = workflow_decision_repairs.run_id
+                    AND retired_activation.activation_id = workflow_decision_repairs.activation_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM turn_disposition_claims
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = turn_disposition_claims.workspace_id
+                    AND retired_turn.turn_id = turn_disposition_claims.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM operations
+             WHERE workspace_id = ?
+                AND ${operationOwnedSql}`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM turn_inputs
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = turn_inputs.workspace_id
+                    AND retired_turn.turn_id = turn_inputs.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM session_claims
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = session_claims.workspace_id
+                    AND retired_turn.turn_id = session_claims.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM resource_claims
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = resource_claims.workspace_id
+                    AND retired_turn.turn_id = resource_claims.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM runtime_claims
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = runtime_claims.workspace_id
+                    AND retired_turn.turn_id = runtime_claims.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM turn_cancel_requests
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = turn_cancel_requests.workspace_id
+                    AND retired_turn.turn_id = turn_cancel_requests.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM reasoning_segments
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = reasoning_segments.workspace_id
+                    AND retired_turn.turn_id = reasoning_segments.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM tool_calls
+             WHERE workspace_id = ?
+               AND EXISTS (
+                 SELECT 1 FROM temp.muster_purge_legacy_turns retired_turn
+                  WHERE retired_turn.workspace_id = tool_calls.workspace_id
+                    AND retired_turn.turn_id = tool_calls.turn_id
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_start_claims AS start_claim
+             WHERE workspace_id = ?
+                AND ${startClaimOwnedSql}`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_artifact_sources AS artifact_source
+             WHERE workspace_id = ?
+                AND ${artifactSourceOwnedSql}`,
+      params: [workspaceId],
+    },
+    // The trigger is intentionally allowed to observe the still-present
+    // relation rows while this statement deletes the retired turns. The
+    // validation above prevents an unrelated caller-turn gate from being
+    // cascaded away; owned legacy relations are removed immediately afterward.
+    {
+      sql: `DELETE FROM turns
+             WHERE workspace_id = ?
+               AND id IN (SELECT turn_id FROM temp.muster_purge_legacy_turns)`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_routed_messages AS routed_message
+             WHERE workspace_id = ?
+                AND ${routedMessageOwnedSql}`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM workflow_activations
+             WHERE workspace_id = ?
+               AND (run_id, activation_id) IN (
+                 SELECT run_id, activation_id
+                   FROM temp.muster_purge_legacy_activations
+               )`,
+      params: [workspaceId],
+    },
+    {
+      sql: `DELETE FROM messages
+             WHERE workspace_id = ?
+               AND id IN (SELECT message_id FROM temp.muster_purge_legacy_messages)`,
+      params: [workspaceId],
+    },
+    {
+      sql: `UPDATE workflow_dependency_gates
+               SET status = (
+                 SELECT guard_row.original_status
+                   FROM temp.muster_purge_terminal_run_guards guard_row
+                  WHERE guard_row.workspace_id = workflow_dependency_gates.workspace_id
+                    AND guard_row.run_id = workflow_dependency_gates.run_id
+                    AND guard_row.gate_id = workflow_dependency_gates.gate_id
+               )
+             WHERE EXISTS (
+               SELECT 1
+                 FROM temp.muster_purge_terminal_run_guards guard_row
+                WHERE guard_row.workspace_id = workflow_dependency_gates.workspace_id
+                  AND guard_row.run_id = workflow_dependency_gates.run_id
+                  AND guard_row.gate_id = workflow_dependency_gates.gate_id
+             )`,
+      params: [],
+    },
+    ...Array.from(
+      { length: RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH + 1 },
+      (_, index): SqlStatement => {
+        const depth = RETIRED_CHILD_RETURN_RETRY_MAX_DEPTH - index;
+        return {
+          sql: `DELETE FROM workflow_runs
+                 WHERE workspace_id = ?
+                   AND run_id IN (
+                     SELECT run_id FROM temp.muster_purge_legacy_runs WHERE depth = ?
+                    )
+                   AND NOT EXISTS (
+                     SELECT 1 FROM workflow_routed_messages canonical_closure
+                      WHERE canonical_closure.workspace_id = workflow_runs.workspace_id
+                        AND canonical_closure.run_id = workflow_runs.run_id
+                        AND canonical_closure.kind = 'run_closure'
+                   )
+                   ${terminalWorkflowRunSafetyPredicate('workflow_runs')}`,
+          params: [workspaceId, depth],
+        };
+      },
+    ),
+  );
+
+  const cleanup: SqlStatement[] = [
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_messages', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_turns', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_runs', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_activations', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_legacy_validation', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_terminal_run_guards', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_target_turns', params: [] },
+    { sql: 'DROP TABLE IF EXISTS temp.muster_purge_target_tasks', params: [] },
+  ];
+  transientGuardResultIndexes.push(
+    setup.findIndex((statement, index) => index >= mutationStartIndex && statement.sql.startsWith('UPDATE workflow_dependency_gates\n               SET status = (')),
+  );
+  return { setup, cleanup, mutationStartIndex, transientGuardResultIndexes };
+}
+
+function workflowActivationOwnsTurnSql(
+  turnAlias: string,
+  activationAlias: string,
+): string {
+  return `EXISTS (
+    WITH RECURSIVE owned_turn_lineage(id, retry_of, depth) AS (
+      SELECT ${turnAlias}.id,
+             json_extract(${turnAlias}.payload_json, '$.retryOf'),
+             0
+      UNION ALL
+      SELECT predecessor.id,
+             json_extract(predecessor.payload_json, '$.retryOf'),
+             owned_turn_lineage.depth + 1
+        FROM owned_turn_lineage
+        JOIN turns predecessor
+          ON predecessor.workspace_id = ${turnAlias}.workspace_id
+         AND predecessor.id = owned_turn_lineage.retry_of
+       WHERE owned_turn_lineage.retry_of IS NOT NULL
+         AND owned_turn_lineage.depth < 64
+    )
+    SELECT 1 FROM owned_turn_lineage
+     WHERE owned_turn_lineage.id = ${activationAlias}.primary_turn_id
+        OR owned_turn_lineage.id = ${activationAlias}.execution_turn_id
+  )`;
+}
+
+/**
+ * A retry turn can outlive the bounded ownership walk when legacy state is
+ * malformed, cyclic, or deeper than the supported retry bound. Such a row
+ * must not fall through as an ordinary turn merely because ownership can no
+ * longer be proven. Scope the conservative fence to the workflow-node task
+ * of a retired activation; a valid active activation still wins when it can
+ * prove ownership of the candidate turn.
+ */
+function turnHasUnownedRetiredWorkflowRetrySql(alias = 'turns'): string {
+  return `(
+    json_extract(${alias}.payload_json, '$.retryOf') IS NOT NULL
+    AND EXISTS (
+      SELECT 1
+        FROM workflow_nodes retired_retry_node
+        JOIN workflow_activations retired_retry_activation
+          ON retired_retry_activation.workspace_id = retired_retry_node.workspace_id
+         AND retired_retry_activation.run_id = retired_retry_node.run_id
+         AND retired_retry_activation.node_id = retired_retry_node.node_id
+        JOIN workflow_runs retired_retry_run
+          ON retired_retry_run.workspace_id = retired_retry_activation.workspace_id
+         AND retired_retry_run.run_id = retired_retry_activation.run_id
+       WHERE retired_retry_node.workspace_id = ${alias}.workspace_id
+         AND retired_retry_node.task_id = ${alias}.task_id
+         AND ${retiredWorkflowActivationSql('retired_retry_activation', 'retired_retry_run')}
+    )
+    AND NOT EXISTS (
+      SELECT 1
+        FROM workflow_nodes active_retry_node
+        JOIN workflow_activations active_retry_activation
+          ON active_retry_activation.workspace_id = active_retry_node.workspace_id
+         AND active_retry_activation.run_id = active_retry_node.run_id
+         AND active_retry_activation.node_id = active_retry_node.node_id
+        JOIN workflow_runs active_retry_run
+          ON active_retry_run.workspace_id = active_retry_activation.workspace_id
+         AND active_retry_run.run_id = active_retry_activation.run_id
+       WHERE active_retry_node.workspace_id = ${alias}.workspace_id
+         AND active_retry_node.task_id = ${alias}.task_id
+         AND NOT (${retiredWorkflowActivationSql('active_retry_activation', 'active_retry_run')})
+         AND ${workflowActivationOwnsTurnSql(alias, 'active_retry_activation')}
+    )
+  )`;
+}
+
+function turnIsVisibleInActiveSurfacesSql(alias = 'turns'): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM tasks retired_task
+     WHERE retired_task.workspace_id = ${alias}.workspace_id
+       AND retired_task.id = ${alias}.task_id
+       AND NOT (${taskIsVisibleInActiveSurfacesSql('retired_task')})
+  )
+  AND NOT EXISTS (
+    SELECT 1
+      FROM workflow_activations retired_activation
+      JOIN workflow_runs retired_run
+        ON retired_run.workspace_id = retired_activation.workspace_id
+       AND retired_run.run_id = retired_activation.run_id
+     WHERE retired_activation.workspace_id = ${alias}.workspace_id
+       AND ${workflowActivationOwnsTurnSql(alias, 'retired_activation')}
+        AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+   )
+   AND NOT (${turnHasUnownedRetiredWorkflowRetrySql(alias)})`;
+}
+
+function messageIsVisibleInActiveSurfacesSql(alias = 'messages'): string {
+  return `NOT EXISTS (
+    SELECT 1
+      FROM workflow_activations retired_activation
+      JOIN workflow_runs retired_run
+        ON retired_run.workspace_id = retired_activation.workspace_id
+       AND retired_run.run_id = retired_activation.run_id
+     WHERE retired_activation.workspace_id = ${alias}.workspace_id
+       AND retired_activation.message_id = ${alias}.id
+       AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+  )
+  AND NOT EXISTS (
+    SELECT 1 FROM turns message_turn
+     WHERE message_turn.workspace_id = ${alias}.workspace_id
+       AND message_turn.id = ${alias}.turn_id
+       AND NOT (${turnIsVisibleInActiveSurfacesSql('message_turn')})
+  )`;
+}
+
+function turnOwnedRowIsVisibleInActiveSurfacesSql(alias: string): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM turns owned_turn
+     WHERE owned_turn.workspace_id = ${alias}.workspace_id
+       AND owned_turn.id = ${alias}.turn_id
+       AND NOT (${turnIsVisibleInActiveSurfacesSql('owned_turn')})
+  )`;
+}
+
+function taskIsVisibleInActiveSurfacesSql(alias = 't'): string {
+  return `NOT EXISTS (
+    WITH RECURSIVE task_ancestors(id, parent_id) AS (
+      SELECT ancestor.id, ancestor.parent_id
+        FROM tasks ancestor
+       WHERE ancestor.workspace_id = ${alias}.workspace_id
+         AND ancestor.id = ${alias}.id
+      UNION
+      SELECT parent.id, parent.parent_id
+        FROM tasks parent
+        JOIN task_ancestors child ON child.parent_id = parent.id
+       WHERE parent.workspace_id = ${alias}.workspace_id
+    )
+    SELECT 1
+      FROM task_ancestors ancestor
+      JOIN workflow_nodes retired_node
+        ON retired_node.workspace_id = ${alias}.workspace_id
+       AND retired_node.task_id = ancestor.id
+      JOIN workflow_runs retired_run
+        ON retired_run.workspace_id = retired_node.workspace_id
+       AND retired_run.run_id = retired_node.run_id
+     WHERE retired_run.origin <> 'top_level' OR retired_run.parent_run_id IS NOT NULL
+  )`;
+}
+
+function taskOwnsRetiredWorkflowStateSql(alias = 'task'): string {
+  return `EXISTS (
+    SELECT 1
+      FROM turns retained_turn
+      JOIN workflow_activations retained_activation
+        ON retained_activation.workspace_id = retained_turn.workspace_id
+       AND ${workflowActivationOwnsTurnSql('retained_turn', 'retained_activation')}
+      JOIN workflow_runs retained_run
+        ON retained_run.workspace_id = retained_activation.workspace_id
+       AND retained_run.run_id = retained_activation.run_id
+     WHERE retained_turn.workspace_id = ${alias}.workspace_id
+       AND retained_turn.task_id = ${alias}.id
+       AND ${retiredWorkflowActivationSql('retained_activation', 'retained_run')}
+  )`;
+}
+
+function operationLedgerBelongsToTurnSql(
+  workspaceExpression: string,
+  ledgerKeyExpression: string,
+  turnAlias: string,
+): string {
+  return `substr(${ledgerKeyExpression}, 1, length(${turnAlias}.id) + 1) = ${turnAlias}.id || ':'
+    AND NOT EXISTS (
+      SELECT 1 FROM turns more_specific_turn
+       WHERE more_specific_turn.workspace_id = ${workspaceExpression}
+         AND length(more_specific_turn.id) > length(${turnAlias}.id)
+         AND substr(${ledgerKeyExpression}, 1, length(more_specific_turn.id) + 1) =
+             more_specific_turn.id || ':'
+    )`;
+}
+
+function operationLedgerIsVisibleInActiveSurfacesSql(
+  workspaceExpression: string,
+  ledgerKeyExpression: string,
+): string {
+  return `NOT EXISTS (
+    SELECT 1 FROM turns operation_turn
+     WHERE operation_turn.workspace_id = ${workspaceExpression}
+       AND ${operationLedgerBelongsToTurnSql(
+         workspaceExpression,
+         ledgerKeyExpression,
+         'operation_turn',
+       )}
+       AND NOT (${turnIsVisibleInActiveSurfacesSql('operation_turn')})
+  )`;
+}
+
 function turnSelect(where: string): string {
   return `SELECT id, workspace_id, task_id, sequence, status, trigger, created_at,
                  started_at, settled_at, payload_json FROM turns ${where}`;
@@ -14019,6 +15535,7 @@ export function activeTurnInputMessagesSql(taskIdCount: number): string {
           WHERE workspace_id = ?
             AND task_id IN (${ids})
             AND status IN ('queued', 'running', 'waiting_user')
+            AND ${turnIsVisibleInActiveSurfacesSql()}
        ),
        active_message_ids AS MATERIALIZED (
          SELECT DISTINCT
@@ -14119,12 +15636,6 @@ function toolCallPayload(tool: PersistedToolCall): string {
   return encodePayload(payload);
 }
 
-/** M018 S06: deterministic return artifact id on the caller run. */
-function stableChildReturnArtifactId(_parentRunId: string, childRunId: string): string {
-  const fence = deriveChildReturnFenceId(childRunId);
-  return fence.replace(/^wfrm_/, 'wfa_');
-}
-
 function taskStatement(workspaceId: string, task: MusterTask, upsert: boolean): SqlStatement {
   const suffix = upsert
     ? ` ON CONFLICT(workspace_id, id) DO UPDATE SET
@@ -14155,7 +15666,7 @@ function taskMutationStatements(workspaceId: string, task: MusterTask): SqlState
 function turnMutationStatements(workspaceId: string, turn: TaskTurn): SqlStatement[] {
   return [
     turnStatement(workspaceId, turn, true),
-    { sql: 'DELETE FROM turn_inputs WHERE workspace_id = ? AND turn_id = ?', params: [workspaceId, turn.id] },
+    turnInputDeleteStatement(workspaceId, turn.id),
     ...turn.inputs.map((input, ordering) => turnInputStatement(workspaceId, turn.id, ordering, input)),
   ];
 }
@@ -14198,12 +15709,16 @@ function taskRevisionGuardStatement(
   return {
     sql: `UPDATE tasks SET updated_at = updated_at
            WHERE workspace_id = ? AND id = ? AND revision = ?
-             AND (SELECT COUNT(*) FROM tasks present
-                    WHERE present.workspace_id = ? AND present.id IN (${ids})) = ?
-             AND NOT EXISTS (
+             AND ${taskIsVisibleInActiveSurfacesSql('tasks')}
+              AND (SELECT COUNT(*) FROM tasks present
+                     WHERE present.workspace_id = ? AND present.id IN (${ids})
+                       AND ${taskIsVisibleInActiveSurfacesSql('present')}) = ?
+              AND NOT EXISTS (
                    SELECT 1 FROM tasks checked
-                    WHERE checked.workspace_id = ? AND (${mismatch})
-             )`,
+                    WHERE checked.workspace_id = ?
+                      AND ${taskIsVisibleInActiveSurfacesSql('checked')}
+                      AND (${mismatch})
+              )`,
     params: [
       workspaceId, first.id, first.revision,
       workspaceId, ...expected.map((entry) => entry.id), expected.length,
@@ -14233,10 +15748,13 @@ function appendTurnFence(
   return {
     sql: `${baseSql}
       AND (SELECT COUNT(*) FROM turns present_turn
-             WHERE present_turn.workspace_id = ? AND present_turn.id IN (${ids})) = ?
+             WHERE present_turn.workspace_id = ? AND present_turn.id IN (${ids})
+               AND ${turnIsVisibleInActiveSurfacesSql('present_turn')}) = ?
       AND NOT EXISTS (
             SELECT 1 FROM turns checked_turn
-             WHERE checked_turn.workspace_id = ? AND (${mismatch})
+             WHERE checked_turn.workspace_id = ?
+               AND ${turnIsVisibleInActiveSurfacesSql('checked_turn')}
+               AND (${mismatch})
           )`,
     params: [
       ...baseParams,
@@ -14244,6 +15762,49 @@ function appendTurnFence(
       workspaceId, ...mismatchParams,
     ],
   };
+}
+
+/**
+ * Aggregate commands may insert new turns, but every supplied turn that already
+ * exists must still belong to the active surface.  Keeping this predicate on
+ * the aggregate's first write makes a retired child-return row abort the whole
+ * transaction before sibling task, input, claim, or feed rows can change.
+ */
+function appendExistingTurnVisibilityFence(
+  baseSql: string,
+  baseParams: SqlValue[],
+  workspaceId: string,
+  turnIds: readonly string[],
+): { sql: string; params: SqlValue[] } {
+  const uniqueTurnIds = [...new Set(turnIds)].filter((turnId) => turnId.length > 0);
+  if (uniqueTurnIds.length === 0) return { sql: baseSql, params: baseParams };
+  return {
+    sql: `${baseSql}
+      AND NOT EXISTS (
+        SELECT 1 FROM turns protected_turn
+         WHERE protected_turn.workspace_id = ?
+            AND protected_turn.id IN (${placeholders(uniqueTurnIds.length)})
+            AND NOT (${turnIsVisibleInActiveSurfacesSql('protected_turn')})
+       )`,
+    params: [
+      ...baseParams,
+      workspaceId,
+      ...uniqueTurnIds,
+    ],
+  };
+}
+
+function existingTurnVisibilityGuardStatement(
+  workspaceId: string,
+  turnIds: readonly string[],
+): SqlStatement {
+  const guard = appendExistingTurnVisibilityFence(
+    'UPDATE workspaces SET last_opened_at = last_opened_at WHERE id = ?',
+    [workspaceId],
+    workspaceId,
+    turnIds,
+  );
+  return { sql: guard.sql, params: guard.params };
 }
 
 /**
@@ -14264,6 +15825,7 @@ function guardedTaskUpdateStatement(
     sql: `UPDATE tasks SET parent_id=?, role=?, lifecycle=?, release_state=?, goal=?, backend=?, model=?,
              revision=?, created_at=?, updated_at=?, payload_json=?
            WHERE workspace_id=? AND id=? AND revision=?
+             AND ${taskIsVisibleInActiveSurfacesSql('tasks')}
              AND json_extract(tasks.payload_json, '$.workflowShell') IS NULL
              AND NOT EXISTS (
                SELECT 1 FROM workflow_nodes
@@ -14276,7 +15838,8 @@ function guardedTaskUpdateStatement(
                 WHERE queued_epoch.workspace_id = tasks.workspace_id
                   AND queued_epoch.task_id = tasks.id
                   AND COALESCE(json_extract(queued_epoch.payload_json, '$.executionEpoch'), 1) = ?
-             ) < ?`,
+                  AND ${turnIsVisibleInActiveSurfacesSql('queued_epoch')}
+              ) < ?`,
     params: [
       task.parentId, task.role, task.lifecycle, task.releaseState, task.goal, task.backend,
       task.model ?? null, task.revision, task.createdAt, task.updatedAt, taskPayload(task), workspaceId,
@@ -14324,16 +15887,20 @@ function guardedWorkflowRetryTaskUpdateStatement(
          WHERE activation.workspace_id = tasks.workspace_id
            AND activation.run_id = ?
            AND activation.activation_id = ?
-           AND activation.execution_turn_id = ?
-           AND activation.status = ?
-           AND source_turn.status = ?
-           AND node.task_id = tasks.id
-           AND run.status = 'running'
-           AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+            AND activation.execution_turn_id = ?
+            AND activation.status = ?
+            AND ${activeWorkflowActivationKindSql('activation')}
+            AND source_turn.status = ?
+            AND node.task_id = tasks.id
+            AND run.status = 'running'
+            AND run.origin = 'top_level'
+            AND run.parent_run_id IS NULL
+            AND (run.deadline_at IS NULL OR run.deadline_at > ?)
            AND run.workflow_turns_reserved < run.max_workflow_turns
            AND (SELECT COUNT(*) FROM turns task_turn
                   WHERE task_turn.workspace_id = tasks.workspace_id
-                    AND task_turn.task_id = tasks.id) < run.max_turns_per_task
+                    AND task_turn.task_id = tasks.id
+                    AND ${turnIsVisibleInActiveSurfacesSql('task_turn')}) < run.max_turns_per_task
            AND run.definition_id = ?
            AND run.definition_version = ?
            AND definition.fingerprint = ?
@@ -14358,6 +15925,7 @@ function guardedWorkflowRetryTaskUpdateStatement(
                WHERE competing.workspace_id = tasks.workspace_id
                  AND competing.task_id = tasks.id
                  AND ${competingTurnPredicate}
+                 AND ${turnIsVisibleInActiveSurfacesSql('competing')}
            )
       )`,
     params: [
@@ -14392,8 +15960,9 @@ function guardedDispatchTaskUpdateStatement(
            WHERE workspace_id=? AND id=? AND revision=?
              AND EXISTS (
                SELECT 1 FROM turns
-                WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
-             )`,
+                 WHERE workspace_id = ? AND id = ? AND task_id = ? AND status = 'queued'
+                   AND ${turnIsVisibleInActiveSurfacesSql()}
+              )`,
     params: [
       task.parentId, task.role, task.lifecycle, task.releaseState, task.goal, task.backend,
       task.model ?? null, task.revision, task.createdAt, task.updatedAt, taskPayload(task), workspaceId,
@@ -14417,7 +15986,8 @@ function turnStatement(workspaceId: string, turn: TaskTurn, upsert: boolean): Sq
     ? ` ON CONFLICT(workspace_id, id) DO UPDATE SET
           task_id=excluded.task_id, sequence=excluded.sequence, status=excluded.status,
           trigger=excluded.trigger, created_at=excluded.created_at, started_at=excluded.started_at,
-          settled_at=excluded.settled_at, payload_json=excluded.payload_json`
+          settled_at=excluded.settled_at, payload_json=excluded.payload_json
+          WHERE ${turnIsVisibleInActiveSurfacesSql('turns')}`
     : '';
   return {
     sql: `INSERT INTO turns
@@ -14447,7 +16017,17 @@ function guardedLiveTurnReplaceStatement(
   return {
     sql: `UPDATE turns
              SET task_id=?, sequence=?, status=?, trigger=?, created_at=?, started_at=?, settled_at=?, payload_json=?
-           WHERE workspace_id=? AND id=? AND status IN (${placeholders(statuses.length)})${epochPredicate}`,
+           WHERE workspace_id=? AND id=? AND status IN (${placeholders(statuses.length)})
+             AND NOT EXISTS (
+               SELECT 1
+                 FROM workflow_activations retired_activation
+                 JOIN workflow_runs retired_run
+                   ON retired_run.workspace_id = retired_activation.workspace_id
+                  AND retired_run.run_id = retired_activation.run_id
+                WHERE retired_activation.workspace_id = turns.workspace_id
+                  AND ${workflowActivationOwnsTurnSql('turns', 'retired_activation')}
+                  AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+             )${epochPredicate}`,
     params: [
       turn.taskId, turn.sequence, turn.status, turn.trigger, turn.createdAt, turn.startedAt ?? null,
       turn.finishedAt ?? null, turnPayload(turn), workspaceId, turn.id, ...statuses,
@@ -14483,7 +16063,8 @@ function guardedStageDispositionStatement(
   return {
     sql: `UPDATE turns
              SET task_id=?, sequence=?, status=?, trigger=?, created_at=?, started_at=?, settled_at=?, payload_json=?
-           WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})${dispositionPredicate}${epochPredicate}${workflowPredicate}`,
+           WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})
+             AND ${turnIsVisibleInActiveSurfacesSql()}${dispositionPredicate}${epochPredicate}${workflowPredicate}`,
     params: [
       command.turn.taskId, command.turn.sequence, command.turn.status, command.turn.trigger, command.turn.createdAt,
       command.turn.startedAt ?? null, command.turn.finishedAt ?? null, turnPayload(command.turn), workspaceId, command.turnId,
@@ -14500,17 +16081,14 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
   sql: string;
   params: SqlValue[];
 } {
-  const isChildWorkflowRoute =
-    disposition.kind === 'workflow_next' && disposition.route?.kind === 'child_workflow';
-  if (
-    isChildWorkflowRoute &&
-    !validateInvokeChildEntryBindings(disposition.route!.entryBindings).ok
-  ) return { sql: '0', params: [] };
   const activationConditions = [
     `activation.workspace_id = turns.workspace_id`,
     `activation.execution_turn_id = turns.id`,
     `activation.status IN ('queued', 'running')`,
+    activeWorkflowActivationKindSql('activation'),
     `run.status = 'running'`,
+    `run.origin = 'top_level'`,
+    `run.parent_run_id IS NULL`,
     `node.task_id = turns.task_id`,
   ];
   if (disposition.kind === 'workflow_next' && (disposition as any).change === 'unchanged') {
@@ -14558,31 +16136,6 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
        )`,
     );
   }
-  if (isChildWorkflowRoute) {
-    activationConditions.push(
-      `EXISTS (
-         SELECT 1 FROM workflow_definition_outputs output
-          WHERE output.workspace_id = run.workspace_id
-            AND output.definition_id = run.definition_id
-            AND output.definition_version = run.definition_version
-            AND output.terminal_node_id = activation.node_id
-       )`,
-      `NOT EXISTS (
-         SELECT 1 FROM workflow_feedback_rounds round_row
-          WHERE round_row.workspace_id = activation.workspace_id
-            AND round_row.run_id = activation.run_id
-            AND round_row.status = 'open'
-       )`,
-      `NOT EXISTS (
-         SELECT 1 FROM workflow_continuations continuation
-          WHERE continuation.workspace_id = activation.workspace_id
-            AND continuation.run_id = activation.run_id
-            AND continuation.kind = 'child_wait'
-            AND continuation.status = 'pending'
-       )`,
-    );
-  }
-
   const activationExists = `EXISTS (
     SELECT 1
       FROM workflow_activations activation
@@ -14596,107 +16149,7 @@ function workflowDispositionAuthorizationPredicate(disposition: TurnDisposition)
       WHERE ${activationConditions.join('\n       AND ')}
   )`;
 
-  if (!isChildWorkflowRoute) return { sql: activationExists, params: [] };
-
-  const route = disposition.route!;
-  const childDefinitionExists = `EXISTS (
-    SELECT 1 FROM workflow_definitions child_definition
-     WHERE child_definition.workspace_id = turns.workspace_id
-       AND child_definition.definition_id = ?
-       AND child_definition.version = ?
-       AND (
-         child_definition.scope_kind = 'workspace'
-         OR (
-           child_definition.scope_kind = 'root'
-           AND child_definition.owner_root_task_id = COALESCE((
-             SELECT caller_run.owner_root_task_id
-               FROM workflow_activations caller_activation
-               JOIN workflow_runs caller_run
-                 ON caller_run.workspace_id = caller_activation.workspace_id
-                AND caller_run.run_id = caller_activation.run_id
-              WHERE caller_activation.workspace_id = turns.workspace_id
-                AND caller_activation.execution_turn_id = turns.id
-              LIMIT 1
-           ), turns.task_id)
-         )
-       )
-  )`;
-  const exactContractCount = `(
-     SELECT COUNT(*) FROM workflow_definition_inputs child_contract
-     WHERE child_contract.workspace_id = turns.workspace_id
-       AND child_contract.definition_id = ?
-       AND child_contract.definition_version = ?
-  ) = ?`;
-  const bindingPredicates = route.entryBindings.map(() => `EXISTS (
-    SELECT 1
-       FROM workflow_definition_inputs child_contract
-       JOIN workflow_activations caller_activation
-         ON caller_activation.workspace_id = turns.workspace_id
-        AND caller_activation.execution_turn_id = turns.id
-       JOIN workflow_gate_fills fill
-         ON fill.workspace_id = caller_activation.workspace_id
-        AND fill.run_id = caller_activation.run_id
-        AND fill.gate_id = COALESCE(
-          caller_activation.source_gate_id,
-          caller_activation.return_gate_id,
-          (
-            SELECT COALESCE(primary_activation.source_gate_id, primary_activation.return_gate_id)
-              FROM workflow_activations primary_activation
-             WHERE primary_activation.workspace_id = caller_activation.workspace_id
-               AND primary_activation.run_id = caller_activation.run_id
-               AND primary_activation.execution_turn_id = caller_activation.primary_turn_id
-             LIMIT 1
-          )
-        )
-        AND fill.input_ref = ?
-       JOIN workflow_artifacts artifact
-         ON artifact.workspace_id = fill.workspace_id
-        AND artifact.run_id = COALESCE(fill.artifact_run_id, fill.run_id)
-        AND artifact.artifact_id = fill.artifact_id
-        AND artifact.revision = fill.artifact_revision
-       JOIN workflow_artifact_sources source
-         ON source.workspace_id = artifact.workspace_id
-       AND source.run_id = artifact.run_id
-       AND source.artifact_id = artifact.artifact_id
-       AND source.artifact_revision = artifact.revision
-     WHERE child_contract.workspace_id = turns.workspace_id
-        AND child_contract.definition_id = ?
-        AND child_contract.definition_version = ?
-        AND child_contract.name = ?
-  )`);
-  const childRouteParams: SqlValue[] = [
-    route.childDefinitionId,
-    route.childDefinitionVersion,
-    route.childDefinitionId,
-    route.childDefinitionVersion,
-    route.entryBindings.length,
-  ];
-  for (const binding of route.entryBindings) {
-    childRouteParams.push(
-      binding.fromInputRef,
-      route.childDefinitionId,
-      route.childDefinitionVersion,
-      binding.name,
-    );
-  }
-
-  return {
-    sql: `EXISTS (
-    SELECT 1 FROM tasks caller
-     WHERE caller.workspace_id = turns.workspace_id
-       AND caller.id = turns.task_id
-       AND caller.role = 'coordinator'
-       AND EXISTS (
-         SELECT 1 FROM json_each(COALESCE(json_extract(caller.payload_json, '$.capabilities'), '[]')) capability
-          WHERE capability.value = 'create_child'
-       )
-       AND ${activationExists}
-       AND ${childDefinitionExists}
-       AND ${exactContractCount}
-       ${bindingPredicates.map((predicate) => `AND ${predicate}`).join('\n       ')}
-  )`,
-    params: childRouteParams,
-  };
+  return { sql: activationExists, params: [] };
 }
 
 function dispositionClaimInsertStatement(
@@ -14755,7 +16208,15 @@ function workflowActivationSettlementStatement(
     sql: `UPDATE workflow_activations
              SET status = ?, updated_at = ?
            WHERE workspace_id = ? AND execution_turn_id = ?
-             AND status IN ('queued', 'running', 'failed', 'interrupted')`,
+               AND status IN ('queued', 'running', 'failed', 'interrupted')
+               AND ${activeWorkflowActivationKindSql('workflow_activations')}
+               AND EXISTS (
+                SELECT 1 FROM workflow_runs run
+                 WHERE run.workspace_id = workflow_activations.workspace_id
+                   AND run.run_id = workflow_activations.run_id
+                   AND run.origin = 'top_level'
+                   AND run.parent_run_id IS NULL
+              )`,
     params: [status, at, workspaceId, turnId],
   };
 }
@@ -14771,7 +16232,8 @@ function workflowActivationRetryStatement(
     sql: `UPDATE workflow_activations
              SET status = 'queued', execution_turn_id = ?, updated_at = ?
            WHERE workspace_id = ? AND run_id = ? AND activation_id = ?
-             AND execution_turn_id = ? AND status = ?`,
+              AND execution_turn_id = ? AND status = ?
+              AND ${activeWorkflowActivationKindSql('workflow_activations')}`,
     params: [
       retryTurnId,
       at,
@@ -14834,7 +16296,15 @@ function workflowActivationRunningStatement(
   return {
     sql: `UPDATE workflow_activations
              SET status = 'running', updated_at = ?
-           WHERE workspace_id = ? AND execution_turn_id = ? AND status = 'queued'`,
+           WHERE workspace_id = ? AND execution_turn_id = ? AND status = 'queued'
+              AND ${activeWorkflowActivationKindSql('workflow_activations')}
+              AND EXISTS (
+               SELECT 1 FROM workflow_runs run
+                WHERE run.workspace_id = workflow_activations.workspace_id
+                  AND run.run_id = workflow_activations.run_id
+                  AND run.origin = 'top_level'
+                  AND run.parent_run_id IS NULL
+             )`,
     params: [at, workspaceId, turnId],
   };
 }
@@ -14849,8 +16319,15 @@ function workflowStartContinuationConsumptionStatement(
     sql: `UPDATE workflow_continuations
              SET status = 'consumed', updated_at = ?
            WHERE workspace_id = ? AND kind = 'start_wait' AND status = 'resolved'
-             AND producing_turn_id = ?
-             ${continuationId === undefined ? '' : 'AND continuation_id = ?'}`,
+              AND producing_turn_id = ?
+              AND EXISTS (
+                SELECT 1 FROM workflow_runs run
+                 WHERE run.workspace_id = workflow_continuations.workspace_id
+                   AND run.run_id = workflow_continuations.run_id
+                   AND run.origin = 'top_level'
+                   AND run.parent_run_id IS NULL
+              )
+              ${continuationId === undefined ? '' : 'AND continuation_id = ?'}`,
     params: [at, workspaceId, turnId, ...(continuationId === undefined ? [] : [continuationId])],
   };
 }
@@ -14872,29 +16349,16 @@ function workflowActivationSourceConsumptionStatements(
                     AND activation.run_id = workflow_feedback_rounds.run_id
                     AND activation.feedback_round_id = workflow_feedback_rounds.round_id
                     AND activation.kind = 'feedback_resume'
-                    AND activation.execution_turn_id = ?
-                    AND activation.status IN ('queued', 'running')
-               )`,
-      params: [at, workspaceId, turnId],
-    },
-    {
-      sql: `UPDATE workflow_continuations
-               SET status = 'consumed', updated_at = ?
-             WHERE workspace_id = ? AND status = 'resolved'
-               AND EXISTS (
-                 SELECT 1 FROM workflow_return_gates return_gate
-                  WHERE return_gate.workspace_id = workflow_continuations.workspace_id
-                    AND return_gate.continuation_run_id = workflow_continuations.run_id
-                    AND return_gate.continuation_id = workflow_continuations.continuation_id
-                    AND return_gate.execution_turn_id = ?
-                    AND return_gate.status = 'satisfied'
-               )`,
-      params: [at, workspaceId, turnId],
-    },
-    {
-      sql: `UPDATE workflow_return_gates
-               SET status = 'consumed', updated_at = ?
-             WHERE workspace_id = ? AND execution_turn_id = ? AND status = 'satisfied'`,
+                     AND activation.execution_turn_id = ?
+                     AND activation.status IN ('queued', 'running')
+                     AND EXISTS (
+                       SELECT 1 FROM workflow_runs run
+                        WHERE run.workspace_id = activation.workspace_id
+                          AND run.run_id = activation.run_id
+                          AND run.origin = 'top_level'
+                          AND run.parent_run_id IS NULL
+                     )
+                )`,
       params: [at, workspaceId, turnId],
     },
   ];
@@ -14918,9 +16382,14 @@ function workflowNodeArtifactSourceStatement(input: {
           )
           SELECT ?, ?, ?, ?, 'workflow_node', ?, ?, ?, ?, activation_id,
                  NULL, NULL, NULL
-            FROM workflow_activations
-           WHERE workspace_id = ? AND run_id = ? AND node_id = ?
-             AND execution_turn_id = ?
+             FROM workflow_activations activation
+             JOIN workflow_runs run
+               ON run.workspace_id = activation.workspace_id
+              AND run.run_id = activation.run_id
+             WHERE activation.workspace_id = ? AND activation.run_id = ? AND activation.node_id = ?
+               AND activation.execution_turn_id = ?
+               AND ${activeWorkflowActivationKindSql('activation')}
+               AND run.origin = 'top_level' AND run.parent_run_id IS NULL
           ON CONFLICT(workspace_id, run_id, artifact_id, artifact_revision) DO NOTHING`,
     params: [
       input.workspaceId,
@@ -15054,10 +16523,13 @@ function guardedSettleTurnStatement(
          AND activation.run_id = ?
          AND activation.activation_id = ?
          AND activation.execution_turn_id = turns.id
-         AND activation.status = ?
-         AND node.task_id = turns.task_id
-         AND run.status = 'running'
-         AND (run.deadline_at IS NULL OR run.deadline_at > ?)
+           AND activation.status = ?
+           AND ${activeWorkflowActivationKindSql('activation')}
+           AND node.task_id = turns.task_id
+          AND run.status = 'running'
+          AND run.origin = 'top_level'
+          AND run.parent_run_id IS NULL
+          AND (run.deadline_at IS NULL OR run.deadline_at > ?)
           AND run.definition_id = ?
           AND run.definition_version = ?
           AND definition.fingerprint = ?
@@ -15099,10 +16571,13 @@ function guardedSettleTurnStatement(
        WHERE activation.workspace_id = turns.workspace_id
          AND activation.run_id = ?
          AND activation.activation_id = ?
-         AND activation.execution_turn_id = ?
-         AND activation.status = ?
-         AND run.status = 'running'
-         ${decision.allowExpiredDeadline ? '' : 'AND (run.deadline_at IS NULL OR run.deadline_at > ?)'}
+          AND activation.execution_turn_id = ?
+           AND activation.status = ?
+           AND ${activeWorkflowActivationKindSql('activation')}
+           AND run.status = 'running'
+          AND run.origin = 'top_level'
+          AND run.parent_run_id IS NULL
+          ${decision.allowExpiredDeadline ? '' : 'AND (run.deadline_at IS NULL OR run.deadline_at > ?)'}
     )`);
     stateParams.push(
       decision.runId,
@@ -15159,20 +16634,20 @@ function guardedSettleTurnStatement(
     statePredicates.push(`AND EXISTS (
       SELECT 1 FROM workflow_runs run
        WHERE run.workspace_id = ? AND run.run_id = ? AND run.status = 'running'
-         AND run.feedback_rounds_reserved = ? AND run.workflow_turns_reserved = ?
-         AND run.children_reserved = ?
+          AND run.origin = 'top_level' AND run.parent_run_id IS NULL
+          AND run.feedback_rounds_reserved = ? AND run.workflow_turns_reserved = ?
     )`);
     stateParams.push(
       workspaceId,
       precondition.runId,
       precondition.feedbackRoundsReserved,
       precondition.workflowTurnsReserved,
-      precondition.childrenReserved,
     );
     for (const task of precondition.taskTurnCounts) {
       statePredicates.push(`AND (
         SELECT COUNT(*) FROM turns counted_turn
          WHERE counted_turn.workspace_id = ? AND counted_turn.task_id = ?
+           AND ${turnIsVisibleInActiveSurfacesSql('counted_turn')}
       ) = ?`);
       stateParams.push(workspaceId, task.taskId, task.count);
     }
@@ -15182,17 +16657,9 @@ function guardedSettleTurnStatement(
       statePredicates.push(`AND EXISTS (
         SELECT 1 FROM workflow_runs run
          WHERE run.workspace_id = ? AND run.run_id = ? AND run.status = 'running'
+           AND run.origin = 'top_level' AND run.parent_run_id IS NULL
       )`);
       stateParams.push(workspaceId, runId);
-    }
-    if (precondition.runIds.length > 0) {
-      statePredicates.push(`AND NOT EXISTS (
-        SELECT 1 FROM workflow_runs child
-         WHERE child.workspace_id = ? AND child.status = 'running'
-           AND child.parent_run_id IN (${placeholders(precondition.runIds.length)})
-           AND child.run_id NOT IN (${placeholders(precondition.runIds.length)})
-      )`);
-      stateParams.push(workspaceId, ...precondition.runIds, ...precondition.runIds);
     }
     for (const task of precondition.tasks) {
       statePredicates.push(`AND EXISTS (
@@ -15206,7 +16673,8 @@ function guardedSettleTurnStatement(
       statePredicates.push(`AND EXISTS (
         SELECT 1 FROM turns live_turn
          WHERE live_turn.workspace_id = ? AND live_turn.id = ?
-           AND live_turn.task_id = ? AND live_turn.status = ?
+            AND live_turn.task_id = ? AND live_turn.status = ?
+            AND ${turnIsVisibleInActiveSurfacesSql('live_turn')}
       )`);
       stateParams.push(workspaceId, liveTurn.turnId, liveTurn.taskId, liveTurn.status);
     }
@@ -15216,9 +16684,10 @@ function guardedSettleTurnStatement(
       statePredicates.push(`AND NOT EXISTS (
         SELECT 1 FROM turns candidate
          WHERE candidate.workspace_id = ?
-           AND candidate.task_id IN (${placeholders(precondition.componentTaskIds.length)})
-           AND candidate.status IN ('queued', 'running', 'waiting_user')
-           ${plannedLiveTurnPredicate}
+            AND candidate.task_id IN (${placeholders(precondition.componentTaskIds.length)})
+            AND candidate.status IN ('queued', 'running', 'waiting_user')
+            AND ${turnIsVisibleInActiveSurfacesSql('candidate')}
+            ${plannedLiveTurnPredicate}
       )`);
       stateParams.push(
         workspaceId,
@@ -15230,13 +16699,23 @@ function guardedSettleTurnStatement(
   const sql = `UPDATE turns
              SET task_id=?, sequence=?, status=?, trigger=?, created_at=?, started_at=?, settled_at=?, payload_json=?
            WHERE workspace_id=? AND id=? AND status IN (${placeholders(command.expectedStatuses.length)})
-             AND EXISTS (
-               SELECT 1 FROM tasks task
-                WHERE task.workspace_id = turns.workspace_id AND task.id = turns.task_id
-                  AND task.revision = ?
-                   AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
+              AND EXISTS (
+                SELECT 1 FROM tasks task
+                 WHERE task.workspace_id = turns.workspace_id AND task.id = turns.task_id
+                   AND task.revision = ?
+                    AND COALESCE(json_extract(task.payload_json, '$.runtimeEpoch'), 1) = ?
+               )
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM workflow_activations retired_activation
+                  JOIN workflow_runs retired_run
+                    ON retired_run.workspace_id = retired_activation.workspace_id
+                   AND retired_run.run_id = retired_activation.run_id
+                 WHERE retired_activation.workspace_id = turns.workspace_id
+                   AND ${workflowActivationOwnsTurnSql('turns', 'retired_activation')}
+                   AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
               )
-               ${statePredicates.join('\n')}`;
+                ${statePredicates.join('\n')}`;
   const params: SqlValue[] = [
       turn.taskId, turn.sequence, turn.status, turn.trigger, turn.createdAt, turn.startedAt ?? null,
       turn.finishedAt ?? null, turnPayload(turn), workspaceId, turn.id, ...command.expectedStatuses,
@@ -15249,8 +16728,27 @@ function guardedSettleTurnStatement(
 function turnInputStatement(workspaceId: string, turnId: string, ordering: number, input: TurnInput): SqlStatement {
   return {
     sql: `INSERT INTO turn_inputs (workspace_id, turn_id, ordering, kind, payload_json)
-          VALUES (?,?,?,?,?)`,
-    params: [workspaceId, turnId, ordering, input.kind, encodePayload(input)],
+          SELECT ?,?,?,?,?
+           WHERE EXISTS (
+             SELECT 1 FROM turns input_turn
+              WHERE input_turn.workspace_id = ? AND input_turn.id = ?
+                AND ${turnIsVisibleInActiveSurfacesSql('input_turn')}
+           )`,
+    params: [workspaceId, turnId, ordering, input.kind, encodePayload(input), workspaceId, turnId],
+  };
+}
+
+function turnInputDeleteStatement(workspaceId: string, turnId: string): SqlStatement {
+  return {
+    sql: `DELETE FROM turn_inputs
+           WHERE workspace_id = ? AND turn_id = ?
+             AND EXISTS (
+               SELECT 1 FROM turns input_turn
+                WHERE input_turn.workspace_id = turn_inputs.workspace_id
+                  AND input_turn.id = turn_inputs.turn_id
+                  AND ${turnIsVisibleInActiveSurfacesSql('input_turn')}
+             )`,
+    params: [workspaceId, turnId],
   };
 }
 
@@ -15259,15 +16757,26 @@ function messageStatement(workspaceId: string, message: TaskMessage, upsert: boo
     ? ` ON CONFLICT(workspace_id, id) DO UPDATE SET
           task_id=excluded.task_id, turn_id=excluded.turn_id, role=excluded.role,
           state=excluded.state, ordering=excluded.ordering, content=excluded.content,
-          created_at=excluded.created_at, updated_at=excluded.updated_at, payload_json=excluded.payload_json`
+          created_at=excluded.created_at, updated_at=excluded.updated_at, payload_json=excluded.payload_json
+          WHERE ${messageIsVisibleInActiveSurfacesSql('messages')}`
     : '';
+  const turnGuard = message.turnId === undefined
+    ? ''
+    : ` WHERE EXISTS (
+          SELECT 1 FROM turns message_turn
+           WHERE message_turn.workspace_id = ?
+             AND message_turn.id = ?
+             AND message_turn.task_id = ?
+             AND ${turnIsVisibleInActiveSurfacesSql('message_turn')}
+        )`;
   return {
     sql: `INSERT INTO messages
           (id, workspace_id, task_id, turn_id, role, state, ordering, content, created_at, updated_at, payload_json)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)${suffix}`,
+          SELECT ?,?,?,?,?,?,?,?,?,?,?${turnGuard}${suffix}`,
     params: [message.id, workspaceId, message.taskId, message.turnId ?? null, message.role,
       message.state, message.order ?? null, message.content, message.createdAt, updatedAt ?? null,
-      messagePayload(message)],
+      messagePayload(message),
+      ...(message.turnId === undefined ? [] : [workspaceId, message.turnId, message.taskId])],
   };
 }
 
@@ -15275,13 +16784,22 @@ function toolCallStatement(workspaceId: string, tool: PersistedToolCall): SqlSta
   return {
     sql: `INSERT INTO tool_calls
           (id, workspace_id, task_id, turn_id, tool_call_id, ordering, status, name, payload_json, created_at, updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?)
+          SELECT ?,?,?,?,?,?,?,?,?,?,?
+           WHERE EXISTS (
+             SELECT 1 FROM turns tool_turn
+              WHERE tool_turn.workspace_id = ?
+                AND tool_turn.id = ?
+                AND tool_turn.task_id = ?
+                AND ${turnIsVisibleInActiveSurfacesSql('tool_turn')}
+           )
           ON CONFLICT(workspace_id, id) DO UPDATE SET task_id=excluded.task_id, turn_id=excluded.turn_id,
             tool_call_id=excluded.tool_call_id, ordering=excluded.ordering, status=excluded.status,
             name=excluded.name, payload_json=excluded.payload_json, created_at=excluded.created_at,
-            updated_at=excluded.updated_at`,
+            updated_at=excluded.updated_at
+          WHERE ${turnOwnedRowIsVisibleInActiveSurfacesSql('tool_calls')}`,
     params: [tool.id, workspaceId, tool.taskId, tool.turnId, tool.toolCallId, tool.order, tool.status,
-      tool.name, toolCallPayload(tool), tool.createdAt, tool.updatedAt],
+      tool.name, toolCallPayload(tool), tool.createdAt, tool.updatedAt,
+      workspaceId, tool.turnId, tool.taskId],
   };
 }
 
@@ -15289,12 +16807,21 @@ function reasoningStatement(workspaceId: string, reasoning: PersistedReasoning):
   return {
     sql: `INSERT INTO reasoning_segments
           (id, workspace_id, task_id, turn_id, ordering, content, created_at, updated_at)
-          VALUES (?,?,?,?,?,?,?,?)
+          SELECT ?,?,?,?,?,?,?,?
+           WHERE EXISTS (
+             SELECT 1 FROM turns reasoning_turn
+              WHERE reasoning_turn.workspace_id = ?
+                AND reasoning_turn.id = ?
+                AND reasoning_turn.task_id = ?
+                AND ${turnIsVisibleInActiveSurfacesSql('reasoning_turn')}
+           )
           ON CONFLICT(workspace_id, id) DO UPDATE SET task_id=excluded.task_id, turn_id=excluded.turn_id,
             ordering=excluded.ordering, content=excluded.content, created_at=excluded.created_at,
-            updated_at=excluded.updated_at`,
+            updated_at=excluded.updated_at
+          WHERE ${turnOwnedRowIsVisibleInActiveSurfacesSql('reasoning_segments')}`,
     params: [reasoning.id, workspaceId, reasoning.taskId, reasoning.turnId, reasoning.order, reasoning.content,
-      reasoning.createdAt, reasoning.updatedAt],
+      reasoning.createdAt, reasoning.updatedAt,
+      workspaceId, reasoning.turnId, reasoning.taskId],
   };
 }
 
@@ -15369,7 +16896,18 @@ function workspaceLocationStatement(command: Extract<RepositoryCommand, { kind: 
 function operationStatement(workspaceId: string, command: Extract<RepositoryCommand, { kind: 'putOperation' }>): SqlStatement {
   return {
     sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
-          VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO UPDATE SET
+          SELECT operation_input.workspace_id, operation_input.ledger_key,
+                 operation_input.fingerprint, operation_input.result_json,
+                 operation_input.created_at
+            FROM (
+              SELECT ? AS workspace_id, ? AS ledger_key, ? AS fingerprint,
+                     ? AS result_json, ? AS created_at
+            ) operation_input
+           WHERE ${operationLedgerIsVisibleInActiveSurfacesSql(
+             'operation_input.workspace_id',
+             'operation_input.ledger_key',
+           )}
+          ON CONFLICT(workspace_id, ledger_key) DO UPDATE SET
           fingerprint=excluded.fingerprint, result_json=excluded.result_json, created_at=excluded.created_at`,
     params: [workspaceId, command.ledgerKey, command.entry.fingerprint,
       encodePayload({ result: command.entry.result }), command.createdAt],
@@ -15382,7 +16920,18 @@ function graphOperationClaimStatement(
 ): SqlStatement {
   return {
     sql: `INSERT INTO operations (workspace_id, ledger_key, fingerprint, result_json, created_at)
-          VALUES (?,?,?,?,?) ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
+          SELECT operation_input.workspace_id, operation_input.ledger_key,
+                 operation_input.fingerprint, operation_input.result_json,
+                 operation_input.created_at
+            FROM (
+              SELECT ? AS workspace_id, ? AS ledger_key, ? AS fingerprint,
+                     ? AS result_json, ? AS created_at
+            ) operation_input
+           WHERE ${operationLedgerIsVisibleInActiveSurfacesSql(
+             'operation_input.workspace_id',
+             'operation_input.ledger_key',
+           )}
+          ON CONFLICT(workspace_id, ledger_key) DO NOTHING`,
     params: [workspaceId, operation.ledgerKey, operation.entry.fingerprint,
       encodePayload({ result: operation.entry.result }), operation.createdAt],
   };
@@ -15402,8 +16951,14 @@ function graphTurnFenceStatement(
   return {
     sql: `UPDATE turns SET payload_json = payload_json
            WHERE workspace_id = ? AND id = ? AND status = ?
-             AND (SELECT COUNT(*) FROM turns present WHERE present.workspace_id = ? AND present.id IN (${placeholders(expected.length)})) = ?
-             AND NOT EXISTS (SELECT 1 FROM turns checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
+             AND ${turnIsVisibleInActiveSurfacesSql()}
+             AND (SELECT COUNT(*) FROM turns present
+                   WHERE present.workspace_id = ? AND present.id IN (${placeholders(expected.length)})
+                     AND ${turnIsVisibleInActiveSurfacesSql('present')}) = ?
+             AND NOT EXISTS (SELECT 1 FROM turns checked
+                              WHERE checked.workspace_id = ?
+                                AND ${turnIsVisibleInActiveSurfacesSql('checked')}
+                                AND (${mismatch}))`,
     params: [workspaceId, expected[0]!.id, expected[0]!.status,
       workspaceId, ...expected.map((entry) => entry.id), expected.length,
       workspaceId, ...mismatchParams],
@@ -15420,6 +16975,12 @@ function graphRuntimeClaimFenceStatement(
   return {
     sql: `UPDATE runtime_claims SET heartbeat_at = heartbeat_at
            WHERE workspace_id = ? AND turn_id = ? AND owner_id = ?
+             AND EXISTS (
+               SELECT 1 FROM turns claimed_turn
+                WHERE claimed_turn.workspace_id = runtime_claims.workspace_id
+                  AND claimed_turn.id = runtime_claims.turn_id
+                  AND ${turnIsVisibleInActiveSurfacesSql('claimed_turn')}
+             )
              AND (SELECT COUNT(*) FROM runtime_claims present WHERE present.workspace_id = ? AND present.turn_id IN (${placeholders(expected.length)})) = ?
              AND NOT EXISTS (SELECT 1 FROM runtime_claims checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
     params: [workspaceId, expected[0]!.turnId, expected[0]!.ownerId,
@@ -15438,6 +16999,12 @@ function graphCancelRequestFenceStatement(
   return {
     sql: `UPDATE turn_cancel_requests SET requested_at = requested_at
            WHERE workspace_id = ? AND turn_id = ? AND kind = ? AND op_id = ?
+             AND EXISTS (
+               SELECT 1 FROM turns cancel_turn
+                WHERE cancel_turn.workspace_id = turn_cancel_requests.workspace_id
+                  AND cancel_turn.id = turn_cancel_requests.turn_id
+                  AND ${turnIsVisibleInActiveSurfacesSql('cancel_turn')}
+             )
              AND (SELECT COUNT(*) FROM turn_cancel_requests present WHERE present.workspace_id = ? AND present.turn_id IN (${placeholders(expected.length)})) = ?
              AND NOT EXISTS (SELECT 1 FROM turn_cancel_requests checked WHERE checked.workspace_id = ? AND (${mismatch}))`,
     params: [workspaceId, expected[0]!.turnId, expected[0]!.kind, expected[0]!.opId,
@@ -15451,9 +17018,10 @@ function cancelRequestStatement(workspaceId: string, command: Extract<Repository
   return {
     sql: `INSERT INTO turn_cancel_requests
           (workspace_id, turn_id, task_id, kind, op_id, requested_by, requested_at, payload_json)
-          SELECT ?, id, task_id, ?, ?, ?, ?, ? FROM turns
-           WHERE workspace_id = ? AND id = ?
-          ON CONFLICT(workspace_id, turn_id) DO UPDATE SET kind=excluded.kind, op_id=excluded.op_id,
+           SELECT ?, id, task_id, ?, ?, ?, ?, ? FROM turns
+            WHERE workspace_id = ? AND id = ?
+              AND ${turnIsVisibleInActiveSurfacesSql()}
+           ON CONFLICT(workspace_id, turn_id) DO UPDATE SET kind=excluded.kind, op_id=excluded.op_id,
           requested_by=excluded.requested_by, requested_at=excluded.requested_at, payload_json=excluded.payload_json`,
     params: [workspaceId, request.kind, request.opId, request.by, request.at,
       encodePayload({ lifecycleAuthority: request.lifecycleAuthority, reason: request.reason }), workspaceId, command.turnId],
@@ -15616,10 +17184,6 @@ function newestTranscriptTime(command: Extract<RepositoryCommand, { kind: 'appen
   return times.sort().at(-1) ?? new Date().toISOString();
 }
 
-function escapeGlob(value: string): string {
-  return value.replace(/[\[\]*?]/g, '[$&]');
-}
-
 /** Canonical claim keys for a task; used by the scheduler adapter before it
  * issues the final worker-owned `claimTurn` command. */
 export function deriveResourceClaimKeys(task: MusterTask): string[] {
@@ -15643,7 +17207,15 @@ function claimTurnStatement(
   const turnId = command.kind === 'prepareDispatch' ? command.turn.id : command.turnId;
   const resource = claimResourcePredicate(workspaceId, command.resourceKeys);
   const sessionPredicate = command.sessionId
-    ? `AND NOT EXISTS (SELECT 1 FROM session_claims sc WHERE sc.workspace_id = ? AND sc.session_id = ?)`
+    ? `AND NOT EXISTS (
+         SELECT 1
+           FROM session_claims sc
+           JOIN turns session_turn
+             ON session_turn.workspace_id = sc.workspace_id
+            AND session_turn.id = sc.turn_id
+          WHERE sc.workspace_id = ? AND sc.session_id = ?
+            AND ${turnIsVisibleInActiveSurfacesSql('session_turn')}
+       )`
     : '';
   const sessionParams: SqlValue[] = command.sessionId ? [workspaceId, command.sessionId] : [];
   const revisionPredicate = command.kind === 'prepareDispatch'
@@ -15663,11 +17235,14 @@ function claimTurnStatement(
                ON authority_definition.workspace_id = authority_run.workspace_id
               AND authority_definition.definition_id = authority_run.definition_id
               AND authority_definition.version = authority_run.definition_version
-            WHERE authority_activation.workspace_id = turns.workspace_id
-              AND authority_activation.execution_turn_id = turns.id
-              AND authority_run.definition_id = ?
-              AND authority_run.definition_version = ?
-              AND authority_definition.fingerprint = ?
+             WHERE authority_activation.workspace_id = turns.workspace_id
+               AND authority_activation.execution_turn_id = turns.id
+               AND ${activeWorkflowActivationKindSql('authority_activation')}
+               AND authority_run.definition_id = ?
+               AND authority_run.definition_version = ?
+               AND authority_definition.fingerprint = ?
+               AND authority_run.origin = 'top_level'
+               AND authority_run.parent_run_id IS NULL
          )`
     : '';
   const authorityParams: SqlValue[] = authority
@@ -15724,10 +17299,12 @@ function claimTurnStatement(
                             ))
              AND NOT EXISTS (SELECT 1 FROM turns same_task
                               WHERE same_task.workspace_id = turns.workspace_id AND same_task.task_id = turns.task_id
-                                AND same_task.id <> turns.id AND same_task.status IN ('running', 'waiting_user'))
+                                AND same_task.id <> turns.id AND same_task.status IN ('running', 'waiting_user')
+                                AND ${turnIsVisibleInActiveSurfacesSql('same_task')})
              AND NOT EXISTS (SELECT 1 FROM turns earlier
                               WHERE earlier.workspace_id = turns.workspace_id AND earlier.task_id = turns.task_id
                                 AND earlier.id <> turns.id AND earlier.status = 'queued'
+                                AND ${turnIsVisibleInActiveSurfacesSql('earlier')}
                                 AND COALESCE(json_extract(earlier.payload_json, '$.holdAutoPromote'), 0) <> 1
                                 AND (earlier.sequence < turns.sequence OR (earlier.sequence = turns.sequence AND
                                      (earlier.created_at < turns.created_at OR (earlier.created_at = turns.created_at AND earlier.id < turns.id)))))
@@ -15745,13 +17322,22 @@ function claimTurnStatement(
                    AND run.run_id = activation.run_id
                  WHERE activation.workspace_id = turns.workspace_id
                    AND activation.execution_turn_id = turns.id
-                    AND (activation.status <> 'queued' OR run.status <> 'running')
+                    AND (activation.status <> 'queued' OR run.status <> 'running'
+                      OR run.origin <> 'top_level' OR run.parent_run_id IS NOT NULL
+                      OR NOT (${activeWorkflowActivationKindSql('activation')}))
                )
                AND NOT EXISTS (
                  SELECT 1 FROM workflow_feedback_rounds round_row
                   WHERE round_row.workspace_id = turns.workspace_id
-                    AND round_row.requester_task_id = turns.task_id
-                    AND round_row.status IN ('open', 'satisfied')
+                     AND round_row.requester_task_id = turns.task_id
+                     AND round_row.status IN ('open', 'satisfied')
+                     AND EXISTS (
+                       SELECT 1 FROM workflow_runs round_run
+                        WHERE round_run.workspace_id = round_row.workspace_id
+                          AND round_run.run_id = round_row.run_id
+                          AND round_run.origin = 'top_level'
+                          AND round_run.parent_run_id IS NULL
+                     )
                     AND NOT EXISTS (
                       SELECT 1 FROM workflow_activations activation
                        WHERE activation.workspace_id = round_row.workspace_id
@@ -15765,8 +17351,16 @@ function claimTurnStatement(
                 AND NOT EXISTS (
                   SELECT 1 FROM workflow_continuations continuation
                    WHERE continuation.workspace_id = turns.workspace_id
-                     AND continuation.caller_task_id = turns.task_id
-                     AND continuation.status IN ('pending', 'resolved')
+                      AND continuation.caller_task_id = turns.task_id
+                      AND continuation.kind = 'start_wait'
+                      AND continuation.status IN ('pending', 'resolved')
+                      AND EXISTS (
+                        SELECT 1 FROM workflow_runs continuation_run
+                         WHERE continuation_run.workspace_id = continuation.workspace_id
+                           AND continuation_run.run_id = continuation.run_id
+                           AND continuation_run.origin = 'top_level'
+                           AND continuation_run.parent_run_id IS NULL
+                      )
                      AND NOT (
                        continuation.kind = 'start_wait'
                        AND continuation.status = 'resolved'
@@ -15775,23 +17369,42 @@ function claimTurnStatement(
                        AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.runId') = continuation.run_id, 0)
                        AND COALESCE(json_extract(turns.payload_json, '$.workflowResume.continuationId') = continuation.continuation_id, 0)
                      )
-                     AND NOT EXISTS (
-                       SELECT 1 FROM workflow_activations activation
-                        WHERE activation.workspace_id = continuation.workspace_id
-                         AND activation.continuation_id = continuation.continuation_id
-                         AND activation.execution_turn_id = turns.id
-                         AND activation.kind = 'child_return'
-                         AND activation.status = 'queued'
-                    )
-               )
+                )
               AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
-                    AND live.status IN ('running', 'waiting_user')) < ?
-             AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
-                    AND live.status IN ('running', 'waiting_user') AND live.task_id IN (SELECT id FROM root_tree)) < ?
-             AND (SELECT COUNT(*) FROM turns live JOIN tasks live_task
-                    ON live_task.workspace_id = live.workspace_id AND live_task.id = live.task_id
-                    WHERE live.workspace_id = turns.workspace_id AND live.status IN ('running', 'waiting_user')
-                      AND live_task.backend = (SELECT backend FROM tasks WHERE workspace_id = turns.workspace_id AND id = turns.task_id)) < ?
+                    AND live.status IN ('running', 'waiting_user')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_activations retired_activation
+                      JOIN workflow_runs retired_run
+                        ON retired_run.workspace_id = retired_activation.workspace_id
+                       AND retired_run.run_id = retired_activation.run_id
+                     WHERE retired_activation.workspace_id = live.workspace_id
+                       AND ${workflowActivationOwnsTurnSql('live', 'retired_activation')}
+                       AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+                    )) < ?
+              AND (SELECT COUNT(*) FROM turns live WHERE live.workspace_id = turns.workspace_id
+                    AND live.status IN ('running', 'waiting_user') AND live.task_id IN (SELECT id FROM root_tree)
+                    AND NOT EXISTS (
+                      SELECT 1 FROM workflow_activations retired_activation
+                      JOIN workflow_runs retired_run
+                        ON retired_run.workspace_id = retired_activation.workspace_id
+                       AND retired_run.run_id = retired_activation.run_id
+                     WHERE retired_activation.workspace_id = live.workspace_id
+                       AND ${workflowActivationOwnsTurnSql('live', 'retired_activation')}
+                       AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+                    )) < ?
+              AND (SELECT COUNT(*) FROM turns live JOIN tasks live_task
+                     ON live_task.workspace_id = live.workspace_id AND live_task.id = live.task_id
+                     WHERE live.workspace_id = turns.workspace_id AND live.status IN ('running', 'waiting_user')
+                       AND live_task.backend = (SELECT backend FROM tasks WHERE workspace_id = turns.workspace_id AND id = turns.task_id)
+                       AND NOT EXISTS (
+                         SELECT 1 FROM workflow_activations retired_activation
+                         JOIN workflow_runs retired_run
+                           ON retired_run.workspace_id = retired_activation.workspace_id
+                          AND retired_run.run_id = retired_activation.run_id
+                        WHERE retired_activation.workspace_id = live.workspace_id
+                          AND ${workflowActivationOwnsTurnSql('live', 'retired_activation')}
+                          AND ${retiredWorkflowActivationSql('retired_activation', 'retired_run')}
+                       )) < ?
              ${sessionPredicate}
              ${resource.sql}`,
     params: [workspaceId, turnId, workspaceId, workspaceId, command.startedAt, workspaceId, turnId,
@@ -15819,7 +17432,16 @@ function claimResourcePredicate(workspaceId: string, resourceKeys: readonly stri
     params.push(key, key, key);
   }
   return {
-    sql: `AND NOT EXISTS (SELECT 1 FROM resource_claims rc WHERE rc.workspace_id = ? AND (${conditions.join(' OR ')}))`,
+    sql: `AND NOT EXISTS (
+      SELECT 1
+        FROM resource_claims rc
+        JOIN turns resource_turn
+          ON resource_turn.workspace_id = rc.workspace_id
+         AND resource_turn.id = rc.turn_id
+       WHERE rc.workspace_id = ?
+         AND (${conditions.join(' OR ')})
+         AND ${turnIsVisibleInActiveSurfacesSql('resource_turn')}
+    )`,
     params: [workspaceId, ...params],
   };
 }
@@ -15827,7 +17449,24 @@ function claimResourcePredicate(workspaceId: string, resourceKeys: readonly stri
 function sessionClaimStatement(workspaceId: string, turnId: string, sessionId: string, claimedAt: string): SqlStatement {
   return {
     sql: `INSERT INTO session_claims (workspace_id, session_id, turn_id, claimed_at)
-          SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM turns WHERE workspace_id = ? AND id = ? AND status = 'running' AND started_at = ?)`,
+          SELECT ?, ?, ?, ?
+           WHERE EXISTS (
+             SELECT 1 FROM turns candidate_turn
+              WHERE candidate_turn.workspace_id = ?
+                AND candidate_turn.id = ?
+                AND candidate_turn.status = 'running'
+                AND candidate_turn.started_at = ?
+                AND ${turnIsVisibleInActiveSurfacesSql('candidate_turn')}
+           )
+          ON CONFLICT(workspace_id, session_id) DO UPDATE SET
+            turn_id = excluded.turn_id,
+            claimed_at = excluded.claimed_at
+          WHERE EXISTS (
+            SELECT 1 FROM turns retired_owner
+             WHERE retired_owner.workspace_id = session_claims.workspace_id
+               AND retired_owner.id = session_claims.turn_id
+               AND NOT (${turnIsVisibleInActiveSurfacesSql('retired_owner')})
+          )`,
     params: [workspaceId, sessionId, turnId, claimedAt, workspaceId, turnId, claimedAt],
   };
 }
@@ -15836,7 +17475,18 @@ function resourceClaimStatement(workspaceId: string, turnId: string, resourceKey
   return {
     sql: `INSERT INTO resource_claims (workspace_id, resource_key, task_id, turn_id, claimed_at)
           SELECT ?, ?, task_id, id, ? FROM turns
-           WHERE workspace_id = ? AND id = ? AND status = 'running' AND started_at = ?`,
+           WHERE workspace_id = ? AND id = ? AND status = 'running' AND started_at = ?
+             AND ${turnIsVisibleInActiveSurfacesSql()}
+          ON CONFLICT(workspace_id, resource_key) DO UPDATE SET
+            task_id = excluded.task_id,
+            turn_id = excluded.turn_id,
+            claimed_at = excluded.claimed_at
+          WHERE EXISTS (
+            SELECT 1 FROM turns retired_owner
+             WHERE retired_owner.workspace_id = resource_claims.workspace_id
+               AND retired_owner.id = resource_claims.turn_id
+               AND NOT (${turnIsVisibleInActiveSurfacesSql('retired_owner')})
+          )`,
     params: [workspaceId, resourceKey, claimedAt, workspaceId, turnId, claimedAt],
   };
 }
@@ -16033,6 +17683,7 @@ task_turns AS MATERIALIZED (
   SELECT id, sequence, status, trigger, workspace_id
   FROM turns
   WHERE workspace_id = ? AND task_id = ?
+    AND ${turnIsVisibleInActiveSurfacesSql()}
 ),
 turn_count AS (
   SELECT COUNT(*) AS n FROM task_turns
@@ -16072,6 +17723,7 @@ items AS (
   LEFT JOIN input_bindings ib ON ib.message_id = m.id
   LEFT JOIN task_turns bt ON bt.id = COALESCE(m.turn_id, ib.turn_id)
   WHERE m.workspace_id = ? AND m.task_id = ? AND m.role = 'user'
+    AND ${messageIsVisibleInActiveSurfacesSql('m')}
     AND (
       bt.id IS NULL                       -- unbound: always visible
       OR bt.status <> 'queued'            -- resolved / running: visible
@@ -16098,6 +17750,7 @@ items AS (
   FROM messages m
   LEFT JOIN task_turns at ON at.id = m.turn_id
   WHERE m.workspace_id = ? AND m.task_id = ? AND m.role = 'assistant'
+    AND ${messageIsVisibleInActiveSurfacesSql('m')}
 
   UNION ALL
 

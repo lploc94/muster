@@ -5,6 +5,12 @@ import { hasResourceConflict } from './resources';
 import type { EngineProjection, TaskTurn } from './types';
 
 const LIVE_STATUSES: ReadonlySet<TaskTurn['status']> = new Set(['running', 'waiting_user']);
+const ACTIVE_WORKFLOW_ACTIVATION_KINDS = new Set<string>([
+  'entry_start',
+  'dependency_gate',
+  'feedback_request',
+  'feedback_resume',
+]);
 
 function turnsForTask(file: EngineProjection, taskId: string): TaskTurn[] {
   return Object.values(file.turns).filter((t) => t.taskId === taskId);
@@ -116,6 +122,12 @@ export function canPromoteTurn(
     return { ok: false, reason: 'task not found' };
   }
   if (
+    turn.workflowActivation
+    && !ACTIVE_WORKFLOW_ACTIVATION_KINDS.has(turn.workflowActivation.kind)
+  ) {
+    return { ok: false, reason: 'workflow activation kind is retired' };
+  }
+  if (
     turn.workflowActivation &&
     (turn.workflowActivation.runStatus !== 'running' ||
       turn.workflowActivation.activationStatus !== 'queued')
@@ -130,7 +142,6 @@ export function canPromoteTurn(
   }
   if (
     turn.workflowWait?.hasPendingContinuation &&
-    turn.workflowActivation?.kind !== 'child_return' &&
     turn.workflowResume?.kind !== 'start_workflow'
   ) {
     return { ok: false, reason: 'waiting on workflow continuation' };

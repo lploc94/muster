@@ -468,17 +468,6 @@ export type TurnDisposition =
       result?: string;
       /** Process metadata is durable but stderr stays on the turn diagnostic, never the artifact. */
       execution?: { kind: 'script'; exitCode: number };
-      route?: {
-        kind: 'child_workflow';
-        childDefinitionId: string;
-        childDefinitionVersion: number;
-        entryBindings: readonly {
-          name: string;
-          fromInputRef: string;
-        }[];
-        childIdempotencyKey?: string;
-        effectivePolicy?: import('./workflow-types').WorkflowPolicy;
-      };
     }
   /**
    * M018 S04: request correction from one or all direct producers (PREV).
@@ -541,7 +530,7 @@ export interface TaskTurn {
     runId: string;
     activationId: string;
     nodeId: string;
-    kind: 'entry_start' | 'dependency_gate' | 'feedback_request' | 'feedback_resume' | 'child_return';
+    kind: 'entry_start' | 'dependency_gate' | 'feedback_request' | 'feedback_resume';
     runStatus: 'running' | 'succeeded' | 'failed' | 'cancelled';
     activationStatus: 'queued' | 'running' | 'failed' | 'interrupted' | 'consumed' | 'cancelled';
     isTerminalNode: boolean;

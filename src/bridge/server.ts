@@ -296,7 +296,113 @@ const WORKFLOW_MANIFEST_SCHEMA = {
   additionalProperties: false,
 };
 
+const TASK_PREREQUISITE_SCHEMA = {
+  type: 'object',
+  required: ['producerTaskId', 'requiredLifecycle', 'onUnmet'],
+  properties: {
+    producerTaskId: OP_ID,
+    requiredLifecycle: { enum: ['succeeded', 'terminal'] },
+    onUnmet: { enum: ['block', 'fail', 'skip'] },
+    requiredVerdict: { enum: ['pass'] },
+  },
+  additionalProperties: false,
+};
+
+const TASK_EXECUTION_POLICY_SCHEMA = {
+  type: 'object',
+  properties: {
+    maxTurns: { type: 'integer', minimum: 1 },
+    maxAutomaticRetries: { type: 'integer', minimum: 0 },
+    runTimeoutOverrideMs: { type: 'integer', minimum: 1 },
+  },
+  additionalProperties: false,
+};
+
+const TASK_BRIEF_SCHEMA = {
+  type: 'object',
+  properties: {
+    kind: {
+      enum: ['coordinate', 'plan', 'breakdown', 'implement', 'test', 'verify', 'research', 'generic'],
+    },
+    title: { type: 'string' },
+    objective: { type: 'string' },
+    context: { type: 'string' },
+    nonGoals: { type: 'array', items: { type: 'string' } },
+    constraints: { type: 'array', items: { type: 'string' } },
+    acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+    definitionOfDone: { type: 'array', items: { type: 'string' } },
+    readPaths: { type: 'array', items: { type: 'string' } },
+    writePaths: { type: 'array', items: { type: 'string' } },
+    verification: {
+      type: 'object',
+      properties: {
+        commands: { type: 'array', items: { type: 'string' } },
+        manualChecks: { type: 'array', items: { type: 'string' } },
+      },
+      additionalProperties: false,
+    },
+    skills: { type: 'array', items: { type: 'string' }, maxItems: 8 },
+  },
+  additionalProperties: false,
+};
+
+const TASK_INPUT_BINDING_SCHEMA = {
+  type: 'object',
+  required: ['fromTaskId', 'output', 'as'],
+  properties: {
+    fromTaskId: OP_ID,
+    output: { enum: ['summary', 'verdict'] },
+    as: { type: 'string', minLength: 1 },
+    required: { type: 'boolean' },
+  },
+  additionalProperties: false,
+};
+
+const CREATE_CHILD_PROPERTIES = {
+  opId: OP_ID,
+  goal: { type: 'string', minLength: 1 },
+  taskType: { type: 'string', minLength: 1 },
+  backend: { type: 'string', minLength: 1, maxLength: 200 },
+  model: { type: 'string', minLength: 1, maxLength: 200 },
+  role: { enum: ['coordinator', 'worker'] },
+  prerequisites: { type: 'array', items: TASK_PREREQUISITE_SCHEMA },
+  executionPolicy: TASK_EXECUTION_POLICY_SCHEMA,
+  description: { type: 'string' },
+  brief: TASK_BRIEF_SCHEMA,
+  inputBindings: { type: 'array', items: TASK_INPUT_BINDING_SCHEMA },
+  claimsGit: { type: 'boolean' },
+  writePaths: { type: 'array', items: { type: 'string' } },
+  readPaths: { type: 'array', items: { type: 'string' } },
+};
+
 const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> = {
+  create_task: {
+    type: 'object',
+    description: 'Create one ordinary draft child task from a configured task profile.',
+    required: ['opId', 'goal', 'taskType'],
+    properties: CREATE_CHILD_PROPERTIES,
+    additionalProperties: false,
+  },
+  delegate_task: {
+    type: 'object',
+    description: 'Create and release one ordinary child task, optionally staging its wait atomically.',
+    required: ['opId', 'goal', 'taskType'],
+    properties: {
+      ...CREATE_CHILD_PROPERTIES,
+      waitForCompletion: { type: 'boolean' },
+    },
+    additionalProperties: false,
+  },
+  wait_for_tasks: {
+    type: 'object',
+    description: 'Wait for an exact non-empty set of already delegated direct child tasks.',
+    required: ['opId', 'taskIds'],
+    properties: {
+      opId: OP_ID,
+      taskIds: { type: 'array', minItems: 1, items: OP_ID },
+    },
+    additionalProperties: false,
+  },
   list_task_types: {
     type: 'object',
     description: 'No arguments. Returns the current semantic task profiles available for workflow nodes.',
@@ -375,29 +481,6 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
     },
     additionalProperties: false,
   },
-  invoke_child_workflow: {
-    type: 'object',
-    description: 'Invoke a saved child workflow from the current live activation using semantic input bindings.',
-    required: ['workflow', 'inputs'],
-    properties: {
-      workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
-      inputs: {
-        type: 'array',
-        maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX,
-        description: 'Bind every public child input name from a named input currently available on this activation.',
-        items: {
-          type: 'object',
-          required: ['name', 'fromInput'],
-          properties: {
-            name: { ...PRESENTATION_ID, description: 'Declared public child input name.' },
-            fromInput: { ...PRESENTATION_ID, description: 'Exact current-activation inputRef whose value should be forwarded.' },
-          },
-          additionalProperties: false,
-        },
-      },
-    },
-    additionalProperties: false,
-  },
   upsert_presentation: {
     type: 'object',
     description: 'Create or refresh one user-facing Markdown document in the IDE.',
@@ -466,6 +549,9 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
 };
 
 const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
+  create_task: 'Create one ordinary draft child task from a configured taskType. The task is not scheduled until an authorized release operation.',
+  delegate_task: 'Create and release one ordinary child task from a configured taskType. Set waitForCompletion:true to arm the child wait in the same operation, then end the current turn without polling.',
+  wait_for_tasks: 'Stage a wait for an exact non-empty set of already delegated direct child tasks, then end the current turn without polling.',
   get_host_context: 'Refresh trusted workspace, caller, workflow rules, available tools, and task-type context. Use when the current host block is missing or may be stale. Read-only; takes no arguments.',
   list_task_types: 'List configured semantic task profiles for workflow nodes. Call before define_workflow when the current task-type list is absent or stale. Select an exact returned id; do not invent backend, model, role, capability, or policy fields.',
   list_predefined_workflows: 'List reusable canonical workflow.json packages from the workspace and user catalog. Workspace names shadow global names. Returns bounded metadata, package kind, and opaque refs only.',
@@ -474,10 +560,9 @@ const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
   workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
   workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide an optional concise diagnostic reason. This is a terminal disposition for the current turn.',
-  invoke_child_workflow: 'Invoke a saved child workflow from the current live activation using a workflowRef returned by define_workflow. Bind every required child source input to an exact current-activation input name; never provide artifact ids, revisions, or idempotency keys.',
   upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
-  start_workflow: 'Start a saved workflow using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run named output for every declared public input name. Inside a workflow activation use invoke_child_workflow instead.',
+  start_workflow: 'Start a saved workflow from an open top-level root coordinator using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run named output for every declared public input name.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -652,14 +737,6 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
           responded: round.responded,
         }))
       : [];
-    const children = Array.isArray(value.continuations)
-      ? value.continuations.filter(isObject).map((continuation) => ({
-          status: continuation.status,
-          kind: continuation.kind,
-          ...(typeof continuation.outcome === 'string' ? { outcome: continuation.outcome } : {}),
-          ...(typeof continuation.reasonCode === 'string' ? { reason: continuation.reasonCode } : {}),
-        }))
-      : [];
     return {
       runRef: value.runId,
       ...(ref ? { workflowRef: ref } : {}),
@@ -667,7 +744,6 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
       nodes,
       activations,
       feedback,
-      children,
       ...(typeof value.terminalReason === 'string' ? { reason: value.terminalReason } : {}),
       diagnostics: Array.isArray(value.diagnostics)
         ? value.diagnostics.filter(isObject).map((diagnostic) => diagnostic.code)

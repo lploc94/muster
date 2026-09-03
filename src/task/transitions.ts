@@ -1370,8 +1370,7 @@ function dispositionsEqual(a: TurnDisposition, b: TurnDisposition): boolean {
       return (
         b.kind === 'workflow_next' &&
         a.change === b.change &&
-        (a.result ?? undefined) === (b.result ?? undefined) &&
-        JSON.stringify(a.route ?? null) === JSON.stringify(b.route ?? null)
+        (a.result ?? undefined) === (b.result ?? undefined)
       );
     case 'workflow_prev':
       return (

@@ -792,8 +792,6 @@ describe('coordinator-tools dispatch', () => {
   it('derives operation slots from semantic call content within one turn', () => {
     const reviewRef = `${generatedWorkflowId('1')}@1`;
     const auditRef = `${generatedWorkflowId('2')}@1`;
-    const deepReviewRef = `${generatedWorkflowId('3')}@1`;
-    const quickReviewRef = `${generatedWorkflowId('4')}@1`;
     const firstStart = dispatch(
       'start_workflow',
       { workflow: reviewRef },
@@ -814,41 +812,7 @@ describe('coordinator-tools dispatch', () => {
       { workflow: auditRef },
       ctx(['start_workflow']),
     );
-    const firstChild = dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: deepReviewRef,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    );
-    const replayedChild = dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: deepReviewRef,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    );
-    const secondChild = dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: deepReviewRef,
-        inputs: [{ name: 'request', fromInput: 'testReport' }],
-      },
-      ctx(['invoke_child_workflow']),
-    );
-    const otherWorkflowChild = dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: quickReviewRef,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    );
-
     expect(firstStart.ok && replayedStart.ok && secondStart.ok && otherWorkflowStart.ok).toBe(true);
-    expect(firstChild.ok && replayedChild.ok && secondChild.ok && otherWorkflowChild.ok).toBe(true);
     if (
       firstStart.ok &&
       replayedStart.ok &&
@@ -862,20 +826,6 @@ describe('coordinator-tools dispatch', () => {
       expect(firstStart.command.opId).toBe(replayedStart.command.opId);
       expect(firstStart.command.opId).not.toBe(secondStart.command.opId);
       expect(firstStart.command.opId).not.toBe(otherWorkflowStart.command.opId);
-    }
-    if (
-      firstChild.ok &&
-      replayedChild.ok &&
-      secondChild.ok &&
-      otherWorkflowChild.ok &&
-      firstChild.command.kind === 'invoke_child_workflow' &&
-      replayedChild.command.kind === 'invoke_child_workflow' &&
-      secondChild.command.kind === 'invoke_child_workflow' &&
-      otherWorkflowChild.command.kind === 'invoke_child_workflow'
-    ) {
-      expect(firstChild.command.opId).toBe(replayedChild.command.opId);
-      expect(firstChild.command.opId).not.toBe(secondChild.command.opId);
-      expect(firstChild.command.opId).not.toBe(otherWorkflowChild.command.opId);
     }
   });
 
@@ -891,22 +841,6 @@ describe('coordinator-tools dispatch', () => {
       { workflow: 'caller-chosen@1' },
       ctx(['start_workflow']),
     )).toEqual({ ok: false, toolError: 'invalid start_workflow arguments' });
-    expect(dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: definitionId,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
-    expect(dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: 'caller-chosen@1',
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({ ok: false, toolError: 'invalid invoke_child_workflow arguments' });
   });
 
   it('rejects action outside allowedActions', () => {
@@ -1766,104 +1700,11 @@ describe('workflow_next tool surface', () => {
     });
   });
 
-  it('rejects model-supplied child artifact coordinates', () => {
-    const binding = {
-      childEntryNodeId: 'entry-a',
-      inputRef: 'request',
-      artifactId: 'artifact-1',
-      artifactRevision: 3,
-    };
+  it('rejects the retired nested-workflow tool even with a forged stale grant', () => {
     expect(dispatch(
       'invoke_child_workflow',
-      {
-        opId: 'op-child',
-        childDefinitionId: 'wf-child',
-        childDefinitionVersion: 2,
-        entryBindings: [binding],
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({
-      ok: false,
-      toolError: 'invalid invoke_child_workflow arguments',
-    });
-  });
-
-  it('maps public child input names without destination coordinates', () => {
-    const definitionId = generatedWorkflowId('d');
-    const result = dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: `${definitionId}@2`,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    );
-    expect(result).toMatchObject({
-      ok: true,
-      command: {
-        kind: 'invoke_child_workflow',
-        childDefinitionId: definitionId,
-        childDefinitionVersion: 2,
-        entryBindings: [{
-          name: 'request',
-          fromInputRef: 'implementation',
-        }],
-      },
-    });
-    if (result.ok && result.command.kind === 'invoke_child_workflow') {
-      expect(result.command.childDefinitionVersion).toBe(2);
-      expect(result.command.childIdempotencyKey).toMatch(/^turn-/);
-      expect(result.command.opId).toMatch(/^auto-/);
-    }
-    expect(dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: `${definitionId}@2`,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-        callKey: 'model-supplied-key',
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({
-      ok: false,
-      toolError: 'invalid invoke_child_workflow arguments',
-    });
-    expect(dispatch(
-      'invoke_child_workflow',
-      {
-        workflow: `${definitionId}@2`,
-        inputs: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-      },
-      ctx(['invoke_child_workflow']),
-    )).toEqual({
-      ok: false,
-      toolError: 'invalid child workflow input',
-    });
-
-    const empty = dispatch(
-      'invoke_child_workflow',
-      { workflow: `${definitionId}@2`, inputs: [] },
-      ctx(['invoke_child_workflow']),
-    );
-    expect(empty).toMatchObject({
-      ok: true,
-      command: { kind: 'invoke_child_workflow', entryBindings: [] },
-    });
-
-    const wideInputs = Array.from({ length: 65 }, (_, index) => ({
-      name: `input${String(index).padStart(2, '0')}`,
-      fromInput: 'implementation',
-    }));
-    const wide = dispatch(
-      'invoke_child_workflow',
-      { workflow: `${definitionId}@2`, inputs: wideInputs },
-      ctx(['invoke_child_workflow']),
-    );
-    expect(wide).toMatchObject({
-      ok: true,
-      command: { kind: 'invoke_child_workflow', entryBindings: wideInputs.map((input) => ({
-        name: input.name,
-        fromInputRef: input.fromInput,
-      })) },
-    });
+      { workflow: `${generatedWorkflowId('d')}@2`, inputs: [] },
+      ctx(['invoke_child_workflow'] as any),
+    )).toEqual({ ok: false, toolError: 'unknown tool: invoke_child_workflow' });
   });
 });

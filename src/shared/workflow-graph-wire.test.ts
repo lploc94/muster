@@ -60,7 +60,6 @@ const valid: WorkflowGraphResult = {
         responded: 1,
       },
     ],
-    childRuns: [{ status: 'running' }],
     reuse: { nodeCount: 1, edgeCount: 1 },
     diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
   },
@@ -89,7 +88,6 @@ describe('workflow graph wire contract', () => {
       'workflow_graph_nodes_truncated',
       'workflow_graph_edges_truncated',
       'workflow_graph_gates_truncated',
-      'workflow_graph_child_runs_truncated',
     ]);
   });
 
@@ -124,7 +122,6 @@ describe('workflow graph wire contract', () => {
           frontierNodeIds: ['repair'], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
       },
@@ -322,10 +319,6 @@ describe('workflow graph wire contract', () => {
         ...valid.graph,
         feedbackRounds: [{ ...valid.graph.feedbackRounds[0], roundId: 'wfbr_private' }],
       },
-      {
-        ...valid.graph,
-        childRuns: [{ ...valid.graph.childRuns[0], runId: 'wfr_child_private' }],
-      },
     ]) {
       expect(parseWorkflowGraphResult({ ...valid, graph })).toBeNull();
     }
@@ -446,7 +439,6 @@ describe('workflow graph wire contract', () => {
           frontierNodeIds: [], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
       },
@@ -652,7 +644,6 @@ describe('workflow graph wire contract', () => {
           frontierNodeIds: ['consumer'], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 1, edgeCount: 1 },
         diagnostics: [],
       },
@@ -766,13 +757,6 @@ describe('workflow graph wire contract', () => {
       ...valid,
       graph: {
         ...valid.graph,
-        childRuns: [valid.graph.childRuns[0], valid.graph.childRuns[0]],
-      },
-    })).not.toBeNull();
-    expect(parseWorkflowGraphResult({
-      ...valid,
-      graph: {
-        ...valid.graph,
         edges: [{ ...valid.graph.edges[0], contributionState: 'supplied_live' }],
         gates: [{
           ...valid.graph.gates[0],
@@ -828,7 +812,6 @@ describe('workflow graph wire contract', () => {
           frontierNodeIds: nodeIds, activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
       },
@@ -878,7 +861,6 @@ describe('workflow graph wire contract', () => {
         frontierNodeIds: nodeIds, activeNodeIds: [],
       },
       feedbackRounds: [],
-      childRuns: [],
       reuse: { nodeCount: 0, edgeCount: 0 },
       diagnostics: [],
     };
@@ -922,15 +904,6 @@ describe('workflow graph wire contract', () => {
           joinMode: 'all',
           required: 2,
           responded: 1,
-        })),
-      },
-    })).toBeNull();
-    expect(parseWorkflowGraphResult({
-      ...valid,
-      graph: {
-        ...valid.graph,
-        childRuns: Array.from({ length: 65 }, () => ({
-          status: 'running',
         })),
       },
     })).toBeNull();

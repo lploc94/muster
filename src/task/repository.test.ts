@@ -3024,26 +3024,56 @@ describe('SqliteTaskRepository', () => {
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
       await client.open(path.join(dir, 'muster.sqlite3'));
+      await client.run(
+        `INSERT INTO workspaces (id, identity_key, display_name, created_at, last_opened_at)
+         VALUES ('ws', 'public-define-replay', 'Public define replay', 'now', 'now')`,
+      );
       const repository = new SqliteTaskRepository(client, 'ws');
       const fixture = canonicalStorageFixture('wf-public-define-replay');
+      const caller: MusterTask = {
+        ...makeTask('public-define-root'),
+        role: 'coordinator',
+        capabilities: ['create_child'],
+      };
+      const callerTurn: TaskTurn = {
+        id: 'public-define-turn',
+        taskId: caller.id,
+        sequence: 1,
+        status: 'running',
+        trigger: 'user',
+        inputs: [],
+        createdAt: '2026-08-30T23:59:59.000Z',
+        startedAt: '2026-08-30T23:59:59.500Z',
+      };
+      await repository.execute({ kind: 'createTask', workspaceId: 'ws', task: caller });
+      await repository.execute({ kind: 'createTurn', workspaceId: 'ws', turn: callerTurn });
+      const publicOperation = (opId: string, fingerprint: string) => ({
+        ledgerKey: `${callerTurn.id}:${opId}`,
+        fingerprint,
+        rootTaskId: caller.id,
+        callerTaskId: caller.id,
+        callerTurnId: callerTurn.id,
+      });
       await expect(repository.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
         ...fixture,
-        publicOperation: { ledgerKey: 'turn-a:define', fingerprint: 'public-fingerprint-a' },
+        ownerRootTaskId: caller.id,
+        publicOperation: publicOperation('define', 'public-fingerprint-a'),
       })).resolves.toMatchObject({ ok: true, changed: true });
 
       const replay = await repository.execute({
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
         ...fixture,
+        ownerRootTaskId: caller.id,
         createdAt: '2026-08-31T00:00:01.000Z',
-        publicOperation: { ledgerKey: 'turn-b:define', fingerprint: 'public-fingerprint-b' },
+        publicOperation: publicOperation('define-replay', 'public-fingerprint-b'),
       });
       expect(replay).toMatchObject({ ok: true, changed: false });
       await expect(client.get<{ fingerprint: string; result_json: string }>(
         'SELECT fingerprint, result_json FROM operations WHERE workspace_id = ? AND ledger_key = ?',
-        ['ws', 'turn-b:define'],
+        ['ws', `${callerTurn.id}:define-replay`],
       )).resolves.toEqual({
         fingerprint: 'public-fingerprint-b',
         result_json: expect.stringContaining('"replay":true'),
@@ -3057,12 +3087,13 @@ describe('SqliteTaskRepository', () => {
         kind: 'defineWorkflowVersion',
         workspaceId: 'ws',
         ...fixture,
+        ownerRootTaskId: caller.id,
         name: 'Conflicting canonical authority',
-        publicOperation: { ledgerKey: 'turn-c:define', fingerprint: 'public-fingerprint-c' },
+        publicOperation: publicOperation('define-conflict', 'public-fingerprint-c'),
       })).resolves.toMatchObject({ ok: false, changed: false, conflict: true });
       await expect(client.get(
         'SELECT ledger_key FROM operations WHERE workspace_id = ? AND ledger_key = ?',
-        ['ws', 'turn-c:define'],
+        ['ws', `${callerTurn.id}:define-conflict`],
       )).resolves.toBeUndefined();
     } finally {
       await client.close();

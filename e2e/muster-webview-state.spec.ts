@@ -11264,7 +11264,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(durableBlob).not.toContain('../../etc');
   });
 
-  test('M024 S05 workflow graph: focused host result renders all gates, frontier, fit, feedback, child run, and degraded state', async ({
+  test('M024 S05 workflow graph: focused host result renders all gates, frontier, fit, feedback, and degraded state', async ({
     page,
   }) => {
     const taskId = 'task-m024-s05-workflow';
@@ -11348,7 +11348,6 @@ test.describe('M019 S05 Assembled First Run', () => {
         feedbackRounds: [
           { requesterNodeId: 'node-5', status: 'open', joinMode: 'all', required: 2, responded: 1 },
         ],
-        childRuns: [{ status: 'running' }],
         reuse: { nodeCount: 1, edgeCount: 1 },
         diagnostics: [{ code: 'workflow_graph_nodes_truncated' }],
     };
@@ -11430,8 +11429,7 @@ test.describe('M019 S05 Assembled First Run', () => {
     expect(canvasBox!.y + canvasBox!.height).toBeLessThanOrEqual(wrapBox!.y + wrapBox!.height + 1);
     await expect(modal).toContainText('Feedback rounds');
     await expect(modal).toContainText('1 of 2 responses received');
-    await expect(modal.getByText('Child workflow 1')).toBeVisible();
-    await expect(modal.getByText('Child workflow 1').locator('..')).toContainText('Running');
+    await expect(modal.locator('.workflow-modal__legend-item')).toHaveCount(5);
     await expect(modal.getByRole('status')).toContainText('Workflow graph may be incomplete');
     await expect(modal).toContainText('Workflow nodes were truncated');
     await modal.getByRole('button', { name: 'Close workflow graph' }).click();

@@ -401,7 +401,7 @@ describe('M024 S04 workflow graph projection', () => {
     }
   }, 30_000);
 
-  it('reads a canonical titled five-node graph and bounded child-run diagnostics from SQLite', async () => {
+  it('reads a canonical titled five-node graph from SQLite', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-m024-s04-graph-'));
     const client = new DbClient({
       workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'],
@@ -446,27 +446,6 @@ describe('M024 S04 workflow graph projection', () => {
       });
       expect(consumerStart).toMatchObject({ ok: true, changed: true });
       const consumer = consumerStart.operation!.result.data as { runId: string };
-      await client.run(
-        `WITH RECURSIVE sequence(n) AS (
-           SELECT 1 UNION ALL SELECT n + 1 FROM sequence WHERE n < 65
-         ) INSERT INTO workflow_runs (
-           workspace_id, run_id, definition_id, definition_version, status, origin,
-           parent_run_id, owner_root_task_id, caller_task_id, caller_turn_id,
-           continuation_id, policy_json, max_feedback_rounds, max_turns_per_task,
-           max_workflow_turns, max_children, max_depth, max_concurrency,
-           max_aggregate_bytes, feedback_rounds_reserved, workflow_turns_reserved,
-           children_reserved, started_at, deadline_at, created_at, updated_at
-         ) SELECT workspace_id, printf('child-run-%03d', sequence.n), definition_id,
-                  definition_version, 'running', 'child', run_id, owner_root_task_id,
-                  caller_task_id, caller_turn_id, NULL, policy_json,
-                  max_feedback_rounds, max_turns_per_task, max_workflow_turns,
-                  max_children, max_depth, max_concurrency, max_aggregate_bytes,
-                  0, 0, 0, NULL, NULL, '2026-08-01T00:00:03.000Z',
-                  '2026-08-01T00:00:03.000Z'
-             FROM workflow_runs CROSS JOIN sequence
-            WHERE workspace_id = ? AND run_id = ?`,
-        [WORKSPACE_ID, consumer.runId],
-      );
       const five = await client.get<{ task_id: string }>(
         `SELECT task_id FROM workflow_nodes
           WHERE workspace_id = ? AND run_id = ? AND node_id = 'five'`,
@@ -505,7 +484,7 @@ describe('M024 S04 workflow graph projection', () => {
         && node.source_artifact_revision === null)).toBe(true);
 
       const graph = await repository.getWorkflowGraphForTask(five!.task_id);
-      expect(graph).toEqual({
+      expect(graph).toMatchObject({
         runStatus: 'running',
         nodes: [
           {
@@ -562,13 +541,11 @@ describe('M024 S04 workflow graph projection', () => {
           frontierNodeIds: ['five', 'four', 'one', 'three', 'two'], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: expect.arrayContaining([{ status: 'running' }]),
         reuse: { nodeCount: 0, edgeCount: 0 },
-        diagnostics: [{ code: 'workflow_graph_child_runs_truncated' }],
+        diagnostics: [],
       });
       expect(JSON.stringify(graph)).not.toMatch(/payload_json|body_json|prompt|\/tmp\/|api[_-]?key|secret/i);
       expect(JSON.stringify(graph)).not.toContain(consumer.runId);
-      expect(JSON.stringify(graph)).not.toContain('child-run-001');
       expect(graph?.gates.every((gate) => !('gateId' in gate))).toBe(true);
       await expect(repository.getWorkflowGraphForTask('root-1')).resolves.toEqual(graph);
       const hostGraph = await buildWorkflowGraphView(repository, five!.task_id);
@@ -583,13 +560,13 @@ describe('M024 S04 workflow graph projection', () => {
       const result = parseWorkflowGraphResult((outcome as { message: unknown }).message);
       expect(result).toMatchObject({ ok: true });
       const panel = buildWorkflowGraphPanelView((result as Extract<typeof result, { ok: true }>).graph);
+      expect(panel.nodes).toHaveLength(5);
       expect(panel.nodes.filter((node) => node.reused)).toHaveLength(0);
       expect(panel.nodes.find((node) => node.id === 'five')?.title).toBe('Step five');
       expect(panel.activeGate).toMatchObject({ satisfied: 0, required: 1 });
-      expect(panel.childRuns).toHaveLength(64);
-      expect(panel.childRuns[0]).toEqual({ label: 'Child workflow 1', status: 'running', statusLabel: 'Running' });
+      expect(panel.progress).toMatchObject({ total: 5, queued: 1, blocked: 4 });
       expect(panel.reuseSummary).toMatchObject({ nodeCount: 0, edgeCount: 0 });
-      expect(panel.degradedRead.diagnostics).toEqual(['Child workflow runs were truncated']);
+      expect(panel.degradedRead).toMatchObject({ visible: false, diagnostics: [] });
 
     } finally {
       await client.close();

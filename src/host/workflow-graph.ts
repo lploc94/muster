@@ -1,6 +1,5 @@
 import type { TaskRepository } from '../task/repository';
 import type {
-  WorkflowGraphChildRunProjection,
   WorkflowGraphEdgeProjection,
   WorkflowGraphFeedbackRoundProjection,
   WorkflowGraphGateProjection,
@@ -37,7 +36,6 @@ export interface WorkflowGraphView {
   activeGate?: WorkflowGraphGateProjection;
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
-  childRuns: readonly WorkflowGraphChildRunProjection[];
   reuse: WorkflowGraphReuseProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

@@ -27,7 +27,6 @@ function graph(overrides = {}) {
     reuseNodeCount: 4,
     reuseEdgeCount: 4,
     nodeStatuses: ['queued', 'reused'],
-    childRunCount: 0,
     feedbackRoundCount: 0,
     diagnostics: [],
     ...overrides,

@@ -1502,8 +1502,7 @@ export class TaskEngine {
       kind === 'start_workflow' ||
       kind === 'workflow_next' ||
       kind === 'workflow_prev' ||
-      kind === 'workflow_fail' ||
-      kind === 'invoke_child_workflow'
+      kind === 'workflow_fail'
     ) {
       this.logLifecycle('workflow.tool.completed', {
         tool: kind,

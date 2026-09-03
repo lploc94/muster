@@ -191,6 +191,7 @@ export async function startWorkflow(
     ownerRootTaskId?: string;
     callerTaskId?: string;
     callerTurnId?: string;
+    resumeCallerOnCompletion?: boolean;
     createdAt?: string;
   },
 ) {
@@ -205,6 +206,7 @@ export async function startWorkflow(
     ownerRootTaskId: input.ownerRootTaskId ?? 'root-task',
     callerTaskId: input.callerTaskId ?? 'root-task',
     callerTurnId: input.callerTurnId ?? 'root-turn',
+    ...(input.resumeCallerOnCompletion === true ? { resumeCallerOnCompletion: true } : {}),
   });
 }
 

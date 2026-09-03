@@ -101,22 +101,22 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
     }
   });
 
-  it('omits only the open-repair guard when reclaiming terminal payload bodies', () => {
+  it('keeps the full safety predicate for payload reclamation except open repair', () => {
     const predicate = terminalWorkflowPayloadReclamationSafetyPredicate('run');
     expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(11);
     expect(predicate).not.toContain('workflow_decision_repairs repair');
+    expect(predicate).toContain('workflow_runs child');
+    expect(predicate).toContain('workflow_continuations continuation');
+    expect(predicate).toContain('workflow_return_gates return_gate');
     for (const table of [
-      'workflow_runs child',
       'workflow_nodes node',
       'workflow_dependency_gates gate_row',
       'workflow_feedback_rounds round_row',
       'workflow_activations activation',
       'workflow_continuations continuation',
-      'workflow_return_gates return_gate',
       'workflow_gate_fills gate_fill',
       'workflow_nodes reused_node',
       'workflow_artifact_sources derived_source',
-      'workflow_return_gates return_gate_artifact',
     ]) {
       expect(predicate).toContain(table);
     }

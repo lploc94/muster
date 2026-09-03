@@ -71,6 +71,7 @@ function expectedToolNamesForRoot(): string[] {
         'interrupt_child',
       ],
       parentId: null,
+      lifecycle: 'open',
     }, {
       turn: { status: 'running' },
       workspaceTrusted: true,

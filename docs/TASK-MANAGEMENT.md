@@ -278,7 +278,7 @@ interface MusterTask {
 
 `parentId` is the source of truth for tree ownership. `childIds` is a derived
 index, not duplicated task data. Child lifecycle and result are read from child
-records; a persisted `childRuns` snapshot is not authoritative.
+records; a persisted graph snapshot is not authoritative.
 
 `capabilities` are issued and validated by the host. A caller cannot grant itself
 new capabilities through workflow-definition input.
@@ -723,12 +723,13 @@ blockers.
 
 ---
 
-## 8. Workflow-only MCP protocol
+## 8. Workflow and ordinary delegation MCP protocol
 
-The agent-facing bridge exposes one orchestration protocol: the gate-routed workflow
-model in §20. The previous delegate-task MCP protocol is removed from catalog,
-capability projection, schemas, and direct-call routing. Its internal task/session
-records remain implementation infrastructure and recovery state, not agent tools.
+The agent-facing bridge uses the gate-routed workflow model in §20 for workflow
+orchestration. A workflow coordinator whose frozen profile grants child creation may
+also create or delegate an ordinary child task and stage its wait. The broader legacy
+batch/lifecycle protocol remains absent; its internal task/session records are
+implementation infrastructure and recovery state, not general agent tools.
 
 Root human input uses **ACP RFD elicitation**. Workflow nodes request producer
 correction through `workflow_prev`; they use `workflow_fail` when the required result
@@ -738,20 +739,23 @@ cannot be produced. MCP `ask_user` and `ask_parent` are not part of this protoco
 
 | Tool | Context | Purpose |
 |------|---------|---------|
+| `create_task` | Live workflow coordinator with `create_child` | Create one ordinary draft child task |
+| `delegate_task` | Live workflow coordinator with `create_child` | Create and release one ordinary child; optionally stage its wait atomically |
+| `wait_for_tasks` | Live workflow coordinator with `create_child` and `wait_child` | Wait on an exact set of delegated direct children |
 | `list_task_types` | Coordinator | Refresh semantic workflow-node profiles and diagnostics |
 | `inspect_workflow_run` | Coordinator with `read_subtree` | Inspect semantic durable state for an owned run |
 | `get_host_context` | Any task | Refresh trusted host, self, rules, and task-profile context |
-| `define_workflow` | Coordinator with `create_child` | Save an engine-versioned definition from semantic nodes and inputs |
-| `start_workflow` | Coordinator with `create_child` | Durably start a workflow, suspend this caller, and resume it at terminal state |
+| `define_workflow` | Open top-level root coordinator with `create_child`, outside a workflow activation | Save an engine-versioned definition from semantic nodes and inputs |
+| `start_workflow` | Open top-level root coordinator with `create_child`, outside a workflow activation | Durably start a workflow, suspend this caller, and resume it at terminal state |
 | `workflow_next` | Live workflow activation | Publish the node result to its forward route |
 | `workflow_prev` | Live activation with direct dependencies | Open targeted producer feedback |
 | `workflow_fail` | Live workflow activation | Fail-fast close the current workflow run |
-| `invoke_child_workflow` | Authorized root or terminal coordinator | Stage the child-workflow `NEXT` route |
 | `upsert_presentation` | Coordinator | Open or revise a user-facing plan/spec document |
 
-The bridge returns `unknown tool` for removed delegate-task names even if an old or
-manually forged credential contains one. `tools/list`, readiness expectations, first-
-turn host context, and `get_host_context` all derive from the same public projection.
+The bridge returns `unknown tool` for removed batch/lifecycle task names even if an old
+or manually forged credential contains one. `tools/list`, readiness expectations,
+first-turn host context, and `get_host_context` all derive from the same public
+projection.
 
 **Task profiles:** `muster.taskTypes` remains the source for workflow-node presets.
 Coordinators choose only the semantic `taskType`. At definition commit the engine
@@ -773,14 +777,14 @@ revision; bare IDs are invalid. The engine derives that ref from normalized sema
 content; agents do not name workflow storage keys. A returned `presentationRef` may
 refresh only an existing document owned by the authenticated caller. The read-only
 `inspect_workflow_run` accepts a `runRef` previously returned by an authorized workflow
-start or route.
+start.
 
 `define_workflow`, `start_workflow`, run inspection, context reads, and presentation
-updates are not competing dispositions. Child-workflow invocation is represented as
-a `NEXT` route and remains mutually exclusive with the three base workflow outcomes.
+updates are not competing dispositions. Workflow activations cannot define or start
+another workflow; they may still delegate ordinary child tasks when authorized.
 
 `inspect_workflow_run` is a bounded recovery/diagnostic read, not a routing or polling
-mechanism. It returns semantic workflow/node/activation/feedback/child state and
+mechanism. It returns semantic workflow/node/activation/feedback state and
 integrity codes without policy budgets, routing IDs, artifact coordinates, task trees,
 topology, prompts, artifact bodies, paths, or secrets. Succeeded materialized nodes may
 expose an opaque `taskRef` for bounded diagnostics only. Workflow progress shown by the
@@ -798,8 +802,8 @@ terminal `workflow_next` body when present. The same resolver runs after workflo
 commits and during reload, and continuation consumption makes delivery exactly once.
 Invalid or unauthorized calls remain ordinary tool errors and never suspend the turn.
 Only one unresolved top-level start wait is allowed per caller task. Workflow
-activations use `invoke_child_workflow` and retain their separate `child_wait`
-continuation semantics. `inspect_workflow_run` is not a normal completion polling loop.
+activations cannot call `start_workflow`. `inspect_workflow_run` is not a normal
+completion polling loop.
 `start_workflow` binds each public destination input exactly once as `{name,value}` or
 `{name,fromRun,output}`. The latter selects one declared named terminal output from an
 owned succeeded source run; the repository resolves and pins its exact immutable
@@ -1658,7 +1662,7 @@ and eventually returning from a workflow is not a separate orchestration mechani
 The engine, rather than an agent or CLI, owns graph topology and routing. A task works
 only with its current input, provenance-bearing dependency inputs, and the outcomes
 `NEXT` and `PREV`. It does not need to know whether another task is its parent, child,
-peer, or a node inside a nested workflow.
+peer, or another node in the same workflow run.
 
 The model has two separate graphs:
 
@@ -1725,7 +1729,7 @@ Implementations of this protocol must preserve all of the following:
 | **Feedback round** | One `PREV` request plus its target set, feedback gate, and correlated responses |
 | **Input reference** | Stable logical name exposed to a task for an input, backed by source-task and artifact provenance |
 | **Artifact revision** | Immutable version of a task result; updating a result creates a revision rather than mutating prior input |
-| **Continuation** | Engine-owned return address used when a nested workflow completes |
+| **Continuation** | Engine-owned return address used when a top-level workflow start completes |
 
 A task may have multiple turns over its lifetime, but never one turn per partial
 dependency arrival. Typical planner behavior is:
@@ -1794,8 +1798,8 @@ destination only by its public input `name`, using either a literal value or a
 `(fromRun, outputName)` source. Internal entry coordinates are resolved from the frozen
 definition inside the transaction. The command:
 
-1. Persists the frozen definition version, workflow run, caller continuation (when
-   nested), and caller-supplied entry artifacts.
+1. Persists the frozen definition version, workflow run, optional top-level
+   `start_wait` caller continuation, and caller-supplied entry artifacts.
 2. Creates one dependency gate for every task. Entry gates include the exact declared
    caller-input references; an entry with no caller data receives one explicit
    engine-authored start artifact rather than an implicit empty prompt.
@@ -1905,15 +1909,11 @@ interface NextOutcome {
   already satisfies it. It still satisfies the named feedback gate.
 - A normal `NEXT` contributes the artifact to its one configured downstream dependency
   gate using the edge's destination `inputRef`.
-- A coordinator/caller with no configured downstream consumer may select the
-  child-workflow invocation route defined in §20.12; it remains a `NEXT` disposition,
-  not a fourth base outcome. A non-terminal workflow task that already has `next`
-  cannot invoke a child workflow when it already has a frozen downstream edge.
 - A `NEXT` responding to feedback satisfies only the matching feedback-round target;
   it cannot accidentally close a later or unrelated round.
-- If the node is terminal, `NEXT` completes the nested workflow result and resolves
-  its engine-owned continuation. The caller then receives that workflow result through
-  its own gate; the terminal task does not need to know the caller identity.
+- If the node is terminal, `NEXT` contributes to completion of the current workflow
+  result. A top-level caller receives that result through the root `start_wait`
+  continuation; the terminal task does not need to know the caller identity.
 
 For a feedback response, artifact lineage is validated before commit:
 
@@ -2135,16 +2135,15 @@ target, or unrecoverable target failure atomically:
 2. marks its open dependency gates and feedback rounds `failed`/`cancelled`;
 3. prevents reserved-but-not-running turns from starting and interrupts running turns
    in that workflow scope under existing interruption rules;
-4. records one bounded aggregate reason and resolves a nested continuation with a
-   typed failed/cancelled workflow result; and
-5. recursively applies the caller workflow's same fail-fast rule, or, at the root,
-   creates durable attention for the owning coordinator/user.
+4. records one bounded aggregate reason and resolves the top-level `start_wait`
+   continuation with a typed failed/cancelled workflow result; and
+5. creates durable attention for the owning coordinator/user.
 
 Terminal workflow state also closes every task owned by that run in the same
 transaction: success seals node tasks `succeeded`, failure seals them `failed`, and
 cancellation seals them `cancelled`, with `finishedAt` and
-`lifecycleAuthority: { kind: 'workflow', runId }`. Recursive child-run failure/cancellation uses the
-same rule. `PREV` remains non-terminal and may reactivate an existing node task.
+`lifecycleAuthority: { kind: 'workflow', runId }`. `PREV` remains non-terminal and may
+reactivate an existing node task.
 Caller/root tasks outside `workflow_nodes` remain open for their own lifecycle owner.
 There is no per-edge choice to skip, continue, or guess another target. A future policy
 variant requires a separately approved contract.
@@ -2154,77 +2153,52 @@ activations from starting, and follows the existing descendant-cascade and lifec
 authority rules. Late `NEXT`/`PREV` messages for closed rounds are retained as bounded
 diagnostics or rejected idempotently; they never reopen work automatically.
 
-### 20.12 Child-workflow invocation and return boundary
+### 20.12 Root workflow start continuation boundary
 
-The canonical runtime supports the coordinator/caller-continuation case: a currently
-executing task may create and enter one child workflow, then be resumed when that child
-returns. It does **not** represent an arbitrary child workflow as a static node inside
-another frozen workflow graph. General nested graph nodes with their own incoming/
-outgoing edges are a future versioned extension.
+Only an open top-level root coordinator outside a workflow activation may define or
+start a workflow. Capability projection provides the first boundary; command execution
+reloads the durable task and turn and independently rejects non-root, closed, stale, or
+workflow-bound callers before definition resolution. The repository repeats that
+durable check under the same SQLite write transaction immediately before any public
+operation replay, claim, or workflow write. A rejected caller creates no operation,
+definition, continuation, or run row. A workflow node may still delegate ordinary child
+tasks through its task profile, but it cannot create, start, invoke, or dynamically
+insert another workflow.
 
-Every workflow definition has one or more terminal sink tasks. A child workflow returns
-only after every terminal sink succeeds; the engine combines their reports in frozen
-topology order and sends that single result through the caller's return gate. The caller
-stages `NEXT` with a child-workflow invocation route as its mutually exclusive workflow
-disposition for the current turn. Public bindings map each frozen child input `name` to
-one current-activation `fromInput`; callers never provide child node/gate coordinates.
-The transaction derives those coordinates and creates a one-result return gate:
+Task-facing lists and snapshots omit task rows owned by persisted pre-cutover child
+workflow runs and every task descended from those rows. They also omit the complete
+primary/current/retry turn lineage of a retired activation and rows owned by those turns.
+At the schema-7 cleanup/terminalization boundary, that obsolete `child_return` state is
+purged—not retained—as one idempotent transaction. The purge uses a bounded
+workspace-qualified retry-lineage relation and table-specific ownership: dependent
+return gates, child continuations, repairs, disposition/runtime/session/resource claims,
+turn inputs, messages/reasoning/tool rows, routed child messages, and exact turn-owned
+operation keys are deleted before their referenced activation/run/turn rows. Exact
+operation ownership uses the longest existing turn-ID prefix, so a visible turn whose ID
+prefixes a retired turn cannot expose or delete the retired turn's ledger. Ambiguous
+  lineage, external artifact pins, or a foreign-key failure rolls back the entire cleanup. The
+  purge also verifies the full composite identity of routed messages, start claims, and artifact
+  sources; matching a `source_turn_id`, caller task, or producer run alone is never sufficient.
+Unscoped operations, shared artifacts/provenance, ordinary delegated child tasks,
+canonical active workflow rows, and the bounded `run_closure` record remain intact.
+This cleanup is not a nested-workflow recovery path or a schema migration; schema 8
+remains reset-only.
 
-```ts
-interface ChildWorkflowInvocation {
-  invocationId: string;
-  callerTaskId: string;
-  callerTurnId: string;
-  callerWorkflowRunId?: string;
-  childWorkflowRef: string;
-  entryBindings: Array<{
-    name: string;
-    fromInput: string;
-  }>;
-}
+An accepted top-level start atomically creates the run and one `start_wait`
+continuation addressed to the caller task and turn. The tool result is delivered before
+the engine settles and technically suspends that caller turn. No adapter process remains
+alive while the workflow runs.
 
-interface WorkflowContinuation {
-  continuationId: string;
-  invocationId: string;
-  callerTaskId: string;
-  callerTurnId: string;
-  callerWorkflowRunId?: string;
-  childWorkflowRunId: string;
-  returnGateId: string;
-  status: 'pending' | 'resolved' | 'consumed' | 'failed' | 'cancelled';
-  resultArtifact?: ArtifactRef;
-}
-```
-
-On successful caller-turn settlement, one repository transaction validates exact child
-input-name coverage against the frozen definition, verifies every `fromInput` against
-the live parent activation's pinned provenance, adapts it to the declared child semantic
-kind, persists the child run and unique continuation, creates all child gates,
-contributes the pinned values, and inserts queued turns for satisfied child entry gates.
-A missing, duplicate, unknown, foreign, or type-incompatible binding fails without
-partially starting the child. The caller then has no live process; its durable return
-gate is the wait state.
-
-Invocation validation also requires that the caller has no configured downstream
-consumer, no open feedback round, and no pending child continuation. While the child
-run is open, that continuation is the caller's sole resume authority. Child entry tasks
-cannot route `PREV` across the workflow boundary into the caller; they may address only
-their own direct dependencies. A child entry task with no dependency that emits `PREV`
-fails the child workflow under §20.11. Thus multiple child entry sessions can never
-become competing feedback authorities for the caller session.
-
-- The final terminal sink's committed `NEXT` atomically resolves the continuation,
-  combines every terminal artifact in topology order, closes that one-result gate, and
-  inserts one aggregate return message plus one queued caller turn.
-- The caller resumes only from that aggregate return message. If it belongs to another
-  workflow, it may then emit its own `NEXT` or `PREV` through that workflow normally.
-- Entry-boundary `PREV` never bubbles to the caller; §20.11 fail-fast handling
-  applies.
-- Resolution and consumption are idempotent; reload can distinguish an unresolved,
-  resolved-but-not-consumed, consumed, failed, or cancelled continuation. A failed or
-  cancelled child follows §20.11 and cannot resolve twice.
-- Workflow return is an engine operation distinct from `PREV`, even if product-level
-  explanations describe it as control returning to the coordinator.
+When the run succeeds, fails, or is cancelled, the repository resolves that continuation
+once and queues one deterministic engine resume message and turn on the still-open root.
+The message contains bounded terminal status/reason and the committed terminal result
+when present. Resolution and consumption are idempotent; reload can distinguish pending,
+resolved, consumed, and cancelled state and cannot deliver the same completion twice. The
+resolver's conditional transition rechecks pending continuation, terminal run status, and
+caller liveness at the write boundary, so a concurrent caller cancellation cannot be followed
+by a resume turn.
+Caller cancellation cancels the pending continuation without creating a resume turn.
+There is no nested-workflow return gate or workflow-to-workflow invocation path.
 
 ### 20.13 Canonical planning example
 

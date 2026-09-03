@@ -32,7 +32,7 @@ describe("workflow graph webview wiring", () => {
     expect(panelSource).toContain("node.provenanceLabel");
     expect(panelSource).toContain("Active node");
     expect(panelSource).toContain("Active gate");
-    expect(panelSource).toContain("Child runs");
+    expect(panelSource).not.toContain("Child runs");
     expect(panelSource).toContain("view.degradedRead.label");
   });
 

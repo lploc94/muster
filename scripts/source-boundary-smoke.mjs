@@ -8,12 +8,49 @@ const SOURCE_FILES = [
   'tsconfig.json',
   '.github/workflows/ci.yml',
   'docs/VERIFICATION-EVIDENCE.md',
+  'docs/MUSTER-BRIDGE.md',
+  'docs/TASK-MANAGEMENT.md',
   'src/extension.ts',
   'src/backends/claude.ts',
+  'src/bridge/server.ts',
   'src/runner.ts',
+  'src/task/capabilities.ts',
+  'src/task/coordinator-tools.ts',
+  'src/task/engine-graph.ts',
+  'src/task/engine.ts',
   'src/task/repository.ts',
+  'src/task/scheduler.ts',
+  'src/task/types.ts',
   'src/types.ts',
   'mcp/muster-ask-server.mjs',
+];
+
+const WORKFLOW_ROOT_BOUNDARY_FILES = [
+  'docs/MUSTER-BRIDGE.md',
+  'docs/TASK-MANAGEMENT.md',
+  'src/bridge/server.ts',
+  'src/task/capabilities.ts',
+  'src/task/coordinator-tools.ts',
+  'src/task/engine-graph.ts',
+  'src/task/engine.ts',
+  'src/task/repository.ts',
+  'src/task/scheduler.ts',
+  'src/task/types.ts',
+];
+
+const RETIRED_NESTED_WORKFLOW_TOKENS = [
+  'invoke_child_workflow',
+  'child_workflow',
+];
+
+const RETIRED_CHILD_RUN_SYMBOLS = [
+  'planWorkflowChildInvocation',
+  'planWorkflowChildReturn',
+  'resolveWorkflowChildContinuation',
+  'getWorkflowChildRun',
+  'listWorkflowChildRuns',
+  'readWorkflowChildRun',
+  'startWorkflowChildRun',
 ];
 
 const FORBIDDEN_LIVE_CLAIMS = [
@@ -364,6 +401,31 @@ function expectVerificationEvidenceContract(evidenceText, failures) {
   }
 }
 
+function expectWorkflowRootBoundary(textFiles, failures) {
+  for (const relativePath of WORKFLOW_ROOT_BOUNDARY_FILES) {
+    const text = textFiles.get(relativePath);
+    if (text === undefined) continue;
+    for (const token of RETIRED_NESTED_WORKFLOW_TOKENS) {
+      if (text.includes(token)) {
+        failures.push(
+          `Expected ${displayPath(relativePath)} to exclude retired nested-workflow token '${token}'.`,
+        );
+      }
+    }
+  }
+
+  const repositoryPath = 'src/task/repository.ts';
+  const repositoryText = textFiles.get(repositoryPath);
+  if (repositoryText === undefined) return;
+  for (const symbol of RETIRED_CHILD_RUN_SYMBOLS) {
+    if (repositoryText.includes(symbol)) {
+      failures.push(
+        `Expected ${repositoryPath} to exclude retired callable child-run symbol '${symbol}'.`,
+      );
+    }
+  }
+}
+
 export async function runSourceBoundarySmoke(options = {}) {
   const rootDir = options.rootDir ?? process.cwd();
   const failures = [];
@@ -498,6 +560,9 @@ export async function runSourceBoundarySmoke(options = {}) {
 
   expectVerificationEvidenceContract(textFiles.get('docs/VERIFICATION-EVIDENCE.md'), failures);
   checked.push('verification evidence boundary');
+
+  expectWorkflowRootBoundary(textFiles, failures);
+  checked.push('root-only workflow orchestration boundary');
 
   for (const [relativePath, text] of textFiles.entries()) {
     if (text === undefined) continue;

@@ -80,13 +80,11 @@ function graph(
         required: 2,
       },
     ],
-    childRuns: [{ status: "running" }],
     reuse: { nodeCount: 4, edgeCount: 4 },
     diagnostics: [
       { code: "workflow_graph_topology_undecodable" },
       { code: "workflow_graph_nodes_truncated" },
       { code: "workflow_graph_edges_truncated" },
-      { code: "workflow_graph_child_runs_truncated" },
     ],
     ...overrides,
   };
@@ -136,7 +134,6 @@ function operationalGraph(): WorkflowGraphWireGraph {
       frontierNodeIds: ["b", "d", "c", "e"], activeNodeIds: ["b", "d"],
     },
     feedbackRounds: [],
-    childRuns: [],
     reuse: { nodeCount: 0, edgeCount: 0 },
     diagnostics: [],
   };
@@ -231,9 +228,6 @@ describe("buildWorkflowGraphPanelView", () => {
         progressLabel: "1 of 2 responses received",
       },
     ]);
-    expect(view.childRuns).toEqual([
-      { label: "Child workflow 1", status: "running", statusLabel: "Running" },
-    ]);
     expect(view.reuseSummary).toEqual({
       nodeCount: 4,
       edgeCount: 4,
@@ -246,7 +240,6 @@ describe("buildWorkflowGraphPanelView", () => {
         "Workflow topology could not be decoded",
         "Workflow nodes were truncated",
         "Workflow edges were truncated",
-        "Child workflow runs were truncated",
       ],
     });
   });
@@ -265,7 +258,6 @@ describe("buildWorkflowGraphPanelView", () => {
         },
         activeGate: undefined,
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
       }),
@@ -276,7 +268,6 @@ describe("buildWorkflowGraphPanelView", () => {
     expect(view.activeNodeId).toBeNull();
     expect(view.activeGate).toBeNull();
     expect(view.feedbackRounds).toEqual([]);
-    expect(view.childRuns).toEqual([]);
     expect(view.reuseSummary.label).toBe("No reused nodes or edges");
     expect(view.degradedRead).toEqual({
       visible: false,

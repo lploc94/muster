@@ -102,7 +102,6 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
       required: round.required,
       responded: round.responded,
     })),
-    childRuns: graph.childRuns.map((run) => ({ status: run.status })),
     reuse: { nodeCount: graph.reuse.nodeCount, edgeCount: graph.reuse.edgeCount },
     diagnostics,
   };

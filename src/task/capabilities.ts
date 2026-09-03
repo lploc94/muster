@@ -31,13 +31,14 @@ export type AnyTaskAction =
   /** M018 S04: stage workflow PREV disposition (does not seal lifecycle). */
   | 'workflow_prev'
   /** M018 S05: stage workflow FAIL disposition (does not seal lifecycle). */
-  | 'workflow_fail'
-  /** M018 S06: stage the child-workflow NEXT route (does not seal lifecycle). */
-  | 'invoke_child_workflow';
+  | 'workflow_fail';
 
 export type ToolAction = CoordinatorAction | AnyTaskAction;
 
 export const PUBLIC_MCP_TOOL_ACTIONS = [
+  'create_task',
+  'delegate_task',
+  'wait_for_tasks',
   'list_task_types',
   'list_predefined_workflows',
   'get_predefined_workflow',
@@ -49,7 +50,6 @@ export const PUBLIC_MCP_TOOL_ACTIONS = [
   'workflow_next',
   'workflow_prev',
   'workflow_fail',
-  'invoke_child_workflow',
 ] as const satisfies readonly ToolAction[];
 
 export type PublicMcpToolAction = (typeof PUBLIC_MCP_TOOL_ACTIONS)[number];
@@ -61,13 +61,10 @@ export function isPublicMcpToolAction(action: string): action is PublicMcpToolAc
 }
 
 const CAPABILITY_TO_ACTIONS: Record<TaskCapability, CoordinatorAction[]> = {
-  // create_child is retained as the internal authority for workflow definition/start.
   create_child: [
     'list_task_types',
     'list_predefined_workflows',
     'get_predefined_workflow',
-    'define_workflow',
-    'start_workflow',
   ],
   start_child: [],
   wait_child: [],
@@ -86,7 +83,7 @@ export interface CapabilityContext {
 }
 
 export function capabilitiesFor(
-  task: Pick<MusterTask, 'role' | 'capabilities' | 'parentId'>,
+  task: Pick<MusterTask, 'role' | 'capabilities' | 'parentId' | 'lifecycle'>,
   context: CapabilityContext = {},
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
@@ -114,21 +111,24 @@ export function capabilitiesFor(
       (!outcome || (outcome.prev !== undefined && outcome.prev.length > 0))
     ) granted.add('workflow_prev');
     if (!outcome || outcome.fail) granted.add('workflow_fail');
+    if (task.role === 'coordinator' && task.capabilities.includes('create_child')) {
+      granted.add('create_task');
+      granted.add('delegate_task');
+      if (task.capabilities.includes('wait_child')) granted.add('wait_for_tasks');
+    }
   }
 
-  const canCreateChildWorkflow =
+  const canMutateWorkflows =
     isLiveTurn &&
     context.workspaceTrusted !== false &&
+    task.lifecycle === 'open' &&
     task.role === 'coordinator' &&
     task.capabilities.includes('create_child') &&
-    (
-      activation === undefined
-        ? task.parentId === null || task.parentId === undefined
-        : isLiveActivation &&
-          activation.isTerminalNode &&
-          !activation.hasOpenFeedbackRound &&
-          !activation.hasPendingContinuation
-    );
-  if (canCreateChildWorkflow) granted.add('invoke_child_workflow');
+    activation === undefined &&
+    (task.parentId === null || task.parentId === undefined);
+  if (canMutateWorkflows) {
+    granted.add('define_workflow');
+    granted.add('start_workflow');
+  }
   return granted;
 }

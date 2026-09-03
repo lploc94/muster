@@ -414,6 +414,48 @@ function workflowHostPolicyError(code: string, message: string): {
   return { ok: false, error: JSON.stringify({ code, message }) };
 }
 
+async function authorizeRootWorkflowMutation(
+  deps: GraphEngineDeps,
+  ctx: { callerTaskId: string; turnId: string; rootId: string },
+  action: 'define_workflow' | 'start_workflow',
+): Promise<
+  | { ok: true; caller: MusterTask; turn: TaskTurn }
+  | { ok: false; error: string }
+> {
+  const [turn, caller, workflowBound] = await Promise.all([
+    deps.repository.getTurn(ctx.turnId),
+    deps.repository.getTask(ctx.callerTaskId),
+    deps.repository.isTurnWorkflowBound(ctx.turnId),
+  ]);
+  if (
+    !turn ||
+    turn.taskId !== ctx.callerTaskId ||
+    (turn.status !== 'running' && turn.status !== 'waiting_user') ||
+    workflowBound ||
+    !caller ||
+    caller.id !== ctx.rootId ||
+    caller.lifecycle !== 'open' ||
+    caller.role !== 'coordinator' ||
+    !caller.capabilities.includes('create_child') ||
+    (caller.parentId !== null && caller.parentId !== undefined)
+  ) {
+    return { ok: false, error: `${action} is not authorized for the current caller` };
+  }
+  const workspaceTrusted =
+    deps.isWorkspaceTrusted?.() !== false && deps.getHostEnvironment?.()?.trusted !== false;
+  if (!workspaceTrusted) {
+    return workflowHostPolicyError(
+      'workspace_untrusted',
+      `workspace is not trusted; cannot ${action === 'define_workflow' ? 'define' : 'start'} workflows`,
+    );
+  }
+  const durableActions = capabilitiesFor(caller, { turn, workspaceTrusted });
+  if (!durableActions.has(action)) {
+    return { ok: false, error: `${action} is not authorized for the current caller` };
+  }
+  return { ok: true, caller, turn };
+}
+
 function predefinedWorkflowDefinitionId(rootId: string, workflowRef: string): string {
   return `workflow-${createHash('sha256')
     .update(rootId).update('\0')
@@ -998,8 +1040,7 @@ export async function executeToolCommand(
   if (
     command.kind === 'workflow_next' ||
     command.kind === 'workflow_prev' ||
-    command.kind === 'workflow_fail' ||
-    command.kind === 'invoke_child_workflow'
+    command.kind === 'workflow_fail'
   ) {
     const durableTurn = await deps.repository.getTurn(ctx.turnId);
     if (
@@ -1037,6 +1078,7 @@ export async function executeToolCommand(
 
   if (
     command.kind !== 'inspect_workflow_run' &&
+    command.kind !== 'define_workflow' &&
     command.kind !== 'start_workflow' &&
     command.kind !== 'get_host_context' &&
     command.kind !== 'list_task_types' &&
@@ -2655,64 +2697,6 @@ export async function executeToolCommand(
       return { ok: true, result: { staged: true } };
     }
 
-    case 'invoke_child_workflow': {
-      // M018 S06: map the public invocation command to a child-workflow NEXT route.
-      // Child run + continuation are owned by repository settle (T02).
-      const childDefinition = command.childDefinitionVersion === undefined
-        ? await deps.repository.getLatestWorkflowDefinition(command.childDefinitionId, ctx.rootId)
-        : await deps.repository.getWorkflowDefinition(
-            command.childDefinitionId,
-            command.childDefinitionVersion,
-          );
-      if (!childDefinition) {
-        return workflowHostPolicyError('definition_not_found', 'child workflow definition not found');
-      }
-      const childDefinitionVersion = childDefinition.version;
-      const prepared = await prepareWorkflowStart(
-        deps,
-        ctx,
-        {
-          definitionId: command.childDefinitionId,
-          version: childDefinitionVersion,
-          useCallerBackendDefault: true,
-        },
-        limits,
-      );
-      if (!prepared.ok) return prepared;
-      const staged = await executeGraphCommand(deps, 'invokeChildGraphTask', (draft) => {
-        const turn = draft.turns[ctx.turnId];
-        if (!turn) return { ok: false, reason: 'turn not found' };
-        const result = stageDisposition(
-          turn,
-          {
-            kind: 'workflow_next',
-            change: 'updated',
-            route: {
-              kind: 'child_workflow',
-              childDefinitionId: command.childDefinitionId,
-              childDefinitionVersion,
-              entryBindings: command.entryBindings,
-              ...(command.childIdempotencyKey !== undefined
-                ? { childIdempotencyKey: command.childIdempotencyKey }
-                : {}),
-              effectivePolicy: prepared.effectivePolicy,
-            },
-          },
-          command.opId,
-          {
-            limits: { maxResult: limits.maxResultBytes, maxError: limits.maxErrorBytes },
-          },
-        );
-        if (!result.ok) return result;
-        draft.turns[ctx.turnId] = result.next.turn;
-        writeLedger(draft, ctx.turnId, command.opId, fingerprint, { ok: true, data: { staged: true } });
-        return { ok: true };
-      });
-      if (!staged.ok) return { ok: false, error: staged.error };
-      return { ok: true, result: { staged: true } };
-    }
-
-
     case 'inspect_workflow_run': {
       const inspection = await deps.repository.inspectWorkflowRun(command.runId, ctx.rootId);
       if (!inspection) return { ok: false, error: 'workflow run not found' };
@@ -2844,10 +2828,9 @@ export async function executeToolCommand(
     }
 
     case 'define_workflow': {
-      const caller = await deps.repository.getTask(ctx.callerTaskId);
-      if (!caller || caller.lifecycle !== 'open') {
-        return workflowHostPolicyError('caller_not_open', 'caller task is not open');
-      }
+      const authorization = await authorizeRootWorkflowMutation(deps, ctx, 'define_workflow');
+      if (!authorization.ok) return authorization;
+      const caller = authorization.caller;
       let definitionId: string;
       let version: number | undefined;
       let name: string;
@@ -2933,6 +2916,9 @@ export async function executeToolCommand(
         publicOperation: {
           ledgerKey: opLedgerKey(ctx.turnId, command.opId),
           fingerprint,
+          rootTaskId: ctx.rootId,
+          callerTaskId: ctx.callerTaskId,
+          callerTurnId: ctx.turnId,
         },
         createdAt: now,
       });
@@ -2955,29 +2941,8 @@ export async function executeToolCommand(
     }
 
     case 'start_workflow': {
-      const durableTurn = await deps.repository.getTurn(ctx.turnId);
-      if (
-        !durableTurn ||
-        durableTurn.taskId !== ctx.callerTaskId ||
-        (durableTurn.status !== 'running' && durableTurn.status !== 'waiting_user')
-      ) {
-        return { ok: false, error: "start_workflow requires the caller's live turn" };
-      }
-      if (durableTurn.workflowActivation) {
-        return {
-          ok: false,
-          error: 'start_workflow is unavailable inside a workflow activation; use invoke_child_workflow',
-        };
-      }
-      const durableTask = await deps.repository.getTask(ctx.callerTaskId);
-      if (!durableTask) return { ok: false, error: 'caller task not found' };
-      const durableActions = capabilitiesFor(durableTask, {
-        turn: durableTurn,
-        workspaceTrusted: deps.isWorkspaceTrusted?.() ?? true,
-      });
-      if (!durableActions.has('start_workflow')) {
-        return { ok: false, error: 'start_workflow is not authorized for the current caller' };
-      }
+      const authorization = await authorizeRootWorkflowMutation(deps, ctx, 'start_workflow');
+      if (!authorization.ok) return authorization;
       const priorResolution = command.version === undefined
         ? await deps.repository.getWorkflowStartResolution({
             ownerRootTaskId: ctx.rootId,
@@ -3030,6 +2995,9 @@ export async function executeToolCommand(
         publicOperation: {
           ledgerKey: opLedgerKey(ctx.turnId, command.opId),
           fingerprint,
+          rootTaskId: ctx.rootId,
+          callerTaskId: ctx.callerTaskId,
+          callerTurnId: ctx.turnId,
         },
       });
       if (started.conflict || !started.operation?.result?.ok) {

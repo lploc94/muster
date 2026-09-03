@@ -421,20 +421,6 @@ export type StartWorkflowResult =
     };
 
 
-/** Public child input name bound to one inputRef of the current activation. */
-export interface InvokeChildEntryBinding {
-  name: string;
-  fromInputRef: string;
-}
-
-/** M018 S06: public child-route command payload (no SQL/paths/bodies). */
-export interface InvokeChildWorkflowInput {
-  childDefinitionId: string;
-  childDefinitionVersion: number;
-  entryBindings: readonly InvokeChildEntryBinding[];
-  childIdempotencyKey?: string;
-}
-
 export type WorkflowRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 export type WorkflowNodeStatus =
   | 'pending' | 'active' | 'reused' | 'succeeded' | 'failed' | 'cancelled' | 'skipped';
@@ -483,8 +469,6 @@ export interface WorkflowActivationStatusProjection {
   sourceGateId?: string;
   feedbackRoundId?: string;
   feedbackTargetNodeId?: string;
-  continuationId?: string;
-  returnGateId?: string;
 }
 
 export interface WorkflowFeedbackRoundProjection {
@@ -500,7 +484,6 @@ export interface WorkflowContinuationStatusProjection {
   continuationId: string;
   status: string;
   kind: string;
-  childRunId?: string;
   outcome?: string;
   reasonCode?: string;
 }
@@ -532,10 +515,6 @@ export interface WorkflowTaskStatusProjection {
   startedAt?: string;
   deadlineAt?: string;
   terminalReason?: string;
-  /** Run origin: top_level | child (not a filesystem path). */
-  origin: string;
-  /** Parent workflow run id when origin is child. */
-  parentRunId?: string;
   nodeId: string;
   /** Frozen display metadata only; never instruction content. */
   title?: string;
@@ -620,11 +599,6 @@ export interface WorkflowGraphProgressProjection {
   activeNodeIds: readonly string[];
 }
 
-/** Direct nested workflow run visible from a host graph read. */
-export interface WorkflowGraphChildRunProjection {
-  status: WorkflowRunStatus;
-}
-
 export interface WorkflowGraphFeedbackRoundProjection {
   requesterNodeId: string;
   status: 'open' | 'satisfied';
@@ -652,7 +626,6 @@ export interface WorkflowGraphProjection {
   activeGate?: WorkflowGraphGateProjection;
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
-  childRuns: readonly WorkflowGraphChildRunProjection[];
   reuse: WorkflowGraphReuseProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }
@@ -712,8 +685,6 @@ export interface WorkflowRunInspectionProjection {
   startedAt?: string;
   deadlineAt?: string;
   terminalReason?: string;
-  origin: string;
-  parentRunId?: string;
   nodes: readonly WorkflowRunNodeInspectionProjection[];
   gates: readonly WorkflowGateStatusProjection[];
   activations: readonly WorkflowRunActivationInspectionProjection[];

@@ -236,7 +236,7 @@ MCP grants, or gain coordinator authority from package contents.
 Catalog, MCP, status, graph, and webview projections never expose manifest or
 instruction bodies, scripts, filesystem paths, credentials, or physical
 artifact identities. Graph topology uses only manifest node keys and input
-references; durable run, dependency-gate, feedback-round, and child-run
+references; durable run, dependency-gate, feedback-round, and start-continuation
 identifiers remain repository-private.
 
 Status and graph projections derive decision state from durable activation and

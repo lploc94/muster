@@ -33,7 +33,6 @@ export type WorkflowGraphProbeGraphObservation = {
   reuseEdgeCount: number;
   /** Sorted unique node statuses; proves `reused` survives to the wire. */
   nodeStatuses: string[];
-  childRunCount: number;
   feedbackRoundCount: number;
   activeGate?: { status: string; satisfied: number; required: number };
   diagnostics: WorkflowGraphDiagnosticCode[];
@@ -86,7 +85,6 @@ function summarizeGraph(graph: WorkflowGraphWireGraph): WorkflowGraphProbeGraphO
     reuseNodeCount: graph.reuse.nodeCount,
     reuseEdgeCount: graph.reuse.edgeCount,
     nodeStatuses: statuses,
-    childRunCount: graph.childRuns.length,
     feedbackRoundCount: graph.feedbackRounds.length,
     ...(graph.activeGate
       ? {

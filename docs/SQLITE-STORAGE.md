@@ -205,13 +205,19 @@ actions stay available.
   digest, normalized outcome, resolved task routing, and script execution provenance. Reload
   reconstructs and validates this authority against the canonical definition fingerprint before use.
 - Dispatch revalidates the owning canonical authority before claiming a queued activation. Entry,
-  dependency, feedback, child-return, retry, activation-recovery, and fresh-session reconstruction
+  dependency, feedback, retry, activation-recovery, and fresh-session reconstruction
   paths retain the same persisted frozen instruction body instead of rereading package files.
 - Manual and safe automatic retries remain owned by the same workflow activation: the retry insert,
   per-run workflow-turn reservation, and activation `execution_turn_id` rebind commit atomically.
   Corrupt canonical authority, stale activation ownership, or exhausted turn budgets deny the retry.
   An original-input manual retry may coexist with queued follow-ups already marked held; live or
   non-held queued turns still block retry allocation.
+- Before any repository-owned turn deletion—direct, queued-turn/message cleanup, graph/task
+  deletion, or terminal reclamation—the same SQLite transaction prepares and applies the narrow
+  schema-7 `child_return` purge. The purge runs before the terminal-history turn-delete trigger
+  can evaluate its run guard, and a stale/hidden non-legacy target remains fail-closed rather than
+  being made visible by cleanup. A failed ownership, lineage, or foreign-key check rolls back the
+  purge and the requested deletion together.
 - Workflow starts accept only complete public input-name bindings. SQLite resolves each destination
   name from the frozen definition while claiming the start; callers never supply entry coordinates.
   A prior-run binding keeps `(fromRun, outputName)` as authority and selects that frozen output's
@@ -219,12 +225,26 @@ actions stay available.
   remains continuation data and is never a named-composition source. The destination stores a local
   `workflow_input` artifact whose `workflow_artifact` source row pins the exact source run, artifact,
   and revision; reference accounting prevents retention from stripping required source evidence.
-- Child workflow invocation likewise resolves public child input names inside the child-start
-  transaction. Each forwarded value must come from the current activation's pinned `fromInput`, and
-  child run, return gate, continuation, provenance pin, and entry fill become durable together. The
-  parent edge has no invented semantic kind: each value is adapted to the frozen child input kind.
-  Validation, source lookup, and every write share one transaction, so any failure leaves no start
-  claim, run, gate, fill, continuation, return gate, or provenance row to clean up.
+- Public definition and start commands carry the authenticated root task and caller turn into the
+  repository. Under the same `BEGIN IMMEDIATE` transaction that would claim an operation or write
+  workflow state, the repository verifies an open top-level coordinator with `create_child`, the
+  matching live caller turn, and no workflow activation of any origin. A stale or forged caller is
+  rejected before replay or persistence and leaves no operation, definition, run, gate, artifact,
+  task, turn, or continuation row to clean up.
+- Pre-cutover child-workflow rows may still exist physically in a schema-v7 store, but no production
+  writer, scheduler, recovery path, or execution reader consumes them. Task-facing list and snapshot
+  queries suppress tasks attached to those runs while preserving ordinary delegated children and
+  canonical top-level workflow tasks. At the cleanup/terminalization boundary, a narrow
+  workspace-qualified purge removes obsolete `child_return` activation/retry-lineage state and
+  its child-only durable dependents in one transaction before the terminal-run guard; it is
+  idempotent, FK-ordered, and rolls back on ambiguous ownership or failure. Each artifact-source,
+  routed-message, and start-claim candidate must match the retired activation's complete
+  workspace/run/turn/message identity; a source turn or task ID by itself never authorizes a
+  delete, and a forward retry edge at the configured depth boundary fails closed before any
+  mutation. Shared/unscoped operations, ordinary tasks, active canonical rows, cross-run pins,
+  and the bounded `run_closure`
+  record are not removed. This is not a schema migration or nested recovery path. The reset-only
+  schema cutover removes the obsolete structure.
 - Schema v7 owns one activation-scoped `workflow_decision_repairs` row for bounded agent outcome
   repair. An authenticated invalid route attempt records only a closed error code before any
   disposition claim; a later valid claim remains authoritative. A clean optional original attempt

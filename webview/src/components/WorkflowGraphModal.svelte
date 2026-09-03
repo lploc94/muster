@@ -233,16 +233,6 @@
         </div>
       {/if}
 
-      {#if view.childRuns.length > 0}
-        <div class="workflow-modal__section">
-          <div class="workflow-modal__section-title">Child runs</div>
-          <ul class="workflow-modal__plain-list">
-            {#each view.childRuns as c}
-              <li><span>{c.label}</span> <span>{c.statusLabel}</span></li>
-            {/each}
-          </ul>
-        </div>
-      {/if}
     </div>
   {/if}
 

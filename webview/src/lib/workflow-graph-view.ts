@@ -67,12 +67,6 @@ export interface WorkflowGraphFeedbackRoundView {
   progressLabel: string;
 }
 
-export interface WorkflowGraphChildRunView {
-  label: string;
-  status: string;
-  statusLabel: string;
-}
-
 export interface WorkflowGraphReuseSummary {
   nodeCount: number;
   edgeCount: number;
@@ -96,7 +90,6 @@ export interface WorkflowGraphPanelView {
   activeNodeId: string | null;
   activeGate: WorkflowGraphGateView | null;
   feedbackRounds: WorkflowGraphFeedbackRoundView[];
-  childRuns: WorkflowGraphChildRunView[];
   reuseSummary: WorkflowGraphReuseSummary;
   degradedRead: WorkflowGraphDegradedReadView;
 }
@@ -129,7 +122,6 @@ const DIAGNOSTIC_LABELS: Readonly<Record<WorkflowGraphDiagnosticCode, string>> =
     workflow_graph_nodes_truncated: "Workflow nodes were truncated",
     workflow_graph_edges_truncated: "Workflow edges were truncated",
     workflow_graph_gates_truncated: "Workflow gates were truncated",
-    workflow_graph_child_runs_truncated: "Child workflow runs were truncated",
   };
 
 export function workflowGraphStatusLabel(status: string): string {
@@ -290,11 +282,6 @@ export function buildWorkflowGraphPanelView(
       responded: round.responded,
       required: round.required,
       progressLabel: `${round.responded} of ${round.required} responses received`,
-    })),
-    childRuns: graph.childRuns.map((childRun, index) => ({
-      label: `Child workflow ${index + 1}`,
-      status: childRun.status,
-      statusLabel: workflowGraphStatusLabel(childRun.status),
     })),
     reuseSummary: {
       nodeCount: graph.reuse.nodeCount,

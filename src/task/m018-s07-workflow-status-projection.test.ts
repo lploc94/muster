@@ -15,11 +15,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import type { AskBridge } from '../bridge/ask-bridge';
 import { CredentialRegistry } from '../bridge/credentials';
+import { buildRepositorySnapshot } from '../host/repository-snapshot';
+import { routeExportTask, TASK_EXPORT_ERROR_MESSAGES } from '../host/task-export-route';
 import { executeToolCommand, type GraphEngineDeps } from './engine-graph';
+import { RepositoryProjection } from './repository-projection';
 import { SqliteTaskRepository } from './repository';
 import { stageDispositionForSettlement } from './m018-test-helpers';
 import { DbClient } from './sqlite/client';
-import type { TaskStoreFile } from './types';
+import type { MusterTask, TaskStoreFile } from './types';
 import { makeGraphFanInDefinition, entryNodeIds } from './workflow';
 import type {
   WorkflowRunInspectionProjection,
@@ -122,7 +125,7 @@ function assertBoundedProjection(w: WorkflowTaskStatusProjection): void {
   expect(Number.isInteger(w.definitionVersion)).toBe(true);
   expect(typeof w.runStatus).toBe('string');
   expect(typeof w.policy.maxWorkflowTurns).toBe('number');
-  expect(typeof w.origin).toBe('string');
+  expect(w).not.toHaveProperty('origin');
   expect(typeof w.nodeId).toBe('string');
   expect(Array.isArray(w.gates)).toBe(true);
   expect(Array.isArray(w.feedbackRounds)).toBe(true);
@@ -161,6 +164,7 @@ function assertBoundedRunInspection(run: WorkflowRunInspectionProjection): void 
   expect(run).not.toHaveProperty('payload_json');
   expect(run).not.toHaveProperty('body_json');
   expect(run).not.toHaveProperty('prompt');
+  expect(run).not.toHaveProperty('origin');
   expect(forbiddenLeak(run)).toEqual([]);
 }
 
@@ -224,8 +228,6 @@ describe('M018 S07 bounded workflow status projection', () => {
       expect(projection!.definitionId).toBe('wf-fan');
       expect(projection!.definitionVersion).toBe(1);
       expect(projection!.runStatus).toBe('running');
-      expect(projection!.origin).toBe('top_level');
-      expect(projection!.parentRunId).toBeUndefined();
       expect(projection!.nodeId).toBe('p1');
       // Fan-in: entry gates satisfied (engine_start), consumer gate open with 2 required.
       expect(projection!.gates.length).toBeGreaterThanOrEqual(1);
@@ -262,6 +264,282 @@ describe('M018 S07 bounded workflow status projection', () => {
       await expect(
         ctx.repository.inspectWorkflowRun(data.runId, 'different-root'),
       ).resolves.toBeUndefined();
+    } finally {
+      await ctx.close();
+    }
+  }, 30_000);
+
+  it('excludes persisted schema-7 child runs from every active projection', async () => {
+    const ctx = await openRepo('legacy-child-hidden');
+    try {
+      const createdAt = '2026-07-21T00:05:00.000Z';
+      const parent = await defineAndStartFanIn(ctx.repository, createdAt, 's07-legacy-parent');
+      const childCreatedAt = '2026-07-21T00:05:01.000Z';
+      await ctx.repository.execute({
+        kind: 'defineWorkflowVersion',
+        workspaceId: 'ws',
+        definitionId: 'wf-legacy-child',
+        version: 1,
+        name: 'legacy child',
+        topology: {
+          kind: 'workflow',
+          inputs: [],
+          outputs: [{ name: 'result', semanticKind: 'result', terminalNodeId: 'entry' }],
+          nodes: [{ nodeId: 'entry' }],
+          edges: [],
+        },
+        createdAt: childCreatedAt,
+      });
+      const parentEntry = parent.entries.find((entry) => entry.nodeId === 'p1')!;
+      const ownerRootTaskId = parentEntry.taskId;
+      const childTask: MusterTask = {
+        id: 'legacy-child-task',
+        role: 'worker',
+        lifecycle: 'open',
+        releaseState: 'released',
+        goal: 'legacy child task',
+        parentId: null,
+        prerequisites: [],
+        backend: 'grok',
+        capabilities: [],
+        executionPolicy: { maxTurns: 3, maxAutomaticRetries: 0 },
+        runtimeEpoch: 1,
+        revision: 0,
+        createdAt: childCreatedAt,
+        updatedAt: childCreatedAt,
+      };
+      await ctx.repository.execute({
+        kind: 'createTask',
+        workspaceId: 'ws',
+        task: childTask,
+      });
+      await ctx.client.run(
+        `UPDATE workflow_runs
+            SET owner_root_task_id = ?, caller_task_id = ?, caller_turn_id = ?, updated_at = ?
+          WHERE workspace_id = ? AND run_id = ?`,
+        [
+          ownerRootTaskId,
+          ownerRootTaskId,
+          parentEntry.activationTurnId,
+          createdAt,
+          'ws',
+          parent.runId,
+        ],
+      );
+      await ctx.client.run(
+        `INSERT INTO workflow_runs (
+                  workspace_id, run_id, definition_id, definition_version, status,
+                  origin, parent_run_id, owner_root_task_id, caller_task_id,
+                  caller_turn_id, continuation_id, policy_json, max_feedback_rounds,
+                  max_turns_per_task, max_workflow_turns, max_children, max_depth,
+                  max_concurrency, max_aggregate_bytes, feedback_rounds_reserved,
+                  workflow_turns_reserved, children_reserved, started_at, deadline_at,
+                  created_at, updated_at
+                )
+                SELECT workspace_id, 'legacy-child-run', 'wf-legacy-child', 1, 'running',
+                       'child', run_id, owner_root_task_id, caller_task_id,
+                       caller_turn_id, NULL, policy_json,
+                       max_feedback_rounds, max_turns_per_task, max_workflow_turns,
+                       max_children, max_depth, max_concurrency, max_aggregate_bytes,
+                       0, 0, 0, ?, deadline_at, ?, ?
+                  FROM workflow_runs
+                 WHERE workspace_id = ? AND run_id = ?`,
+        [
+          childCreatedAt,
+          childCreatedAt,
+          '2026-07-21T00:05:02.000Z',
+          'ws',
+          parent.runId,
+        ],
+      );
+      await ctx.client.run(
+        `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
+         VALUES (?, 'legacy-child-run', 'entry', ?, 'active')`,
+        ['ws', childTask.id],
+      );
+
+      const ordinaryRoot: MusterTask = {
+        ...childTask,
+        id: 'ordinary-root-task',
+        role: 'coordinator',
+        goal: 'ordinary root task',
+      };
+      const ordinaryChild: MusterTask = {
+        ...childTask,
+        id: 'ordinary-delegated-child',
+        parentId: ordinaryRoot.id,
+        goal: 'ordinary delegated child',
+      };
+      await ctx.repository.execute({ kind: 'createTask', workspaceId: 'ws', task: ordinaryRoot });
+      await ctx.repository.execute({ kind: 'createTask', workspaceId: 'ws', task: ordinaryChild });
+
+      await expect(ctx.repository.getWorkflowStatusForTask(childTask.id)).resolves.toBeUndefined();
+      await expect(
+        ctx.repository.inspectWorkflowRun('legacy-child-run', ownerRootTaskId),
+      ).resolves.toBeUndefined();
+      await expect(ctx.repository.getWorkflowGraphForTask(childTask.id)).resolves.toBeUndefined();
+      const ownerGraph = await ctx.repository.getWorkflowGraphForTask(ownerRootTaskId);
+      expect(ownerGraph?.nodes.map((node) => node.nodeId).sort()).toEqual(['consumer', 'p1', 'p2']);
+
+      await expect(ctx.repository.getTask(childTask.id)).resolves.toBeUndefined();
+      let saveDialogCalls = 0;
+      let writeCalls = 0;
+      await expect(routeExportTask(
+        { type: 'exportTask', taskId: childTask.id },
+        {
+          getRepository: () => ctx.repository,
+          showSaveDialog: async () => {
+            saveDialogCalls += 1;
+            return { path: '/tmp/legacy-child.md' };
+          },
+          writeFile: async () => {
+            writeCalls += 1;
+          },
+          exportedAt: childCreatedAt,
+        },
+      )).resolves.toEqual({
+        kind: 'messages',
+        messages: [{
+          type: 'commandError',
+          taskId: childTask.id,
+          message: TASK_EXPORT_ERROR_MESSAGES.task_not_found,
+        }],
+      });
+      expect(saveDialogCalls).toBe(0);
+      expect(writeCalls).toBe(0);
+      expect((await ctx.repository.listRootTasks('ws')).items.map((task) => task.id)).not.toContain(childTask.id);
+
+      await expect(ctx.repository.execute({
+        kind: 'renameTask',
+        workspaceId: 'ws',
+        taskId: childTask.id,
+        goal: 'must remain unchanged',
+        expectedTaskRevision: childTask.revision,
+        updatedAt: '2026-07-21T00:05:03.000Z',
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.repository.execute({
+        kind: 'upsertTask',
+        workspaceId: 'ws',
+        task: { ...childTask, goal: 'must not be upserted' },
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.repository.execute({
+        kind: 'deleteTask',
+        workspaceId: 'ws',
+        taskId: childTask.id,
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.repository.execute({
+        kind: 'deleteTaskSubtree',
+        workspaceId: 'ws',
+        rootTaskId: childTask.id,
+      })).resolves.toMatchObject({ changed: false });
+      await ctx.client.run(
+        `UPDATE tasks SET parent_id = ? WHERE workspace_id = 'ws' AND id = ?`,
+        [ordinaryRoot.id, childTask.id],
+      );
+      await expect(ctx.repository.execute({
+        kind: 'deleteTask',
+        workspaceId: 'ws',
+        taskId: ordinaryRoot.id,
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.repository.execute({
+        kind: 'deleteTaskSubtree',
+        workspaceId: 'ws',
+        rootTaskId: ordinaryRoot.id,
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.repository.execute({
+        kind: 'clearHistory',
+        workspaceId: 'ws',
+      })).resolves.toMatchObject({ changed: false });
+      await expect(ctx.client.get(
+        `SELECT goal FROM tasks WHERE workspace_id = 'ws' AND id = ?`,
+        [childTask.id],
+      )).resolves.toEqual({ goal: childTask.goal });
+      await expect(ctx.client.get(
+        `SELECT task_id FROM workflow_nodes
+          WHERE workspace_id = 'ws' AND run_id = 'legacy-child-run' AND node_id = 'entry'`,
+      )).resolves.toEqual({ task_id: childTask.id });
+
+      await expect(ctx.repository.execute({
+        kind: 'renameTask',
+        workspaceId: 'ws',
+        taskId: ordinaryChild.id,
+        goal: 'renamed ordinary delegated child',
+        expectedTaskRevision: ordinaryChild.revision,
+        updatedAt: '2026-07-21T00:05:04.000Z',
+      })).resolves.toMatchObject({ changed: true });
+      await expect(ctx.repository.getTask(ordinaryChild.id)).resolves.toMatchObject({
+        goal: 'renamed ordinary delegated child',
+      });
+
+      const listedTaskIds = (await ctx.repository.listTasks('ws')).map((task) => task.id);
+      expect(listedTaskIds).not.toContain(childTask.id);
+      expect(listedTaskIds).toEqual(expect.arrayContaining([ordinaryRoot.id, ordinaryChild.id]));
+      await expect(ctx.repository.listTasksByIds([
+        childTask.id,
+        ordinaryRoot.id,
+        ordinaryChild.id,
+      ])).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: ordinaryRoot.id }),
+        expect.objectContaining({ id: ordinaryChild.id }),
+      ]));
+      expect((await ctx.repository.listTasksByIds([childTask.id])).map((task) => task.id)).toEqual([]);
+      const listedRootIds = (await ctx.repository.listRootTasks('ws')).items.map((task) => task.id);
+      expect(listedRootIds).not.toContain(childTask.id);
+      expect(listedRootIds).toContain(ordinaryRoot.id);
+      await expect(ctx.repository.listSubtree(childTask.id)).resolves.toEqual([]);
+      await expect(ctx.repository.listSubtree(ordinaryRoot.id)).resolves.toEqual(expect.arrayContaining([
+        expect.objectContaining({ id: ordinaryRoot.id }),
+        expect.objectContaining({ id: ordinaryChild.id }),
+      ]));
+
+      const runtimeProjection = await RepositoryProjection.load(ctx.repository, 'ws');
+      expect(runtimeProjection.getFile().tasks).not.toHaveProperty(childTask.id);
+      expect(runtimeProjection.getFile().tasks).toHaveProperty(ordinaryChild.id);
+      const hostProjection = await buildRepositorySnapshot(
+        ctx.repository,
+        'ws',
+        childTask.id,
+        new Map(),
+      );
+      expect(hostProjection.observation.tasks).not.toHaveProperty(childTask.id);
+      expect(hostProjection.observation.tasks).toHaveProperty(ordinaryChild.id);
+      expect(hostProjection.snapshot.focusedTaskId).toBeUndefined();
+      expect(hostProjection.snapshot.rootTasks.map((task) => task.id)).not.toContain(childTask.id);
+
+      await ctx.client.transaction([
+        {
+          sql: `UPDATE tasks SET lifecycle = 'failed', updated_at = ?
+                 WHERE workspace_id = 'ws' AND id = ?`,
+          params: ['2026-07-21T00:05:05.000Z', childTask.id],
+        },
+        {
+          sql: `UPDATE workflow_nodes SET status = 'failed'
+                 WHERE workspace_id = 'ws' AND run_id = 'legacy-child-run'`,
+        },
+        {
+          sql: `UPDATE workflow_runs
+                   SET status = 'failed', terminal_reason_code = 'agent_fail', updated_at = ?
+                 WHERE workspace_id = 'ws' AND run_id = 'legacy-child-run'`,
+          params: ['2026-07-21T00:05:05.000Z'],
+        },
+        {
+          sql: `INSERT INTO workflow_routed_messages (
+                  workspace_id, run_id, message_id, source_node_id, destination_node_id,
+                  kind, body_json, created_at
+                ) VALUES ('ws', 'legacy-child-run', 'legacy-child-history',
+                          'entry', 'entry', 'terminal_next', ?, ?)`,
+          params: ['{"legacy":"must remain immutable"}', '2026-07-21T00:05:05.000Z'],
+        },
+      ]);
+      await expect(ctx.repository.execute({
+        kind: 'reclaimTerminalWorkflowMetadata',
+        workspaceId: 'ws',
+      })).resolves.toMatchObject({ changed: false, strippedWorkflowMessageBodies: 0 });
+      await expect(ctx.client.get(
+        `SELECT body_json FROM workflow_routed_messages
+          WHERE workspace_id = 'ws' AND run_id = 'legacy-child-run'
+            AND message_id = 'legacy-child-history'`,
+      )).resolves.toEqual({ body_json: '{"legacy":"must remain immutable"}' });
     } finally {
       await ctx.close();
     }
@@ -331,66 +609,15 @@ describe('M018 S07 bounded workflow status projection', () => {
     }
   }, 30_000);
 
-  it('projects parent linkage for child runs and open feedback round when present', async () => {
+  it('projects an open feedback round when present', async () => {
     const ctx = await openRepo('parent-round');
     try {
       const createdAt = '2026-07-21T00:20:00.000Z';
-      // Parent top-level run
       const parentStart = await defineAndStartFanIn(
         ctx.repository,
         createdAt,
         's07-parent-1',
       );
-      // Manually insert a child run row linked to parent for projection contract
-      // (full child invoke is S06; here we only prove parent linkage read).
-      const childRunId = 'wfr_s07_child_proj_1';
-      await ctx.client.run(
-        `INSERT INTO workflow_runs (
-           workspace_id, run_id, definition_id, definition_version, status, origin,
-           parent_run_id, created_at, updated_at
-         ) VALUES (?,?,?,?,?,?,?,?,?)`,
-        [
-          'ws',
-          childRunId,
-          'wf-fan',
-          1,
-          'running',
-          'child',
-          parentStart.runId,
-          createdAt,
-          createdAt,
-        ],
-      );
-      // Use a distinct child task; workflow ownership forbids one task belonging to two runs.
-      const p2 = parentStart.entries.find((e) => e.nodeId === 'p2')!;
-      const parentTask = await ctx.repository.getTask(p2.taskId);
-      const childTaskId = 's07-child-projection-task';
-      await ctx.repository.execute({
-        kind: 'createTask',
-        workspaceId: 'ws',
-        task: {
-          ...parentTask!,
-          id: childTaskId,
-          parentId: p2.taskId,
-          revision: 0,
-          createdAt,
-          updatedAt: createdAt,
-        },
-      });
-      await ctx.client.run(
-        `INSERT INTO workflow_nodes (workspace_id, run_id, node_id, task_id, status)
-         VALUES (?,?,?,?,?)`,
-        ['ws', childRunId, 'entry', childTaskId, 'open'],
-      );
-
-      const childProj = await ctx.repository.getWorkflowStatusForTask(childTaskId);
-      expect(childProj).toBeTruthy();
-      assertBoundedProjection(childProj!);
-      expect(childProj!.runId).toBe(childRunId);
-      expect(childProj!.origin).toBe('child');
-      expect(childProj!.parentRunId).toBe(parentStart.runId);
-
-      // Open feedback round on parent consumer path
       const p1 = parentStart.entries.find((e) => e.nodeId === 'p1')!;
       const roundId = 'wfrd_s07_open_round_1';
       await ctx.client.run(
@@ -901,7 +1128,6 @@ describe('M018 S07 bounded workflow status projection', () => {
           frontierNodeIds: ['consumer', 'p1', 'p2'], activeNodeIds: [],
         },
         feedbackRounds: [],
-        childRuns: [],
         reuse: { nodeCount: 0, edgeCount: 0 },
         diagnostics: [],
       });

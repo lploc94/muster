@@ -193,18 +193,6 @@ export type ToolCommand =
       attemptedDisposition: 'workflow_next' | 'workflow_prev' | 'workflow_fail';
       errorCode: 'decision_invalid';
     }
-  /** M018 S06: stage child-workflow invocation (engine owns child run/continuation). */
-  | {
-      kind: 'invoke_child_workflow';
-      opId: string;
-      childDefinitionId: string;
-      childDefinitionVersion?: number;
-      entryBindings: readonly {
-        name: string;
-        fromInputRef: string;
-      }[];
-      childIdempotencyKey?: string;
-    }
   | { kind: 'ask_parent'; opId: string; questions: Question[] }
   | {
       kind: 'answer_child_question';
@@ -269,7 +257,6 @@ const MUTATING_TOOLS: ReadonlySet<string> = new Set([
   'workflow_next',
   'workflow_prev',
   'workflow_fail',
-  'invoke_child_workflow',
   'ask_parent',
   'answer_child_question',
   'upsert_presentation',
@@ -281,7 +268,6 @@ const ENGINE_OPERATION_TOOLS: ReadonlySet<string> = new Set([
   'workflow_next',
   'workflow_prev',
   'workflow_fail',
-  'invoke_child_workflow',
   'upsert_presentation',
   'define_workflow',
   'start_workflow',
@@ -310,7 +296,6 @@ function toolActionForName(name: string): ToolAction | undefined {
     'workflow_next',
     'workflow_prev',
     'workflow_fail',
-    'invoke_child_workflow',
       'ask_parent',
     'answer_child_question',
     'upsert_presentation',
@@ -841,7 +826,6 @@ export function dispatch(
     }
     const semanticKey = tool === 'define_workflow' ||
       tool === 'start_workflow' ||
-      tool === 'invoke_child_workflow' ||
       tool === 'upsert_presentation'
       ? stableHash(canonicalJson(args))
       : requireString(args, 'definitionId') ?? 'default';
@@ -1169,59 +1153,6 @@ export function dispatch(
             ...(reason !== undefined ? { reason } : {}),
           },
         };
-      }
-      case 'invoke_child_workflow': {
-        const semanticReference = parseWorkflowReference(args.workflow);
-        if (
-          !semanticReference ||
-          Object.keys(args).some((key) => !['workflow', 'inputs'].includes(key))
-        ) return { ok: false, toolError: 'invalid invoke_child_workflow arguments' };
-        const childDefinitionId = semanticReference.definitionId;
-        const childDefinitionVersion = semanticReference.version;
-
-        if (Array.isArray(args.inputs)) {
-          if (
-            args.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX
-          ) {
-            return { ok: false, toolError: 'inputs exceed bounds' };
-          }
-          const entryBindings: Array<{
-            name: string;
-            fromInputRef: string;
-          }> = [];
-          const seenNames = new Set<string>();
-          for (const entry of args.inputs) {
-            if (!isRecord(entry)) return { ok: false, toolError: 'invalid child workflow input' };
-            if (Object.keys(entry).some((key) => !['name', 'fromInput'].includes(key))) {
-              return { ok: false, toolError: 'invalid child workflow input' };
-            }
-            const name = requireString(entry, 'name');
-            const fromInputRef = requireString(entry, 'fromInput');
-            if (
-              !name || !isStablePresentationId(name) ||
-              !fromInputRef || !isStablePresentationId(fromInputRef)
-            ) {
-              return { ok: false, toolError: 'invalid child workflow input' };
-            }
-            if (seenNames.has(name)) {
-              return { ok: false, toolError: `duplicate child workflow input: ${name}` };
-            }
-            seenNames.add(name);
-            entryBindings.push({ name, fromInputRef });
-          }
-          return {
-            ok: true,
-            command: {
-              kind: 'invoke_child_workflow',
-              opId,
-              childDefinitionId,
-              ...(childDefinitionVersion !== undefined ? { childDefinitionVersion } : {}),
-              entryBindings,
-              childIdempotencyKey: `turn-${stableHash(ctx.turnId, opId)}`,
-            },
-          };
-        }
-        return { ok: false, toolError: 'inputs must be an array' };
       }
       case 'ask_parent': {
         const questions = parseQuestions(args.questions);

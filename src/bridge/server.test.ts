@@ -1,13 +1,12 @@
 import { describe, expect, it, afterEach } from 'vitest';
 import { CredentialRegistry } from './credentials';
+import { McpReadinessSupervisor } from './mcp-readiness';
 import { formatToolError, MusterBridgeServer } from './server';
-import { PUBLIC_MCP_TOOL_ACTIONS } from '../task/capabilities';
+import { capabilitiesFor, PUBLIC_MCP_TOOL_ACTIONS } from '../task/capabilities';
 import { PRESENTATION_REF_PATTERN, WORKFLOW_REF_PATTERN } from '../task/coordinator-tools';
 import { WORKFLOW_INSTRUCTIONS_MAX_LENGTH } from '../task/workflow-types';
 
 const REMOVED_MCP_TOOLS = [
-  'create_task',
-  'delegate_task',
   'create_tasks',
   'delegate_tasks',
   'release_tasks',
@@ -16,13 +15,13 @@ const REMOVED_MCP_TOOLS = [
   'cancel_tasks',
   'continue_child',
   'set_task_lifecycle',
-  'wait_for_tasks',
   'complete_task',
   'fail_task',
   'get_task_status',
   'report_progress',
   'ask_parent',
   'answer_child_question',
+  'invoke_child_workflow',
 ] as const;
 
 interface WorkflowManifestFixture extends Record<string, unknown> {
@@ -326,7 +325,7 @@ describe('MusterBridgeServer auth', () => {
       callerTaskId: 'task-1',
       turnId: 'turn-1',
       attemptId: 'a0',
-      allowedActions: new Set(['define_workflow', 'start_workflow', 'invoke_child_workflow']),
+      allowedActions: new Set(['define_workflow', 'start_workflow']),
       ttlMs: 60_000,
     });
     const session = await openMcpSession(port, token);
@@ -450,19 +449,7 @@ describe('MusterBridgeServer auth', () => {
     expect(startTool?.inputSchema.properties).not.toHaveProperty('reuse');
     expect(startTool?.inputSchema.properties).not.toHaveProperty('instanceKey');
 
-    const childTool = workflowTools.find((tool) => tool.name === 'invoke_child_workflow');
-    expect(childTool?.inputSchema.properties?.inputs).toMatchObject({
-      maxItems: 128,
-      items: {
-        required: ['name', 'fromInput'],
-        additionalProperties: false,
-        properties: {
-          fromInput: { pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]*$' },
-        },
-      },
-    });
-    expect(childTool?.inputSchema.properties?.inputs).not.toHaveProperty('minItems');
-    expect(JSON.stringify(childTool?.inputSchema)).not.toContain('toNode');
+    expect(names).not.toContain('invoke_child_workflow');
 
     const defined = await session.request('tools/call', {
       name: 'define_workflow',
@@ -685,9 +672,6 @@ describe('MusterBridgeServer auth', () => {
         additionalProperties: false,
       },
     });
-    expect(tools.find((tool) => tool.name === 'invoke_child_workflow')).toMatchObject({
-      inputSchema: { properties: { workflow: { pattern: WORKFLOW_REF_PATTERN } } },
-    });
     expect(tools.find((tool) => tool.name === 'upsert_presentation')).toMatchObject({
       inputSchema: { properties: { presentationRef: { pattern: PRESENTATION_REF_PATTERN } } },
     });
@@ -704,7 +688,6 @@ describe('MusterBridgeServer auth', () => {
       nodes: [{ node: 'review', status: 'succeeded', taskRef: 'task-review' }],
       activations: [{ node: 'review', kind: 'dependency_gate', status: 'running' }],
       feedback: [],
-      children: [],
       diagnostics: [],
     });
     expect(inspectedText).not.toContain('gate-internal');
@@ -762,31 +745,6 @@ describe('MusterBridgeServer auth', () => {
     expect(rejectedReuse.result).toMatchObject({ isError: true });
     expect(handled).toHaveLength(2);
 
-    const child = await coordinator.request('tools/call', {
-      name: 'invoke_child_workflow',
-      arguments: {
-        workflow: publicInspection.workflowRef,
-        inputs: [{ name: 'request', fromInput: 'implementation' }],
-      },
-    });
-    expect(child.result).not.toHaveProperty('isError', true);
-    expect(handled[2]).toMatchObject({
-      tool: 'invoke_child_workflow',
-      command: {
-        kind: 'invoke_child_workflow',
-        entryBindings: [{ name: 'request', fromInputRef: 'implementation' }],
-      },
-    });
-
-    const coordinateChild = await coordinator.request('tools/call', {
-      name: 'invoke_child_workflow',
-      arguments: {
-        workflow: publicInspection.workflowRef,
-        inputs: [{ toNode: 'entry', input: 'request', fromInput: 'implementation' }],
-      },
-    });
-    expect(coordinateChild.result).toMatchObject({ isError: true });
-    expect(handled).toHaveLength(3);
     for (const name of REMOVED_MCP_TOOLS) {
       expect(names).not.toContain(name);
       const removed = await coordinator.request('tools/call', {
@@ -798,7 +756,7 @@ describe('MusterBridgeServer auth', () => {
         isError: true,
       });
     }
-    expect(handled).toHaveLength(3);
+    expect(handled).toHaveLength(2);
   });
 
   it('accepts valid token with loopback host and absent origin on initialize', async () => {
@@ -974,23 +932,61 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
     void first;
   });
 
-  it('ListTools fires onMcpObservation with exact credentialed catalog (no token)', async () => {
+  it('workflow coordinator delegation catalog satisfies exact MCP readiness', async () => {
     const credentials = new CredentialRegistry();
     const observations: Array<Record<string, unknown>> = [];
+    const handled: Array<{ tool: string; command: unknown }> = [];
+    const readiness = new McpReadinessSupervisor();
+    const allowedActions = capabilitiesFor({
+      role: 'coordinator',
+      capabilities: ['create_child', 'wait_child'],
+      parentId: 'root-1',
+      lifecycle: 'open',
+    }, {
+      turn: {
+        status: 'running',
+        workflowActivation: {
+          runId: 'run-1',
+          activationId: 'activation-1',
+          nodeId: 'coordinator',
+          kind: 'dependency_gate',
+          runStatus: 'running',
+          activationStatus: 'running',
+          isTerminalNode: false,
+          hasDirectDependencies: true,
+          hasOpenFeedbackRound: false,
+          hasPendingContinuation: false,
+          hasInheritedFeedbackResponse: false,
+        },
+      },
+      workspaceTrusted: true,
+    });
     server = new MusterBridgeServer({
       credentials,
-      toolHandler: { handleToolCall: async () => ({ ok: true, result: {} }) },
+      toolHandler: {
+        handleToolCall: async (_ctx, tool, command) => {
+          handled.push({ tool, command });
+          return { ok: true, result: {} };
+        },
+      },
       onMcpObservation: (obs) => {
         observations.push({ ...obs });
+        readiness.recordObservation(obs);
       },
     });
     const { port } = await server.listen();
+    readiness.beginAttempt({
+      turnId: 'turn-obs',
+      attemptId: 'attempt-1',
+      expectedToolNames: allowedActions,
+      bridgeGeneration: server.getGeneration(),
+    });
     const token = credentials.issue({
       rootId: 'root-1',
       callerTaskId: 'task-1',
       turnId: 'turn-obs',
       attemptId: 'attempt-1',
-      allowedActions: new Set(['workflow_next', 'workflow_fail']),
+      allowedActions,
       ttlMs: 60_000,
     });
     const verified = credentials.verify(token)!;
@@ -998,7 +994,16 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
     const listed = await session.request('tools/list');
     const tools = (listed.result as { tools: Array<{ name: string }> }).tools;
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(['workflow_fail', 'workflow_next']);
+    expect(names).toEqual([...allowedActions].sort());
+    expect(names).toEqual(expect.arrayContaining([
+      'create_task',
+      'delegate_task',
+      'wait_for_tasks',
+      'workflow_next',
+      'workflow_prev',
+      'workflow_fail',
+    ]));
+    expect(names).not.toEqual(expect.arrayContaining(['define_workflow', 'start_workflow']));
 
     const listObs = observations.filter((o) => o.phase === 'list_tools');
     expect(listObs.length).toBeGreaterThanOrEqual(1);
@@ -1010,7 +1015,31 @@ describe('MusterBridgeServer generation, /health, and observers', () => {
       attemptId: 'attempt-1',
       generation: 1,
     });
-    expect((last.toolNames as string[]).slice().sort()).toEqual(['workflow_fail', 'workflow_next']);
+    expect((last.toolNames as string[]).slice().sort()).toEqual([...allowedActions].sort());
+    expect(readiness.evaluate('turn-obs', 'attempt-1', server.getGeneration())).toMatchObject({
+      ok: true,
+      toolNames: [...allowedActions].sort(),
+    });
+
+    const delegated = await session.request('tools/call', {
+      name: 'delegate_task',
+      arguments: {
+        opId: 'delegate-through-bridge',
+        goal: 'perform ordinary delegated work',
+        taskType: 'worker',
+        waitForCompletion: true,
+      },
+    });
+    expect(delegated.result).not.toHaveProperty('isError', true);
+    expect(handled).toEqual([{
+      tool: 'delegate_task',
+      command: {
+        kind: 'delegate_task',
+        opId: 'delegate-through-bridge',
+        spec: { goal: 'perform ordinary delegated work', taskType: 'worker' },
+        waitForCompletion: true,
+      },
+    }]);
     // Never leak bearer token into observation.
     const serialized = JSON.stringify(last);
     expect(serialized).not.toContain(token);

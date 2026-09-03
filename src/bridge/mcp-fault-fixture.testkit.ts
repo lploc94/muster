@@ -96,9 +96,14 @@ function connectionMessage(code: ConnectionFaultCode): string {
   }
 }
 
-/** Exact workflow-only tool names advertised by the real bridge. */
+/** Exact public tool names advertised by the real bridge. */
 export const DEFAULT_MUSTER_TOOLS: readonly string[] = [
+  'create_task',
+  'delegate_task',
+  'wait_for_tasks',
   'list_task_types',
+  'list_predefined_workflows',
+  'get_predefined_workflow',
   'inspect_workflow_run',
   'get_host_context',
   'upsert_presentation',
@@ -107,7 +112,6 @@ export const DEFAULT_MUSTER_TOOLS: readonly string[] = [
   'workflow_next',
   'workflow_prev',
   'workflow_fail',
-  'invoke_child_workflow',
 ] as const;
 
 export function defaultMusterToolCatalog(): FakeMcpTool[] {

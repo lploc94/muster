@@ -34,7 +34,7 @@ function chainGraph(count: number): WorkflowGraphWireGraph {
       blocked: 0, notStarted: 0, failed: 0, cancelled: 0, skipped: 0,
       frontierNodeIds: nodeIds, activeNodeIds: [],
     },
-    feedbackRounds: [], childRuns: [], reuse: { nodeCount: 0, edgeCount: 0 }, diagnostics: [],
+    feedbackRounds: [], reuse: { nodeCount: 0, edgeCount: 0 }, diagnostics: [],
   };
 }
 

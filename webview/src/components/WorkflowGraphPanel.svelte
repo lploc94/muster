@@ -109,19 +109,6 @@
     </div>
   {/if}
 
-  {#if view.childRuns.length > 0}
-    <div class="workflow-graph-panel__section">
-      <div class="workflow-graph-panel__section-title">Child runs</div>
-      <ul class="workflow-graph-panel__plain-list">
-        {#each view.childRuns as childRun}
-          <li>
-            <span>{childRun.label}</span>
-            <span class="workflow-graph-panel__status">{childRun.statusLabel}</span>
-          </li>
-        {/each}
-      </ul>
-    </div>
-  {/if}
 </section>
 
 <style>

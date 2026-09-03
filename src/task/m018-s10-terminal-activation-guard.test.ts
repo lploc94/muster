@@ -353,31 +353,22 @@ describe('M018 terminal workflow activation guards', () => {
         WHERE workspace_id = ? AND run_id = ? AND round_id = ?`,
       ['ws', data.runId, 'round-wait'],
     );
-    const childRunId = 'wfr_wait_child';
-    await client.transaction([
-      {
-        sql: `INSERT INTO workflow_runs (
-                workspace_id, run_id, definition_id, definition_version, status,
-                origin, parent_run_id, created_at, updated_at
-              ) VALUES (?,?,?,?,?,?,?,?,?)`,
-        params: [
-          'ws', childRunId, 'wf-waits', 1, 'running', 'child', data.runId,
-          '2026-07-22T05:00:05.000Z', '2026-07-22T05:00:05.000Z',
-        ],
-      },
-      {
-        sql: `INSERT INTO workflow_continuations (
-                workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
-                caller_run_id, caller_node_id, child_run_id, kind, status,
-                payload_json, created_at, updated_at
-              ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        params: [
-          'ws', data.runId, 'continuation-wait', task!.id, activationTurn!.id,
-          data.runId, 'entry', childRunId, 'child_workflow', 'pending', '{}',
-          '2026-07-22T05:00:05.000Z', '2026-07-22T05:00:05.000Z',
-        ],
-      },
-    ]);
+    await client.run(
+      `INSERT INTO workflow_continuations (
+         workspace_id, run_id, continuation_id, caller_task_id, caller_turn_id,
+         kind, status, payload_json, created_at, updated_at
+       ) VALUES (?,?,?,?,?,'start_wait','pending',?,?,?)`,
+      [
+        'ws', data.runId, 'continuation-wait', task!.id, activationTurn!.id,
+        JSON.stringify({
+          kind: 'start_wait',
+          runId: data.runId,
+          callerTaskId: task!.id,
+          callerTurnId: activationTurn!.id,
+        }),
+        '2026-07-22T05:00:05.000Z', '2026-07-22T05:00:05.000Z',
+      ],
+    );
     const continuationBlocked = await repository.getTurn(ordinary.id);
     const continuationProjection: EngineProjection = {
       ...feedbackProjection,

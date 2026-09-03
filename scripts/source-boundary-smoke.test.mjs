@@ -138,10 +138,19 @@ const validFixture = {
   }),
   '.github/workflows/ci.yml': validVisualCiWorkflow,
   'docs/VERIFICATION-EVIDENCE.md': validEvidenceDocument,
+  'docs/MUSTER-BRIDGE.md': 'Only an open top-level root coordinator may mutate workflow orchestration.\n',
+  'docs/TASK-MANAGEMENT.md': 'Workflow activations may delegate ordinary child tasks.\n',
   'src/extension.ts': "import * as vscode from 'vscode';\nimport { makeBackend } from './backends/index';\nwebview.postMessage({ type: 'done' });\n",
   'src/backends/claude.ts': "import { spawn } from 'child_process';\nimport { Backend, NormalizedEvent, RunOptions } from '../types';\nspawn('claude', []);\nyield { type: 'turnCompleted' };\n",
   'src/runner.ts': "import { Backend, NormalizedEvent, RunOptions } from './types';\nexport async function* runTurn(backend: Backend, options: RunOptions): AsyncIterable<NormalizedEvent> { yield* backend.run(options); }\n",
+  'src/bridge/server.ts': 'export const publicWorkflowTools = [];\n',
+  'src/task/capabilities.ts': 'export const workflowMutationActions = new Set();\n',
+  'src/task/coordinator-tools.ts': 'export function dispatch() {}\n',
+  'src/task/engine-graph.ts': 'export async function executeToolCommand() {}\n',
+  'src/task/engine.ts': 'export function resolveWorkflowStartContinuations() {}\n',
   'src/task/repository.ts': "export interface TaskRepository { execute(command: unknown): Promise<unknown> }\nexport class SqliteTaskRepository implements TaskRepository { async execute(command) {} }\n",
+  'src/task/scheduler.ts': 'export function canPromoteTurn() { return true; }\n',
+  'src/task/types.ts': 'export type TurnDisposition = { kind: string };\n',
   'src/types.ts': "export type NormalizedEvent = { type: 'turnCompleted' } | { type: 'error'; message: string };\nexport interface RunOptions { prompt: string; resumeId?: string; mcpConfigPath?: string; }\nexport interface Backend { run(options: RunOptions): AsyncIterable<NormalizedEvent>; }\n",
   'mcp/muster-ask-server.mjs': "import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';\nconst runtimeDir = process.env.MUSTER_RUNTIME_DIR;\nif (!runtimeDir) process.exit(1);\nawait server.connect(new StdioServerTransport());\n",
 };
@@ -161,6 +170,29 @@ test('repository package.json exposes the source-boundary smoke command', async 
   const packageJson = JSON.parse(await readFile(packageJsonUrl, 'utf8'));
 
   assert.match(packageJson.scripts?.['test:source-boundary'] ?? '', /node scripts\/source-boundary-smoke\.mjs/);
+});
+
+test('rejects retired nested-workflow execution paths in active surfaces', async () => {
+  const fixture = {
+    ...validFixture,
+    'docs/MUSTER-BRIDGE.md': 'Public tool: invoke_child_workflow\n',
+    'src/task/capabilities.ts': "export const action = 'invoke_child_workflow';\n",
+    'src/task/engine-graph.ts': "if (route.kind === 'child_workflow') throw new Error();\n",
+    'src/task/repository.ts': `${validFixture['src/task/repository.ts']}\nfunction planWorkflowChildInvocation() {}`,
+  };
+
+  await withFixture(fixture, async (rootDir) => {
+    const result = await runSourceBoundarySmoke({ rootDir });
+
+    assert.equal(result.ok, false);
+    assert.match(result.failures.join('\n'), /docs\/MUSTER-BRIDGE\.md/);
+    assert.match(result.failures.join('\n'), /src\/task\/capabilities\.ts/);
+    assert.match(result.failures.join('\n'), /src\/task\/engine-graph\.ts/);
+    assert.match(result.failures.join('\n'), /src\/task\/repository\.ts/);
+    assert.match(result.failures.join('\n'), /invoke_child_workflow/);
+    assert.match(result.failures.join('\n'), /child_workflow/);
+    assert.match(result.failures.join('\n'), /planWorkflowChildInvocation/);
+  });
 });
 
 test('repository GitHub Actions workflow runs npm test automatically on main push and pull request', async () => {

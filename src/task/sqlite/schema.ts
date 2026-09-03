@@ -1249,11 +1249,6 @@ export function terminalWorkflowRunSafetyPredicate(
            )`;
 }
 
-/**
- * Terminal open repair rows are durable audit evidence, not resumable work.
- * Payload reclamation may therefore ignore only that guard while preserving
- * every liveness and cross-run reference check used by run deletion.
- */
 export function terminalWorkflowPayloadReclamationSafetyPredicate(alias: string): string {
   return terminalWorkflowRunSafetyPredicate(alias, { includeOpenDecisionRepairGuard: false });
 }

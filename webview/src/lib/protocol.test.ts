@@ -2423,7 +2423,6 @@ describe('isExtMessage workflowGraphResult (M024/S05)', () => {
             frontierNodeIds: ['node-1'], activeNodeIds: [],
           },
           feedbackRounds: [],
-          childRuns: [],
           reuse: { nodeCount: 0, edgeCount: 0 },
           diagnostics: [],
         },
