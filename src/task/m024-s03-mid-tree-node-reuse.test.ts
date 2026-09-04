@@ -185,7 +185,7 @@ describe('M024 S03 named output failure atomicity', () => {
         `SELECT COUNT(*) AS count FROM workflow_gate_fills fill
           JOIN workflow_runs run
             ON run.workspace_id = fill.workspace_id AND run.run_id = fill.run_id
-          WHERE fill.workspace_id = ? AND run.definition_id = 'wf-fault-consumer'`,
+          WHERE fill.workspace_id = ? AND run.source_definition_id = 'wf-fault-consumer'`,
         [NAMED_WORKSPACE_ID],
       )).resolves.toEqual({ count: 0 });
 

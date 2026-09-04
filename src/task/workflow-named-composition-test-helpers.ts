@@ -301,7 +301,7 @@ export async function workflowRowCount(
 ): Promise<number> {
   const row = await harness.client.get<{ count: number }>(
     `SELECT COUNT(*) AS count FROM workflow_runs
-      WHERE workspace_id = ? AND definition_id = ?`,
+      WHERE workspace_id = ? AND source_definition_id = ?`,
     [NAMED_WORKSPACE_ID, definitionId],
   );
   return Number(row?.count ?? 0);

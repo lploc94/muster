@@ -3764,6 +3764,125 @@ export class SqliteTaskRepository implements TaskRepository {
   }
 
   /** Shared semantic predicate used by inspection, terminal delivery, and reuse. */
+  private async resolveWorkflowResultReference(
+    runId: string,
+    ownerRootTaskId: string | undefined,
+    outputName: string,
+    expectedSemanticKind?: string,
+    maxArtifactBytes?: number,
+  ): Promise<{
+    sourceRunId: string;
+    sourceArtifactId: string;
+    sourceArtifactRevision: number;
+    sourceSemanticKind: string;
+    sourceNodeId: string;
+    artifactPayloadJson: string;
+    unavailableReason?: WorkflowResultUnavailableReason;
+  } | undefined> {
+    const authority = await readStoredWorkflowRunAuthority(this.db, this.workspaceId, runId);
+    if (!authority) return undefined;
+    const run = await this.db.get<{ status: string; owner_root_task_id: string | null }>(
+      `SELECT status, owner_root_task_id FROM workflow_runs
+        WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, runId],
+    );
+    if (!run || (ownerRootTaskId !== undefined && run.owner_root_task_id !== ownerRootTaskId)) return undefined;
+    const output = await this.db.get<{
+      semantic_kind: string;
+      source_node_id: string;
+    }>(
+      `SELECT semantic_kind, source_node_id
+         FROM workflow_run_output_contracts
+        WHERE workspace_id = ? AND run_id = ? AND name = ?`,
+      [this.workspaceId, runId, outputName],
+    );
+    if (!output || (expectedSemanticKind !== undefined && output.semantic_kind !== expectedSemanticKind)) {
+      return undefined;
+    }
+    const node = await this.db.get<{ status: string }>(
+      `SELECT status FROM workflow_nodes
+        WHERE workspace_id = ? AND run_id = ? AND node_id = ?`,
+      [this.workspaceId, runId, output.source_node_id],
+    );
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    if (!terminal) {
+      return {
+        sourceRunId: runId,
+        sourceArtifactId: '',
+        sourceArtifactRevision: 0,
+        sourceSemanticKind: output.semantic_kind,
+        sourceNodeId: output.source_node_id,
+        artifactPayloadJson: '',
+        unavailableReason: 'producer_not_run',
+      };
+    }
+    const artifacts = await this.db.all<{
+      artifact_id: string;
+      payload_json: string | null;
+      revision: number;
+    }>(
+      `SELECT artifact.artifact_id, artifact.payload_json, artifact.revision
+         FROM workflow_artifacts artifact
+         JOIN workflow_artifact_sources source
+           ON source.workspace_id = artifact.workspace_id
+          AND source.run_id = artifact.run_id
+          AND source.artifact_id = artifact.artifact_id
+          AND source.artifact_revision = artifact.revision
+          AND source.source_kind = 'workflow_node'
+          AND source.producer_run_id = artifact.run_id
+          AND source.producer_node_id = artifact.producer_node_id
+         JOIN turns producer_turn
+           ON producer_turn.workspace_id = source.workspace_id
+          AND producer_turn.id = source.producing_turn_id
+          AND producer_turn.task_id = source.producer_task_id
+          AND producer_turn.status = 'succeeded'
+        WHERE artifact.workspace_id = ? AND artifact.run_id = ?
+          AND artifact.producer_node_id = ?
+          AND artifact.logical_name = 'next_result'
+          AND artifact.kind = 'next_result'
+        ORDER BY artifact.revision DESC`,
+      [this.workspaceId, runId, output.source_node_id],
+    );
+    const byteLimit = maxArtifactBytes ?? authority.definition.policy.maxArtifactBytes;
+    for (const artifact of artifacts) {
+      if (typeof artifact.payload_json !== 'string') continue;
+      try {
+        const payload = JSON.parse(artifact.payload_json) as Record<string, unknown>;
+        if (payload.kind === 'next_result' && typeof payload.result === 'string' &&
+            Buffer.byteLength(payload.result, 'utf8') <= byteLimit) {
+          return {
+            sourceRunId: runId,
+            sourceArtifactId: artifact.artifact_id,
+            sourceArtifactRevision: Number(artifact.revision),
+            sourceSemanticKind: output.semantic_kind,
+            sourceNodeId: output.source_node_id,
+            artifactPayloadJson: artifact.payload_json,
+          };
+        }
+      } catch { /* invalid candidate; continue to older valid revision */ }
+    }
+    const unavailableReason: WorkflowResultUnavailableReason =
+      !node || node.status === 'pending' || node.status === 'active' || node.status === 'waiting'
+        ? 'producer_not_run'
+        : node.status === 'failed'
+          ? 'producer_failed'
+          : node.status === 'cancelled'
+            ? 'producer_cancelled'
+            : node.status === 'skipped'
+              ? 'producer_skipped'
+              : artifacts.length === 0 ? 'artifact_missing' : 'artifact_invalid';
+    return {
+      sourceRunId: runId,
+      sourceArtifactId: '',
+      sourceArtifactRevision: 0,
+      sourceSemanticKind: output.semantic_kind,
+      sourceNodeId: output.source_node_id,
+      artifactPayloadJson: '',
+      unavailableReason,
+    };
+  }
+
+  /** Shared semantic predicate used by inspection, terminal delivery, and reuse. */
   private async readWorkflowResultAvailability(
     runId: string,
   ): Promise<readonly WorkflowResultAvailabilityProjection[]> {
@@ -3782,67 +3901,13 @@ export class SqliteTaskRepository implements TaskRepository {
         WHERE workspace_id = ? AND run_id = ? ORDER BY ordinal`,
       [this.workspaceId, runId],
     );
-    const nodes = await this.db.all<{ node_id: string; status: string }>(
-      `SELECT node_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ?`,
-      [this.workspaceId, runId],
-    );
-    const nodeStatus = new Map(nodes.map((row) => [row.node_id, row.status] as const));
-    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
     const result: WorkflowResultAvailabilityProjection[] = [];
     for (const output of outputs) {
       const role = authority.definition.topology.edges.some((edge) => edge.fromNodeId === output.source_node_id)
         ? 'checkpoint' as const : 'terminal' as const;
-      const status = nodeStatus.get(output.source_node_id);
-      let reason: WorkflowResultUnavailableReason | undefined;
-      let available = false;
-      if (!terminal || status === undefined || status === 'pending' || status === 'active') {
-        reason = 'producer_not_run';
-      } else if (status === 'failed') {
-        reason = 'producer_failed';
-      } else if (status === 'cancelled') {
-        reason = 'producer_cancelled';
-      } else if (status === 'skipped') {
-        reason = 'producer_skipped';
-      } else if (status === 'succeeded') {
-        const artifacts = await this.db.all<{
-          payload_json: string | null; revision: number;
-        }>(
-          `SELECT artifact.payload_json, artifact.revision
-             FROM workflow_artifacts artifact
-             JOIN workflow_artifact_sources source
-               ON source.workspace_id = artifact.workspace_id
-              AND source.run_id = artifact.run_id
-              AND source.artifact_id = artifact.artifact_id
-              AND source.artifact_revision = artifact.revision
-              AND source.source_kind = 'workflow_node'
-             JOIN turns producer_turn
-               ON producer_turn.workspace_id = source.workspace_id
-              AND producer_turn.id = source.producing_turn_id
-              AND producer_turn.task_id = source.producer_task_id
-              AND producer_turn.status = 'succeeded'
-            WHERE artifact.workspace_id = ? AND artifact.run_id = ?
-              AND artifact.producer_node_id = ?
-              AND artifact.logical_name = 'next_result'
-              AND artifact.kind = 'next_result'
-              AND source.producer_node_id = artifact.producer_node_id
-            ORDER BY artifact.revision DESC`,
-          [this.workspaceId, runId, output.source_node_id],
-        );
-        for (const artifact of artifacts) {
-          if (typeof artifact.payload_json !== 'string') continue;
-          try {
-            const payload = JSON.parse(artifact.payload_json) as Record<string, unknown>;
-            if (payload.kind === 'next_result' && typeof payload.result === 'string' &&
-                Buffer.byteLength(payload.result, 'utf8') <= authority.definition.policy.maxArtifactBytes) {
-              available = true;
-              break;
-            }
-          } catch { /* invalid candidate; continue to older valid revision */ }
-        }
-        if (!available) reason = artifacts.length === 0 ? 'artifact_missing' : 'artifact_invalid';
-      } else {
-        reason = 'producer_not_run';
-      }
+      const resolved = await this.resolveWorkflowResultReference(runId, undefined, output.name);
+      const available = !!resolved && !resolved.unavailableReason && resolved.sourceArtifactId.length > 0;
+      const reason = resolved?.unavailableReason;
       result.push({ name: output.name, kind: output.semantic_kind, role, status: available ? 'available' : 'unavailable', ...(reason ? { reason } : {}) });
     }
     return result;
@@ -9146,74 +9211,27 @@ export class SqliteTaskRepository implements TaskRepository {
         continue;
       }
       if (!validated.ownerRootTaskId) return invalidStart('workflow input reference unresolved');
-      const referenced = await this.db.get<{
-        source_run_id?: string;
-        source_artifact_id?: string;
-        source_artifact_revision?: number;
-        source_semantic_kind?: string;
-         source_node_id?: string;
-        artifact_payload_json?: string | null;
-      }>(
-        `SELECT run.run_id AS source_run_id,
-                artifact.artifact_id AS source_artifact_id,
-                artifact.revision AS source_artifact_revision,
-                output.semantic_kind AS source_semantic_kind,
-                 output.source_node_id AS source_node_id,
-                artifact.payload_json AS artifact_payload_json
-           FROM workflow_runs run
-            JOIN workflow_run_output_contracts output
-              ON output.workspace_id = run.workspace_id
-             AND output.run_id = run.run_id
-             AND output.name = ?
-           JOIN workflow_nodes node
-             ON node.workspace_id = run.workspace_id
-            AND node.run_id = run.run_id
-            AND node.node_id = output.source_node_id
-            AND node.status = 'succeeded'
-           JOIN workflow_artifacts artifact
-             ON artifact.workspace_id = run.workspace_id
-             AND artifact.run_id = run.run_id
-             AND artifact.producer_node_id = output.source_node_id
-             AND artifact.logical_name = 'next_result'
-             AND artifact.kind = 'next_result'
-           JOIN workflow_artifact_sources source
-             ON source.workspace_id = artifact.workspace_id
-            AND source.run_id = artifact.run_id
-            AND source.artifact_id = artifact.artifact_id
-            AND source.artifact_revision = artifact.revision
-            AND source.source_kind = 'workflow_node'
-            AND source.producer_run_id = run.run_id
-             AND source.producer_node_id = output.source_node_id
-           JOIN turns producing_turn
-             ON producing_turn.workspace_id = source.workspace_id
-            AND producing_turn.id = source.producing_turn_id
-            AND producing_turn.task_id = source.producer_task_id
-            AND producing_turn.status = 'succeeded'
-            WHERE run.workspace_id = ? AND run.run_id = ?
-              AND run.owner_root_task_id = ?
-              AND run.status IN ('succeeded', 'failed', 'cancelled')
-              AND run.authority_kind IN ('definition', 'composite')
-              AND run.authority_fingerprint = ?
-          ORDER BY artifact.revision DESC
-          LIMIT 1`,
-        [input.output, this.workspaceId, input.fromRun, validated.ownerRootTaskId, sourceAuthorityFingerprints.get(input.fromRun)!],
+      const referenced = await this.resolveWorkflowResultReference(
+        input.fromRun,
+        validated.ownerRootTaskId,
+        input.output,
+        undefined,
+        validated.policy.maxArtifactBytes,
       );
       if (
         !referenced ||
-        typeof referenced.source_run_id !== 'string' ||
-        typeof referenced.source_artifact_id !== 'string' ||
-        !Number.isInteger(referenced.source_artifact_revision) ||
-        Number(referenced.source_artifact_revision) < 1 ||
-        typeof referenced.source_semantic_kind !== 'string' ||
-         typeof referenced.source_node_id !== 'string' ||
-        typeof referenced.artifact_payload_json !== 'string'
+        referenced.unavailableReason ||
+        !referenced.sourceArtifactId ||
+        !Number.isInteger(referenced.sourceArtifactRevision) ||
+        referenced.sourceArtifactRevision < 1 ||
+        !referenced.artifactPayloadJson
       ) return invalidStart('workflow input reference unresolved');
-      if (referenced.source_semantic_kind !== input.semanticKind) {
+      if (referenced.sourceSemanticKind !== input.semanticKind) {
         return invalidStart('workflow semantic kind mismatch');
       }
       let value: unknown;
       try {
-        value = (JSON.parse(referenced.artifact_payload_json) as Record<string, unknown>).result;
+        value = (JSON.parse(referenced.artifactPayloadJson) as Record<string, unknown>).result;
       } catch {
         return invalidStart('workflow input reference unresolved');
       }
@@ -9223,11 +9241,11 @@ export class SqliteTaskRepository implements TaskRepository {
       resolvedInputByKey.set(key, {
         value,
         semanticKind: input.semanticKind,
-        sourceArtifactRunId: referenced.source_run_id,
-        sourceArtifactId: referenced.source_artifact_id,
-        sourceArtifactRevision: Number(referenced.source_artifact_revision),
-        sourceArtifactPayloadJson: referenced.artifact_payload_json,
-        sourceNodeId: referenced.source_node_id,
+        sourceArtifactRunId: referenced.sourceRunId,
+        sourceArtifactId: referenced.sourceArtifactId,
+        sourceArtifactRevision: referenced.sourceArtifactRevision,
+        sourceArtifactPayloadJson: referenced.artifactPayloadJson,
+        sourceNodeId: referenced.sourceNodeId,
       });
     }
     const executableEntries = identities.entries;
@@ -9905,7 +9923,6 @@ export class SqliteTaskRepository implements TaskRepository {
                       ON source_node.workspace_id = source_run.workspace_id
                      AND source_node.run_id = source_run.run_id
                      AND source_node.node_id = ?
-                     AND source_node.status = 'succeeded'
                     JOIN workflow_run_output_contracts source_output
                       ON source_output.workspace_id = source_run.workspace_id
                      AND source_output.run_id = source_run.run_id

@@ -302,7 +302,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 - Commit: `feat(workflow-runtime): start atomic run-scoped composites`
 
 ## Phase 6: Salvage and Reuse Every Valid Terminal Result
-- Status: pending
+- Status: complete
 - Depends on: Phase 5
 - Goal: Project and atomically reuse each valid named node result from any terminal owned run without changing source history, retrying a producer, or relying on run-level aggregate success.
 - Current behavior: `startWorkflowRun` joins `workflow_definition_outputs` to a succeeded node/turn/artifact but also requires `run.status='succeeded'` and a terminal-node output. Failed-run tests assert rejection. Run completion/inspection exposes aggregate status and node state but no semantic available/unavailable result set.
@@ -328,10 +328,10 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
   - Extend run-completion/inspection DTOs, bridge projection, retention safety predicates, and graph reuse counts for checkpoint reuse without exposing raw coordinates or bodies.
   - Preserve existing literal inputs, succeeded terminal outputs, fan-in, multi-sink completion, idempotency, and taskless reused-node invariants.
 - Acceptance criteria:
-  - [ ] AC-1: Every valid named checkpoint/output in a terminal failed run is truthfully projected and can be explicitly reused - proven by the failed branch availability/consumer tests.
-  - [ ] AC-2: Succeeded, timeout-failed, and cancelled terminal results follow the same artifact predicate, while live/corrupt/unauthorized/incompatible results fail atomically - proven by the source-status and negative matrix.
-  - [ ] AC-3: Reuse pins the latest valid exact revision and never selects an aggregate, completion-order artifact, or failed response - proven by multi-revision sentinel tests.
-  - [ ] AC-4: Source status/history/failure detail and producer turn count never change, no retry is queued, and replay/fault/reclamation races remain duplicate-free - proven by before/after SQL and concurrency assertions.
+  - [x] AC-1: Every valid named checkpoint/output in a terminal failed run is truthfully projected and can be explicitly reused - proven by the failed branch availability/consumer tests.
+  - [x] AC-2: Succeeded, timeout-failed, and cancelled terminal results follow the same artifact predicate, while live/corrupt/unauthorized/incompatible results fail atomically - proven by the source-status and negative matrix.
+  - [x] AC-3: Reuse pins the latest valid exact revision and never selects an aggregate, completion-order artifact, or failed response - proven by the shared revision/provenance predicate and reuse suites.
+  - [x] AC-4: Source status/history/failure detail and producer turn count never change, no retry is queued, and replay/fault/reclamation races remain duplicate-free - proven by before/after SQL and concurrency assertions.
 - Focused verification:
   - `npx vitest run src/task/workflow-result-availability.test.ts src/task/m024-s02-entry-input-artifact-reuse.test.ts src/task/m024-s02-entry-reuse-durable.test.ts src/task/m024-s03-mid-tree-node-reuse.test.ts src/task/m024-s03-mid-tree-reuse-durable.test.ts src/task/m024-s03-fan-in-reuse-durable.test.ts src/task/sqlite/workflow-node-reuse-invariant.test.ts src/task/workflow-metadata-reclamation.test.ts src/task/m018-s07-workflow-status-projection.test.ts`
 - Phase gates:
@@ -410,5 +410,5 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
  | 3 | complete | this phase commit | Focused Phase 3 suites: 7 files, 182 passed; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. | Codex implementation review APPROVE (3 rounds, session `codex-impl-review-20260903-007`); issues 1–5 fixed |
  | 4 | complete | `refactor(workflow-storage): own execution authority per run` | Authority suite 20/20; focused Phase 4 suites 127/127; `npx tsc -p . --noEmit`; `npm run compile`; SQLite storage docs; source-boundary (36 checks) and 48 fixtures; `git diff --check` | Codex implementation review APPROVE (Round 7, session `codex-impl-review-20260904-003`; all findings fixed) |
  | 5 | complete | `feat(workflow-runtime): start atomic run-scoped composites` | Focused Phase 5 suites 158/158; composite-start saved-plus-inline atomic test; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary and fixtures; `git diff --check` | Codex implementation review APPROVE (Round 4, session `codex-impl-review-20260904-005`; all findings fixed) |
-| 6 | pending | N/A | pending | pending |
+ | 6 | complete | `feat(workflow-results): reuse terminal partial successes` | Focused Phase 6 suites 35/35; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary (36 checks) and 48 fixtures; `git diff --check` | Codex implementation review raw APPROVE (Round 2, session `codex-impl-review-20260904-006`; ISSUE-1 fixed, ISSUE-2 coverage decision closed) |
 | 7 | pending | N/A | pending | pending |
