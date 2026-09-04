@@ -63,6 +63,10 @@ import {
   deriveDefaultWorkflowPolicy,
   fingerprintWorkflowDefinition,
 } from './workflow-codec';
+import {
+  expandWorkflowComposite,
+  type WorkflowCompositeComponentAuthority,
+} from './workflow-composite-codec';
 import type { TaskReadPort } from './store-port';
 import {
   createTask,
@@ -549,6 +553,7 @@ async function prepareWorkflowStart(
     version: number;
     backend?: string;
     useCallerBackendDefault?: boolean;
+    definition?: WorkflowDefinition;
   },
   limits: ResourceLimits,
 ): Promise<
@@ -565,7 +570,7 @@ async function prepareWorkflowStart(
   if (!caller || caller.lifecycle !== 'open') {
     return workflowHostPolicyError('caller_not_open', 'caller task is not open');
   }
-  const definition = await deps.repository.getWorkflowDefinition(input.definitionId, input.version);
+  const definition = input.definition ?? await deps.repository.getWorkflowDefinition(input.definitionId, input.version);
   if (!definition) {
     return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
   }
@@ -2957,13 +2962,23 @@ export async function executeToolCommand(
         if (publicReplay.fingerprint !== fingerprint) {
           return { ok: false, error: 'opId conflict: different arguments' };
         }
-        return publicReplay.result.ok
-          ? { ok: true, result: publicReplay.result.data }
-          : { ok: false, error: publicReplay.result.error ?? 'start_workflow failed' };
+        if (publicReplay.result.ok) {
+          const data = publicReplay.result.data;
+          return {
+            ok: true,
+            result: data && typeof data === 'object'
+              ? { ...(data as Record<string, unknown>), changed: false, replay: true }
+              : data,
+          };
+        }
+        return { ok: false, error: publicReplay.result.error ?? 'start_workflow failed' };
       }
       const authorization = await authorizeRootWorkflowMutation(deps, ctx, 'start_workflow');
       if (!authorization.ok) return authorization;
-      const priorResolution = command.version === undefined
+      let compositeExpansion: import('./workflow-composite-codec').WorkflowCompositeExpansion | undefined;
+      let definitionId = command.definitionId;
+      let version: number;
+      const priorResolution = !command.composite && command.version === undefined && command.definitionId
         ? await deps.repository.getWorkflowStartResolution({
             ownerRootTaskId: ctx.rootId,
             callerTaskId: ctx.callerTaskId,
@@ -2971,27 +2986,71 @@ export async function executeToolCommand(
             startIdempotencyKey: command.startIdempotencyKey,
           })
         : undefined;
-      const version = command.version ?? priorResolution?.version ?? (
-        await deps.repository.getLatestWorkflowDefinition(command.definitionId, ctx.rootId)
-      )?.version;
-      if (version === undefined) {
-        return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+      if (command.composite) {
+        const authorities: WorkflowCompositeComponentAuthority[] = [];
+        for (const component of command.composite.components) {
+          if ('workflow' in component) {
+            const definition = await deps.repository.getWorkflowDefinition(
+              component.workflow.definitionId,
+              component.workflow.version,
+            );
+            if (!definition || (definition.scope.kind === 'root' && definition.scope.ownerRootTaskId !== ctx.rootId)) {
+              return workflowHostPolicyError('workflow_scope_denied', 'workflow component is unavailable for this root');
+            }
+            authorities.push({
+              key: component.key,
+              source: {
+                kind: 'workflow',
+                workflowRef: component.workflow.workflowRef,
+                fingerprint: fingerprintWorkflowDefinition(definition),
+              },
+              definition,
+            });
+          }
+        }
+        const expanded = expandWorkflowComposite({ spec: command.composite, authorities });
+        if (!expanded.ok) return workflowHostPolicyError('invalid_workflow_composite', expanded.reason);
+        compositeExpansion = expanded;
+        definitionId = 'workflow-composite';
+        version = 1;
+      } else {
+        if (!definitionId) return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
+        version = command.version ?? priorResolution?.version ?? (
+          await deps.repository.getLatestWorkflowDefinition(definitionId, ctx.rootId)
+        )?.version ?? 0;
+        if (version === 0) return workflowHostPolicyError('definition_not_found', 'workflow definition not found');
       }
-      const replayPolicy = priorResolution?.policy ?? await deps.repository.getWorkflowStartPolicy({
-        ownerRootTaskId: ctx.rootId,
-        callerTaskId: ctx.callerTaskId,
-        definitionId: command.definitionId,
-        version,
-        startIdempotencyKey: command.startIdempotencyKey,
-      });
+      const replayPolicy = !compositeExpansion && priorResolution
+        ? priorResolution.policy
+        : !compositeExpansion && definitionId
+          ? await deps.repository.getWorkflowStartPolicy({
+              ownerRootTaskId: ctx.rootId,
+              callerTaskId: ctx.callerTaskId,
+              definitionId,
+              version,
+              startIdempotencyKey: command.startIdempotencyKey,
+            })
+          : undefined;
       const prepared = replayPolicy
         ? { ok: true as const, effectivePolicy: replayPolicy }
         : await prepareWorkflowStart(
             deps,
             ctx,
             {
-              definitionId: command.definitionId,
+              definitionId: definitionId!,
               version,
+              ...(compositeExpansion ? {
+                definition: {
+                  definitionId: definitionId!,
+                  version: 1,
+                  name: 'workflow-composite',
+                  topology: compositeExpansion.topology,
+                  entryContracts: compositeExpansion.entryContracts,
+                  policy: compositeExpansion.policy,
+                  scope: { kind: 'workspace' },
+                  createdAt: now,
+                },
+              } : {}),
             },
             limits,
           );
@@ -3001,7 +3060,7 @@ export async function executeToolCommand(
       const started = await deps.repository.execute({
         kind: 'startWorkflowRun',
         workspaceId: deps.workspaceId,
-        definitionId: command.definitionId,
+        definitionId: definitionId!,
         version,
         startIdempotencyKey: command.startIdempotencyKey,
         createdAt: now,
@@ -3012,6 +3071,7 @@ export async function executeToolCommand(
         callerTurnId: ctx.turnId,
         resumeCallerOnCompletion: suspendCaller,
         effectivePolicy: prepared.effectivePolicy,
+        ...(compositeExpansion ? { composite: compositeExpansion } : {}),
         publicOperation: {
           ledgerKey: opLedgerKey(ctx.turnId, command.opId),
           fingerprint,

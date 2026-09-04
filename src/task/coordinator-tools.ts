@@ -24,11 +24,13 @@ import type { VerdictCriterionInput, VerdictInput } from './verdict';
 import {
   WORKFLOW_ENTRY_CONTRACTS_MAX,
   WORKFLOW_RUN_GOAL_MAX_LENGTH,
+  type WorkflowCompositeSpec,
   type WorkflowEntryContract,
   type WorkflowPolicy,
   type WorkflowStartInput,
 } from './workflow-types';
 import { decodeWorkflowManifest } from './workflow-codec';
+import { decodeWorkflowCompositeSpec } from './workflow-composite-codec';
 
 export interface CreateChildSpec {
   goal: string;
@@ -232,8 +234,9 @@ export type ToolCommand =
   | {
       kind: 'start_workflow';
       opId: string;
-      definitionId: string;
+      definitionId?: string;
       version?: number;
+      composite?: WorkflowCompositeSpec;
       startIdempotencyKey: string;
       goal?: string;
       backend?: string;
@@ -1303,25 +1306,39 @@ export function dispatch(
         return { ok: false, toolError: 'invalid define_workflow arguments' };
       }
       case 'start_workflow': {
+        const allowedKeys = ['workflow', 'composite', 'goal', 'inputs'];
+        if (Object.keys(args).some((key) => !allowedKeys.includes(key))) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        const hasWorkflow = Object.prototype.hasOwnProperty.call(args, 'workflow');
+        const hasComposite = Object.prototype.hasOwnProperty.call(args, 'composite');
+        if (hasWorkflow === hasComposite) {
+          return { ok: false, toolError: 'invalid start_workflow arguments' };
+        }
+        const inputs = parseSemanticWorkflowInputs(args.inputs);
+        if (!inputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
+        if (
+          'goal' in args &&
+          (typeof args.goal !== 'string' || args.goal.length === 0 || args.goal.length > WORKFLOW_RUN_GOAL_MAX_LENGTH)
+        ) return { ok: false, toolError: 'invalid start_workflow goal' };
+        if (hasComposite) {
+          const decoded = decodeWorkflowCompositeSpec(args.composite);
+          if (!decoded.ok) return { ok: false, toolError: `invalid start_workflow composite: ${decoded.reason}` };
+          const startIdempotencyKey = `turn-${stableHash(ctx.turnId, opId)}`;
+          return {
+            ok: true,
+            command: {
+              kind: 'start_workflow',
+              opId,
+              composite: decoded.spec,
+              startIdempotencyKey,
+              ...(typeof args.goal === 'string' ? { goal: args.goal } : {}),
+              inputs,
+            },
+          };
+        }
         const semanticReference = parseWorkflowReference(args.workflow);
         if (semanticReference) {
-          const inputs = parseSemanticWorkflowInputs(args.inputs);
-          if (!inputs) return { ok: false, toolError: 'invalid start_workflow inputs' };
-          if (
-            'goal' in args &&
-            (
-              typeof args.goal !== 'string' ||
-              args.goal.length === 0 ||
-              args.goal.length > WORKFLOW_RUN_GOAL_MAX_LENGTH
-            )
-          ) {
-            return { ok: false, toolError: 'invalid start_workflow goal' };
-          }
-          if (
-            Object.keys(args).some((key) => !['workflow', 'goal', 'inputs'].includes(key))
-          ) {
-            return { ok: false, toolError: 'invalid start_workflow arguments' };
-          }
           const startIdempotencyKey = `turn-${stableHash(ctx.turnId, opId)}`;
           return {
             ok: true,

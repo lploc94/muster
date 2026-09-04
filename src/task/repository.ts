@@ -98,7 +98,10 @@ import type {
   WorkflowRunCompletionProjection,
   WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
+  WorkflowResultAvailabilityProjection,
+  WorkflowResultUnavailableReason,
 } from './workflow-types';
+import type { WorkflowCompositeExpansion } from './workflow-composite-codec';
 import { decodeWorkflowNodeOutcome } from './workflow-codec';
 import { durableDispositionClaim, type DurableDispositionClaim } from './disposition-claim';
 import { isMutatingTask, normalizedWritePaths } from './resources';
@@ -273,6 +276,7 @@ function fingerprintUnresolvedWorkflowStart(command: Extract<RepositoryCommand, 
     callerTaskId: command.callerTaskId,
     callerTurnId: command.callerTurnId,
     effectivePolicy: command.effectivePolicy,
+    compositeFingerprint: command.composite?.fingerprint,
   }), 'utf8').digest('hex');
 }
 
@@ -530,6 +534,7 @@ export type RepositoryCommand =
       resumeCallerOnCompletion?: boolean;
       effectivePolicy?: WorkflowPolicy;
       publicOperation?: PublicWorkflowOperation;
+      composite?: WorkflowCompositeExpansion;
     }
   | {
       /** Close every running workflow whose frozen absolute deadline has elapsed. */
@@ -832,7 +837,6 @@ async function readStoredWorkflowDefinition(
     typeof row.policy_json !== 'string' ||
     typeof row.created_at !== 'string'
   ) return undefined;
-
   const [inputRows, outputRows, nodeRows, edgeRows] = await Promise.all([
     db.all<StoredWorkflowInputRow>(
       `SELECT name, semantic_kind, entry_node_id, input_ref, ordinal, expected_artifact_kind
@@ -878,7 +882,6 @@ async function readStoredWorkflowDefinition(
     !hasContiguousOrdinals(edgeRows) ||
     outputRows.some((output) => output.expected_artifact_kind !== 'next_result')
   ) return undefined;
-
   const nodes: unknown[] = [];
   for (const stored of nodeRows) {
     if (typeof stored.node_id !== 'string') return undefined;
@@ -1409,7 +1412,7 @@ async function buildValidatedRunAuthority(
   ) return undefined;
   const identity = run.authority_kind === 'definition'
     ? { definitionId: run.source_definition_id!, version: Number(run.source_definition_version) }
-    : { definitionId: `workflow-run-${runId}`, version: 1 };
+    : { definitionId: 'workflow-composite', version: 1 };
   const definitionInput = {
     ...identity,
     name: run.authority_name,
@@ -1580,6 +1583,118 @@ function workflowRunAuthorityProvenance(input: {
     destination_component_key: componentKey,
     destination_local_node_key: edge.toNodeId,
   }));
+  return { components, inputs, outputs, nodes, edges };
+}
+
+function workflowRunCompositeAuthorityProvenance(
+  expansion: WorkflowCompositeExpansion,
+): CanonicalRunAuthorityProvenance | undefined {
+  const provenanceByNode = new Map(expansion.nodeProvenance.map((row) => [row.nodeId, row] as const));
+  const nodeIds = new Set(expansion.topology.nodes.map((node) => node.nodeId));
+  const componentKeys = new Set(expansion.components.map((component) => component.key));
+  if (
+    !/^[a-f0-9]{64}$/.test(expansion.fingerprint) ||
+    expansion.components.length === 0 ||
+    expansion.nodeProvenance.length !== expansion.topology.nodes.length ||
+    provenanceByNode.size !== expansion.topology.nodes.length ||
+    [...provenanceByNode.values()].some((row) => !nodeIds.has(row.nodeId) || !componentKeys.has(row.componentKey) || row.localNodeKey.length === 0)
+  ) return undefined;
+  if (expansion.topology.inputs.some((input) => !provenanceByNode.has(input.entryNodeId)) ||
+      expansion.topology.outputs.some((output) => !provenanceByNode.has(output.sourceNodeId)) ||
+      expansion.topology.edges.some((edge) => !nodeIds.has(edge.fromNodeId) || !nodeIds.has(edge.toNodeId))) {
+    return undefined;
+  }
+  const assuredProvenance = (nodeId: string) => {
+    const value = provenanceByNode.get(nodeId);
+    if (!value) throw new Error('composite provenance validation drift');
+    return value;
+  };
+  const components = expansion.components.map((component, ordinal) => ({
+    component_key: component.key,
+    ordinal,
+    source_kind: component.source.kind,
+    workflow_ref: component.source.kind === 'workflow' ? component.source.workflowRef : null,
+    source_definition_id: component.source.kind === 'workflow' ? component.source.workflowRef.split('@')[0] ?? null : null,
+    source_definition_version: component.source.kind === 'workflow' ? Number(component.source.workflowRef.split('@')[1] ?? 0) : null,
+    source_fingerprint: component.source.kind === 'workflow' ? component.source.fingerprint : null,
+    component_fingerprint: component.source.fingerprint,
+  }));
+  const inputs = expansion.topology.inputs.map((input, ordinal) => {
+    const provenance = assuredProvenance(input.entryNodeId);
+    return {
+      name: input.name,
+      semantic_kind: input.semanticKind,
+      entry_node_id: input.entryNodeId,
+      input_ref: input.inputRef,
+      ordinal,
+      expected_artifact_kind: 'workflow_input',
+      component_key: provenance.componentKey,
+      local_input_name: input.name,
+    };
+  });
+  const outputs = expansion.topology.outputs.map((output, ordinal) => {
+    const provenance = assuredProvenance(output.sourceNodeId);
+    return {
+      name: output.name,
+      semantic_kind: output.semanticKind,
+      source_node_id: output.sourceNodeId,
+      ordinal,
+      expected_artifact_kind: 'next_result',
+      component_key: provenance.componentKey,
+      local_output_name: output.name,
+    };
+  });
+  const nodes = expansion.topology.nodes.map((node, ordinal) => {
+    const source = node.execution?.source;
+    const provenance = assuredProvenance(node.nodeId);
+    return {
+      node_id: node.nodeId,
+      ordinal,
+      component_key: provenance.componentKey,
+      local_node_key: provenance.localNodeKey,
+      title: node.title ?? null,
+      instructions_kind: node.instructions?.kind ?? null,
+      instructions_file: node.instructions?.kind === 'file' ? node.instructions.file : null,
+      instructions_content: node.instructions?.content ?? null,
+      instructions_sha256: node.instructions?.sha256 ?? null,
+      instructions_retained: 0,
+      role: node.role ?? null,
+      task_type: node.taskType ?? null,
+      backend: node.backend ?? null,
+      model: node.model ?? null,
+      capabilities_json: node.capabilities === undefined ? null : JSON.stringify(node.capabilities),
+      execution_kind: node.execution?.kind ?? null,
+      script_interpreter: node.execution?.interpreter ?? null,
+      script_file: node.execution?.file ?? null,
+      script_args_json: node.execution ? JSON.stringify(node.execution.args) : null,
+      script_source_kind: source?.kind ?? null,
+      script_source_scope: source?.scope ?? null,
+      script_package_kind: source?.packageKind ?? null,
+      script_catalog_root_kind: source?.catalogRootKind ?? null,
+      script_package_path: source?.packagePath ?? null,
+      script_entry_file: source?.entryFile ?? null,
+      script_workflow_ref: source?.workflowRef ?? null,
+      script_package_sha256: source?.packageSha256 ?? null,
+      script_sha256: source?.scriptSha256 ?? null,
+      outcome_kind: node.outcome?.kind ?? null,
+      outcome_json: node.outcome === undefined ? null : JSON.stringify(node.outcome),
+    };
+  });
+  const edges = expansion.topology.edges.map((edge, ordinal) => {
+    const source = assuredProvenance(edge.fromNodeId);
+    const destination = assuredProvenance(edge.toNodeId);
+    return {
+      source_node_id: edge.fromNodeId,
+      destination_node_id: edge.toNodeId,
+      destination_input_ref: edge.inputRef,
+      ordinal,
+      expected_artifact_kind: edge.expectedArtifactKind ?? 'next_result',
+      source_component_key: source.componentKey,
+      source_local_node_key: source.localNodeKey,
+      destination_component_key: destination.componentKey,
+      destination_local_node_key: destination.localNodeKey,
+    };
+  });
   return { components, inputs, outputs, nodes, edges };
 }
 
@@ -3648,6 +3763,91 @@ export class SqliteTaskRepository implements TaskRepository {
       authority.fingerprint === row.authority_fingerprint;
   }
 
+  /** Shared semantic predicate used by inspection, terminal delivery, and reuse. */
+  private async readWorkflowResultAvailability(
+    runId: string,
+  ): Promise<readonly WorkflowResultAvailabilityProjection[]> {
+    const authority = await readStoredWorkflowRunAuthority(this.db, this.workspaceId, runId);
+    if (!authority) return [];
+    const run = await this.db.get<{ status: string }>(
+      `SELECT status FROM workflow_runs WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, runId],
+    );
+    if (!run) return [];
+    const outputs = await this.db.all<{
+      name: string; semantic_kind: string; source_node_id: string;
+    }>(
+      `SELECT name, semantic_kind, source_node_id
+         FROM workflow_run_output_contracts
+        WHERE workspace_id = ? AND run_id = ? ORDER BY ordinal`,
+      [this.workspaceId, runId],
+    );
+    const nodes = await this.db.all<{ node_id: string; status: string }>(
+      `SELECT node_id, status FROM workflow_nodes WHERE workspace_id = ? AND run_id = ?`,
+      [this.workspaceId, runId],
+    );
+    const nodeStatus = new Map(nodes.map((row) => [row.node_id, row.status] as const));
+    const terminal = run.status === 'succeeded' || run.status === 'failed' || run.status === 'cancelled';
+    const result: WorkflowResultAvailabilityProjection[] = [];
+    for (const output of outputs) {
+      const role = authority.definition.topology.edges.some((edge) => edge.fromNodeId === output.source_node_id)
+        ? 'checkpoint' as const : 'terminal' as const;
+      const status = nodeStatus.get(output.source_node_id);
+      let reason: WorkflowResultUnavailableReason | undefined;
+      let available = false;
+      if (!terminal || status === undefined || status === 'pending' || status === 'active') {
+        reason = 'producer_not_run';
+      } else if (status === 'failed') {
+        reason = 'producer_failed';
+      } else if (status === 'cancelled') {
+        reason = 'producer_cancelled';
+      } else if (status === 'skipped') {
+        reason = 'producer_skipped';
+      } else if (status === 'succeeded') {
+        const artifacts = await this.db.all<{
+          payload_json: string | null; revision: number;
+        }>(
+          `SELECT artifact.payload_json, artifact.revision
+             FROM workflow_artifacts artifact
+             JOIN workflow_artifact_sources source
+               ON source.workspace_id = artifact.workspace_id
+              AND source.run_id = artifact.run_id
+              AND source.artifact_id = artifact.artifact_id
+              AND source.artifact_revision = artifact.revision
+              AND source.source_kind = 'workflow_node'
+             JOIN turns producer_turn
+               ON producer_turn.workspace_id = source.workspace_id
+              AND producer_turn.id = source.producing_turn_id
+              AND producer_turn.task_id = source.producer_task_id
+              AND producer_turn.status = 'succeeded'
+            WHERE artifact.workspace_id = ? AND artifact.run_id = ?
+              AND artifact.producer_node_id = ?
+              AND artifact.logical_name = 'next_result'
+              AND artifact.kind = 'next_result'
+              AND source.producer_node_id = artifact.producer_node_id
+            ORDER BY artifact.revision DESC`,
+          [this.workspaceId, runId, output.source_node_id],
+        );
+        for (const artifact of artifacts) {
+          if (typeof artifact.payload_json !== 'string') continue;
+          try {
+            const payload = JSON.parse(artifact.payload_json) as Record<string, unknown>;
+            if (payload.kind === 'next_result' && typeof payload.result === 'string' &&
+                Buffer.byteLength(payload.result, 'utf8') <= authority.definition.policy.maxArtifactBytes) {
+              available = true;
+              break;
+            }
+          } catch { /* invalid candidate; continue to older valid revision */ }
+        }
+        if (!available) reason = artifacts.length === 0 ? 'artifact_missing' : 'artifact_invalid';
+      } else {
+        reason = 'producer_not_run';
+      }
+      result.push({ name: output.name, kind: output.semantic_kind, role, status: available ? 'available' : 'unavailable', ...(reason ? { reason } : {}) });
+    }
+    return result;
+  }
+
   async getLatestWorkflowDefinition(
     definitionId: string,
     ownerRootTaskId: string,
@@ -5040,6 +5240,7 @@ export class SqliteTaskRepository implements TaskRepository {
         artifactRevision: Number(run.terminal_result_artifact_revision),
       };
     }
+    projection.results = await this.readWorkflowResultAvailability(run.run_id);
     // Phase 2: same-root inspection exposes the validated failure detail;
     // corrupt or missing closure metadata yields the fixed unavailable
     // diagnostic instead of raw payload.
@@ -5198,6 +5399,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const projection: WorkflowRunCompletionProjection = {
       runId: row.run_id,
       runStatus: row.status,
+      results: await this.readWorkflowResultAvailability(row.run_id),
     };
     if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
       projection.terminalReason = row.terminal_reason_code;
@@ -8631,6 +8833,7 @@ export class SqliteTaskRepository implements TaskRepository {
     if (command.workspaceId !== this.workspaceId) {
       throw new Error('workspace mismatch');
     }
+    const isComposite = command.composite !== undefined;
     const unresolvedFingerprint = command.publicOperation?.fingerprint
       ?? fingerprintUnresolvedWorkflowStart(command);
     const invalidCaller = (): RepositoryCommandResult => {
@@ -8680,12 +8883,21 @@ export class SqliteTaskRepository implements TaskRepository {
             operation,
           };
         }
+        const replayOperation = operation.result.ok && operation.result.data && typeof operation.result.data === 'object'
+          ? {
+              ...operation,
+              result: {
+                ok: true as const,
+                data: { ...(operation.result.data as Record<string, unknown>), changed: false, replay: true },
+              },
+            }
+          : operation;
         return {
           ok: operation.result.ok,
           changed: false,
           conflict: operation.result.ok ? undefined : true,
           reason: operation.result.ok ? undefined : operation.result.error,
-          operation,
+          operation: replayOperation,
         };
       }
     }
@@ -8726,6 +8938,7 @@ export class SqliteTaskRepository implements TaskRepository {
         | 'workflow input reference unresolved'
         | 'workflow semantic kind mismatch',
     ): RepositoryCommandResult => {
+      // composite/start validation remains intentionally bounded at this boundary
       const shaped = startWorkflowInvalid(reason, command.definitionId, command.version);
       return {
         ok: false,
@@ -8736,12 +8949,24 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     };
 
-    const storedDefinition = await readStoredWorkflowDefinition(
-      this.db,
-      this.workspaceId,
-      command.definitionId,
-      command.version,
-    );
+    const authorityKind: 'definition' | 'composite' = isComposite ? 'composite' : 'definition';
+    const storedDefinition = command.composite
+      ? {
+          definitionId: command.definitionId,
+          version: command.version,
+          name: 'workflow-composite',
+          topology: command.composite.topology,
+          entryContracts: command.composite.entryContracts,
+          policy: command.composite.policy,
+          scope: { kind: 'workspace' as const },
+          createdAt: command.createdAt,
+        } satisfies WorkflowDefinition
+      : await readStoredWorkflowDefinition(
+          this.db,
+          this.workspaceId,
+          command.definitionId,
+          command.version,
+        );
     if (!storedDefinition) {
       // Direct repository replays carry a source-independent request
       // fingerprint in the accepted result payload.  Never replay a changed
@@ -8785,7 +9010,7 @@ export class SqliteTaskRepository implements TaskRepository {
       }
       return invalidStart('definition not found');
     }
-    if (
+    if (!isComposite && storedDefinition &&
       storedDefinition.scope.kind === 'root' &&
       command.ownerRootTaskId !== storedDefinition.scope.ownerRootTaskId
     ) {
@@ -8827,10 +9052,13 @@ export class SqliteTaskRepository implements TaskRepository {
     // The run digest covers the effective definition digest plus the complete
     // ordered provenance snapshot, so later definition changes and
     // provenance-only corruption are both detectable on reload/inspection.
-    const runProvenance = workflowRunAuthorityProvenance({
+    const runProvenance = isComposite
+      ? workflowRunCompositeAuthorityProvenance(command.composite!)
+      : workflowRunAuthorityProvenance({
       definition: authorityDefinition,
       sourceDefinitionFingerprint: fingerprintWorkflowDefinition(storedDefinition),
-    });
+      });
+    if (!runProvenance) return invalidStart('invalid start');
     const topo = storedDefinition.topology;
     const startEntryNodeIds = entryNodeIds(topo);
     const allNodeIds = topo.nodes.map((n) => n.nodeId);
@@ -8868,7 +9096,14 @@ export class SqliteTaskRepository implements TaskRepository {
       );
     }
 
-    const { identities, fingerprint } = validated;
+    const { identities } = validated;
+    let fingerprint = validated.fingerprint;
+    if (isComposite) {
+      fingerprint = createHash('sha256').update(JSON.stringify({
+        base: validated.fingerprint,
+        compositeFingerprint: command.composite!.fingerprint,
+      }), 'utf8').digest('hex');
+    }
     const durableCallerTask = validated.callerTaskId
       ? await this.getTask(validated.callerTaskId)
       : undefined;
@@ -8956,7 +9191,7 @@ export class SqliteTaskRepository implements TaskRepository {
             AND producing_turn.status = 'succeeded'
             WHERE run.workspace_id = ? AND run.run_id = ?
               AND run.owner_root_task_id = ?
-              AND run.status = 'succeeded'
+              AND run.status IN ('succeeded', 'failed', 'cancelled')
               AND run.authority_kind IN ('definition', 'composite')
               AND run.authority_fingerprint = ?
           ORDER BY artifact.revision DESC
@@ -9002,6 +9237,8 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const resultPayload = {
       ...startWorkflowCreated(validated),
+      kind: authorityKind,
+      fingerprint,
       // Kept inside the durable operation result so direct repository starts
       // can verify source-independent replay when the definition is gone.
       requestFingerprint: unresolvedFingerprint,
@@ -9079,9 +9316,11 @@ export class SqliteTaskRepository implements TaskRepository {
           WHERE workspace_id = ? AND run_id = ?`,
         [this.workspaceId, identities.runId],
       );
-      if (!replayRun || replayRun.authority_kind !== 'definition' ||
-          replayRun.source_definition_id !== validated.definitionId ||
-          replayRun.source_definition_version !== validated.version) {
+      if (!replayRun || replayRun.authority_kind !== authorityKind ||
+          (authorityKind === 'definition' && (
+            replayRun.source_definition_id !== validated.definitionId ||
+            replayRun.source_definition_version !== validated.version
+          ))) {
         return invalidStart('invalid start');
       }
 
@@ -9134,7 +9373,7 @@ export class SqliteTaskRepository implements TaskRepository {
         changed: continuationChanged,
         operation: {
           fingerprint,
-          result: { ok: true, data: startWorkflowReplay(validated) },
+          result: { ok: true, data: { ...startWorkflowReplay(validated), kind: authorityKind, fingerprint } },
         },
       };
     }
@@ -9259,14 +9498,14 @@ export class SqliteTaskRepository implements TaskRepository {
         params: [
           this.workspaceId,
           identities.runId,
-          'definition',
+                 authorityKind,
           authorityFingerprint,
           authorityDefinition.name,
           authorityDefinition.topology.description ?? null,
           authorityDefinition.scope.kind,
           authorityDefinition.scope.kind === 'root' ? authorityDefinition.scope.ownerRootTaskId : null,
-          validated.definitionId,
-          validated.version,
+          authorityKind === 'definition' ? validated.definitionId : null,
+          authorityKind === 'definition' ? validated.version : null,
           'running',
           validated.ownerRootTaskId ?? null,
           validated.callerTaskId ?? null,
@@ -9301,7 +9540,7 @@ export class SqliteTaskRepository implements TaskRepository {
     ];
 
     if (validated.ownerRootTaskId && validated.callerTaskId && validated.callerTurnId) {
-      rest.push({
+      if (authorityKind === 'definition') rest.push({
         sql: `INSERT INTO workflow_start_claims (
                 workspace_id, owner_task_id, caller_task_id, caller_turn_id,
                 definition_id, definition_version, idempotency_key, fingerprint,
@@ -9653,7 +9892,7 @@ export class SqliteTaskRepository implements TaskRepository {
                WHERE source_run.workspace_id = ?
                  AND source_run.run_id = ?
                  AND source_run.owner_root_task_id = ?
-                 AND source_run.status = 'succeeded'
+                 AND source_run.status IN ('succeeded', 'failed', 'cancelled')
                  AND source_run.authority_fingerprint = ?
                  AND EXISTS (
                    SELECT 1 FROM workflow_artifacts artifact
@@ -9706,10 +9945,15 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const transactionStatements = [...claims, ...rest, ...revisionStatementsForStart, ...priorInputGuards];
     const guardIndexes = priorInputGuards.map((_guard, index) => transactionStatements.length - priorInputGuards.length + index);
-    const tx = await this.db.transaction(transactionStatements, {
-      abortIfFirstUnchanged: true,
-      abortIfUnchangedAt: guardIndexes,
-    });
+    let tx: readonly import('./sqlite/rpc').RunResult[];
+    try {
+      tx = await this.db.transaction(transactionStatements, {
+        abortIfFirstUnchanged: true,
+        abortIfUnchangedAt: guardIndexes,
+      });
+    } catch (error) {
+      throw error;
+    }
     if (guardIndexes.some((index) => (tx[index]?.changes ?? 0) === 0)) {
       return invalidStart('workflow input reference unresolved');
     }
@@ -9742,7 +9986,7 @@ export class SqliteTaskRepository implements TaskRepository {
       };
     }
     if (existing.fingerprint === fingerprint) {
-      const replay = startWorkflowReplay(validated);
+      const replay = { ...startWorkflowReplay(validated), kind: authorityKind, fingerprint };
       return {
         ok: true,
         changed: false,
@@ -10413,7 +10657,6 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTaskId: command.task.id,
         sourceTurnId: command.turn.id,
         failureSource: 'decision_exhausted',
-        failureNodeKey: row.node_id,
         failureAttempt: { number: 3, limit: 3 },
       });
       return {
@@ -13173,7 +13416,6 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTaskId: command.task.id,
         sourceTurnId: command.turn.id,
         failureSource: 'workflow_fail',
-        failureNodeKey: node.nodeId,
       });
     }
 
@@ -13204,7 +13446,6 @@ export class SqliteTaskRepository implements TaskRepository {
             sourceTaskId: command.task.id,
             sourceTurnId: command.turn.id,
             failureSource: 'engine',
-            failureNodeKey: node.nodeId,
           });
         }
       }
@@ -13246,7 +13487,6 @@ export class SqliteTaskRepository implements TaskRepository {
         sourceTaskId: command.task.id,
         sourceTurnId: command.turn.id,
         failureSource: 'backend_refusal',
-        failureNodeKey: node.nodeId,
       });
     }
 
@@ -13528,6 +13768,7 @@ export class SqliteTaskRepository implements TaskRepository {
     const completion: Record<string, unknown> = {
       runRef: row.run_id,
       status: row.run_status,
+      results: await this.readWorkflowResultAvailability(row.run_id),
     };
     if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
       completion.reason = row.terminal_reason_code;

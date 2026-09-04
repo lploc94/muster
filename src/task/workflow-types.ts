@@ -786,6 +786,20 @@ export interface WorkflowNextResultProjection {
   result?: string;
 }
 
+export type WorkflowResultAvailabilityStatus = 'available' | 'unavailable';
+export type WorkflowResultUnavailableReason =
+  | 'producer_failed' | 'producer_cancelled' | 'producer_skipped'
+  | 'producer_not_run' | 'artifact_missing' | 'artifact_invalid';
+
+/** Bounded semantic result availability; physical artifact coordinates stay private. */
+export interface WorkflowResultAvailabilityProjection {
+  name: string;
+  kind: string;
+  role: 'terminal' | 'checkpoint';
+  status: WorkflowResultAvailabilityStatus;
+  reason?: WorkflowResultUnavailableReason;
+}
+
 /** Closed source of a terminal workflow failure. */
 export type WorkflowFailureSource =
   | 'workflow_fail'
@@ -821,6 +835,7 @@ export interface WorkflowRunCompletionProjection {
   terminalReason?: string;
   terminalResult?: WorkflowArtifactReferenceProjection;
   workflowNext?: WorkflowNextResultProjection;
+  results?: readonly WorkflowResultAvailabilityProjection[];
   failure?: WorkflowFailureDetail;
 }
 
@@ -845,6 +860,7 @@ export interface WorkflowRunInspectionProjection {
   feedbackRounds: readonly WorkflowRunFeedbackRoundInspectionProjection[];
   continuations: readonly WorkflowContinuationStatusProjection[];
   terminalResult?: WorkflowArtifactReferenceProjection;
+  results?: readonly WorkflowResultAvailabilityProjection[];
   failure?: WorkflowFailureDetail;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

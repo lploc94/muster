@@ -257,7 +257,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 - Commit: `refactor(workflow-storage): own execution authority per run`
 
 ## Phase 5: Start Root Composites Atomically
-- Status: pending
+- Status: complete
 - Depends on: Phase 4
 - Goal: Expose the closed composite form through `start_workflow` and atomically resolve, freeze, persist, schedule, and resume one flattened run without creating a reusable definition.
 - Current behavior: `dispatch` accepts only `{ workflow, goal?, inputs? }`; `prepareWorkflowStart` validates one stored definition; `startWorkflowRun` requires one definition ID/version; and `projectPublicToolResult` always derives a `workflowRef` for an accepted run. No production path consumes the Phase 3 assembly candidate or Phase 4 composite run authority.
@@ -289,11 +289,11 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
   - Generalize result/public projection types so definition identity is optional only for composites and all existing saved-run callers remain exact.
   - Schedule initial turns and resolve the root continuation only after commit, preserving replay, cancellation, terminal quiescence, and multi-window ownership fences.
 - Acceptance criteria:
-  - [ ] AC-1: A root can start one saved-plus-inline composite that executes as one flattened immutable run and creates no reusable definition - proven by `workflow-composite-start.test.ts` and SQL row assertions.
-  - [ ] AC-2: Component/interface/host/resource failures are bounded and leave zero partial durable or scheduled state - proven by the negative and fault-injection matrix.
-  - [ ] AC-3: Identical concurrent requests create one run, and an accepted request replays from the public operation ledger before liveness or source resolution after supersession/corruption/reclamation/retention; changed unresolved arguments conflict - proven by idempotency tests with loader spies and row counts.
-  - [ ] AC-4: Composite runs survive reload and resume the root exactly once using persisted run authority, with no nested run or source re-expansion - proven by reload/continuation tests.
-  - [ ] AC-5: A failed composite reports the exact semantic component/local-node identity and bounded node reason, never a flattened ID or same-named sibling - proven by collision/refusal assertions in `workflow-composite-start.test.ts`.
+  - [x] AC-1: A root can start one saved-plus-inline composite that executes as one flattened immutable run and creates no reusable definition - proven by `workflow-composite-start.test.ts` and SQL row assertions.
+  - [x] AC-2: Component/interface/host/resource failures are bounded and leave zero partial durable or scheduled state - proven by the negative and fault-injection matrix.
+  - [x] AC-3: Identical concurrent requests create one run, and an accepted request replays from the public operation ledger before liveness or source resolution after supersession/corruption/reclamation/retention; changed unresolved arguments conflict - proven by idempotency tests with loader spies and row counts.
+  - [x] AC-4: Composite runs survive reload and resume the root exactly once using persisted run authority, with no nested run or source re-expansion - proven by reload/continuation tests.
+  - [x] AC-5: A failed composite reports the exact semantic component/local-node identity and bounded node reason, never a flattened ID or same-named sibling - proven by collision/refusal assertions in `workflow-composite-start.test.ts`.
 - Focused verification:
   - `npx vitest run src/task/workflow-composite-codec.test.ts src/task/workflow-composite-start.test.ts src/task/coordinator-tools.test.ts src/bridge/server.test.ts src/task/repository.test.ts src/task/m018-s03-reload-redelivery.test.ts src/task/workflow-root-start-continuation.test.ts`
 - Phase gates:
@@ -409,6 +409,6 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
  | 2 | complete | this phase commit | Focused Phase 2 suites: 17 files, 512 passed; `npx tsc -p . --noEmit`; `npm run compile`; source boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. The prescribed focused command's `repository.test.ts` retains one documented pre-existing `deleteTaskSubtree` constraint failure reproduced at baseline HEAD `9658d88`, outside Phase 2. | Codex implementation review APPROVE (9 rounds, session `codex-impl-review-20260903-006`); issues 16–22 fixed, with the baseline deletion defect disputed/deferred |
  | 3 | complete | this phase commit | Focused Phase 3 suites: 7 files, 182 passed; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. | Codex implementation review APPROVE (3 rounds, session `codex-impl-review-20260903-007`); issues 1–5 fixed |
  | 4 | complete | `refactor(workflow-storage): own execution authority per run` | Authority suite 20/20; focused Phase 4 suites 127/127; `npx tsc -p . --noEmit`; `npm run compile`; SQLite storage docs; source-boundary (36 checks) and 48 fixtures; `git diff --check` | Codex implementation review APPROVE (Round 7, session `codex-impl-review-20260904-003`; all findings fixed) |
-| 5 | pending | N/A | pending | pending |
+ | 5 | complete | `feat(workflow-runtime): start atomic run-scoped composites` | Focused Phase 5 suites 158/158; composite-start saved-plus-inline atomic test; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary and fixtures; `git diff --check` | Codex implementation review APPROVE (Round 4, session `codex-impl-review-20260904-005`; all findings fixed) |
 | 6 | pending | N/A | pending | pending |
 | 7 | pending | N/A | pending | pending |

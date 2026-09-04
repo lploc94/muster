@@ -511,10 +511,33 @@ const TOOL_INPUT_SCHEMAS: Record<PublicMcpToolAction, Record<string, unknown>> =
   },
   start_workflow: {
     type: 'object',
-    description: 'Start a workflow by public input name and suspend this caller after durable acceptance. Supply every declared input exactly once using a literal value or an exact prior-run named output.',
-    required: ['workflow'],
+    description: 'Start a saved workflow or one closed run-scoped composite by public semantic inputs. The root is suspended after durable acceptance and resumes the caller exactly once on terminal delivery.',
+    oneOf: [
+      { required: ['workflow'] },
+      { required: ['composite'] },
+    ],
     properties: {
       workflow: { ...WORKFLOW_REF, description: 'Immutable workflowRef returned by define_workflow.' },
+      composite: {
+        type: 'object',
+        required: ['components', 'connections', 'inputs', 'outputs'],
+        properties: {
+          components: {
+            type: 'array', minItems: 1, maxItems: WORKFLOW_GRAPH_MAX_NODES,
+            items: {
+              type: 'object', required: ['key'], additionalProperties: false,
+              oneOf: [
+                { required: ['workflow'], properties: { key: { ...PRESENTATION_ID }, workflow: { ...WORKFLOW_REF } } },
+                { required: ['manifest'], properties: { key: { ...PRESENTATION_ID }, manifest: WORKFLOW_MANIFEST_SCHEMA } },
+              ],
+            },
+          },
+          connections: { type: 'array', maxItems: WORKFLOW_GRAPH_MAX_EDGES, items: { type: 'object', required: ['from', 'to'], additionalProperties: false } },
+          inputs: { type: 'array', maxItems: WORKFLOW_ENTRY_CONTRACTS_MAX, items: { type: 'object', required: ['name', 'to'], additionalProperties: false } },
+          outputs: { type: 'array', minItems: 1, maxItems: WORKFLOW_GRAPH_MAX_NODES, items: { type: 'object', required: ['name', 'from'], additionalProperties: false } },
+        },
+        additionalProperties: false,
+      },
       goal: { type: 'string', minLength: 1, maxLength: WORKFLOW_RUN_GOAL_MAX_LENGTH, description: 'Optional run-specific objective shared with workflow nodes.' },
       inputs: {
         type: 'array',
@@ -699,6 +722,14 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
     };
   }
   if (tool === 'start_workflow') {
+    if (value.kind === 'composite' && typeof value.runId === 'string') {
+      return {
+        runRef: value.runId,
+        kind: 'composite',
+        replay: value.replay === true || value.changed === false,
+        status: 'accepted',
+      };
+    }
     const ref = workflowRef(value.definitionId, value.version);
     if (typeof value.runId !== 'string' || !ref) return value;
     return {
@@ -738,6 +769,15 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
           responded: round.responded,
         }))
       : [];
+    const results = Array.isArray(value.results)
+      ? value.results.filter(isObject).map((result) => ({
+          name: result.name,
+          kind: result.kind,
+          role: result.role,
+          status: result.status,
+          ...(typeof result.reason === 'string' ? { reason: result.reason } : {}),
+        }))
+      : [];
     return {
       runRef: value.runId,
       ...(ref ? { workflowRef: ref } : {}),
@@ -745,7 +785,22 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
       nodes,
       activations,
       feedback,
+      ...(results.length > 0 ? { results } : {}),
       ...(typeof value.terminalReason === 'string' ? { reason: value.terminalReason } : {}),
+      ...(isObject(value.failure) ? {
+        failure: {
+          source: value.failure.source,
+          code: value.failure.code,
+          ...(typeof value.failure.componentKey === 'string' ? { component: value.failure.componentKey } : {}),
+          ...(typeof value.failure.nodeKey === 'string' ? { node: value.failure.nodeKey } : {}),
+          ...(typeof value.failure.nodeTitle === 'string' ? { title: value.failure.nodeTitle } : {}),
+          report: isObject(value.failure.report) ? {
+            text: value.failure.report.text,
+            truncated: value.failure.report.truncated === true,
+          } : undefined,
+          ...(isObject(value.failure.attempt) ? { attempt: value.failure.attempt } : {}),
+        },
+      } : {}),
       diagnostics: Array.isArray(value.diagnostics)
         ? value.diagnostics.filter(isObject).map((diagnostic) => diagnostic.code)
         : [],
