@@ -34,6 +34,16 @@ export interface WorkflowCatalogWireEntry {
   description: string;
   scope: WorkflowCatalogWireScope;
   packageKind: WorkflowCatalogWirePackageKind;
+  inputCount?: number;
+  outputCount?: number;
+  nodeCount?: number;
+}
+
+export interface WorkflowCatalogWireDetail extends WorkflowCatalogWireEntry {
+  inputs: readonly { name: string; kind: string; entryNodeId: string; inputRef: string }[];
+  outputs: readonly { name: string; kind: string; role: 'terminal' | 'checkpoint' }[];
+  nodes: readonly { nodeKey: string; title?: string; kind: 'agent' | 'exit' | 'script'; decision: { next: boolean; prev: boolean; fail: boolean }; assetRefs?: readonly string[] }[];
+  edges: readonly { fromNodeKey: string; toNodeKey: string; inputRef: string }[];
 }
 
 export interface WorkflowCatalogWireDiagnostic {
@@ -54,9 +64,19 @@ export interface RequestWorkflowCatalog {
   reason: WorkflowCatalogReason;
 }
 
+export interface RequestWorkflowCatalogDetail {
+  type: 'requestWorkflowCatalogDetail';
+  requestId: string;
+  workflowRef: string;
+}
+
 export type WorkflowCatalogResult =
   | { type: 'workflowCatalogResult'; requestId: string; ok: true; catalog: WorkflowCatalogWire }
   | { type: 'workflowCatalogResult'; requestId: string; ok: false; code: WorkflowCatalogErrorCode };
+
+export type WorkflowCatalogDetailResult =
+  | { type: 'workflowCatalogDetailResult'; requestId: string; ok: true; detail: WorkflowCatalogWireDetail }
+  | { type: 'workflowCatalogDetailResult'; requestId: string; ok: false; code: WorkflowCatalogErrorCode };
 
 /** Route-facing classification preserves safe correlation for a bounded error reply. */
 export type ParsedRequestWorkflowCatalog =
@@ -83,6 +103,13 @@ function isBoundedString(value: unknown, max: number): value is string {
 }
 
 const UNSAFE_DIAGNOSTIC_FILE = /[\\/\x00-\x1f\x7f]/;
+
+function isSafeWorkflowAssetRef(value: unknown): value is string {
+  if (!isBoundedString(value, 1024)) return false;
+  const portable = value.replace(/\\/g, '/');
+  if (portable.startsWith('/') || /^[A-Za-z]:/.test(portable) || /[\x00-\x1f\x7f]/.test(portable)) return false;
+  return !portable.split('/').some((part) => part === '' || part === '.' || part === '..');
+}
 
 /** Diagnostic file labels are basenames or reserved host labels, never paths. */
 export function isSafeWorkflowCatalogDiagnosticFile(value: unknown): value is string {
@@ -125,17 +152,24 @@ export function parseRequestWorkflowCatalogMessage(raw: unknown): ParsedRequestW
 
 function parseEntry(raw: unknown): WorkflowCatalogWireEntry | null {
   if (!isRecord(raw)) return null;
-  if (!hasExactKeys(raw, ['workflowRef', 'name', 'description', 'scope', 'packageKind'])) return null;
+  const baseKeys = ['workflowRef', 'name', 'description', 'scope', 'packageKind'];
+  const countKeys = ['inputCount', 'outputCount', 'nodeCount'];
+  if (!hasExactKeys(raw, baseKeys) && !hasExactKeys(raw, [...baseKeys, ...countKeys])) return null;
   const { workflowRef, name, description, scope, packageKind } = raw;
   if (!isBoundedString(workflowRef, WORKFLOW_CATALOG_REF_MAX)) return null;
   if (!isBoundedString(name, WORKFLOW_CATALOG_NAME_MAX)) return null;
   if (!isBoundedOrEmptyString(description, WORKFLOW_CATALOG_DESCRIPTION_MAX)) return null;
   if (typeof scope !== 'string' || !SCOPES.has(scope)) return null;
   if (typeof packageKind !== 'string' || !PACKAGE_KINDS.has(packageKind)) return null;
+  const counts = countKeys.map((key) => raw[key]);
+  if (counts.some((value, index) => value !== undefined && (!Number.isInteger(value) || (value as number) < 0 || (value as number) > (index === 0 ? 128 : 64)))) return null;
   return {
     workflowRef, name, description,
     scope: scope as WorkflowCatalogWireScope,
     packageKind: packageKind as WorkflowCatalogWirePackageKind,
+    ...(counts[0] !== undefined ? { inputCount: counts[0] as number } : {}),
+    ...(counts[1] !== undefined ? { outputCount: counts[1] as number } : {}),
+    ...(counts[2] !== undefined ? { nodeCount: counts[2] as number } : {}),
   };
 }
 
@@ -186,4 +220,64 @@ export function parseWorkflowCatalogResult(raw: unknown): WorkflowCatalogResult 
     };
   }
   return null;
+}
+
+function parseDetail(raw: unknown): WorkflowCatalogWireDetail | null {
+  if (!isRecord(raw)) return null;
+  const allowedKeys = ['workflowRef', 'name', 'description', 'scope', 'packageKind', 'inputCount', 'outputCount', 'nodeCount', 'inputs', 'outputs', 'nodes', 'edges'];
+  if (Object.keys(raw).some((key) => !allowedKeys.includes(key)) || !('inputs' in raw) || !('outputs' in raw) || !('nodes' in raw) || !('edges' in raw)) return null;
+  const base = parseEntry({
+    workflowRef: raw.workflowRef,
+    name: raw.name,
+    description: raw.description,
+    scope: raw.scope,
+    packageKind: raw.packageKind,
+    ...(raw.inputCount !== undefined ? { inputCount: raw.inputCount } : {}),
+    ...(raw.outputCount !== undefined ? { outputCount: raw.outputCount } : {}),
+    ...(raw.nodeCount !== undefined ? { nodeCount: raw.nodeCount } : {}),
+  });
+  if (!base) return null;
+  const inputs = parseList(raw.inputs, 128, (item) => {
+    if (!isRecord(item) || !hasExactKeys(item, ['name', 'kind', 'entryNodeId', 'inputRef']) || !isBoundedString(item.name, 128) || !isBoundedString(item.kind, 128) || !isBoundedString(item.entryNodeId, 128) || !isBoundedString(item.inputRef, 128)) return null;
+    return { name: item.name, kind: item.kind, entryNodeId: item.entryNodeId, inputRef: item.inputRef };
+  });
+  const outputs = parseList(raw.outputs, 64, (item) => {
+    if (!isRecord(item) || !hasExactKeys(item, ['name', 'kind', 'role']) || !isBoundedString(item.name, 128) || !isBoundedString(item.kind, 128) || (item.role !== 'terminal' && item.role !== 'checkpoint')) return null;
+    return { name: item.name, kind: item.kind, role: item.role as 'terminal' | 'checkpoint' };
+  });
+  const nodes = parseList(raw.nodes, 64, (item) => {
+    if (!isRecord(item) || !isRecord(item.decision) || !hasExactKeys(item, ['nodeKey', 'kind', 'decision', ...('title' in item ? ['title'] : []), ...('assetRefs' in item ? ['assetRefs'] : [])]) || !isBoundedString(item.nodeKey, 128) || (item.kind !== 'agent' && item.kind !== 'exit' && item.kind !== 'script') || ('title' in item && !isBoundedString(item.title, 200)) || !hasExactKeys(item.decision, ['next', 'prev', 'fail']) || typeof item.decision.next !== 'boolean' || typeof item.decision.prev !== 'boolean' || typeof item.decision.fail !== 'boolean') return null;
+    const assetRefs = 'assetRefs' in item ? parseList(item.assetRefs, 8, (value) => isSafeWorkflowAssetRef(value) ? value : null) : undefined;
+    if ('assetRefs' in item && !assetRefs) return null;
+    return { nodeKey: item.nodeKey, ...(typeof item.title === 'string' ? { title: item.title } : {}), kind: item.kind as 'agent' | 'exit' | 'script', decision: { next: item.decision.next, prev: item.decision.prev, fail: item.decision.fail }, ...(assetRefs ? { assetRefs } : {}) };
+  });
+  const edges = parseList(raw.edges, 128, (item) => {
+    if (!isRecord(item) || !hasExactKeys(item, ['fromNodeKey', 'toNodeKey', 'inputRef']) || !isBoundedString(item.fromNodeKey, 128) || !isBoundedString(item.toNodeKey, 128) || !isBoundedString(item.inputRef, 128)) return null;
+    return { fromNodeKey: item.fromNodeKey, toNodeKey: item.toNodeKey, inputRef: item.inputRef };
+  });
+  if (!inputs || !outputs || !nodes || !edges) return null;
+  if ((base.inputCount !== undefined && base.inputCount !== inputs.length) ||
+      (base.outputCount !== undefined && base.outputCount !== outputs.length) ||
+      (base.nodeCount !== undefined && base.nodeCount !== nodes.length)) return null;
+  return { ...base, inputs, outputs, nodes, edges };
+}
+
+export function parseRequestWorkflowCatalogDetailMessage(raw: unknown): { ok: true; requestId: string; workflowRef: string } | { ok: false; silent: true } | { ok: false; silent: false; requestId: string; code: 'invalidRequest' } {
+  if (!isRecord(raw) || raw.type !== 'requestWorkflowCatalogDetail') return { ok: false, silent: true };
+  const requestId = raw.requestId;
+  const workflowRef = raw.workflowRef;
+  if (!isBoundedString(requestId, WORKFLOW_CATALOG_REQUEST_ID_MAX) || !isBoundedString(workflowRef, WORKFLOW_CATALOG_REF_MAX)) return { ok: false, silent: true };
+  if (!hasExactKeys(raw, ['type', 'requestId', 'workflowRef']) || !/^pwf_[a-f0-9]{32}$/.test(workflowRef)) return { ok: false, silent: false, requestId, code: 'invalidRequest' };
+  return { ok: true, requestId, workflowRef };
+}
+
+export function parseWorkflowCatalogDetailResult(raw: unknown): WorkflowCatalogDetailResult | null {
+  if (!isRecord(raw) || raw.type !== 'workflowCatalogDetailResult' || !isBoundedString(raw.requestId, WORKFLOW_CATALOG_REQUEST_ID_MAX) || typeof raw.ok !== 'boolean') return null;
+  if (raw.ok === true) {
+    if (!hasExactKeys(raw, ['type', 'requestId', 'ok', 'detail'])) return null;
+    const detail = parseDetail(raw.detail);
+    return detail ? { type: 'workflowCatalogDetailResult', requestId: raw.requestId, ok: true, detail } : null;
+  }
+  if (!hasExactKeys(raw, ['type', 'requestId', 'ok', 'code']) || typeof raw.code !== 'string' || !ERROR_CODES.has(raw.code)) return null;
+  return { type: 'workflowCatalogDetailResult', requestId: raw.requestId, ok: false, code: raw.code as WorkflowCatalogErrorCode };
 }

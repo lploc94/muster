@@ -616,6 +616,18 @@ describe('M024 S04 workflow graph projection', () => {
       expect(panel.reuseSummary).toMatchObject({ nodeCount: 0, edgeCount: 0 });
       expect(panel.degradedRead).toMatchObject({ visible: false, diagnostics: [] });
 
+      await client.run(
+        `UPDATE workflow_runs SET authority_fingerprint = ? WHERE workspace_id = ? AND run_id = ?`,
+        ['f'.repeat(64), WORKSPACE_ID, consumer.runId],
+      );
+      const corruptGraph = await repository.getWorkflowGraphForTask('root-1');
+      expect(corruptGraph).toMatchObject({
+        runStatus: 'running', nodes: [], edges: [], gates: [], feedbackRounds: [],
+        reuse: { nodeCount: 0, edgeCount: 0 },
+        diagnostics: [{ code: 'workflow_graph_topology_undecodable' }],
+      });
+      expect(JSON.stringify(corruptGraph)).not.toContain('five');
+
     } finally {
       await client.close();
       fs.rmSync(dir, { recursive: true, force: true });

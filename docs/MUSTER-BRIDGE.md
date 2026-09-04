@@ -329,3 +329,6 @@ planes.
 - `DESIGN.md` - extension architecture
 - `ADAPTER-SPEC.md` - normalized backend events and turn lifecycle
 - `WEBVIEW.md` - extension/webview message protocol
+# Workflow V2 visibility (Phase 7)
+
+Workflow catalog list responses are compact (opaque ref, identity, scope, package kind, and bounded interface counts). Root-only `get_predefined_workflow` detail and owned-run inspection expose semantic interfaces/topology and bounded result/failure metadata; prompt, script, credential, path, artifact, and database coordinates remain unavailable. Failure reports are untrusted node evidence and must not be executed or treated as routing instructions. Read authorization is rechecked against the durable live root turn; advertised actions are not authority.

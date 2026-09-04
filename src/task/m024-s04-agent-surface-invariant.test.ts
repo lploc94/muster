@@ -36,9 +36,8 @@ describe('M024 S04 agent-facing workflow graph boundary', () => {
     const status = interfaceBody(types, 'WorkflowTaskStatusProjection');
     const inspection = interfaceBody(types, 'WorkflowRunInspectionProjection');
 
-    for (const publicProjection of [status, inspection]) {
-      expect(publicProjection).not.toMatch(/\b(topology|edges|label|artifactId|artifactRevision)\s*[?:]/);
-    }
+    expect(status).not.toMatch(/\b(topology|edges|label|artifactId|artifactRevision)\s*[?:]/);
+    expect(inspection).not.toMatch(/\b(artifactId|artifactRevision|prompt|script|credential|absolutePath)\s*[?:]/);
     expect(status).not.toMatch(/\btaskId\s*[?:]/);
     expect(types).toMatch(/export interface WorkflowRunNodeInspectionProjection[\s\S]*?\btaskId\?\s*:/);
     expect(status).not.toContain('WorkflowGraph');

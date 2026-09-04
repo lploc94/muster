@@ -499,9 +499,11 @@ export async function runScriptWorkflowUatFixture(
       credential,
       'get_predefined_workflow',
       { kind: 'get_predefined_workflow', workflowRef: selected.workflowRef },
-     ) as { name?: unknown; description?: unknown; body?: unknown; provenance?: unknown };
+     ) as { name?: unknown; description?: unknown; body?: unknown; provenance?: unknown; inputs?: unknown; outputs?: unknown; nodes?: unknown; edges?: unknown };
      assertQa(loaded.name === savedName, 'opaque catalog ref returned wrong metadata');
      assertQa(loaded.description === 'workspace native QA', 'catalog metadata was not explicit');
+     assertQa(Array.isArray(loaded.inputs) && Array.isArray(loaded.outputs) && Array.isArray(loaded.nodes) && Array.isArray(loaded.edges), 'catalog detail omitted semantic topology');
+     assertQa(loaded.outputs.every((output) => typeof output === 'object' && output !== null && typeof (output as { name?: unknown }).name === 'string' && typeof (output as { kind?: unknown }).kind === 'string' && ((output as { role?: unknown }).role === 'terminal' || (output as { role?: unknown }).role === 'checkpoint')), 'catalog detail output contract was not semantic');
      assertQa(loaded.body === undefined && loaded.provenance === undefined, 'catalog returned package body');
      await writeFile(join(workspaceSaved, 'workflow.json'), JSON.stringify(savedManifest('workspace native QA changed')), 'utf8');
     const stale = await deps.engine.handleToolCall(
@@ -546,7 +548,7 @@ export async function runScriptWorkflowUatFixture(
     // rejected downstream. Denial must leave no run, no node and no materialized task.
     const deniedRuns = await deps.client.get<{ count: number }>(
       `SELECT COUNT(*) AS count FROM workflow_runs
-        WHERE workspace_id = ? AND definition_id = ?`,
+        WHERE workspace_id = ? AND source_definition_id = ?`,
       [deps.workspaceId, dataflowDefinition.definitionId],
     );
     assertQa(deniedRuns?.count === 0, 'denied start persisted a workflow run');

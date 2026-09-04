@@ -1,7 +1,10 @@
 import type {
   RequestWorkflowCatalog,
+  RequestWorkflowCatalogDetail,
+  WorkflowCatalogDetailResult,
   WorkflowCatalogResult,
   WorkflowCatalogWire,
+  WorkflowCatalogWireDetail,
 } from '../../../src/shared/workflow-catalog-wire';
 import { post as defaultPost } from './protocol';
 import {
@@ -24,8 +27,13 @@ export class WorkflowCatalogStore {
   catalog = $state<WorkflowCatalogWire | null>(null);
   loading = $state(false);
   error = $state<string | null>(null);
+  detail = $state<WorkflowCatalogWireDetail | null>(null);
+  detailLoading = $state(false);
+  detailError = $state<string | null>(null);
   private policy = new WorkflowCatalogRequestPolicy();
   private timeoutId: ReturnType<typeof setTimeout> | null = null;
+  private detailTimeoutId: ReturnType<typeof setTimeout> | null = null;
+  private detailRequestId: string | null = null;
   private panelOpen = false;
   private revalidateAfterFlight = false;
 
@@ -61,9 +69,49 @@ export class WorkflowCatalogStore {
     this.revalidateOpenPanel();
   }
 
-  /** Panel close preserves request correlation so a background result can settle. */
+  requestDetail(workflowRef: string): void {
+    if (this.detailTimeoutId !== null) clearTimeout(this.detailTimeoutId);
+    const requestId = `detail-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    this.detailRequestId = requestId;
+    this.detailLoading = true;
+    this.detailError = null;
+    const message: RequestWorkflowCatalogDetail = {
+      type: 'requestWorkflowCatalogDetail',
+      requestId,
+      workflowRef,
+    };
+    this.doPost(message);
+    this.detailTimeoutId = setTimeout(() => {
+      if (this.detailRequestId !== requestId) return;
+      this.detailLoading = false;
+      this.detailError = 'unavailable';
+      this.detailTimeoutId = null;
+    }, WORKFLOW_CATALOG_TIMEOUT_MS);
+  }
+
+  handleDetailResult(msg: WorkflowCatalogDetailResult): void {
+    if (msg.requestId !== this.detailRequestId) return;
+    this.detailLoading = false;
+    this.detailRequestId = null;
+    if (this.detailTimeoutId !== null) clearTimeout(this.detailTimeoutId);
+    this.detailTimeoutId = null;
+    if (msg.ok) {
+      this.detail = msg.detail;
+      this.detailError = null;
+    } else {
+      this.detailError = msg.code;
+    }
+  }
+
+  /** Panel close cancels pending detail work and clears stale selection state. */
   close(): void {
     this.panelOpen = false;
+    this.detail = null;
+    this.detailError = null;
+    this.detailLoading = false;
+    this.detailRequestId = null;
+    if (this.detailTimeoutId !== null) clearTimeout(this.detailTimeoutId);
+    this.detailTimeoutId = null;
   }
 
   private dispatch(fetch: WorkflowCatalogFetch): void {

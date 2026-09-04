@@ -738,6 +738,16 @@ describe('run-authority review hardening (Codex round 1)', () => {
       goal: 'public replay', backend: 'grok',
       ownerRootTaskId: caller.taskId, callerTaskId: caller.taskId, callerTurnId: caller.turnId,
       publicOperation: op,
+    })).resolves.toMatchObject({ ok: false, changed: false, reason: 'start_workflow is not authorized for the current caller' });
+
+    await ctx.client.run(`UPDATE turns SET status = 'running' WHERE workspace_id = ? AND id = ?`, [WS, caller.turnId]);
+    await expect(ctx.repository.execute({
+      kind: 'startWorkflowRun', workspaceId: WS,
+      definitionId: definition.definitionId, version: 1,
+      startIdempotencyKey: 'public-replay-order', createdAt: NOW,
+      goal: 'public replay', backend: 'grok',
+      ownerRootTaskId: caller.taskId, callerTaskId: caller.taskId, callerTurnId: caller.turnId,
+      publicOperation: op,
     })).resolves.toMatchObject({ ok: true, changed: false });
 
     await expect(ctx.repository.execute({

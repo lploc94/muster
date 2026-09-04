@@ -14,6 +14,9 @@ export const WORKFLOW_GRAPH_GATE_INPUTS_MAX = 64;
 export const WORKFLOW_GRAPH_FEEDBACK_ROUNDS_MAX = 32;
 export const WORKFLOW_GRAPH_DIAGNOSTICS_MAX = 8;
 export const WORKFLOW_GRAPH_TITLE_MAX = 200;
+export const WORKFLOW_GRAPH_RESULT_NAME_MAX = 128;
+export const WORKFLOW_GRAPH_RESULT_KIND_MAX = 128;
+export const WORKFLOW_GRAPH_FAILURE_TEXT_MAX = 16_384;
 
 export const WORKFLOW_GRAPH_ERROR_CODES = [
   'invalidRequest',
@@ -101,6 +104,29 @@ export interface WorkflowGraphWireFeedbackRound {
   required: number;
   responded: number;
 }
+export interface WorkflowGraphWireResult {
+  name: string;
+  kind: string;
+  role: 'terminal' | 'checkpoint';
+  status: 'available' | 'unavailable';
+  reason?: 'producer_failed' | 'producer_cancelled' | 'producer_skipped' | 'producer_not_run' | 'artifact_missing' | 'artifact_invalid';
+}
+export interface WorkflowGraphWireFailure {
+  source: 'workflow_fail' | 'backend_refusal' | 'decision_exhausted' | 'engine';
+  code: string;
+  component?: string;
+  node?: string;
+  title?: string;
+  report: { text: string; truncated: boolean };
+  attempt?: { number: number; limit: 3 };
+}
+export interface WorkflowGraphWireTopology {
+  inputs: { name: string; kind: string; entryNodeId: string; inputRef: string }[];
+  outputs: { name: string; kind: string; role: 'terminal' | 'checkpoint'; sourceNodeKey: string }[];
+  nodes: { nodeKey: string; title?: string; kind: 'agent' | 'exit' | 'script' }[];
+  edges: { fromNodeKey: string; toNodeKey: string; inputRef: string }[];
+  components: { key: string; workflowRef?: string; fingerprint: string }[];
+}
 export interface WorkflowGraphWireGraph {
   runStatus: WorkflowGraphWireRunStatus;
   nodes: WorkflowGraphWireNode[];
@@ -110,6 +136,9 @@ export interface WorkflowGraphWireGraph {
   progress: WorkflowGraphWireProgress;
   feedbackRounds: WorkflowGraphWireFeedbackRound[];
   reuse: { nodeCount: number; edgeCount: number };
+  results?: WorkflowGraphWireResult[];
+  failure?: WorkflowGraphWireFailure;
+  topology?: WorkflowGraphWireTopology;
   diagnostics: { code: WorkflowGraphDiagnosticCode }[];
 }
 
@@ -150,6 +179,19 @@ const NODE_REASONS = new Set<string>([
 ]);
 const DECISION_GATES = new Set<string>(['optional', 'required']);
 const DECISION_STATUSES = new Set<string>(['waiting', 'correcting', 'decided', 'exhausted']);
+const RESULT_REASONS = new Set<string>(['producer_failed', 'producer_cancelled', 'producer_skipped', 'producer_not_run', 'artifact_missing', 'artifact_invalid']);
+const FAILURE_SOURCES = new Set<string>(['workflow_fail', 'backend_refusal', 'decision_exhausted', 'engine']);
+const FAILURE_CODES = new Set<string>(['agent_fail', 'decision_missing', 'decision_invalid', 'invalid_route', 'run_timeout', 'aggregate_too_large', 'feedback_budget_exhausted', 'turn_budget_exhausted', 'required_target_cancelled', 'required_target_unavailable']);
+const FAILURE_ENGINE_CODES = new Set<string>(['invalid_route', 'run_timeout', 'aggregate_too_large', 'feedback_budget_exhausted', 'turn_budget_exhausted', 'required_target_cancelled', 'required_target_unavailable']);
+const FAILURE_ENGINE_REPORTS: Record<string, string> = {
+  invalid_route: 'The workflow agent selected a route that is not declared for the current node.',
+  run_timeout: 'The workflow run exceeded its deadline.',
+  aggregate_too_large: 'The workflow result exceeded the aggregate size bound.',
+  feedback_budget_exhausted: 'The workflow run exhausted its feedback budget.',
+  turn_budget_exhausted: 'The workflow run exhausted its turn budget.',
+  required_target_cancelled: 'A required workflow target was cancelled.',
+  required_target_unavailable: 'A required workflow target is unavailable.',
+};
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -395,6 +437,84 @@ function parseFeedbackRound(raw: unknown): WorkflowGraphWireFeedbackRound | null
   if (raw.status === 'open' && raw.responded >= raw.required) return null;
   return { requesterNodeId: raw.requesterNodeId, status: raw.status as WorkflowGraphWireFeedbackRound['status'], joinMode: raw.joinMode as WorkflowGraphWireFeedbackRound['joinMode'], required: raw.required, responded: raw.responded };
 }
+function parseResult(raw: unknown): WorkflowGraphWireResult | null {
+  if (!isRecord(raw)) return null;
+  const optional = ['reason'];
+  if (!hasExactKeys(raw, ['name', 'kind', 'role', 'status', ...('reason' in raw ? optional : [])])) return null;
+  if (!isBoundedString(raw.name, WORKFLOW_GRAPH_RESULT_NAME_MAX) || !isBoundedString(raw.kind, WORKFLOW_GRAPH_RESULT_KIND_MAX)) return null;
+  if (raw.role !== 'terminal' && raw.role !== 'checkpoint') return null;
+  if (raw.status !== 'available' && raw.status !== 'unavailable') return null;
+  if (raw.status === 'available' && 'reason' in raw) return null;
+  if (raw.status === 'unavailable' && (!('reason' in raw) || typeof raw.reason !== 'string' || !RESULT_REASONS.has(raw.reason))) return null;
+  return {
+    name: raw.name,
+    kind: raw.kind,
+    role: raw.role,
+    status: raw.status,
+    ...('reason' in raw ? { reason: raw.reason as WorkflowGraphWireResult['reason'] } : {}),
+  };
+}
+function parseFailure(raw: unknown): WorkflowGraphWireFailure | null {
+  if (!isRecord(raw) || !isRecord(raw.report)) return null;
+  // Repository graph views use the canonical inspection names while the
+  // host→webview wire uses shorter aliases. Normalize the former here so the
+  // strict checks below remain identical for both internal and wire callers.
+  if ('nodeKey' in raw || 'nodeTitle' in raw || 'componentKey' in raw) {
+    if ('node' in raw || 'title' in raw || 'component' in raw) return null;
+    const { schema, nodeKey, nodeTitle, componentKey, ...rest } = raw;
+    return parseFailure({
+      ...rest,
+      ...(schema !== undefined ? { schema } : {}),
+      ...(nodeKey !== undefined ? { node: nodeKey } : {}),
+      ...(nodeTitle !== undefined ? { title: nodeTitle } : {}),
+      ...(componentKey !== undefined ? { component: componentKey } : {}),
+    });
+  }
+  const optional = ['schema', 'component', 'node', 'title', 'attempt'];
+  const keys = ['source', 'code', 'report', ...optional.filter((key) => key in raw)];
+  if (!hasExactKeys(raw, keys) || ('schema' in raw && raw.schema !== 1) || typeof raw.source !== 'string' || !FAILURE_SOURCES.has(raw.source) || typeof raw.code !== 'string' || !FAILURE_CODES.has(raw.code)) return null;
+  const report = raw.report;
+  if (!hasExactKeys(report, ['text', 'truncated']) || typeof report.text !== 'string' || report.text.trim().length === 0 || report.text !== report.text.trim() || new TextEncoder().encode(report.text).byteLength > WORKFLOW_GRAPH_FAILURE_TEXT_MAX || typeof report.truncated !== 'boolean') return null;
+  if ('component' in raw && !isBoundedString(raw.component, 128)) return null;
+  if ('node' in raw && !isBoundedString(raw.node, 128)) return null;
+  if ('title' in raw && !isBoundedString(raw.title, WORKFLOW_GRAPH_TITLE_MAX)) return null;
+  if ('node' in raw && /^(wft_|wftn_|wfa_|wfr_|wfc_|wfg_|wfact_|wfrm_|wfrd_|wftg_)/.test(raw.node as string)) return null;
+  if ('component' in raw && /^(wft_|wftn_|wfa_|wfr_|wfc_|wfg_|wfact_|wfrm_|wfrd_|wftg_)/.test(raw.component as string)) return null;
+  let attempt: WorkflowGraphWireFailure['attempt'];
+  if ('attempt' in raw) {
+    if (!isRecord(raw.attempt) || !hasExactKeys(raw.attempt, ['number', 'limit']) || !isCount(raw.attempt.number) || (raw.attempt.number !== 1 && raw.attempt.number !== 2 && raw.attempt.number !== 3) || raw.attempt.limit !== 3) return null;
+    attempt = { number: raw.attempt.number as 1 | 2 | 3, limit: 3 };
+  }
+  if (raw.source !== 'engine' && typeof raw.node !== 'string') return null;
+  if (raw.source === 'decision_exhausted' && !attempt) return null;
+  if (raw.source !== 'decision_exhausted' && attempt) return null;
+  if ((raw.source === 'backend_refusal' && raw.code !== 'agent_fail') || (raw.source === 'decision_exhausted' && raw.code !== 'decision_missing' && raw.code !== 'decision_invalid')) return null;
+  if (raw.source === 'workflow_fail' && (typeof raw.node !== 'string' || raw.code !== 'agent_fail')) return null;
+  if (raw.source === 'engine' && (
+    raw.report.truncated !== false ||
+    (raw.report.text === 'Workflow failure detail is unavailable.'
+      ? raw.node !== undefined || raw.component !== undefined || raw.title !== undefined
+      : !FAILURE_ENGINE_CODES.has(raw.code) || FAILURE_ENGINE_REPORTS[raw.code] !== raw.report.text)
+  )) return null;
+  return {
+    source: raw.source as WorkflowGraphWireFailure['source'], code: raw.code,
+    ...(typeof raw.component === 'string' ? { component: raw.component } : {}),
+    ...(typeof raw.node === 'string' ? { node: raw.node } : {}),
+    ...(typeof raw.title === 'string' ? { title: raw.title } : {}),
+    report: { text: report.text, truncated: report.truncated },
+    ...(attempt ? { attempt } : {}),
+  };
+}
+function parseTopology(raw: unknown): WorkflowGraphWireTopology | null {
+  if (!isRecord(raw) || !hasExactKeys(raw, ['inputs', 'outputs', 'nodes', 'edges', 'components'])) return null;
+  const inputs = parseList(raw.inputs, 128, (item) => isRecord(item) && hasExactKeys(item, ['name', 'kind', 'entryNodeId', 'inputRef']) && isBoundedString(item.name, 128) && isBoundedString(item.kind, 128) && isBoundedString(item.entryNodeId, 128) && isBoundedString(item.inputRef, 128) ? { name: item.name, kind: item.kind, entryNodeId: item.entryNodeId, inputRef: item.inputRef } : null);
+  const outputs = parseList(raw.outputs, 64, (item) => isRecord(item) && hasExactKeys(item, ['name', 'kind', 'role', 'sourceNodeKey']) && isBoundedString(item.name, 128) && isBoundedString(item.kind, 128) && isBoundedString(item.sourceNodeKey, 128) && (item.role === 'terminal' || item.role === 'checkpoint') ? { name: item.name, kind: item.kind, role: item.role as 'terminal' | 'checkpoint', sourceNodeKey: item.sourceNodeKey } : null);
+  const nodes = parseList(raw.nodes, 64, (item) => isRecord(item) && hasExactKeys(item, ['nodeKey', 'kind', ...('title' in item ? ['title'] : [])]) && isBoundedString(item.nodeKey, 128) && (item.kind === 'agent' || item.kind === 'exit' || item.kind === 'script') && (!('title' in item) || isBoundedString(item.title, 200)) ? { nodeKey: item.nodeKey, ...(typeof item.title === 'string' ? { title: item.title } : {}), kind: item.kind as 'agent' | 'exit' | 'script' } : null);
+  const edges = parseList(raw.edges, 128, (item) => isRecord(item) && hasExactKeys(item, ['fromNodeKey', 'toNodeKey', 'inputRef']) && isBoundedString(item.fromNodeKey, 128) && isBoundedString(item.toNodeKey, 128) && isBoundedString(item.inputRef, 128) ? { fromNodeKey: item.fromNodeKey, toNodeKey: item.toNodeKey, inputRef: item.inputRef } : null);
+  const components = parseList(raw.components, 64, (item) => isRecord(item) && hasExactKeys(item, ['key', 'fingerprint', ...('workflowRef' in item ? ['workflowRef'] : [])]) && isBoundedString(item.key, 128) && isBoundedString(item.fingerprint, 128) && (!('workflowRef' in item) || isBoundedString(item.workflowRef, 64)) ? { key: item.key, fingerprint: item.fingerprint, ...(typeof item.workflowRef === 'string' ? { workflowRef: item.workflowRef } : {}) } : null);
+  if (!inputs || !outputs || !nodes || !edges || !components) return null;
+  return { inputs, outputs, nodes, edges, components };
+}
 function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | null {
   if (!isRecord(raw) || !hasExactKeys(raw, ['code']) || typeof raw.code !== 'string' || !DIAGNOSTIC_CODES.has(raw.code)) return null;
   return { code: raw.code as WorkflowGraphDiagnosticCode };
@@ -402,13 +522,17 @@ function parseDiagnostic(raw: unknown): { code: WorkflowGraphDiagnosticCode } | 
 function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
   if (!isRecord(raw)) return null;
   const baseKeys = ['runStatus', 'nodes', 'edges', 'gates', 'progress', 'feedbackRounds', 'reuse', 'diagnostics'];
-  if (!hasExactKeys(raw, 'activeGate' in raw ? [...baseKeys, 'activeGate'] : baseKeys) || typeof raw.runStatus !== 'string' || !RUN_STATUSES.has(raw.runStatus)) return null;
+  const optionalKeys = ['activeGate', 'results', 'failure', 'topology'].filter((key) => key in raw);
+  if (!hasExactKeys(raw, [...baseKeys, ...optionalKeys]) || typeof raw.runStatus !== 'string' || !RUN_STATUSES.has(raw.runStatus)) return null;
   const nodes = parseList(raw.nodes, WORKFLOW_GRAPH_NODES_MAX, parseNode);
   const edges = parseList(raw.edges, WORKFLOW_GRAPH_EDGES_MAX, parseEdge);
   const gates = parseList(raw.gates, WORKFLOW_GRAPH_GATES_MAX, parseGate);
   const feedbackRounds = parseList(raw.feedbackRounds, WORKFLOW_GRAPH_FEEDBACK_ROUNDS_MAX, parseFeedbackRound);
   const diagnostics = parseList(raw.diagnostics, WORKFLOW_GRAPH_DIAGNOSTICS_MAX, parseDiagnostic);
-  if (!nodes || !edges || !gates || !feedbackRounds || !diagnostics || !isRecord(raw.reuse) || !hasExactKeys(raw.reuse, ['nodeCount', 'edgeCount']) || !isCount(raw.reuse.nodeCount) || !isCount(raw.reuse.edgeCount)) return null;
+  const results = 'results' in raw ? parseList(raw.results, WORKFLOW_GRAPH_NODES_MAX, parseResult) : [];
+  const failure = 'failure' in raw ? parseFailure(raw.failure) : undefined;
+  const topology = 'topology' in raw ? parseTopology(raw.topology) : undefined;
+  if (!nodes || !edges || !gates || !feedbackRounds || !diagnostics || results === null || ('failure' in raw && (!failure || (raw.runStatus !== 'failed' && raw.runStatus !== 'cancelled'))) || ('topology' in raw && !topology) || !isRecord(raw.reuse) || !hasExactKeys(raw.reuse, ['nodeCount', 'edgeCount']) || !isCount(raw.reuse.nodeCount) || !isCount(raw.reuse.edgeCount)) return null;
   const progress = parseProgress(raw.progress, nodes.length);
   if (!progress) return null;
   const nodeIds = new Set(nodes.map((node) => node.nodeId));
@@ -499,7 +623,7 @@ function parseGraph(raw: unknown): WorkflowGraphWireGraph | null {
     || raw.reuse.edgeCount !== edges.filter((edge) => edge.reused).length
     || edges.some((edge) => edge.reused !== reusedNodeIds.has(edge.fromNodeId))
   ) return null;
-  return { runStatus: raw.runStatus as WorkflowGraphWireRunStatus, nodes, edges, gates, ...(activeGate ? { activeGate } : {}), progress, feedbackRounds, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, diagnostics };
+  return { runStatus: raw.runStatus as WorkflowGraphWireRunStatus, nodes, edges, gates, ...(activeGate ? { activeGate } : {}), progress, feedbackRounds, reuse: { nodeCount: raw.reuse.nodeCount, edgeCount: raw.reuse.edgeCount }, ...(results.length > 0 ? { results } : {}), ...(failure ? { failure } : {}), ...(topology ? { topology } : {}), diagnostics };
 }
 
 /** Fail-closed host→webview parser: any malformed or extra field rejects the whole result. */

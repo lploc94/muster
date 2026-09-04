@@ -307,3 +307,6 @@ sessions do not expose a DOM-scraping command. Revalidate the committed proof
 with `npm run test:m023-s07-render-evidence`; rerun
 `npm run test:m023-s07-truncated-render-live-uat` only when intentionally
 refreshing the live-host evidence.
+# Workflow V2 read-surface invariants
+
+Run-owned authority, immutable artifact provenance, and terminal result availability are validated before inspection or reuse. Reuse accepts only terminal succeeded/failed/cancelled runs with an exact valid named artifact; source rows, failure detail, and producer history remain unchanged. Host/user projections contain semantic fields only and never expose SQL, paths, credentials, prompts, scripts, or raw artifact bodies.

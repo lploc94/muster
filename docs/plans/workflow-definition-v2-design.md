@@ -918,3 +918,6 @@ gate fill from the selected terminal artifact rather than the legacy aggregate.
 - [Task and workflow domain](../TASK-MANAGEMENT.md)
 - [Muster bridge contract](../MUSTER-BRIDGE.md)
 - [Workflow catalog surface design](2026-08-29-workflow-catalog-surface-design.md)
+# Audience-aware visibility
+
+The active V2 design uses one bounded semantic projection across root inspection and the user graph: immutable interfaces/topology, ordered result availability, and the validated failure envelope. Catalog list is metadata-only; catalog detail is safe author topology. Model-reported failure text is explicitly untrusted and rendered inert. Execution-time durable root authorization is required for every agent-facing catalog/run read.

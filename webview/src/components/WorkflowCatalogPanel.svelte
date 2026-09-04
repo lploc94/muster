@@ -3,6 +3,7 @@
   import type {
     WorkflowCatalogWire,
     WorkflowCatalogWirePackageKind,
+    WorkflowCatalogWireDetail,
   } from '../../../src/shared/workflow-catalog-wire';
 
   interface Props {
@@ -12,11 +13,15 @@
     onClose: () => void;
     onReload: () => void;
     onRetry: () => void;
+    detail: WorkflowCatalogWireDetail | null;
+    detailLoading: boolean;
+    detailError: string | null;
+    onSelect: (workflowRef: string) => void;
   }
 
   type CatalogViewState = 'loading' | 'populated' | 'empty' | 'diagnostics-only' | 'error';
 
-  let { catalog, loading, error, onClose, onReload, onRetry }: Props = $props();
+  let { catalog, loading, error, onClose, onReload, onRetry, detail, detailLoading, detailError, onSelect }: Props = $props();
 
   // The host already orders entries by name bytes, scope, then entry file.
   // Filtering only partitions that stable order into the two visible scope groups.
@@ -94,7 +99,7 @@
         class="workflow-catalog__list"
       >
         {#each workspaceEntries as entry (entry.workflowRef)}
-          <li class="workflow-catalog__row" data-testid="workflow-catalog-row">
+          <li><button type="button" class="workflow-catalog__row" data-testid="workflow-catalog-row" onclick={() => onSelect(entry.workflowRef)}>
             <div class="workflow-catalog__row-primary">
               <span class="workflow-catalog__name">{entry.name}</span>
               <span class="workflow-catalog__kind" data-testid="workflow-catalog-kind">
@@ -105,7 +110,10 @@
             {#if entry.description}
               <p class="workflow-catalog__description">{entry.description}</p>
             {/if}
-          </li>
+            {#if entry.nodeCount !== undefined}
+              <p class="workflow-catalog__description">{entry.nodeCount} nodes · {entry.inputCount ?? 0} inputs · {entry.outputCount ?? 0} outputs</p>
+            {/if}
+          </button></li>
         {/each}
       </ul>
     </section>
@@ -125,7 +133,7 @@
         class="workflow-catalog__list"
       >
         {#each globalEntries as entry (entry.workflowRef)}
-          <li class="workflow-catalog__row" data-testid="workflow-catalog-row">
+          <li><button type="button" class="workflow-catalog__row" data-testid="workflow-catalog-row" onclick={() => onSelect(entry.workflowRef)}>
             <div class="workflow-catalog__row-primary">
               <span class="workflow-catalog__name">{entry.name}</span>
               <span class="workflow-catalog__kind" data-testid="workflow-catalog-kind">
@@ -136,7 +144,10 @@
             {#if entry.description}
               <p class="workflow-catalog__description">{entry.description}</p>
             {/if}
-          </li>
+            {#if entry.nodeCount !== undefined}
+              <p class="workflow-catalog__description">{entry.nodeCount} nodes · {entry.inputCount ?? 0} inputs · {entry.outputCount ?? 0} outputs</p>
+            {/if}
+          </button></li>
         {/each}
       </ul>
     </section>
@@ -154,6 +165,43 @@
         </p>
       </div>
     </div>
+  {/if}
+
+  {#if detailLoading || detailError || detail}
+    <section class="workflow-catalog__detail" data-testid="workflow-catalog-detail" aria-live="polite">
+      <h3 class="workflow-catalog__group-heading">Workflow details</h3>
+      {#if detailLoading}
+        <p>Loading workflow details…</p>
+      {:else if detailError}
+        <p role="alert">Workflow details unavailable. Reload the catalog and try again.</p>
+      {:else if detail}
+        <p><strong>{detail.name}</strong> · {detail.nodes.length} nodes</p>
+        <p>{detail.inputs.length} inputs · {detail.outputs.length} outputs</p>
+        <h4>Inputs</h4>
+        <ul class="workflow-catalog__list">
+          {#each detail.inputs as input (input.name)}
+            <li class="workflow-catalog__diagnostic">{input.name} · {input.kind} · {input.entryNodeId}:{input.inputRef}</li>
+          {/each}
+        </ul>
+        <h4>Outputs</h4>
+        <ul class="workflow-catalog__list">
+          {#each detail.outputs as output (output.name)}
+            <li class="workflow-catalog__diagnostic">{output.name} · {output.kind} · {output.role}</li>
+          {/each}
+        </ul>
+        <h4>Nodes and routes</h4>
+        <ul class="workflow-catalog__list">
+          {#each detail.nodes as node (node.nodeKey)}
+            <li class="workflow-catalog__diagnostic">{node.title ?? node.nodeKey} · {node.kind} · NEXT {node.decision.next ? 'yes' : 'no'} · PREV {node.decision.prev ? 'yes' : 'no'} · FAIL {node.decision.fail ? 'yes' : 'no'}{node.assetRefs && node.assetRefs.length > 0 ? ` · ${node.assetRefs.join(', ')}` : ''}</li>
+          {/each}
+        </ul>
+        <ul class="workflow-catalog__list">
+          {#each detail.edges as edge (`${edge.fromNodeKey}:${edge.toNodeKey}:${edge.inputRef}`)}
+            <li class="workflow-catalog__diagnostic">{edge.fromNodeKey} → {edge.toNodeKey} · {edge.inputRef}</li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
   {/if}
 
   {#if diagnostics.length > 0}

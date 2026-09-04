@@ -1,12 +1,15 @@
 import {
   isSafeWorkflowCatalogDiagnosticFile,
   parseRequestWorkflowCatalogMessage,
+  parseRequestWorkflowCatalogDetailMessage,
   WORKFLOW_CATALOG_DIAGNOSTICS_MAX,
   WORKFLOW_CATALOG_DIAGNOSTIC_MESSAGE_MAX,
   WORKFLOW_CATALOG_WORKFLOWS_MAX,
   type WorkflowCatalogErrorCode,
   type WorkflowCatalogReason,
   type WorkflowCatalogResult,
+  type WorkflowCatalogDetailResult,
+  type WorkflowCatalogWireDetail,
   type WorkflowCatalogWire,
   type WorkflowCatalogWireDiagnostic,
 } from '../shared/workflow-catalog-wire';
@@ -19,6 +22,10 @@ export interface WorkflowCatalogRouteDeps {
 export type WorkflowCatalogHostOutcome =
   | { kind: 'silent' }
   | { kind: 'message'; message: WorkflowCatalogResult };
+
+export type WorkflowCatalogDetailHostOutcome =
+  | { kind: 'silent' }
+  | { kind: 'message'; message: WorkflowCatalogDetailResult };
 
 function failure(requestId: string, code: WorkflowCatalogErrorCode): WorkflowCatalogHostOutcome {
   return {
@@ -45,8 +52,11 @@ function toWireCatalog(
 ): WorkflowCatalogWire {
   const workflows = snapshot.workflows
     .slice(0, WORKFLOW_CATALOG_WORKFLOWS_MAX)
-    .map(({ workflowRef, name, description, scope, packageKind }) => ({
+    .map(({ workflowRef, name, description, scope, packageKind, inputCount, outputCount, nodeCount }) => ({
       workflowRef, name, description, scope, packageKind,
+      ...(inputCount !== undefined ? { inputCount } : {}),
+      ...(outputCount !== undefined ? { outputCount } : {}),
+      ...(nodeCount !== undefined ? { nodeCount } : {}),
     }));
 
   const diagnostics: WorkflowCatalogWireDiagnostic[] = snapshot.diagnostics
@@ -100,4 +110,28 @@ export async function routeRequestWorkflowCatalog(
       catalog: toWireCatalog(snapshot, reason),
     },
   };
+}
+
+export interface WorkflowCatalogDetailRouteDeps extends WorkflowCatalogRouteDeps {
+  readDetail(ref: string): Promise<WorkflowCatalogWireDetail | undefined>;
+}
+
+export async function routeRequestWorkflowCatalogDetail(
+  data: unknown,
+  deps: WorkflowCatalogDetailRouteDeps,
+): Promise<WorkflowCatalogDetailHostOutcome> {
+  const parsed = parseRequestWorkflowCatalogDetailMessage(data);
+  if (!parsed.ok) {
+    return parsed.silent ? { kind: 'silent' } : {
+      kind: 'message',
+      message: { type: 'workflowCatalogDetailResult', requestId: parsed.requestId, ok: false, code: parsed.code },
+    };
+  }
+  try {
+    const detail = await deps.readDetail(parsed.workflowRef);
+    if (!detail) return { kind: 'message', message: { type: 'workflowCatalogDetailResult', requestId: parsed.requestId, ok: false, code: 'unavailable' } };
+    return { kind: 'message', message: { type: 'workflowCatalogDetailResult', requestId: parsed.requestId, ok: true, detail } };
+  } catch {
+    return { kind: 'message', message: { type: 'workflowCatalogDetailResult', requestId: parsed.requestId, ok: false, code: 'unavailable' } };
+  }
 }

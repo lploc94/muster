@@ -87,17 +87,21 @@ export function capabilitiesFor(
   context: CapabilityContext = {},
 ): Set<ToolAction> {
   const granted = new Set<ToolAction>(ANY_TASK_ACTIONS);
+  const turn = context.turn;
+  const isLiveTurn = turn?.status === 'queued' || turn?.status === 'running' || turn?.status === 'waiting_user';
+  const canReadWorkflow = task.role === 'coordinator' &&
+    task.parentId == null && task.lifecycle === 'open' && isLiveTurn &&
+    turn?.workflowActivation === undefined && context.workspaceTrusted !== false;
   if (task.role === 'coordinator') {
     granted.add('upsert_presentation');
     for (const cap of task.capabilities) {
       for (const action of CAPABILITY_TO_ACTIONS[cap] ?? []) {
+        if ((action === 'list_predefined_workflows' || action === 'get_predefined_workflow' || action === 'inspect_workflow_run') && !canReadWorkflow) continue;
         granted.add(action);
       }
     }
   }
 
-  const turn = context.turn;
-  const isLiveTurn = turn?.status === 'queued' || turn?.status === 'running' || turn?.status === 'waiting_user';
   const activation = turn?.workflowActivation;
   const isLiveActivation =
     isLiveTurn &&

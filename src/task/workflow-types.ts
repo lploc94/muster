@@ -751,6 +751,10 @@ export interface WorkflowGraphProjection {
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   reuse: WorkflowGraphReuseProjection;
+  /** Same bounded semantic result/failure data as authorized run inspection. */
+  results?: readonly WorkflowResultAvailabilityProjection[];
+  failure?: WorkflowFailureDetail;
+  topology?: WorkflowRunSemanticTopologyProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }
 
@@ -759,6 +763,14 @@ export interface WorkflowRunNodeInspectionProjection {
   status: string;
   /** Opaque exact execution reference accepted as start_workflow reuse.fromTask. */
   taskId?: string;
+}
+
+export interface WorkflowRunSemanticTopologyProjection {
+  inputs: readonly { name: string; kind: string; entryNodeId: string; inputRef: string }[];
+  outputs: readonly { name: string; kind: string; role: 'terminal' | 'checkpoint'; sourceNodeKey: string }[];
+  nodes: readonly { nodeKey: string; title?: string; kind: 'agent' | 'exit' | 'script' }[];
+  edges: readonly { fromNodeKey: string; toNodeKey: string; inputRef: string }[];
+  components: readonly { key: string; workflowRef?: string; fingerprint: string }[];
 }
 
 export interface WorkflowRunActivationInspectionProjection
@@ -831,12 +843,14 @@ export interface WorkflowFailureDetail {
 /** Authorized terminal state delivered to a resumed start_workflow caller. */
 export interface WorkflowRunCompletionProjection {
   runId: string;
+  authorityKind: 'definition' | 'composite';
   runStatus: WorkflowRunStatus;
   terminalReason?: string;
   terminalResult?: WorkflowArtifactReferenceProjection;
   workflowNext?: WorkflowNextResultProjection;
   results?: readonly WorkflowResultAvailabilityProjection[];
   failure?: WorkflowFailureDetail;
+  topology?: WorkflowRunSemanticTopologyProjection;
 }
 
 /**
@@ -862,5 +876,6 @@ export interface WorkflowRunInspectionProjection {
   terminalResult?: WorkflowArtifactReferenceProjection;
   results?: readonly WorkflowResultAvailabilityProjection[];
   failure?: WorkflowFailureDetail;
+  topology?: WorkflowRunSemanticTopologyProjection;
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }

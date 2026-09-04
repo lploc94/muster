@@ -116,6 +116,9 @@
   let workflowCatalog = $derived(workflowCatalogStore.catalog);
   let workflowCatalogLoading = $derived(workflowCatalogStore.loading);
   let workflowCatalogError = $derived(workflowCatalogStore.error);
+  let workflowCatalogDetail = $derived(workflowCatalogStore.detail);
+  let workflowCatalogDetailLoading = $derived(workflowCatalogStore.detailLoading);
+  let workflowCatalogDetailError = $derived(workflowCatalogStore.detailError);
   let taskSnapshotHydrated = $state(false);
   const visibleCommandError = $derived(
     tasks.commandError &&
@@ -901,6 +904,10 @@
           workflowCatalogStore.handleResult(msg);
           break;
 
+        case 'workflowCatalogDetailResult':
+          workflowCatalogStore.handleDetailResult(msg);
+          break;
+
         case 'transcriptPageResult': {
           // Drop early if the message is not for the currently focused task.
           if (msg.taskId !== tasks.focusedTaskId) break;
@@ -1359,6 +1366,10 @@
     onClose={closeWorkflows}
     onReload={() => workflowCatalogStore.reload()}
     onRetry={() => workflowCatalogStore.retry()}
+    detail={workflowCatalogDetail}
+    detailLoading={workflowCatalogDetailLoading}
+    detailError={workflowCatalogDetailError}
+    onSelect={(workflowRef) => workflowCatalogStore.requestDetail(workflowRef)}
   />
 {:else}
 {#if visibleCommandError}

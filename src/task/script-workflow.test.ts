@@ -990,7 +990,7 @@ describe('script workflow runtime', () => {
     expect(denied).toMatchObject({ ok: false });
     expect(denied.ok ? '' : denied.error).toContain('host_run_disabled');
     await expect(ctx.client.get<{ count: number }>(
-      'SELECT COUNT(*) AS count FROM workflow_runs WHERE workspace_id = ? AND definition_id = ?',
+      'SELECT COUNT(*) AS count FROM workflow_runs WHERE workspace_id = ? AND source_definition_id = ?',
       ['ws', definitionId],
     )).resolves.toEqual({ count: 0 });
 

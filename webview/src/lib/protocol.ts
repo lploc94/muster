@@ -32,8 +32,11 @@ import {
 } from '../../../src/shared/workflow-graph-wire';
 import {
   parseWorkflowCatalogResult,
+  parseWorkflowCatalogDetailResult,
   type RequestWorkflowCatalog,
+  type RequestWorkflowCatalogDetail,
   type WorkflowCatalogResult,
+  type WorkflowCatalogDetailResult,
 } from '../../../src/shared/workflow-catalog-wire';
 
 export const PROTOCOL_VERSION = 13;
@@ -597,6 +600,7 @@ export type ExtMessage =
   | WorkflowGraphResult
   /** Correlated bounded predefined workflow catalog snapshot. */
   | WorkflowCatalogResult
+  | WorkflowCatalogDetailResult
   /**
    * Host response to `requestFileMentionSuggestions`.
    * Success returns relative suggestion items only (never absolute paths, cwd,
@@ -675,6 +679,7 @@ export type OutMessage =
   | RequestWorkflowGraph
   /** Correlated bounded workflow catalog request; reason distinguishes first open from Reload. */
   | RequestWorkflowCatalog
+  | RequestWorkflowCatalogDetail
   /**
    * Request one bounded older transcript page for the focused task (introduced in v7).
    * Host replies with `transcriptPageResult` (typed success or fixed error code).
@@ -1808,6 +1813,8 @@ export function isExtMessage(data: unknown): data is ExtMessage {
       return parseWorkflowGraphResult(data) !== null;
     case 'workflowCatalogResult':
       return parseWorkflowCatalogResult(data) !== null;
+    case 'workflowCatalogDetailResult':
+      return parseWorkflowCatalogDetailResult(data) !== null;
 
     case 'askPending':
       return isString(data.askId) && Array.isArray(data.questions) && data.questions.every(isQuestion);

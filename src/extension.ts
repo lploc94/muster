@@ -160,9 +160,9 @@ import { routeExportTask } from './host/task-export-route';
 import { routeRuntimeHandoff } from './host/runtime-handoff-route';
 import { routeLoadTranscriptPage } from './host/transcript-page-route';
 import { routeRequestWorkflowGraph } from './host/workflow-graph-route';
-import { routeRequestWorkflowCatalog } from './host/workflow-catalog-route';
+import { routeRequestWorkflowCatalog, routeRequestWorkflowCatalogDetail } from './host/workflow-catalog-route';
 import { WorkflowCatalogCache } from './host/workflow-catalog-cache';
-import { listPredefinedWorkflows } from './host/predefined-workflows';
+import { getPredefinedWorkflow, listPredefinedWorkflows } from './host/predefined-workflows';
 import {
   createWorkflowGraphProbeCoordinator,
   type WorkflowGraphProbeCoordinator,
@@ -2748,6 +2748,20 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
     if (outcome.kind === 'message') this.post(outcome.message);
   }
 
+  private async handleRequestWorkflowCatalogDetail(data: unknown): Promise<void> {
+    const raw = data && typeof data === 'object' ? data as Record<string, unknown> : {};
+    const outcome = await routeRequestWorkflowCatalogDetail(data, {
+      readCatalog: (reason) => this.workflowCatalogCache.read(resolveTaskCwd(), reason),
+      readDetail: (ref) => getPredefinedWorkflow({ workspaceFolder: resolveTaskCwd() }, ref),
+    });
+    debugMuster('workflow_catalog_detail.host_outcome', {
+      requestId: raw.requestId,
+      kind: outcome.kind,
+      ...(outcome.kind === 'message' ? { ok: outcome.message.ok } : {}),
+    });
+    if (outcome.kind === 'message') this.post(outcome.message);
+  }
+
   /**
    * Export one task as Markdown via native Save As. Read-only store access;
    * never mutates task-store state. Cancel is intentionally silent.
@@ -3827,6 +3841,9 @@ class MusterChatProvider implements vscode.WebviewViewProvider {
           break;
         case 'requestWorkflowCatalog':
           await this.handleRequestWorkflowCatalog(data);
+          break;
+        case 'requestWorkflowCatalogDetail':
+          await this.handleRequestWorkflowCatalogDetail(data);
           break;
         case 'requestWorkspaceRecovery':
           this.handleRequestWorkspaceRecovery(data);

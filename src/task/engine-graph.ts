@@ -460,6 +460,36 @@ async function authorizeRootWorkflowMutation(
   return { ok: true, caller, turn };
 }
 
+/**
+ * Durable execution-time authorization for agent-facing workflow reads.
+ * Advertised MCP actions and ctx.allowedActions are hints only; every read
+ * reloads the caller turn/task and rejects activations, child coordinators,
+ * stale identities, and untrusted workspaces before touching catalog/run data.
+ */
+async function authorizeRootWorkflowRead(
+  deps: GraphEngineDeps,
+  ctx: { callerTaskId: string; turnId: string; rootId: string },
+  action: 'list_predefined_workflows' | 'get_predefined_workflow' | 'inspect_workflow_run',
+): Promise<{ ok: true; caller: MusterTask; turn: TaskTurn } | { ok: false; error: string }> {
+  const [turn, caller, workflowBound] = await Promise.all([
+    deps.repository.getTurn(ctx.turnId),
+    deps.repository.getTask(ctx.callerTaskId),
+    deps.repository.isTurnWorkflowBound(ctx.turnId),
+  ]);
+  const live = turn?.status === 'queued' || turn?.status === 'running' || turn?.status === 'waiting_user';
+  const root = caller && caller.id === ctx.rootId && caller.parentId == null && caller.role === 'coordinator' && caller.lifecycle === 'open';
+  const requiredCapability = action === 'inspect_workflow_run' ? 'read_subtree' : 'create_child';
+  if (
+    !turn || turn.taskId !== ctx.callerTaskId || !live ||
+    !caller || !root || workflowBound || !caller.capabilities.includes(requiredCapability)
+  ) {
+    return { ok: false, error: 'workflow read is not authorized for the current caller' };
+  }
+  const trusted = deps.isWorkspaceTrusted?.() !== false && deps.getHostEnvironment?.()?.trusted !== false;
+  if (!trusted) return { ok: false, error: 'workflow read is not authorized for the current caller' };
+  return { ok: true, caller, turn };
+}
+
 function predefinedWorkflowDefinitionId(rootId: string, workflowRef: string): string {
   return `workflow-${createHash('sha256')
     .update(rootId).update('\0')
@@ -2707,6 +2737,8 @@ export async function executeToolCommand(
     }
 
     case 'inspect_workflow_run': {
+      const authorization = await authorizeRootWorkflowRead(deps, ctx, 'inspect_workflow_run');
+      if (!authorization.ok) return authorization;
       const inspection = await deps.repository.inspectWorkflowRun(command.runId, ctx.rootId);
       if (!inspection) return { ok: false, error: 'workflow run not found' };
       return { ok: true, result: inspection };
@@ -2803,10 +2835,9 @@ export async function executeToolCommand(
     }
 
     case 'list_predefined_workflows': {
-      const file = deps.store.getFile();
-      const task = file.tasks[ctx.callerTaskId];
-      if (!task) return { ok: false, error: 'task not found' };
-      const workspaceFolder = workflowCatalogFolder(deps, task);
+      const authorization = await authorizeRootWorkflowRead(deps, ctx, 'list_predefined_workflows');
+      if (!authorization.ok) return authorization;
+      const workspaceFolder = workflowCatalogFolder(deps, authorization.caller);
       return {
         ok: true,
         result: await listPredefinedWorkflows({
@@ -2819,10 +2850,9 @@ export async function executeToolCommand(
     }
 
     case 'get_predefined_workflow': {
-      const file = deps.store.getFile();
-      const task = file.tasks[ctx.callerTaskId];
-      if (!task) return { ok: false, error: 'task not found' };
-      const workspaceFolder = workflowCatalogFolder(deps, task);
+      const authorization = await authorizeRootWorkflowRead(deps, ctx, 'get_predefined_workflow');
+      if (!authorization.ok) return authorization;
+      const workspaceFolder = workflowCatalogFolder(deps, authorization.caller);
       const workflow = await getPredefinedWorkflow(
         {
           workspaceFolder,
@@ -2959,6 +2989,8 @@ export async function executeToolCommand(
       const publicLedgerKey = opLedgerKey(ctx.turnId, command.opId);
       const publicReplay = await deps.repository.getOperation(publicLedgerKey);
       if (publicReplay) {
+        const replayAuthorization = await authorizeRootWorkflowMutation(deps, ctx, 'start_workflow');
+        if (!replayAuthorization.ok) return replayAuthorization;
         if (publicReplay.fingerprint !== fingerprint) {
           return { ok: false, error: 'opId conflict: different arguments' };
         }

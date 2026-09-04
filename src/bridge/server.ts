@@ -579,14 +579,14 @@ const TOOL_DESCRIPTIONS: Record<PublicMcpToolAction, string> = {
   get_host_context: 'Refresh trusted workspace, caller, workflow rules, available tools, and task-type context. Use when the current host block is missing or may be stale. Read-only; takes no arguments.',
   list_task_types: 'List configured semantic task profiles for workflow nodes. Call before define_workflow when the current task-type list is absent or stale. Select an exact returned id; do not invent backend, model, role, capability, or policy fields.',
   list_predefined_workflows: 'List reusable canonical workflow.json packages from the workspace and user catalog. Workspace names shadow global names. Returns bounded metadata, package kind, and opaque refs only.',
-  get_predefined_workflow: 'Read bounded metadata for one canonical workflow.json package by opaque ref. The host, not the coordinator, loads and freezes its graph and assets during define_workflow.',
-  inspect_workflow_run: 'Inspect bounded durable state for one owned workflow using the opaque runRef returned by start_workflow. Use only for recovery and diagnosis after uncertainty; do not poll for normal routing or pass internal gate, activation, task, or artifact ids.',
+  get_predefined_workflow: 'Read bounded semantic interfaces, outputs, node decision shape, and safe package-relative asset refs for one immutable workflow.json package by opaque ref. Use the detail to define a saved component or assemble a root composite; executable bodies remain host-only.',
+  inspect_workflow_run: 'Inspect bounded durable state for one owned saved or composite workflow using the opaque runRef returned by start_workflow. Use only for recovery and diagnosis; it includes semantic topology, result availability, and validated failure detail, never internal gate, activation, task, or artifact ids.',
   workflow_next: 'Publish the current live workflow activation result to its downstream node or terminal caller. message must be a self-contained final response because the receiver cannot see earlier assistant messages. change defaults to updated; use unchanged only for an exact feedback replay.',
   workflow_prev: 'Request correction from direct predecessor inputs of the current live activation. targets are semantic input names, not node ids, and default to all. message is the final assistant response committed before the host ends the turn.',
   workflow_fail: 'Fail the current live workflow run only when this activation cannot produce a usable result or request a valid correction. Provide a required concise diagnostic reason. This is a terminal disposition for the current turn.',
   upsert_presentation: 'Open or refresh a read-only IDE Markdown tab. REQUIRED for user-facing plans/specs. Send the full markdown document (not a patch); Mermaid fenced blocks are supported. The engine generates a presentationRef on create; pass that returned ref to refresh the same document.',
   define_workflow: DEFINE_WORKFLOW_DESCRIPTION,
-  start_workflow: 'Start a saved workflow from an open top-level root coordinator using the workflowRef returned by define_workflow. A successful call returns durable acceptance, then the host suspends this turn and resumes the caller exactly once with the terminal result; do not poll inspect_workflow_run. Supply exactly one literal value or prior-run named output for every declared public input name.',
+  start_workflow: 'Start either a saved workflow or a closed root-scoped composite from an open top-level root coordinator. Composite components use immutable workflow refs or inline one-node manifests with explicit interface mappings; prior terminal named outputs may be reused atomically. Supply exactly one literal value or named prior-run output for every public input name. A successful call suspends this turn and resumes the caller exactly once with bounded terminal status, topology, availability, and failure detail; do not poll inspect_workflow_run.',
 };
 
 function parseBearer(header: string | undefined): string | undefined {
@@ -630,7 +630,7 @@ export function formatToolError(error: string): string {
     return JSON.stringify({
       code: 'invalid_workflow_inputs',
       message: error,
-      hint: 'Supply exactly one literal value or named prior-run output for every public input name declared by define_workflow.',
+      hint: 'Use catalog detail to match semantic names and kinds; supply exactly one literal value or named prior-run output for every public input name. start_workflow accepts a saved workflow or an immutable-ref/inline one-node composite.',
     });
   }
   if (error === 'definition fingerprint conflict') {
@@ -778,14 +778,35 @@ function projectPublicToolResult(tool: PublicMcpToolAction, value: unknown): unk
           ...(typeof result.reason === 'string' ? { reason: result.reason } : {}),
         }))
       : [];
+    const topology = isObject(value.topology) ? {
+      inputs: Array.isArray(value.topology.inputs) ? value.topology.inputs.filter(isObject).map((input) => ({
+        name: input.name, kind: input.kind, entryNodeId: input.entryNodeId, inputRef: input.inputRef,
+      })) : [],
+      outputs: Array.isArray(value.topology.outputs) ? value.topology.outputs.filter(isObject).map((output) => ({
+        name: output.name, kind: output.kind, role: output.role, sourceNodeKey: output.sourceNodeKey,
+      })) : [],
+      nodes: Array.isArray(value.topology.nodes) ? value.topology.nodes.filter(isObject).map((node) => ({
+        nodeKey: node.nodeKey, ...(typeof node.title === 'string' ? { title: node.title } : {}), kind: node.kind,
+      })) : [],
+      edges: Array.isArray(value.topology.edges) ? value.topology.edges.filter(isObject).map((edge) => ({
+        fromNodeKey: edge.fromNodeKey, toNodeKey: edge.toNodeKey, inputRef: edge.inputRef,
+      })) : [],
+      components: Array.isArray(value.topology.components) ? value.topology.components.filter(isObject).map((component) => ({
+        key: component.key, ...(typeof component.workflowRef === 'string' ? { workflowRef: component.workflowRef } : {}), fingerprint: component.fingerprint,
+      })) : [],
+    } : undefined;
     return {
       runRef: value.runId,
+      ...(value.authorityKind === 'definition' || value.authorityKind === 'composite'
+        ? { kind: value.authorityKind }
+        : {}),
       ...(ref ? { workflowRef: ref } : {}),
       status: value.runStatus,
       nodes,
       activations,
       feedback,
       ...(results.length > 0 ? { results } : {}),
+      ...(topology ? { topology } : {}),
       ...(typeof value.terminalReason === 'string' ? { reason: value.terminalReason } : {}),
       ...(isObject(value.failure) ? {
         failure: {

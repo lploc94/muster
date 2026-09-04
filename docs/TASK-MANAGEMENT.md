@@ -2256,3 +2256,6 @@ Future extensions may add richer gates, dynamic sub-workflows, feedback coalesci
 or incremental computation, but they must be versioned and must not weaken session
 ownership, aggregate-before-execute, provenance, bounded-loop, durability, or
 lifecycle-separation invariants.
+# Workflow visibility and terminal results
+
+Workflow runs expose semantic node/output names, ordered availability, and one bounded failure detail only to the owning root and its user graph. Catalog list/detail uses immutable opaque refs and safe topology; workflow activations and diagnostics receive no catalog, unrelated-run, model-report, prompt, script, credential, path, or artifact-body data. Node-reported text is inert untrusted evidence. Terminal failed/cancelled runs may be explicitly reused by named valid outputs without retrying or rewriting the producer.

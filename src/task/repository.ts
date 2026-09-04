@@ -100,6 +100,7 @@ import type {
   WorkflowTaskStatusProjection,
   WorkflowResultAvailabilityProjection,
   WorkflowResultUnavailableReason,
+  WorkflowRunSemanticTopologyProjection,
 } from './workflow-types';
 import type { WorkflowCompositeExpansion } from './workflow-composite-codec';
 import { decodeWorkflowNodeOutcome } from './workflow-codec';
@@ -759,6 +760,58 @@ type WorkflowRunAuthority = {
   components: readonly WorkflowRunAuthorityComponent[];
   nodeProvenance: ReadonlyMap<string, { componentKey: string; localNodeKey: string }>;
 };
+
+function semanticTopologyFromWorkflowRunAuthority(
+  authority: WorkflowRunAuthority,
+): WorkflowRunSemanticTopologyProjection {
+  const topology = authority.definition.topology;
+  const terminalSources = new Set(
+    topology.nodes
+      .filter((node) => !topology.edges.some((edge) => edge.fromNodeId === node.nodeId))
+      .map((node) => node.nodeId),
+  );
+  const semanticNodeKey = (nodeId: string): string => semanticWorkflowNodeKey(authority, nodeId);
+  return {
+    inputs: topology.inputs.map((input) => ({
+      name: input.name,
+      kind: input.semanticKind,
+      entryNodeId: semanticNodeKey(input.entryNodeId),
+      inputRef: input.inputRef,
+    })),
+    outputs: topology.outputs.map((output) => ({
+      name: output.name,
+      kind: output.semanticKind,
+      role: terminalSources.has(output.sourceNodeId) ? 'terminal' : 'checkpoint',
+      sourceNodeKey: semanticNodeKey(output.sourceNodeId),
+    })),
+    nodes: topology.nodes.map((node) => ({
+      nodeKey: semanticNodeKey(node.nodeId),
+      ...(node.title ? { title: boundedWorkflowDisplayTitle(node.title) } : {}),
+      kind: node.execution?.kind === 'script' ? 'script' : node.outcome?.kind === 'exit' ? 'exit' : 'agent',
+    })),
+    edges: topology.edges.map((edge) => ({
+      fromNodeKey: semanticNodeKey(edge.fromNodeId),
+      toNodeKey: semanticNodeKey(edge.toNodeId),
+      inputRef: edge.inputRef,
+    })),
+    components: authority.components.map((component) => ({
+      key: component.key,
+      ...(component.source.kind === 'workflow' ? { workflowRef: component.source.workflowRef } : {}),
+      fingerprint: component.source.fingerprint,
+    })),
+  };
+}
+
+function semanticWorkflowNodeKey(authority: WorkflowRunAuthority, nodeId: string): string {
+  const provenance = authority.nodeProvenance.get(nodeId);
+  if (!provenance) return nodeId;
+  return authority.kind === 'composite'
+    // Component and local keys are both allowed to contain ':'.  Length
+    // prefixes keep the public pair injective while remaining readable and
+    // bounded for the graph wire contract.
+    ? `${provenance.componentKey.length}:${provenance.componentKey}/${provenance.localNodeKey.length}:${provenance.localNodeKey}`
+    : provenance.localNodeKey;
+}
 
 type StoredWorkflowNodeRow = {
   node_id: string;
@@ -4718,9 +4771,12 @@ export class SqliteTaskRepository implements TaskRepository {
       authority_kind: 'definition' | 'composite';
       authority_fingerprint: string;
       status: WorkflowRunStatus;
+      terminal_reason_code: string | null;
+      closure_id: string | null;
     };
     const nodeRun = await this.db.get<WorkflowGraphRunRow>(
-      `SELECT node.run_id, node.node_id, run.authority_kind, run.authority_fingerprint, run.status
+      `SELECT node.run_id, node.node_id, run.authority_kind, run.authority_fingerprint, run.status,
+              run.terminal_reason_code, run.closure_id
          FROM workflow_nodes node
          JOIN workflow_runs run
            ON run.workspace_id = node.workspace_id AND run.run_id = node.run_id
@@ -4729,7 +4785,8 @@ export class SqliteTaskRepository implements TaskRepository {
       [this.workspaceId, taskId],
     );
     const run = nodeRun ?? await this.db.get<WorkflowGraphRunRow>(
-      `SELECT run.run_id, NULL AS node_id, run.authority_kind, run.authority_fingerprint, run.status
+      `SELECT run.run_id, NULL AS node_id, run.authority_kind, run.authority_fingerprint, run.status,
+              run.terminal_reason_code, run.closure_id
          FROM workflow_runs run
          WHERE run.workspace_id = ?
            AND run.owner_root_task_id = ?
@@ -4746,6 +4803,37 @@ export class SqliteTaskRepository implements TaskRepository {
       this.workspaceId,
       run.run_id,
     );
+    const authorityValid = storedAuthority !== undefined
+      && storedAuthority.kind === run.authority_kind
+      && storedAuthority.fingerprint === run.authority_fingerprint;
+    if (!authorityValid) {
+      // A corrupt or incomplete authority snapshot may reveal only bounded
+      // lifecycle state.  Never fall back to physical node/gate IDs when the
+      // semantic mapping cannot be proved.
+      return {
+        runStatus: run.status,
+        nodes: [],
+        edges: [],
+        gates: [],
+        progress: {
+          total: 0,
+          completed: 0,
+          queued: 0,
+          executing: 0,
+          waiting: 0,
+          blocked: 0,
+          notStarted: 0,
+          failed: 0,
+          cancelled: 0,
+          skipped: 0,
+          frontierNodeIds: [],
+          activeNodeIds: [],
+        },
+        feedbackRounds: [],
+        reuse: { nodeCount: 0, edgeCount: 0 },
+        diagnostics: [{ code: 'workflow_graph_topology_undecodable' }],
+      };
+    }
 
     const [nodeRows, edgeRows, gateRead, roundRows, decisionRows] = await Promise.all([
       this.db.all<{
@@ -4802,9 +4890,6 @@ export class SqliteTaskRepository implements TaskRepository {
     ]);
 
     const diagnostics: Array<{ code: string }> = [];
-    if (!storedAuthority) {
-      diagnostics.push({ code: 'workflow_graph_topology_undecodable' });
-    }
     if (nodeRows.length > 64) diagnostics.push({ code: 'workflow_graph_nodes_truncated' });
     if (edgeRows.length > 128) diagnostics.push({ code: 'workflow_graph_edges_truncated' });
     if (gateRead.truncated) diagnostics.push({ code: 'workflow_graph_gates_truncated' });
@@ -4859,17 +4944,63 @@ export class SqliteTaskRepository implements TaskRepository {
     );
     const progress = workflowGraphProgressProjection(nodes);
 
+    const graphResults = await this.readWorkflowResultAvailability(run.run_id);
+    const graphClosure = run.status === 'failed' || run.status === 'cancelled'
+      ? await this.readValidatedClosureFailure(run.run_id, run.terminal_reason_code, run.status, run.closure_id)
+      : { failure: undefined, unavailable: false };
+    if (graphClosure.unavailable && diagnostics.length < 8) diagnostics.push({ code: 'failure_detail_unavailable' });
+    const graphFailure = graphClosure.failure ?? (
+      graphClosure.unavailable && run.terminal_reason_code &&
+      (WORKFLOW_FAIL_REASON_CODES as readonly string[]).includes(run.terminal_reason_code)
+        ? unavailableWorkflowFailureDetail(run.terminal_reason_code as WorkflowFailReasonCode)
+        : undefined
+    );
+    const graphTopology = semanticTopologyFromWorkflowRunAuthority(storedAuthority);
+    const publicNodeId = (nodeId: string): string =>
+      semanticWorkflowNodeKey(storedAuthority, nodeId);
+    const publicGraphNodes = nodes.map((node) => ({ ...node, nodeId: publicNodeId(node.nodeId) }));
+    const publicGraphEdges = edges.map((edge) => ({
+      ...edge,
+      fromNodeId: publicNodeId(edge.fromNodeId),
+      toNodeId: publicNodeId(edge.toNodeId),
+    }));
+    const publicGraphGates = graphGates.map((gate) => ({
+      ...gate,
+      consumerNodeId: publicNodeId(gate.consumerNodeId),
+      inputs: gate.inputs.map((input) => ({
+        ...input,
+        producerNodeId: input.producerNodeId === 'engine_start'
+          ? input.producerNodeId
+          : publicNodeId(input.producerNodeId),
+      })),
+    }));
+    const publicActiveGate = activeGate
+      ? {
+          ...activeGate,
+          consumerNodeId: publicNodeId(activeGate.consumerNodeId),
+          inputs: activeGate.inputs.map((input) => ({
+            ...input,
+            producerNodeId: input.producerNodeId === 'engine_start'
+              ? input.producerNodeId
+              : publicNodeId(input.producerNodeId),
+          })),
+        }
+      : undefined;
     return {
       runStatus: run.status,
-      nodes,
-      edges,
-      gates: graphGates,
-      ...(activeGate
-        ? { activeGate: (({ gateId: _gateId, ...gate }) => gate)(activeGate) }
+      nodes: publicGraphNodes,
+      edges: publicGraphEdges,
+      gates: publicGraphGates,
+      ...(publicActiveGate
+        ? { activeGate: (({ gateId: _gateId, ...gate }) => gate)(publicActiveGate) }
         : {}),
-      progress,
+      progress: {
+        ...progress,
+        frontierNodeIds: progress.frontierNodeIds.map(publicNodeId),
+        activeNodeIds: progress.activeNodeIds.map(publicNodeId),
+      },
       feedbackRounds: roundRows.slice(0, 32).map((round) => ({
-        requesterNodeId: round.requester_node_id,
+        requesterNodeId: publicNodeId(round.requester_node_id),
         status: round.status,
         joinMode: round.join_mode,
         required: Number(round.required) || 0,
@@ -4879,6 +5010,9 @@ export class SqliteTaskRepository implements TaskRepository {
         nodeCount: reusedNodeIds.size,
         edgeCount: edges.filter((edge) => reusedNodeIds.has(edge.fromNodeId)).length,
       },
+      ...(graphResults.length > 0 ? { results: graphResults } : {}),
+      ...(graphFailure ? { failure: graphFailure } : {}),
+      ...(graphTopology ? { topology: graphTopology } : {}),
       diagnostics: diagnostics.slice(0, 8),
     };
   }
@@ -5305,6 +5439,7 @@ export class SqliteTaskRepository implements TaskRepository {
         artifactRevision: Number(run.terminal_result_artifact_revision),
       };
     }
+    projection.topology = semanticTopologyFromWorkflowRunAuthority(runAuthority);
     projection.results = await this.readWorkflowResultAvailability(run.run_id);
     // Phase 2: same-root inspection exposes the validated failure detail;
     // corrupt or missing closure metadata yields the fixed unavailable
@@ -5448,6 +5583,7 @@ export class SqliteTaskRepository implements TaskRepository {
     ) {
       const projection: WorkflowRunCompletionProjection = {
         runId: row.run_id,
+        authorityKind: row.authority_kind,
         runStatus: row.status as WorkflowRunCompletionProjection['runStatus'],
       };
       if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
@@ -5463,8 +5599,10 @@ export class SqliteTaskRepository implements TaskRepository {
     }
     const projection: WorkflowRunCompletionProjection = {
       runId: row.run_id,
+      authorityKind: row.authority_kind,
       runStatus: row.status,
       results: await this.readWorkflowResultAvailability(row.run_id),
+      topology: semanticTopologyFromWorkflowRunAuthority(authority),
     };
     if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
       projection.terminalReason = row.terminal_reason_code;
@@ -8933,6 +9071,14 @@ export class SqliteTaskRepository implements TaskRepository {
         [this.workspaceId, publicOperation.ledgerKey],
       );
       if (publicRow) {
+        const unauthorizedReplay = await this.rejectUnauthorizedPublicWorkflowMutation(
+          'start_workflow',
+          command.ownerRootTaskId,
+          publicOperation,
+          command.callerTaskId,
+          command.callerTurnId,
+        );
+        if (unauthorizedReplay) return unauthorizedReplay;
         let operation: OperationLedgerEntry;
         try {
           operation = decodeOperation(publicRow);
@@ -13784,8 +13930,10 @@ export class SqliteTaskRepository implements TaskRepository {
       : '';
     const completion: Record<string, unknown> = {
       runRef: row.run_id,
+      authorityKind: row.authority_kind,
       status: row.run_status,
       results: await this.readWorkflowResultAvailability(row.run_id),
+      topology: semanticTopologyFromWorkflowRunAuthority(authority),
     };
     if (row.terminal_reason_code && /^[a-z0-9_]{1,64}$/.test(row.terminal_reason_code)) {
       completion.reason = row.terminal_reason_code;

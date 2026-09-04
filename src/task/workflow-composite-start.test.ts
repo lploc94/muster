@@ -44,17 +44,19 @@ describe('atomic run-scoped workflow composites', () => {
         createdAt: '2026-08-01T00:00:00.000Z', startedAt: '2026-08-01T00:00:00.000Z',
       },
     });
-    const leftBase = makeOneNodeDefinition({ definitionId: 'workflow-11111111111111111111111111111111', createdAt: '2026-08-01T00:00:00.000Z' });
-    const rightBase = makeOneNodeDefinition({ definitionId: 'workflow-22222222222222222222222222222222', createdAt: '2026-08-01T00:00:00.000Z' });
+    // Both component and local keys may contain ':'. The graph projection
+    // must preserve the pair without collapsing (a, b:c) with (a:b, c).
+    const leftBase = makeOneNodeDefinition({ definitionId: 'workflow-11111111111111111111111111111111', nodeId: 'b:c', createdAt: '2026-08-01T00:00:00.000Z' });
+    const rightBase = makeOneNodeDefinition({ definitionId: 'workflow-22222222222222222222222222222222', nodeId: 'c', createdAt: '2026-08-01T00:00:00.000Z' });
     const left = {
       ...leftBase,
-      topology: { ...leftBase.topology, inputs: [{ name: 'input', semanticKind: 'result', entryNodeId: 'entry', inputRef: 'input' }] },
-      entryContracts: [{ entryNodeId: 'entry', inputRef: 'input', expectedArtifactKind: 'workflow_input' as const }],
+      topology: { ...leftBase.topology, inputs: [{ name: 'input', semanticKind: 'result', entryNodeId: 'b:c', inputRef: 'input' }] },
+      entryContracts: [{ entryNodeId: 'b:c', inputRef: 'input', expectedArtifactKind: 'workflow_input' as const }],
     };
     const right = {
       ...rightBase,
-      topology: { ...rightBase.topology, inputs: [{ name: 'input', semanticKind: 'result', entryNodeId: 'entry', inputRef: 'input' }] },
-      entryContracts: [{ entryNodeId: 'entry', inputRef: 'input', expectedArtifactKind: 'workflow_input' as const }],
+      topology: { ...rightBase.topology, inputs: [{ name: 'input', semanticKind: 'result', entryNodeId: 'c', inputRef: 'input' }] },
+      entryContracts: [{ entryNodeId: 'c', inputRef: 'input', expectedArtifactKind: 'workflow_input' as const }],
     };
     for (const definition of [left]) {
       await expect(repository.execute({
@@ -66,12 +68,12 @@ describe('atomic run-scoped workflow composites', () => {
     }
     const parsed = decodeWorkflowCompositeSpec({
       components: [
-        { key: 'left', workflow: `${left.definitionId}@1` },
-        { key: 'right', manifest: {
+        { key: 'a', workflow: `${left.definitionId}@1` },
+        { key: 'a:b', manifest: {
           schema: 'muster.workflow/v2', name: 'inline-right',
-          inputs: [{ name: 'input', kind: 'result', to: 'entry', inputRef: 'input' }],
-          outputs: [{ name: 'result', kind: 'result', from: 'entry' }],
-          nodes: [{ nodeKey: 'entry', taskType: 'general', outcome: {
+          inputs: [{ name: 'input', kind: 'result', to: 'c', inputRef: 'input' }],
+          outputs: [{ name: 'result', kind: 'result', from: 'c' }],
+          nodes: [{ nodeKey: 'c', taskType: 'general', outcome: {
             kind: 'agent', requireExplicitDisposition: true,
             next: { when: 'complete' }, fail: { when: 'fail' },
           } }],
@@ -79,19 +81,19 @@ describe('atomic run-scoped workflow composites', () => {
         } },
       ],
       connections: [{
-        from: { component: 'left', output: left.topology.outputs[0]!.name },
-        to: { component: 'right', input: right.topology.inputs[0]!.name },
+        from: { component: 'a', output: left.topology.outputs[0]!.name },
+        to: { component: 'a:b', input: right.topology.inputs[0]!.name },
       }],
-      inputs: [{ name: 'leftInput', to: { component: 'left', input: left.topology.inputs[0]!.name } }],
+      inputs: [{ name: 'leftInput', to: { component: 'a', input: left.topology.inputs[0]!.name } }],
       outputs: [
-        { name: 'leftResult', from: { component: 'left', output: left.topology.outputs[0]!.name } },
-        { name: 'rightResult', from: { component: 'right', output: right.topology.outputs[0]!.name } },
+        { name: 'leftResult', from: { component: 'a', output: left.topology.outputs[0]!.name } },
+        { name: 'rightResult', from: { component: 'a:b', output: right.topology.outputs[0]!.name } },
       ],
     });
     expect(parsed.ok).toBe(true);
     if (!parsed.ok) return;
     const authorities = [{
-      key: 'left',
+      key: 'a',
       source: { kind: 'workflow' as const, workflowRef: `${left.definitionId}@1`, fingerprint: fingerprintWorkflowDefinition(left) },
       definition: left,
     }];
@@ -114,5 +116,10 @@ describe('atomic run-scoped workflow composites', () => {
     await expect(client.get<{ count: number }>(`SELECT COUNT(*) AS count FROM workflow_continuations WHERE workspace_id = 'ws' AND run_id = ? AND kind = 'start_wait'`, [run.runId])).resolves.toEqual({ count: 0 });
     const authority = await repository.getWorkflowRunAuthority(run.runId);
     expect(authority).toMatchObject({ kind: 'composite' });
+    const graph = await repository.getWorkflowGraphForTask('root');
+    const publicNodeKeys = graph?.topology?.nodes.map((node) => node.nodeKey) ?? [];
+    expect(publicNodeKeys).toHaveLength(2);
+    expect(new Set(publicNodeKeys).size).toBe(publicNodeKeys.length);
+    expect(publicNodeKeys).toEqual(expect.arrayContaining(['1:a/3:b:c', '3:a:b/1:c']));
   });
 });

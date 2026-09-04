@@ -103,6 +103,43 @@ function toWireGraph(graph: WorkflowGraphView): WorkflowGraphWireGraph {
       responded: round.responded,
     })),
     reuse: { nodeCount: graph.reuse.nodeCount, edgeCount: graph.reuse.edgeCount },
+    ...(graph.results && graph.results.length > 0
+      ? {
+          results: graph.results.map((result) => ({
+            name: result.name,
+            kind: result.kind,
+            role: result.role,
+            status: result.status,
+            ...(result.reason ? { reason: result.reason } : {}),
+          })),
+        }
+      : {}),
+    ...(graph.failure
+      ? {
+          failure: {
+            source: graph.failure.source,
+            code: graph.failure.code,
+            ...(graph.failure.componentKey ? { component: graph.failure.componentKey } : {}),
+            ...(graph.failure.nodeKey ? { node: graph.failure.nodeKey } : {}),
+            ...(graph.failure.nodeTitle ? { title: graph.failure.nodeTitle } : {}),
+            report: { ...graph.failure.report },
+            ...(graph.failure.attempt
+              ? { attempt: { number: graph.failure.attempt.number as 1 | 2 | 3, limit: 3 as const } }
+              : {}),
+          },
+        }
+      : {}),
+    ...(graph.topology
+      ? {
+          topology: {
+            inputs: graph.topology.inputs.map((input) => ({ ...input })),
+            outputs: graph.topology.outputs.map((output) => ({ ...output })),
+            nodes: graph.topology.nodes.map((node) => ({ ...node })),
+            edges: graph.topology.edges.map((edge) => ({ ...edge })),
+            components: graph.topology.components.map((component) => ({ ...component })),
+          },
+        }
+      : {}),
     diagnostics,
   };
 }

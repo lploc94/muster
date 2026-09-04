@@ -109,6 +109,66 @@
     </div>
   {/if}
 
+  {#if graph.results && graph.results.length > 0}
+    <div class="workflow-graph-panel__section" data-testid="workflow-result-availability">
+      <div class="workflow-graph-panel__section-title">Result availability</div>
+      <ul class="workflow-graph-panel__plain-list">
+        {#each graph.results as result (result.name)}
+          <li>
+            <span>{result.name} · {result.kind} · {result.role}</span>
+            <span class={result.status === 'available' ? 'task-status--success' : 'task-status--muted'}>{result.status}{result.reason ? ` · ${result.reason}` : ''}</span>
+          </li>
+        {/each}
+      </ul>
+    </div>
+  {/if}
+
+  {#if graph.topology}
+    <div class="workflow-graph-panel__section" data-testid="workflow-semantic-topology">
+      <div class="workflow-graph-panel__section-title">Semantic interface</div>
+      <p>{graph.topology.inputs.length} inputs · {graph.topology.outputs.length} outputs · {graph.topology.components.length} components</p>
+      {#if graph.topology.inputs.length > 0}
+        <div class="workflow-graph-panel__subheading">Inputs</div>
+        <ul class="workflow-graph-panel__plain-list">
+          {#each graph.topology.inputs as input (input.inputRef)}
+            <li><span>{input.name} · {input.kind}</span><span>{input.inputRef} → {input.entryNodeId}</span></li>
+          {/each}
+        </ul>
+      {/if}
+      <ul class="workflow-graph-panel__plain-list">
+        {#each graph.topology.outputs as output (output.name)}
+          <li><span>{output.name} · {output.kind}</span><span>{output.role}</span></li>
+        {/each}
+      </ul>
+      {#if graph.topology.components.length > 0}
+        <div class="workflow-graph-panel__subheading">Components</div>
+        <ul class="workflow-graph-panel__plain-list">
+          {#each graph.topology.components as component (component.key)}
+            <li><span>{component.key}</span><span>{component.workflowRef ?? 'inline component'}</span></li>
+          {/each}
+        </ul>
+      {/if}
+      {#if graph.topology.edges.length > 0}
+        <div class="workflow-graph-panel__subheading">Edges</div>
+        <ul class="workflow-graph-panel__plain-list">
+          {#each graph.topology.edges as edge (`${edge.fromNodeKey}:${edge.toNodeKey}:${edge.inputRef}`)}
+            <li><span>{edge.fromNodeKey} → {edge.toNodeKey}</span><span>{edge.inputRef}</span></li>
+          {/each}
+        </ul>
+      {/if}
+    </div>
+  {/if}
+
+  {#if graph.failure}
+    <div class="workflow-graph-panel__section workflow-graph-panel__failure" data-testid="workflow-failure-detail">
+      <div class="workflow-graph-panel__section-title">Reported by workflow node</div>
+      <p>{graph.failure.component ? `${graph.failure.component} / ` : ''}{graph.failure.node ?? 'Workflow node'}{graph.failure.title ? ` — ${graph.failure.title}` : ''} · {graph.failure.source} · {graph.failure.code}</p>
+      <p class="workflow-graph-panel__failure-report">{graph.failure.report.text}</p>
+      {#if graph.failure.report.truncated}<small>Report truncated</small>{/if}
+      {#if graph.failure.attempt}<small>Attempt {graph.failure.attempt.number} of {graph.failure.attempt.limit}</small>{/if}
+    </div>
+  {/if}
+
 </section>
 
 <style>
@@ -166,6 +226,13 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.06em;
+  }
+
+  .workflow-graph-panel__subheading {
+    margin-top: 0.55rem;
+    color: var(--vscode-descriptionForeground, #9ca3af);
+    font-size: 11px;
+    font-weight: 600;
   }
 
   .workflow-graph-panel__reuse {

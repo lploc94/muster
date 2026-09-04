@@ -48,7 +48,6 @@ import {
 } from './workflow';
 import type {
   WorkflowTopology,
-  WorkflowRunInspectionProjection,
   WorkflowTaskStatusProjection,
 } from './workflow-types';
 
@@ -726,19 +725,10 @@ describe('M018 S07 canonical research → planner → verifier workflow', () => 
         },
         { kind: 'inspect_workflow_run', runId: childRunId! },
       );
-      expect(inspectionTool.ok).toBe(true);
-      if (inspectionTool.ok) {
-        const inspection = inspectionTool.result as WorkflowRunInspectionProjection;
-        expect(inspection.runId).toBe(childRunId);
-        expect(inspection.nodes.map((node) => node.nodeId)).toEqual([
-          'planner',
-          'r1',
-          'r2',
-          'verifier',
-        ]);
-        expect(inspection).not.toHaveProperty('tasks');
-        expect(forbiddenLeak(inspection)).toEqual([]);
-      }
+      expect(inspectionTool).toEqual({
+        ok: false,
+        error: 'workflow read is not authorized for the current caller',
+      });
 
       // --- Phase: planner NEXT → verifier activates ---
       const nextPlanner = await settleSucceeded(

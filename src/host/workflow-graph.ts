@@ -37,6 +37,9 @@ export interface WorkflowGraphView {
   progress: WorkflowGraphProgressProjection;
   feedbackRounds: readonly WorkflowGraphFeedbackRoundProjection[];
   reuse: WorkflowGraphReuseProjection;
+  results?: WorkflowGraphProjection['results'];
+  failure?: WorkflowGraphProjection['failure'];
+  topology?: WorkflowGraphProjection['topology'];
   diagnostics: readonly WorkflowIntegrityDiagnosticProjection[];
 }
 

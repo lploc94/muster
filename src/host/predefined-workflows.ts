@@ -15,6 +15,9 @@ import type { VerifiedScriptPackageSnapshot } from '../types';
 import { decodeWorkflowManifest } from '../task/workflow-codec';
 import {
   WORKFLOW_DESCRIPTION_MAX_LENGTH,
+  WORKFLOW_ENTRY_CONTRACTS_MAX,
+  WORKFLOW_GRAPH_MAX_EDGES,
+  WORKFLOW_GRAPH_MAX_NODES,
   WORKFLOW_INSTRUCTIONS_MAX_LENGTH,
   WORKFLOW_NAME_MAX_LENGTH,
   WORKFLOW_PACKAGE_PATH_MAX_LENGTH,
@@ -49,6 +52,23 @@ export interface PredefinedWorkflowSummary {
   description: string;
   scope: PredefinedWorkflowScope;
   packageKind: PredefinedWorkflowPackageKind;
+  inputCount?: number;
+  outputCount?: number;
+  nodeCount?: number;
+}
+
+/** Safe root/user detail; executable bytes and host paths never cross this boundary. */
+export interface PredefinedWorkflowDetail extends PredefinedWorkflowSummary {
+  inputs: readonly { name: string; kind: string; entryNodeId: string; inputRef: string }[];
+  outputs: readonly { name: string; kind: string; role: 'terminal' | 'checkpoint' }[];
+  nodes: readonly {
+    nodeKey: string;
+    title?: string;
+    kind: 'agent' | 'exit' | 'script';
+    decision: { next: boolean; prev: boolean; fail: boolean };
+    assetRefs?: readonly string[];
+  }[];
+  edges: readonly { fromNodeKey: string; toNodeKey: string; inputRef: string }[];
 }
 
 export type PredefinedWorkflowDocument = PredefinedWorkflowSummary;
@@ -121,6 +141,9 @@ interface CanonicalBundle {
 interface CanonicalManifestMetadata {
   name: string;
   description: string;
+  inputCount: number;
+  outputCount: number;
+  nodeCount: number;
 }
 
 const packageFiles = new WeakMap<ResolvedPredefinedWorkflow, readonly PackageFile[]>();
@@ -356,9 +379,15 @@ function parseCanonicalManifestMetadata(content: Buffer): CanonicalManifestMetad
   if (!Array.isArray(raw.inputs) || !Array.isArray(raw.outputs) || !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)) {
     throw new CatalogFileError('workflow manifest arrays are required');
   }
+  if (raw.inputs.length > WORKFLOW_ENTRY_CONTRACTS_MAX || raw.outputs.length > WORKFLOW_GRAPH_MAX_NODES || raw.nodes.length > WORKFLOW_GRAPH_MAX_NODES || raw.edges.length > WORKFLOW_GRAPH_MAX_EDGES) {
+    throw new CatalogFileError('workflow manifest exceeds topology bounds');
+  }
   return {
     name: raw.name,
     description: typeof raw.description === 'string' ? raw.description : '',
+    inputCount: raw.inputs.length,
+    outputCount: raw.outputs.length,
+    nodeCount: raw.nodes.length,
   };
 }
 
@@ -399,13 +428,16 @@ function makeResolvedPredefinedWorkflow(input: {
   files: readonly PackageFile[];
 }): ResolvedPredefinedWorkflow {
   const resolved: ResolvedPredefinedWorkflow = {
-    document: {
+      document: {
       workflowRef: input.source.workflowRef,
       name: input.manifest.name,
       description: input.manifest.topology.description ?? '',
       scope: input.source.scope,
-      packageKind: 'bundle',
-    },
+          packageKind: 'bundle',
+          inputCount: input.manifest.topology.inputs.length,
+          outputCount: input.manifest.topology.outputs.length,
+          nodeCount: input.manifest.topology.nodes.length,
+      },
     source: input.source,
     packageRoot: input.packageRoot,
     manifest: input.manifest,
@@ -511,6 +543,9 @@ async function scanScope(
           description: metadata.description,
           scope,
           packageKind: 'bundle',
+          inputCount: metadata.inputCount,
+          outputCount: metadata.outputCount,
+          nodeCount: metadata.nodeCount,
         },
         source,
         collisionKey: metadata.name.trim().toLowerCase(),
@@ -653,11 +688,53 @@ export async function resolvePredefinedWorkflowSource(
 export async function getPredefinedWorkflow(
   options: PredefinedWorkflowCatalogOptions,
   ref: string,
-): Promise<PredefinedWorkflowDocument | undefined> {
+): Promise<PredefinedWorkflowDetail | undefined> {
   if (!/^pwf_[a-f0-9]{32}$/.test(ref)) return undefined;
-  const catalog = await scanCatalog(options);
-  const entry = catalog.entries.find((candidate) => candidate.source.workflowRef === ref);
-  return entry ? { ...entry.document } : undefined;
+  const resolved = await resolvePredefinedWorkflow(options, ref);
+  if (!resolved) return undefined;
+  const topology = resolved.manifest.topology;
+  const terminalSources = new Set(
+    topology.nodes
+      .filter((node) => !topology.edges.some((edge) => edge.fromNodeId === node.nodeId))
+      .map((node) => node.nodeId),
+  );
+  return {
+    ...resolved.document,
+    inputs: topology.inputs.map((input) => ({
+      name: input.name,
+      kind: input.semanticKind,
+      entryNodeId: input.entryNodeId,
+      inputRef: input.inputRef,
+    })),
+    outputs: topology.outputs.map((output) => ({
+      name: output.name,
+      kind: output.semanticKind,
+      role: terminalSources.has(output.sourceNodeId) ? 'terminal' : 'checkpoint',
+    })),
+    nodes: topology.nodes.map((node) => ({
+      nodeKey: node.nodeId,
+      ...(node.title !== undefined ? { title: node.title } : {}),
+      kind: node.execution?.kind === 'script' ? 'script' : node.outcome?.kind === 'exit' ? 'exit' : 'agent',
+      decision: {
+        next: node.outcome?.next !== undefined,
+        prev: node.outcome?.prev !== undefined,
+        fail: node.outcome?.fail !== undefined,
+      },
+      ...((node.instructions?.kind === 'file' || node.execution?.kind === 'script')
+        ? {
+            assetRefs: [
+              ...(node.instructions?.kind === 'file' ? [node.instructions.file] : []),
+              ...(node.execution?.kind === 'script' ? [node.execution.file] : []),
+            ],
+          }
+        : {}),
+    })),
+    edges: topology.edges.map((edge) => ({
+      fromNodeKey: edge.fromNodeId,
+      toNodeKey: edge.toNodeId,
+      inputRef: edge.inputRef,
+    })),
+  };
 }
 
 function utf8Asset(
