@@ -98,9 +98,10 @@ An inline manifest uses the literal schema `muster.workflow/v2`:
 The manifest and every nested object are closed. Unknown fields fail validation. Public
 input `name` and output `name` are stable caller-facing interface names; input `to` and
 `inputRef`, output `from`, node `nodeKey`, and edge `from`/`to`/`inputRef` describe the
-semantic graph. Every input targets an entry node, every output names a terminal node,
-and every terminal is exported exactly once. Duplicate semantic names, duplicate
-consumer slots, cycles, fan-out, isolated nodes, and unexported terminals are rejected.
+semantic graph. Every input targets an entry node, every output names a source node
+(terminal or non-terminal checkpoint), and every node result is exported exactly once.
+Duplicate semantic names, duplicate consumer slots, cycles, fan-out, isolated nodes, and
+unexported nodes are rejected.
 
 Agent nodes contain `taskType`; execute nodes contain `script`; the forms are mutually
 exclusive. `title` is optional display metadata only and never becomes executable task
@@ -123,7 +124,7 @@ Stderr remains diagnostic-only; spawn, timeout, cancellation, integrity,
 missing-exit-status, and output-bound failures remain operational failures.
 
 For an agent outcome, the host renders only the bounded declared routes and
-authorizes each disposition against the live activation and frozen definition.
+authorizes each disposition against the live activation and immutable run authority.
 A strict missing route or an authenticated invalid route enters one durable
 activation-owned repair sequence. The original turn is attempt 1, at most two
 deterministic correction turns may follow, and attempt 3 exhausts with bounded
@@ -179,11 +180,13 @@ Each `start_workflow` input uses exactly one of these public named forms:
 { "name": "plan", "fromRun": "run-ref", "output": "verifiedPlan" }
 ```
 
-The host resolves each public input name through the frozen definition. A prior-run
+The host resolves each public input name through the immutable run authority. A prior-run
 binding retains both the source run and selected named output for authoritative atomic
 resolution. Internal entry-node coordinates, artifact fields, task/backend selection,
 and policy are not public start inputs. The run `goal` remains the task objective; node
-instructions augment that objective without replacing it.
+instructions augment that objective without replacing it. After acceptance, reusable
+definitions and packages are provenance only: reload, routing, recovery, inspection,
+completion, and failure reporting read the run-owned snapshot.
 
 ## 2. Removed protocol
 
@@ -226,7 +229,8 @@ with the response `runRef` and node name, that is the exact source execution acc
 continuation IDs, artifact coordinates, a generic task tree, topology, prompts, artifact
 bodies, paths, or secrets and must not be used as a polling loop.
 
-`start_workflow` returns a successful `accepted` result only after the run and a
+`start_workflow` returns a successful `accepted` result only after the run-owned authority,
+run, and a
 top-level `start_wait` continuation are durable. After that successful tool result is
 delivered, the host settles the current caller turn without asking the model to wait.
 The transcript shows `Workflow dispatched. Waiting for results...` for this technical
@@ -243,18 +247,10 @@ Coordinators must not poll `inspect_workflow_run` for normal completion. Invalid
 unauthorized starts return ordinary tool errors and do not suspend the caller. A live
 workflow activation cannot define or start another workflow; it may still delegate
 ordinary child tasks when its frozen task profile grants that capability.
-Task-facing projections hide inert task rows attached to, or descended from, pre-cutover
-child workflow runs without hiding ordinary delegated children or canonical top-level
-workflow tasks. The schema-7 cleanup boundary then purges obsolete `child_return` state:
-the retired activation, its bounded retry lineage, and only the child-owned continuation,
-return-gate, repair, claim, operation, transcript, and routed rows are removed in one
-SQLite transaction before terminal-run safety is evaluated. The ownership query is
-workspace-qualified and delimiter-safe; shared/unscoped operations, ordinary delegated
-tasks, canonical active workflow rows, cross-run pins, and the bounded `run_closure`
-record are preserved. A malformed or ambiguous lineage aborts the whole cleanup rather
-than broadening deletion. This is a narrow cleanup of already-open schema-7 stores, not
-a migration or a child-workflow execution/recovery path. The later schema-8 cutover is
-still reset-only.
+Task-facing projections expose only current schema-8 task and workflow state. A pre-cutover
+schema-7 store is rejected before repository access and is not migrated or inspected; the
+schema-8 bridge has no legacy `child_return` reader, purge fallback, or child-workflow
+execution/recovery path. Explicitly reset the store before using the current bridge.
 The terminal transaction seals tasks owned by the run to the matching lifecycle
 (`succeeded`, `failed`, or `cancelled`); the coordinator/caller task remains open.
 
@@ -322,8 +318,9 @@ planes.
   document. A refresh ref must already exist for the authenticated owner; an unknown
   ref cannot create a caller-named document. Mutation tools never accept internal
   routing coordinates.
-- Keep resolved workflow policy and task-type routing frozen in each immutable
-  definition so extension upgrades cannot reinterpret an existing revision.
+- Keep resolved workflow policy and task-type routing frozen in each immutable run-owned
+  authority snapshot so extension upgrades, definition edits, or package changes cannot
+  reinterpret an accepted run. Reusable definitions remain authoring products only.
 
 ## 8. Related documents
 

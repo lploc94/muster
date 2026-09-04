@@ -31,15 +31,15 @@ afterEach(() => {
 });
 
 describe('M024 S06 schema evidence baseline', () => {
-  it('uses reset-only schema v7 and refuses schema 6 without mutation', () => {
-    expect(SQLITE_SCHEMA_VERSION).toBe(7);
+  it('uses reset-only schema v8 and refuses schema 7 without mutation', () => {
+    expect(SQLITE_SCHEMA_VERSION).toBe(8);
 
     const dbPath = tempDbPath();
     const current = openStoreDatabase({ path: dbPath });
     current.close();
 
     const incompatible = new DatabaseSync(dbPath);
-    incompatible.exec('PRAGMA user_version = 6');
+    incompatible.exec('PRAGMA user_version = 7');
     const beforeObjects = incompatible
       .prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")
       .all();
@@ -50,7 +50,7 @@ describe('M024 S06 schema evidence baseline', () => {
     const beforeReset = new DatabaseSync(dbPath);
     try {
       expect(scalar(beforeReset, 'application_id')).toBe(MUSTER_APPLICATION_ID);
-      expect(scalar(beforeReset, 'user_version')).toBe(6);
+      expect(scalar(beforeReset, 'user_version')).toBe(7);
       expect(
         beforeReset
           .prepare("SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name")

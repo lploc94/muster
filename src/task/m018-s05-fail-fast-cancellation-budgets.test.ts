@@ -118,6 +118,7 @@ async function defineAndStartOneNode(
   createdAt: string,
   startKey: string,
   defId = 'wf-s05',
+  effectivePolicy?: WorkflowPolicyV1,
 ): Promise<OneNodeStart> {
   const def = await repository.execute({
     kind: 'defineWorkflowVersion',
@@ -139,6 +140,7 @@ async function defineAndStartOneNode(
     createdAt,
     goal: 's05 fail-fast goal',
     backend: 'grok',
+    ...(effectivePolicy ? { effectivePolicy } : {}),
   });
   expect(start.ok).toBe(true);
   return start.operation?.result?.data as OneNodeStart;
@@ -1329,11 +1331,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         '2026-07-22T13:00:00.000Z',
         'deadline-reload-start',
         'wf-deadline-reload',
-      );
-      await opened.client.run(
-        `UPDATE workflow_runs SET deadline_at = ?
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['2026-07-22T13:01:00.000Z', 'ws', data.runId],
+        { ...DEFAULT_WORKFLOW_POLICY, runTimeoutMs: 60_000 },
       );
       let adapterStarts = 0;
       engine = await TaskEngine.loadAsync({
@@ -1389,6 +1387,7 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         '2026-07-22T14:00:00.000Z',
         'activation-recovery-start',
         'wf-activation-recovery',
+        { ...DEFAULT_WORKFLOW_POLICY, runTimeoutMs: 5 * 60 * 1000 },
       );
       await promoteRunning(opened.client, data.activationTurnId, '2026-07-22T14:01:00.000Z');
       const task = await opened.repository.getTask(data.entryTaskId);
@@ -1500,11 +1499,6 @@ describe('M018 S05 fail-fast cancellation and budgets (named flow)', () => {
         ['ws', data.entryTaskId],
       )).resolves.toHaveLength(1);
 
-      await opened.client.run(
-        `UPDATE workflow_runs SET deadline_at = ?
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['2026-07-22T14:04:00.000Z', 'ws', data.runId],
-      );
       await reloaded.execute({
         kind: 'reapWorkflowTimeouts',
         workspaceId: 'ws',

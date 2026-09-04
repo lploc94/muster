@@ -23,11 +23,11 @@ import { normalizeSchemaSql } from './schema-fingerprint';
 
 const TRIGGER_NAME = 'trg_terminal_workflow_history_prune_before_turn_delete';
 
-/** Captured from the schema-7 decision-repair and cross-run artifact-pin predicate. */
-const PINNED_NORMALIZED_LENGTH = 3446;
+/** Captured from the schema-8 decision-repair and cross-run artifact-pin predicate. */
+const PINNED_NORMALIZED_LENGTH = 2676;
 const PINNED_NORMALIZED_SHA256 =
-  '2472b74e9cfc9698902cf5a052fcfc00ceb587b194d7c3c51499911c49237141';
-const PINNED_TRIGGER_COUNT = 160;
+  '59a3aa6720c8c16fd61f9cba4353fe80705f97f268440e34617b7a09e3d9f4eb';
+const PINNED_TRIGGER_COUNT = 182;
 
 function openCurrentSchema(): DatabaseSync {
   const db = new DatabaseSync(':memory:');
@@ -80,34 +80,32 @@ describe('terminalWorkflowRunSafetyPredicate', () => {
     expect(predicate).not.toContain('workflow_runs.run_id');
   });
 
-  it('emits all eight liveness and four cross-run artifact-pin guards', () => {
+  it('emits all five liveness and four cross-run artifact-pin guards', () => {
     const predicate = terminalWorkflowRunSafetyPredicate('run');
-    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(12);
+    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(9);
     for (const table of [
-      'workflow_runs child',
       'workflow_nodes node',
       'workflow_dependency_gates gate_row',
       'workflow_feedback_rounds round_row',
       'workflow_activations activation',
       'workflow_decision_repairs repair',
       'workflow_continuations continuation',
-      'workflow_return_gates return_gate',
       'workflow_gate_fills gate_fill',
       'workflow_nodes reused_node',
       'workflow_artifact_sources derived_source',
-      'workflow_return_gates return_gate_artifact',
     ]) {
       expect(predicate).toContain(table);
     }
+    expect(predicate).not.toContain('workflow_return_gates');
+    expect(predicate).not.toContain('parent_run_id');
   });
 
   it('keeps the full safety predicate for payload reclamation except open repair', () => {
     const predicate = terminalWorkflowPayloadReclamationSafetyPredicate('run');
-    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(11);
+    expect(predicate.match(/AND NOT EXISTS/g) ?? []).toHaveLength(8);
     expect(predicate).not.toContain('workflow_decision_repairs repair');
-    expect(predicate).toContain('workflow_runs child');
     expect(predicate).toContain('workflow_continuations continuation');
-    expect(predicate).toContain('workflow_return_gates return_gate');
+    expect(predicate).not.toContain('workflow_return_gates');
     for (const table of [
       'workflow_nodes node',
       'workflow_dependency_gates gate_row',

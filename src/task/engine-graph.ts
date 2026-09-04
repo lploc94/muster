@@ -2945,6 +2945,22 @@ export async function executeToolCommand(
     }
 
     case 'start_workflow': {
+      // Public start replay is source-independent.  Check the durable operation
+      // ledger before any caller liveness, definition, catalog, or input reads;
+      // only the static root/caller binding is safe to enforce first.
+      if (ctx.callerTaskId !== ctx.rootId) {
+        return { ok: false, error: 'start_workflow is not authorized for the current caller' };
+      }
+      const publicLedgerKey = opLedgerKey(ctx.turnId, command.opId);
+      const publicReplay = await deps.repository.getOperation(publicLedgerKey);
+      if (publicReplay) {
+        if (publicReplay.fingerprint !== fingerprint) {
+          return { ok: false, error: 'opId conflict: different arguments' };
+        }
+        return publicReplay.result.ok
+          ? { ok: true, result: publicReplay.result.data }
+          : { ok: false, error: publicReplay.result.error ?? 'start_workflow failed' };
+      }
       const authorization = await authorizeRootWorkflowMutation(deps, ctx, 'start_workflow');
       if (!authorization.ok) return authorization;
       const priorResolution = command.version === undefined

@@ -578,7 +578,6 @@ export interface WorkflowRunPolicyProjection {
   maxFeedbackRounds: number;
   maxTurnsPerTask: number;
   maxWorkflowTurns: number;
-  maxChildren: number;
   maxDepth: number;
   maxConcurrency: number;
   maxAggregateBytes: number;
@@ -632,8 +631,9 @@ export type WorkflowDecisionGateProjection = 'optional' | 'required';
  */
 export interface WorkflowTaskStatusProjection {
   runId: string;
-  definitionId: string;
-  definitionVersion: number;
+  authorityKind: 'definition' | 'composite';
+  definitionId?: string;
+  definitionVersion?: number;
   runStatus: string;
   policy: WorkflowRunPolicyProjection;
   startedAt?: string;
@@ -831,8 +831,9 @@ export interface WorkflowRunCompletionProjection {
  */
 export interface WorkflowRunInspectionProjection {
   runId: string;
-  definitionId: string;
-  definitionVersion: number;
+  authorityKind: 'definition' | 'composite';
+  definitionId?: string;
+  definitionVersion?: number;
   runStatus: string;
   policy: WorkflowRunPolicyProjection;
   startedAt?: string;

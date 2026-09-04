@@ -214,7 +214,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 - Commit: `feat(workflow): define semantic composite authority`
 
 ## Phase 4: Make Run-Owned Authority the Sole Execution Source
-- Status: pending
+- Status: complete
 - Depends on: Phase 3
 - Goal: Cut schema 8 so every run owns the complete immutable authority and bounded failure history it executes, while reusable definitions remain only reusable source products and nested-run storage is removed.
 - Current behavior: Schema 7 requires `(definition_id, definition_version)` on `workflow_runs`, stores `origin`, `parent_run_id`, child budgets, child continuation/return state, and reconstructs runtime topology from `workflow_definition_*` rows. `startWorkflowRun` materializes execution rows from a stored definition. Phase 2 makes the deterministic `run_closure` the retained canonical bounded failure detail, but schema 8 must preserve that event's semantic node identity after runtime authority moves away from definition rows and nested-run recursion disappears.
@@ -245,10 +245,10 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
   - Update all schema inventories, docs evidence, privacy lists, reset assertions, deletion/reclamation ownership, immutable guards, test fixtures, and repository command boundary lists.
   - Remove dead child-run schema and repository code rather than leaving schema-8 compatibility columns or dormant readers.
 - Acceptance criteria:
-  - [ ] AC-1: Fresh/reset stores contain exactly schema 8 run authority and no nested-run authority, while schema 7 fails closed without migration - proven by SQLite connection/reset/fingerprint/evidence tests.
-  - [ ] AC-2: Every ordinary start atomically snapshots complete authority, including mandatory agent FAIL outcomes, and all runtime/reload/decision-repair paths execute that snapshot only - proven by repository and `workflow-run-authority.test.ts`.
-  - [ ] AC-3: Corrupt run authority fails closed, while later definition/package changes cannot alter an accepted run - proven by differential corruption/reload tests.
-  - [ ] AC-4: Terminal reclamation removes only authorized payload content and preserves the one bounded code-matched semantic failure detail, result reuse, foreign keys, continuations, and idempotent replay until safe run deletion - proven by retention/reclamation tests.
+  - [x] AC-1: Fresh/reset stores contain exactly schema 8 run authority and no nested-run authority, while schema 7 fails closed without migration - proven by SQLite connection/reset/fingerprint/evidence tests.
+  - [x] AC-2: Every ordinary start atomically snapshots complete authority, including mandatory agent FAIL outcomes, and all runtime/reload/decision-repair paths execute that snapshot only - proven by repository and `workflow-run-authority.test.ts`.
+  - [x] AC-3: Corrupt run authority fails closed, while later definition/package changes cannot alter an accepted run - proven by differential corruption/reload tests.
+  - [x] AC-4: Terminal reclamation removes only authorized payload content and preserves the one bounded code-matched semantic failure detail, result reuse, foreign keys, continuations, and idempotent replay until safe run deletion - proven by retention/reclamation tests.
 - Focused verification:
   - `npx vitest run src/task/workflow-run-authority.test.ts src/task/repository.test.ts src/task/m018-s03-reload-redelivery.test.ts src/task/m018-s07-workflow-status-projection.test.ts src/task/m024-s04-workflow-graph-projection.test.ts src/task/workflow-metadata-reclamation.test.ts src/task/m024-s01-pinned-run-retention.test.ts src/task/sqlite/schema-fingerprint.test.ts src/task/sqlite/connection.test.ts src/task/sqlite/reset.test.ts src/task/sqlite/privacy-redaction.test.ts src/task/m024-s06-schema-evidence.test.ts`
 - Phase gates:
@@ -408,7 +408,7 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
  | 1 | complete | this phase commit | Focused 178/178; `npx tsc -p . --noEmit`; source boundary (34 checks) and repository boundary; 47 source-boundary fixtures; `git diff --check` | Plan review APPROVE; implementation review APPROVE (3 rounds, 2 fixes) |
  | 2 | complete | this phase commit | Focused Phase 2 suites: 17 files, 512 passed; `npx tsc -p . --noEmit`; `npm run compile`; source boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. The prescribed focused command's `repository.test.ts` retains one documented pre-existing `deleteTaskSubtree` constraint failure reproduced at baseline HEAD `9658d88`, outside Phase 2. | Codex implementation review APPROVE (9 rounds, session `codex-impl-review-20260903-006`); issues 16–22 fixed, with the baseline deletion defect disputed/deferred |
  | 3 | complete | this phase commit | Focused Phase 3 suites: 7 files, 182 passed; `npx tsc -p . --noEmit`; `npm run compile`; source-boundary (36 checks) and repository boundary; 48 source-boundary fixtures; `git diff --check`. | Codex implementation review APPROVE (3 rounds, session `codex-impl-review-20260903-007`); issues 1–5 fixed |
-| 4 | pending | N/A | pending | pending |
+ | 4 | complete | `refactor(workflow-storage): own execution authority per run` | Authority suite 20/20; focused Phase 4 suites 127/127; `npx tsc -p . --noEmit`; `npm run compile`; SQLite storage docs; source-boundary (36 checks) and 48 fixtures; `git diff --check` | Codex implementation review APPROVE (Round 7, session `codex-impl-review-20260904-003`; all findings fixed) |
 | 5 | pending | N/A | pending | pending |
 | 6 | pending | N/A | pending | pending |
 | 7 | pending | N/A | pending | pending |

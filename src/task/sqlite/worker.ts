@@ -131,8 +131,8 @@ class WorkflowTransactionDatabase implements RepositoryDatabase {
     }
     const results: RunResult[] = [];
     try {
-      for (const stmt of statements) {
-        results.push(runStatement(stmt.sql, stmt.params));
+        for (const stmt of statements) {
+          results.push(runStatement(stmt.sql, stmt.params));
         const shouldAbort =
           (options.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) ||
           (options.abortIfUnchangedAt?.includes(results.length - 1) && results.at(-1)?.changes === 0);
@@ -143,8 +143,8 @@ class WorkflowTransactionDatabase implements RepositoryDatabase {
         }
       }
       return results;
-    } catch (error) {
-      this.conn.exec('ROLLBACK');
+      } catch (error) {
+        this.conn.exec('ROLLBACK');
       this.transactionActive = false;
       throw error;
     }
@@ -478,10 +478,10 @@ async function handle(req: DbRequest): Promise<DbResponse> {
       // busy_timeout wait rather than mid-batch after partial work.
       conn.exec('BEGIN IMMEDIATE TRANSACTION');
       try {
-          const results: RunResult[] = [];
-          for (const stmt of req.statements) {
-            const result = runStatement(stmt.sql, stmt.params);
-            results.push(result);
+        const results: RunResult[] = [];
+        for (const stmt of req.statements) {
+          const result = runStatement(stmt.sql, stmt.params);
+          results.push(result);
           const shouldAbort =
             (req.abortIfFirstUnchanged && results.length === 1 && results[0]?.changes === 0) ||
             (req.abortIfUnchangedAt?.includes(results.length - 1) && results.at(-1)?.changes === 0);

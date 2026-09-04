@@ -793,6 +793,30 @@ Physical gates, fills, feedback rounds, continuations, tasks, turns, messages,
 artifacts, revisions, decision-repair records, and idempotency fences remain
 run-time repository records.
 
+### 16.1 Run-owned execution authority
+
+The reusable definition is a source product, not a live runtime dependency. At an
+ordinary start, the repository copies the complete validated definition and effective
+policy into one immutable run snapshot in the same transaction as the operation claim,
+run, gates, inputs, tasks, turns, activations, and `start_wait` continuation. A composite
+copies its flattened authority and ordered component provenance into the same run-owned
+shape and never creates a definition row.
+
+Schema 8 stores that snapshot in ordered `workflow_run_components`,
+`workflow_run_input_contracts`, `workflow_run_output_contracts`,
+`workflow_run_node_specs`, and `workflow_run_edges` rows beneath `workflow_runs`. The run
+stores `authority_kind` and `authority_fingerprint`; an ordinary run may retain a paired
+source definition id/version only as provenance, and a composite has no source definition.
+`workflow_definition_outputs` uses the semantic `source_node_id` name in the clean schema.
+
+After start, prompt compilation, disposition authorization, routing, decision repair,
+status/graph/inspection, reload, recovery, completion, and retention read only the
+run-owned snapshot. They fail closed on missing, malformed, or fingerprint-mismatched
+authority and never fall back to a mutable package or reusable definition. Executable
+instruction content may receive one explicit terminal retention marker; semantic
+interfaces, topology, provenance, fingerprints, policy, and the bounded `run_closure`
+failure envelope remain intact until safe run deletion.
+
 ## 17. UI Semantics
 
 Normal correction is not workflow failure.
@@ -824,6 +848,10 @@ receive prompt bodies or host paths.
 - Legacy Markdown catalog entries remain available until explicitly migrated.
 - Existing durable NEXT/PREV/FAIL settlement and feedback-round semantics remain
   unchanged.
+- SQLite schema 8 is a reset-only clean break. Schema 7 and earlier stores are rejected
+  with reset guidance; there is no migration, dual-schema reader, or compatibility
+  fallback. Obsolete nested-run and `child_return` structures are not part of current
+  history or execution authority.
 
 ## 19. Implementation Workstreams
 
@@ -879,7 +907,10 @@ gate fill from the selected terminal artifact rather than the legacy aggregate.
 - PREV is reserved for an actual decision that direct producer work needs revision.
 - No separate workflow runtime is introduced.
 - Workflow orchestration is root-only; workflow activations cannot invoke another
-  workflow or create a child workflow run.
+   workflow or create a child workflow run.
+- Every ordinary or composite run executes only its immutable run-owned authority;
+  reusable definitions and package files are source/provenance inputs to start, never
+  post-start execution readers.
 
 ## References
 

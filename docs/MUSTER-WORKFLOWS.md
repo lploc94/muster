@@ -151,9 +151,12 @@ loader returns a complete frozen definition but never writes or executes it.
 
 ## 6. Runtime semantics
 
-Frozen instruction bytes are persisted as node task content. Normal entry,
-dependency, child, retry, and reload paths use those bytes and never reread a
-mutable prompt file.
+Frozen instruction bytes are persisted as node task content and snapshotted into
+run-owned authority at start. Normal entry, dependency, retry, recovery, and reload
+paths use the run snapshot and never reread a mutable prompt file, package, or reusable
+definition as live execution authority. Reusable definitions remain source products and
+provenance only; a run-scoped composite stores its flattened authority under its own run
+without creating a definition row.
 
 Workflow start fingerprints canonically order public binding names by their
 UTF-8 bytes. Replay identity is therefore independent of the host locale and
@@ -283,7 +286,9 @@ authoritative for the displayed state and progress counts.
 | Typed ACP `refusal` without a winning disposition | Immediate `agent_fail` with `backend_refusal`; no generic fallback |
 
 Recovery is explicit: fix the package, reload the catalog, obtain the new opaque
-reference, and define a new immutable workflow version.
+reference, and define a new immutable workflow version. A missing or corrupt run-owned
+authority is a fail-closed integrity error; runtime never falls back to the source
+definition or mutable package.
 
 ## 9. Acceptance contract
 
@@ -294,7 +299,10 @@ reference, and define a new immutable workflow version.
 - Saved define accepts only the opaque package reference.
 - Every referenced instruction and script is bounded, contained, integrity
   checked, and frozen before persistence.
-- Runtime prompt content comes only from persisted frozen bytes.
+- Runtime prompt content comes only from persisted run-owned frozen bytes after start.
+- Every run owns an immutable authority snapshot (including semantic interfaces,
+  topology, outcomes, policy, component provenance, and fingerprints); source
+  definitions are never consulted as runtime authority after the start transaction.
 - Runtime script resolution remains package-root-relative with workspace cwd.
 - Agent outcomes are explicit with mandatory NEXT/FAIL, and `workflow_fail` has a
   required bounded reason. Missing/invalid outcomes use activation-owned repair,

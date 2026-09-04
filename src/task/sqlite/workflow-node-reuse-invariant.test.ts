@@ -21,13 +21,29 @@ function openFixture(): DatabaseSync {
     ) VALUES ('ws', 'wf', 1, 'node', 0);
     INSERT INTO workflow_definition_outputs (
       workspace_id, definition_id, definition_version, name, semantic_kind,
-      terminal_node_id, ordinal, expected_artifact_kind
+      source_node_id, ordinal, expected_artifact_kind
     ) VALUES ('ws', 'wf', 1, 'result', 'result', 'node', 0, 'next_result');
     INSERT INTO workflow_runs (
-      workspace_id, run_id, definition_id, definition_version, status, origin, created_at, updated_at
+      workspace_id, run_id, authority_kind, authority_fingerprint, authority_name,
+      authority_scope_kind, source_definition_id, source_definition_version,
+      status, policy_json, created_at, updated_at
     ) VALUES
-      ('ws', 'run', 'wf', 1, 'running', 'top_level', 'now', 'now'),
-      ('ws', 'source-run', 'wf', 1, 'succeeded', 'top_level', 'now', 'now');
+      ('ws', 'run', 'definition', '${'a'.repeat(64)}', 'wf', 'workspace', 'wf', 1,
+       'running', '{"failWorkflow":true}', 'now', 'now'),
+      ('ws', 'source-run', 'definition', '${'b'.repeat(64)}', 'wf', 'workspace', 'wf', 1,
+       'succeeded', '{"failWorkflow":true}', 'now', 'now');
+    INSERT INTO workflow_run_components (
+      workspace_id, run_id, component_key, ordinal, source_kind, workflow_ref,
+      source_definition_id, source_definition_version, source_fingerprint, component_fingerprint
+    ) VALUES
+      ('ws', 'run', 'definition', 0, 'workflow', 'wf@1', 'wf', 1, '${'c'.repeat(64)}', '${'a'.repeat(64)}'),
+      ('ws', 'source-run', 'definition', 0, 'workflow', 'wf@1', 'wf', 1, '${'c'.repeat(64)}', '${'b'.repeat(64)}');
+    INSERT INTO workflow_run_node_specs (
+      workspace_id, run_id, node_id, ordinal, component_key, local_node_key,
+      outcome_kind, outcome_json
+    ) VALUES
+      ('ws', 'run', 'node', 0, 'definition', 'node', 'agent', '{"kind":"agent","requireExplicitDisposition":true,"next":{"when":"next"},"fail":{"when":"fail"}}'),
+      ('ws', 'source-run', 'source', 0, 'definition', 'node', 'agent', '{"kind":"agent","requireExplicitDisposition":true,"next":{"when":"next"},"fail":{"when":"fail"}}');
     INSERT INTO tasks (
       id, workspace_id, parent_id, role, lifecycle, release_state, goal, backend, model,
       revision, created_at, updated_at, payload_json

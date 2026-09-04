@@ -18,16 +18,16 @@ describe('M024 pinned terminal workflow run retention', () => {
     expect(predicate).toContain('reused_node.source_run_id = run.run_id');
     expect(predicate).toContain('reused_node.run_id <> run.run_id');
 
-    expect(predicate).toContain('FROM workflow_return_gates return_gate_artifact');
-    expect(predicate).toContain('return_gate_artifact.workspace_id = run.workspace_id');
-    expect(predicate).toContain('return_gate_artifact.result_run_id = run.run_id');
-    expect(predicate).toContain('return_gate_artifact.continuation_run_id <> run.run_id');
+    // Schema 8 removes nested-run return gates. Cross-run pins are represented
+    // only by the run-owned gate-fill, reused-node, and artifact-source rows.
+    expect(predicate).not.toContain('workflow_return_gates');
+    expect(predicate).not.toContain('parent_run_id');
+    expect(predicate).toContain('FROM workflow_artifact_sources derived_source');
   });
 
   it('retains the pinned-run predicate in the current schema version', () => {
-    // v5 introduced immutable workflow-node reuse provenance; v6 adds global
-    // preference/verification tables; v7 adds canonical workflow authority and
-    // decision repair without changing this pinned predicate.
-    expect(SQLITE_SCHEMA_VERSION).toBe(7);
+    // Schema 8 adds immutable run-owned execution authority and removes nested
+    // workflow return-gate state without weakening cross-run pin protection.
+    expect(SQLITE_SCHEMA_VERSION).toBe(8);
   });
 });

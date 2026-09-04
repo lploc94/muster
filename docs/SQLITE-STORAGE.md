@@ -101,7 +101,7 @@ Command Palette: **Muster: Developer Reset Global Database**
   successful reset hard-quiesce and offer **Reload Window** — they must not keep writing a stale
   projection.
 - **Never automatic:** activation, open, or write failures do **not** auto-reset the database.
-- **Schema v7:** the store is **reset-only**. Any incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
+- **Schema v8:** the store is **reset-only**. Any incompatible Muster-owned schema is rejected rather than migrated in place. Back up first if the history matters, then use **Developer Reset Global Database** to create the current empty schema. This can erase task and chat history; it is not a data-preserving upgrade.
 
 ---
 
@@ -196,28 +196,43 @@ actions stay available.
 
 ---
 
-## 8. Schema v7 and reset-only notes
+## 8. Schema v8 and reset-only notes
 
-- Current owned schema is **v7**. Muster has no in-place migration framework: opening an owned store
+- Current owned schema is **v8**. Muster has no in-place migration framework: opening an owned store
   with any incompatible version fails closed with reset guidance and never rewrites user data.
-- Schema v7 persists each canonical workflow definition through ordered input, output, node, and edge
-  authority rows. Node authority includes display title, frozen instruction kind/reference/content/
-  digest, normalized outcome, resolved task routing, and script execution provenance. Reload
-  reconstructs and validates this authority against the canonical definition fingerprint before use.
-- Dispatch revalidates the owning canonical authority before claiming a queued activation. Entry,
-  dependency, feedback, retry, activation-recovery, and fresh-session reconstruction
-  paths retain the same persisted frozen instruction body instead of rereading package files.
+- Reusable workflow definitions remain ordered source products. A started run snapshots its complete
+  executable authority into the run-owned tables `workflow_run_components`,
+  `workflow_run_input_contracts`, `workflow_run_output_contracts`, `workflow_run_node_specs`, and
+  `workflow_run_edges`. `workflow_runs.authority_kind` is `definition` or `composite`; ordinary runs
+  retain a nullable source definition id/version only as provenance, while composite runs have none.
+- Run authority includes semantic component/local keys, public input/output contracts, topology,
+  display metadata, frozen instruction bytes/digests, task routing, script provenance, mandatory
+  NEXT/PREV/FAIL outcomes, effective policy, and an authority fingerprint. These rows are keyed by
+  `(workspace_id, run_id)` and are immutable except for the explicit terminal retention marker.
+- The ordinary start snapshot, operation claim, gates, artifacts, tasks, messages, turns, activations,
+  continuation, and initial fills are one transaction. After that commit, prompt compilation,
+  disposition authorization, decision repair, routing, inspection, reload, recovery, completion,
+  and reclamation read run authority—not mutable definition/package rows.
+- `workflow_definition_outputs.source_node_id` is the clean-schema semantic source column; output
+  contracts may identify terminal results or nonterminal checkpoints. Definition tables are never
+  populated for a run-scoped composite.
+- Reload re-decodes the run-owned rows and compares their canonical authority fingerprint. Missing,
+  malformed, mismatched, or live-run retention-marked authority fails closed; it never falls back to
+  a reusable definition or mutable package.
 - Manual and safe automatic retries remain owned by the same workflow activation: the retry insert,
   per-run workflow-turn reservation, and activation `execution_turn_id` rebind commit atomically.
-  Corrupt canonical authority, stale activation ownership, or exhausted turn budgets deny the retry.
+  Corrupt run authority, stale activation ownership, or exhausted turn budgets deny the retry.
   An original-input manual retry may coexist with queued follow-ups already marked held; live or
   non-held queued turns still block retry allocation.
-- Before any repository-owned turn deletion—direct, queued-turn/message cleanup, graph/task
-  deletion, or terminal reclamation—the same SQLite transaction prepares and applies the narrow
-  schema-7 `child_return` purge. The purge runs before the terminal-history turn-delete trigger
-  can evaluate its run guard, and a stale/hidden non-legacy target remains fail-closed rather than
-  being made visible by cleanup. A failed ownership, lineage, or foreign-key check rolls back the
-  purge and the requested deletion together.
+- Schema 8 contains no nested-run authority, `child_return` activation/continuation/return-gate
+  state, parent/child run linkage, or child-only indexes/triggers. A readable pre-cutover schema-7
+  file is not migrated: it fails closed and must be explicitly reset. The schema-8 process has no
+  legacy-state reader or purge fallback; it never reconstructs, resumes, routes, or exposes a child
+  run from superseded storage.
+- Terminal reclamation strips only authorized executable and ordinary routed transport payloads.
+  The single bounded, code-matched `run_closure` body remains owned by its run until safe run
+  deletion, preserving semantic node/component identity and the bounded failure report. A failed
+  ownership, fingerprint, lineage, or foreign-key check rolls back the requested deletion together.
 - Workflow starts accept only complete public input-name bindings. SQLite resolves each destination
   name from the frozen definition while claiming the start; callers never supply entry coordinates.
   A prior-run binding keeps `(fromRun, outputName)` as authority and selects that frozen output's
@@ -231,21 +246,7 @@ actions stay available.
   matching live caller turn, and no workflow activation of any origin. A stale or forged caller is
   rejected before replay or persistence and leaves no operation, definition, run, gate, artifact,
   task, turn, or continuation row to clean up.
-- Pre-cutover child-workflow rows may still exist physically in a schema-v7 store, but no production
-  writer, scheduler, recovery path, or execution reader consumes them. Task-facing list and snapshot
-  queries suppress tasks attached to those runs while preserving ordinary delegated children and
-  canonical top-level workflow tasks. At the cleanup/terminalization boundary, a narrow
-  workspace-qualified purge removes obsolete `child_return` activation/retry-lineage state and
-  its child-only durable dependents in one transaction before the terminal-run guard; it is
-  idempotent, FK-ordered, and rolls back on ambiguous ownership or failure. Each artifact-source,
-  routed-message, and start-claim candidate must match the retired activation's complete
-  workspace/run/turn/message identity; a source turn or task ID by itself never authorizes a
-  delete, and a forward retry edge at the configured depth boundary fails closed before any
-  mutation. Shared/unscoped operations, ordinary tasks, active canonical rows, cross-run pins,
-  and the bounded `run_closure`
-  record are not removed. This is not a schema migration or nested recovery path. The reset-only
-  schema cutover removes the obsolete structure.
-- Schema v7 owns one activation-scoped `workflow_decision_repairs` row for bounded agent outcome
+- Schema v8 owns one activation-scoped `workflow_decision_repairs` row for bounded agent outcome
   repair. An authenticated invalid route attempt records only a closed error code before any
   disposition claim; a later valid claim remains authoritative. Every accepted agent node requires
   an explicit disposition, so a text-only completion never becomes final-message NEXT. Missing
@@ -267,7 +268,7 @@ actions stay available.
   truncation state, and the decision attempt when applicable. The detail survives completion,
   root-continuation delivery, reload, and safe reclamation; malformed/private/raw values are never
   projected.
-- Schema v6 and every earlier marker are rejected rather than interpreted as canonical workflow
+- Schema v7 and every earlier marker are rejected rather than interpreted as canonical workflow
   authority. There is no `ALTER TABLE`, row reinterpretation, compatibility decoder, or automatic
   migration path. An already-open stale writer fails closed with terminal `schema_changed` and must
   reload.

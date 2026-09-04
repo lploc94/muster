@@ -1203,7 +1203,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 30_000);
 
-  it('denies manual and automatic workflow retries when canonical authority is corrupt', async () => {
+  it('denies manual and automatic workflow retries when run authority is corrupt', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-workflow-retry-corrupt-'));
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
     try {
@@ -1228,6 +1228,7 @@ describe('SqliteTaskRepository', () => {
       )).resolves.toMatchObject({ ok: true, changed: true });
 
       await client.run('DROP TRIGGER trg_workflow_definition_outputs_immutable_update');
+      await client.run('DROP TRIGGER trg_workflow_run_outputs_immutable_update');
       for (const fixture of [automatic, manual]) {
         await client.run(
           `UPDATE workflow_definition_outputs SET semantic_kind = ?
@@ -1235,6 +1236,11 @@ describe('SqliteTaskRepository', () => {
           [`corrupt.${fixture.definitionId}`, 'ws', fixture.definitionId],
         );
         await expect(repository.getWorkflowDefinition(fixture.definitionId, 1)).resolves.toBeUndefined();
+        await client.run(
+          `UPDATE workflow_run_output_contracts SET semantic_kind = ?
+            WHERE workspace_id = ? AND run_id = ?`,
+          [`corrupt.${fixture.runId}`, 'ws', fixture.runId],
+        );
       }
 
       const automaticSource = await repository.getTurn(automatic.activationTurnId);
@@ -2847,15 +2853,15 @@ describe('SqliteTaskRepository', () => {
         },
       ]);
       await expect(client.all(
-        `SELECT name, semantic_kind, terminal_node_id, ordinal, expected_artifact_kind
+         `SELECT name, semantic_kind, source_node_id, ordinal, expected_artifact_kind
            FROM workflow_definition_outputs
           WHERE workspace_id = ? AND definition_id = ? ORDER BY ordinal`,
         ['ws', fixture.definitionId],
       )).resolves.toEqual([
-         { name: 'rightSourceResult', semantic_kind: 'checkpoint.right', terminal_node_id: 'right', ordinal: 0, expected_artifact_kind: 'next_result' },
-         { name: 'leftSourceResult', semantic_kind: 'checkpoint.left', terminal_node_id: 'left', ordinal: 1, expected_artifact_kind: 'next_result' },
-         { name: 'publishedResult', semantic_kind: 'result.published', terminal_node_id: 'publish', ordinal: 2, expected_artifact_kind: 'next_result' },
-         { name: 'checkedResult', semantic_kind: 'result.checked', terminal_node_id: 'check', ordinal: 3, expected_artifact_kind: 'next_result' },
+         { name: 'rightSourceResult', semantic_kind: 'checkpoint.right', source_node_id: 'right', ordinal: 0, expected_artifact_kind: 'next_result' },
+         { name: 'leftSourceResult', semantic_kind: 'checkpoint.left', source_node_id: 'left', ordinal: 1, expected_artifact_kind: 'next_result' },
+         { name: 'publishedResult', semantic_kind: 'result.published', source_node_id: 'publish', ordinal: 2, expected_artifact_kind: 'next_result' },
+         { name: 'checkedResult', semantic_kind: 'result.checked', source_node_id: 'check', ordinal: 3, expected_artifact_kind: 'next_result' },
        ]);
       await expect(client.all(
         `SELECT node_id, ordinal, title, instructions_kind, instructions_file,
@@ -3357,7 +3363,7 @@ describe('SqliteTaskRepository', () => {
     }
   }, 20_000);
 
-  it('denies a queued activation claim when its definition is corrupted after start and reopen', async () => {
+  it('denies a queued activation claim when run authority is corrupted after start and reopen', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'muster-repository-active-corruption-'));
     const dbPath = path.join(dir, 'muster.sqlite3');
     const client = new DbClient({ workerPath: path.join(__dirname, 'sqlite', 'worker.ts'), execArgv: ['--import', 'tsx'] });
@@ -3396,13 +3402,13 @@ describe('SqliteTaskRepository', () => {
       });
       await reloadedClient.open(dbPath);
       const reloadedRepository = new SqliteTaskRepository(reloadedClient, 'ws');
-      await reloadedClient.run('DROP TRIGGER trg_workflow_definition_outputs_immutable_update');
+      await reloadedClient.run('DROP TRIGGER trg_workflow_run_outputs_immutable_update');
       await reloadedClient.run(
-        `UPDATE workflow_definition_outputs SET semantic_kind = 'corrupt.active.output'
-          WHERE workspace_id = ? AND definition_id = ? AND ordinal = 0`,
-        ['ws', definitionId],
+        `UPDATE workflow_run_output_contracts SET semantic_kind = 'corrupt.active.output'
+          WHERE workspace_id = ? AND run_id = ? AND ordinal = 0`,
+        ['ws', (started.operation?.result?.data as { runId: string }).runId],
       );
-      await expect(reloadedRepository.getWorkflowDefinition(definitionId, 1)).resolves.toBeUndefined();
+      await expect(reloadedRepository.getWorkflowDefinition(definitionId, 1)).resolves.toBeDefined();
       const corruptedTask = await reloadedRepository.getTask(data.entryTaskId);
       const corruptedTurn = await reloadedRepository.getTurn(data.activationTurnId);
       await expect(reloadedRepository.execute({

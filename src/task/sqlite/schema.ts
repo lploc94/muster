@@ -14,7 +14,7 @@
 export const MUSTER_APPLICATION_ID = 0x4d555354; // 'MUST'
 
 /** Clean-break development schema marker. Older stores require an explicit reset. */
-export const SQLITE_SCHEMA_VERSION = 7 as const;
+export const SQLITE_SCHEMA_VERSION = 8 as const;
 
 /**
  * Core task-store tables.
@@ -67,10 +67,14 @@ const REQUIRED_WORKFLOW_AUTHORITY_TABLES = [
   'workflow_definition_outputs',
   'workflow_definition_nodes',
   'workflow_definition_edges',
+  'workflow_run_components',
+  'workflow_run_input_contracts',
+  'workflow_run_output_contracts',
+  'workflow_run_node_specs',
+  'workflow_run_edges',
   'workflow_start_claims',
   'workflow_activations',
   'workflow_decision_repairs',
-  'workflow_return_gates',
   'workflow_artifact_sources',
   'session_owners',
   'task_session_bindings',
@@ -480,11 +484,16 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
   `CREATE TABLE IF NOT EXISTS workflow_runs (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
     run_id TEXT NOT NULL,
-    definition_id TEXT NOT NULL,
-    definition_version INTEGER NOT NULL,
+    authority_kind TEXT NOT NULL CHECK (authority_kind IN ('definition', 'composite')),
+    authority_fingerprint TEXT NOT NULL
+      CHECK (length(authority_fingerprint) = 64 AND authority_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    authority_name TEXT NOT NULL,
+    authority_description TEXT,
+    authority_scope_kind TEXT NOT NULL CHECK (authority_scope_kind IN ('workspace', 'root')),
+    authority_scope_root_task_id TEXT,
+    source_definition_id TEXT,
+    source_definition_version INTEGER,
     status TEXT NOT NULL,
-    origin TEXT NOT NULL,
-    parent_run_id TEXT,
     owner_root_task_id TEXT,
     caller_task_id TEXT,
     caller_turn_id TEXT,
@@ -494,14 +503,13 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     max_feedback_rounds INTEGER NOT NULL DEFAULT 8 CHECK (max_feedback_rounds BETWEEN 1 AND 32),
     max_turns_per_task INTEGER NOT NULL DEFAULT 50 CHECK (max_turns_per_task BETWEEN 1 AND 500),
     max_workflow_turns INTEGER NOT NULL DEFAULT 64 CHECK (max_workflow_turns BETWEEN 1 AND 256),
-    max_children INTEGER NOT NULL DEFAULT 64 CHECK (max_children BETWEEN 1 AND 64),
+    max_task_count INTEGER NOT NULL DEFAULT 64 CHECK (max_task_count BETWEEN 1 AND 64),
     max_depth INTEGER NOT NULL DEFAULT 8 CHECK (max_depth BETWEEN 1 AND 8),
     max_concurrency INTEGER NOT NULL DEFAULT 20 CHECK (max_concurrency BETWEEN 1 AND 64),
     max_aggregate_bytes INTEGER NOT NULL DEFAULT 1048576
       CHECK (max_aggregate_bytes BETWEEN 1 AND 1048576),
     feedback_rounds_reserved INTEGER NOT NULL DEFAULT 0 CHECK (feedback_rounds_reserved >= 0),
     workflow_turns_reserved INTEGER NOT NULL DEFAULT 0 CHECK (workflow_turns_reserved >= 0),
-    children_reserved INTEGER NOT NULL DEFAULT 0 CHECK (children_reserved >= 0),
     started_at TEXT,
     deadline_at TEXT,
     terminal_reason_code TEXT,
@@ -512,16 +520,16 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (workspace_id, run_id),
+    CHECK ((authority_kind = 'definition') = (source_definition_id IS NOT NULL)),
+    CHECK ((source_definition_id IS NULL) = (source_definition_version IS NULL)),
+    CHECK (source_definition_version IS NULL OR source_definition_version >= 1),
+    CHECK ((authority_scope_kind = 'root') = (authority_scope_root_task_id IS NOT NULL)),
     CHECK ((owner_root_task_id IS NULL) = (caller_task_id IS NULL)),
     CHECK ((caller_task_id IS NULL) = (caller_turn_id IS NULL)),
     CHECK (
       (terminal_result_run_id IS NULL AND terminal_result_artifact_id IS NULL AND terminal_result_artifact_revision IS NULL)
       OR (terminal_result_run_id IS NOT NULL AND terminal_result_artifact_id IS NOT NULL AND terminal_result_artifact_revision IS NOT NULL)
-    ),
-    FOREIGN KEY (workspace_id, definition_id, definition_version)
-      REFERENCES workflow_definitions(workspace_id, definition_id, version),
-    FOREIGN KEY (workspace_id, parent_run_id)
-      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE RESTRICT
+    )
   )`,
 
   /**
@@ -705,11 +713,7 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     invocation_fingerprint TEXT,
     caller_task_id TEXT,
     caller_turn_id TEXT,
-    caller_run_id TEXT,
-    caller_node_id TEXT,
-    child_run_id TEXT,
-    return_gate_id TEXT,
-    kind TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind = 'start_wait'),
     status TEXT NOT NULL,
     outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded', 'failed', 'cancelled')),
     reason_code TEXT,
@@ -723,13 +727,11 @@ const WORKFLOW_SCHEMA_STATEMENTS: readonly string[] = [
     updated_at TEXT,
     PRIMARY KEY (workspace_id, run_id, continuation_id),
     FOREIGN KEY (workspace_id, run_id)
-      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, child_run_id)
       REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
   )`,
 
-  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_definition
-     ON workflow_runs(workspace_id, definition_id, definition_version)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_source_definition
+     ON workflow_runs(workspace_id, source_definition_id, source_definition_version)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_runs_status
      ON workflow_runs(workspace_id, status, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_nodes_task
@@ -842,13 +844,13 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     definition_version INTEGER NOT NULL,
     name TEXT NOT NULL,
     semantic_kind TEXT NOT NULL,
-    terminal_node_id TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
     expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'next_result'),
     PRIMARY KEY (workspace_id, definition_id, definition_version, name),
-    UNIQUE (workspace_id, definition_id, definition_version, terminal_node_id),
+    UNIQUE (workspace_id, definition_id, definition_version, source_node_id),
     UNIQUE (workspace_id, definition_id, definition_version, ordinal),
-    FOREIGN KEY (workspace_id, definition_id, definition_version, terminal_node_id)
+    FOREIGN KEY (workspace_id, definition_id, definition_version, source_node_id)
       REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
       ON DELETE CASCADE
   )`,
@@ -872,6 +874,148 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
       REFERENCES workflow_definition_nodes(workspace_id, definition_id, definition_version, node_id)
       ON DELETE CASCADE
   )`,
+
+  /**
+   * Immutable execution authority.  These rows are deliberately separate from
+   * reusable definition rows: a run may outlive, or be independent of, the
+   * definition/package that supplied it.
+   */
+  `CREATE TABLE IF NOT EXISTS workflow_run_components (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    component_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    source_kind TEXT NOT NULL CHECK (source_kind IN ('workflow', 'inline')),
+    workflow_ref TEXT,
+    source_definition_id TEXT,
+    source_definition_version INTEGER,
+    source_fingerprint TEXT,
+    component_fingerprint TEXT NOT NULL
+      CHECK (length(component_fingerprint) = 64 AND component_fingerprint NOT GLOB '*[^0-9a-f]*'),
+    PRIMARY KEY (workspace_id, run_id, component_key),
+    UNIQUE (workspace_id, run_id, ordinal),
+    CHECK ((source_definition_id IS NULL) = (source_definition_version IS NULL)),
+    CHECK (source_definition_version IS NULL OR source_definition_version >= 1),
+    CHECK (
+      (source_kind = 'workflow' AND workflow_ref IS NOT NULL
+       AND source_definition_id IS NOT NULL AND source_fingerprint IS NOT NULL
+       AND length(source_fingerprint) = 64 AND source_fingerprint NOT GLOB '*[^0-9a-f]*')
+      OR (source_kind = 'inline' AND workflow_ref IS NULL
+          AND source_definition_id IS NULL AND source_fingerprint IS NULL)
+    ),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_run_input_contracts (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    semantic_kind TEXT NOT NULL,
+    entry_node_id TEXT NOT NULL,
+    input_ref TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'workflow_input'),
+    component_key TEXT NOT NULL,
+    local_input_name TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, name),
+    UNIQUE (workspace_id, run_id, entry_node_id, input_ref),
+    UNIQUE (workspace_id, run_id, ordinal),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, run_id, component_key)
+      REFERENCES workflow_run_components(workspace_id, run_id, component_key) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_run_output_contracts (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    semantic_kind TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'next_result'),
+    component_key TEXT NOT NULL,
+    local_output_name TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, name),
+    UNIQUE (workspace_id, run_id, source_node_id),
+    UNIQUE (workspace_id, run_id, ordinal),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, run_id, component_key)
+      REFERENCES workflow_run_components(workspace_id, run_id, component_key) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_run_node_specs (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    component_key TEXT NOT NULL,
+    local_node_key TEXT NOT NULL,
+    title TEXT,
+    instructions_kind TEXT CHECK (instructions_kind IS NULL OR instructions_kind IN ('inline', 'file')),
+    instructions_file TEXT,
+    instructions_content TEXT,
+    instructions_sha256 TEXT,
+    instructions_retained INTEGER NOT NULL DEFAULT 0 CHECK (instructions_retained IN (0, 1)),
+    role TEXT,
+    task_type TEXT,
+    backend TEXT,
+    model TEXT,
+    capabilities_json TEXT CHECK (capabilities_json IS NULL OR json_valid(capabilities_json) = 1),
+    execution_kind TEXT CHECK (execution_kind IS NULL OR execution_kind = 'script'),
+    script_interpreter TEXT CHECK (script_interpreter IS NULL OR script_interpreter IN ('node', 'python', 'python3')),
+    script_file TEXT,
+    script_args_json TEXT CHECK (script_args_json IS NULL OR json_valid(script_args_json) = 1),
+    script_source_kind TEXT CHECK (script_source_kind IS NULL OR script_source_kind = 'predefined'),
+    script_source_scope TEXT CHECK (script_source_scope IS NULL OR script_source_scope IN ('workspace', 'global')),
+    script_package_kind TEXT CHECK (script_package_kind IS NULL OR script_package_kind = 'bundle'),
+    script_catalog_root_kind TEXT CHECK (script_catalog_root_kind IS NULL OR script_catalog_root_kind IN ('canonical', 'custom')),
+    script_package_path TEXT,
+    script_entry_file TEXT,
+    script_workflow_ref TEXT,
+    script_package_sha256 TEXT,
+    script_sha256 TEXT,
+    outcome_kind TEXT NOT NULL CHECK (outcome_kind IN ('agent', 'exit')),
+    outcome_json TEXT NOT NULL CHECK (json_valid(outcome_json) = 1),
+    PRIMARY KEY (workspace_id, run_id, node_id),
+    UNIQUE (workspace_id, run_id, ordinal),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
+    FOREIGN KEY (workspace_id, run_id, component_key)
+      REFERENCES workflow_run_components(workspace_id, run_id, component_key) ON DELETE CASCADE
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS workflow_run_edges (
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL,
+    source_node_id TEXT NOT NULL,
+    destination_node_id TEXT NOT NULL,
+    destination_input_ref TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    expected_artifact_kind TEXT NOT NULL CHECK (expected_artifact_kind = 'next_result'),
+    source_component_key TEXT NOT NULL,
+    source_local_node_key TEXT NOT NULL,
+    destination_component_key TEXT NOT NULL,
+    destination_local_node_key TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, run_id, source_node_id),
+    UNIQUE (workspace_id, run_id, destination_node_id, destination_input_ref),
+    UNIQUE (workspace_id, run_id, ordinal),
+    FOREIGN KEY (workspace_id, run_id)
+      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE
+  )`,
+
+  `CREATE INDEX IF NOT EXISTS idx_workflow_run_components_ordinal
+     ON workflow_run_components(workspace_id, run_id, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_run_inputs_ordinal
+     ON workflow_run_input_contracts(workspace_id, run_id, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_run_outputs_ordinal
+     ON workflow_run_output_contracts(workspace_id, run_id, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_run_nodes_ordinal
+     ON workflow_run_node_specs(workspace_id, run_id, ordinal)`,
+  `CREATE INDEX IF NOT EXISTS idx_workflow_run_edges_ordinal
+     ON workflow_run_edges(workspace_id, run_id, ordinal)`,
 
   `CREATE TABLE IF NOT EXISTS workflow_start_claims (
     workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
@@ -907,15 +1051,11 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     run_id TEXT NOT NULL,
     activation_id TEXT NOT NULL,
     node_id TEXT NOT NULL,
-    kind TEXT NOT NULL CHECK (kind IN ('entry_start', 'dependency_gate', 'feedback_request', 'feedback_resume', 'child_return')),
+    kind TEXT NOT NULL CHECK (kind IN ('entry_start', 'dependency_gate', 'feedback_request', 'feedback_resume')),
     status TEXT NOT NULL CHECK (status IN ('queued', 'running', 'failed', 'interrupted', 'consumed', 'cancelled')),
     source_gate_id TEXT,
     feedback_round_id TEXT,
     feedback_target_node_id TEXT,
-    continuation_id TEXT,
-    return_gate_id TEXT,
-    inherited_feedback_round_id TEXT,
-    inherited_feedback_target_node_id TEXT,
     primary_turn_id TEXT NOT NULL,
     message_id TEXT NOT NULL,
     execution_turn_id TEXT NOT NULL,
@@ -924,12 +1064,10 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     PRIMARY KEY (workspace_id, run_id, activation_id),
     UNIQUE (workspace_id, primary_turn_id),
     UNIQUE (workspace_id, execution_turn_id),
-    CHECK ((inherited_feedback_round_id IS NULL AND inherited_feedback_target_node_id IS NULL) OR (inherited_feedback_round_id IS NOT NULL AND inherited_feedback_target_node_id IS NOT NULL)),
     CHECK (
-      (kind IN ('entry_start', 'dependency_gate') AND source_gate_id IS NOT NULL AND feedback_round_id IS NULL AND continuation_id IS NULL AND return_gate_id IS NULL)
-      OR (kind = 'feedback_request' AND source_gate_id IS NULL AND feedback_round_id IS NOT NULL AND feedback_target_node_id IS NOT NULL AND continuation_id IS NULL AND return_gate_id IS NULL)
-      OR (kind = 'feedback_resume' AND source_gate_id IS NULL AND feedback_round_id IS NOT NULL AND feedback_target_node_id IS NULL AND continuation_id IS NULL AND return_gate_id IS NULL)
-      OR (kind = 'child_return' AND source_gate_id IS NULL AND feedback_round_id IS NULL AND continuation_id IS NOT NULL AND return_gate_id IS NOT NULL)
+      (kind IN ('entry_start', 'dependency_gate') AND source_gate_id IS NOT NULL AND feedback_round_id IS NULL)
+      OR (kind = 'feedback_request' AND source_gate_id IS NULL AND feedback_round_id IS NOT NULL AND feedback_target_node_id IS NOT NULL)
+      OR (kind = 'feedback_resume' AND source_gate_id IS NULL AND feedback_round_id IS NOT NULL AND feedback_target_node_id IS NULL)
     ),
     FOREIGN KEY (workspace_id, run_id, node_id)
       REFERENCES workflow_nodes(workspace_id, run_id, node_id) ON DELETE CASCADE,
@@ -967,51 +1105,6 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
     FOREIGN KEY (workspace_id, last_response_message_id)
       REFERENCES messages(workspace_id, id),
     FOREIGN KEY (workspace_id, next_repair_turn_id)
-      REFERENCES turns(workspace_id, id)
-  )`,
-
-  `CREATE TABLE IF NOT EXISTS workflow_return_gates (
-    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE CASCADE,
-    return_gate_id TEXT NOT NULL,
-    continuation_run_id TEXT NOT NULL,
-    continuation_id TEXT NOT NULL,
-    caller_task_id TEXT NOT NULL,
-    caller_turn_id TEXT NOT NULL,
-    caller_run_id TEXT,
-    caller_node_id TEXT,
-    child_run_id TEXT NOT NULL,
-    status TEXT NOT NULL CHECK (status IN ('open', 'satisfied', 'consumed', 'failed', 'cancelled')),
-    result_run_id TEXT,
-    result_artifact_id TEXT,
-    result_artifact_revision INTEGER,
-    return_activation_run_id TEXT,
-    return_activation_id TEXT,
-    return_message_id TEXT,
-    execution_turn_id TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    PRIMARY KEY (workspace_id, return_gate_id),
-    UNIQUE (workspace_id, continuation_run_id, continuation_id),
-    CHECK ((caller_run_id IS NULL AND caller_node_id IS NULL) OR (caller_run_id IS NOT NULL AND caller_node_id IS NOT NULL)),
-    CHECK ((result_run_id IS NULL AND result_artifact_id IS NULL AND result_artifact_revision IS NULL) OR (result_run_id IS NOT NULL AND result_artifact_id IS NOT NULL AND result_artifact_revision IS NOT NULL)),
-    CHECK ((return_activation_run_id IS NULL AND return_activation_id IS NULL) OR (return_activation_run_id IS NOT NULL AND return_activation_id IS NOT NULL)),
-    FOREIGN KEY (workspace_id, continuation_run_id, continuation_id)
-      REFERENCES workflow_continuations(workspace_id, run_id, continuation_id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, caller_task_id)
-      REFERENCES tasks(workspace_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, caller_turn_id, caller_task_id)
-      REFERENCES turns(workspace_id, id, task_id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, caller_run_id, caller_node_id)
-      REFERENCES workflow_nodes(workspace_id, run_id, node_id),
-    FOREIGN KEY (workspace_id, child_run_id)
-      REFERENCES workflow_runs(workspace_id, run_id) ON DELETE CASCADE,
-    FOREIGN KEY (workspace_id, result_run_id, result_artifact_id, result_artifact_revision)
-      REFERENCES workflow_artifacts(workspace_id, run_id, artifact_id, revision),
-    FOREIGN KEY (workspace_id, return_activation_run_id, return_activation_id)
-      REFERENCES workflow_activations(workspace_id, run_id, activation_id),
-    FOREIGN KEY (workspace_id, return_message_id)
-      REFERENCES messages(workspace_id, id),
-    FOREIGN KEY (workspace_id, execution_turn_id)
       REFERENCES turns(workspace_id, id)
   )`,
 
@@ -1132,8 +1225,6 @@ const WORKFLOW_AUTHORITY_SCHEMA_STATEMENTS: readonly string[] = [
      ON workflow_activations(workspace_id, run_id, status, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_decision_repairs_status
      ON workflow_decision_repairs(workspace_id, run_id, status)`,
-  `CREATE INDEX IF NOT EXISTS idx_workflow_return_gates_status
-     ON workflow_return_gates(workspace_id, child_run_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_runs_deadline_scan
      ON workflow_runs(workspace_id, status, updated_at)`,
   `CREATE INDEX IF NOT EXISTS idx_turn_disposition_claims_status
@@ -1175,11 +1266,6 @@ export function terminalWorkflowRunSafetyPredicate(
                AND repair.status = 'open'
           )`;
   return `AND NOT EXISTS (
-            SELECT 1 FROM workflow_runs child
-             WHERE child.workspace_id = ${alias}.workspace_id
-               AND child.parent_run_id = ${alias}.run_id
-          )
-          AND NOT EXISTS (
             SELECT 1
               FROM workflow_nodes node
               JOIN tasks task
@@ -1208,20 +1294,12 @@ export function terminalWorkflowRunSafetyPredicate(
                AND activation.status IN ('queued', 'running')
           )
           ${openDecisionRepairGuard}
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_continuations continuation
-             WHERE continuation.workspace_id = ${alias}.workspace_id
-               AND (continuation.run_id = ${alias}.run_id
-                 OR continuation.child_run_id = ${alias}.run_id)
-               AND continuation.status IN ('pending', 'resolved')
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_return_gates return_gate
-             WHERE return_gate.workspace_id = ${alias}.workspace_id
-               AND (return_gate.continuation_run_id = ${alias}.run_id
-                 OR return_gate.child_run_id = ${alias}.run_id)
-               AND return_gate.status IN ('open', 'satisfied')
-          )
+           AND NOT EXISTS (
+             SELECT 1 FROM workflow_continuations continuation
+              WHERE continuation.workspace_id = ${alias}.workspace_id
+                AND continuation.run_id = ${alias}.run_id
+                AND continuation.status IN ('pending', 'resolved')
+           )
           AND NOT EXISTS (
             SELECT 1 FROM workflow_gate_fills gate_fill
              WHERE gate_fill.workspace_id = ${alias}.workspace_id
@@ -1241,12 +1319,7 @@ export function terminalWorkflowRunSafetyPredicate(
                AND derived_source.source_artifact_run_id = ${alias}.run_id
                AND derived_source.run_id <> ${alias}.run_id
           )
-          AND NOT EXISTS (
-            SELECT 1 FROM workflow_return_gates return_gate_artifact
-             WHERE return_gate_artifact.workspace_id = ${alias}.workspace_id
-               AND return_gate_artifact.result_run_id = ${alias}.run_id
-               AND return_gate_artifact.continuation_run_id <> ${alias}.run_id
-           )`;
+           `;
 }
 
 export function terminalWorkflowPayloadReclamationSafetyPredicate(alias: string): string {
@@ -1267,8 +1340,6 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
      WHERE continuation_id IS NOT NULL`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_runs_deadline_at
      ON workflow_runs(workspace_id, status, deadline_at)`,
-  `CREATE INDEX IF NOT EXISTS idx_workflow_runs_parent
-     ON workflow_runs(workspace_id, parent_run_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_feedback_requester
      ON workflow_feedback_rounds(workspace_id, requester_task_id, status)`,
   `CREATE INDEX IF NOT EXISTS idx_workflow_continuation_caller
@@ -1356,11 +1427,129 @@ const WORKFLOW_CONFORMANCE_SCHEMA_STATEMENTS: readonly string[] = [
      )
      BEGIN
        SELECT RAISE(ABORT, 'workflow_definition_edge_immutable');
-     END`,
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_components_immutable_update
+      BEFORE UPDATE ON workflow_run_components
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_component_immutable');
+      END`,
+  // Run-authority child deletes are rejected while the owning run exists, but
+  // permitted once the run row itself is gone so ON DELETE CASCADE from a
+  // safely deleted run can prune its authority (SQLite fires child BEFORE
+  // DELETE triggers after removing the parent row). This mirrors the
+  // reusable-definition child triggers below.
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_components_immutable_delete
+      BEFORE DELETE ON workflow_run_components
+      WHEN EXISTS (
+        SELECT 1 FROM workflow_runs parent
+         WHERE parent.workspace_id = OLD.workspace_id
+           AND parent.run_id = OLD.run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_component_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_inputs_immutable_update
+      BEFORE UPDATE ON workflow_run_input_contracts
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_input_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_inputs_immutable_delete
+      BEFORE DELETE ON workflow_run_input_contracts
+      WHEN EXISTS (
+        SELECT 1 FROM workflow_runs parent
+         WHERE parent.workspace_id = OLD.workspace_id
+           AND parent.run_id = OLD.run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_input_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_outputs_immutable_update
+      BEFORE UPDATE ON workflow_run_output_contracts
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_output_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_outputs_immutable_delete
+      BEFORE DELETE ON workflow_run_output_contracts
+      WHEN EXISTS (
+        SELECT 1 FROM workflow_runs parent
+         WHERE parent.workspace_id = OLD.workspace_id
+           AND parent.run_id = OLD.run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_output_immutable');
+      END`,
+  // Node-spec rows are immutable except for the one authorized terminal
+  // retention transition: executable instruction bytes are stripped (content
+  // and file nulled, marker set) while the preserved content digest, semantic
+  // fields, and outcomes stay byte-identical on a terminal run. The
+  // repository performs this transition inside terminal reclamation only.
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_nodes_immutable_update
+      BEFORE UPDATE ON workflow_run_node_specs
+      WHEN NOT (
+        OLD.instructions_retained = 0 AND NEW.instructions_retained = 1
+        AND NEW.instructions_content IS NULL AND NEW.instructions_file IS NULL
+        AND OLD.instructions_sha256 IS NEW.instructions_sha256
+        AND OLD.node_id IS NEW.node_id AND OLD.ordinal IS NEW.ordinal
+        AND OLD.component_key IS NEW.component_key AND OLD.local_node_key IS NEW.local_node_key
+        AND OLD.title IS NEW.title AND OLD.instructions_kind IS NEW.instructions_kind
+        AND OLD.role IS NEW.role AND OLD.task_type IS NEW.task_type
+        AND OLD.backend IS NEW.backend AND OLD.model IS NEW.model
+        AND OLD.capabilities_json IS NEW.capabilities_json
+        AND OLD.execution_kind IS NEW.execution_kind
+        AND OLD.script_interpreter IS NEW.script_interpreter AND OLD.script_file IS NEW.script_file
+        AND OLD.script_args_json IS NEW.script_args_json
+        AND OLD.script_source_kind IS NEW.script_source_kind
+        AND OLD.script_source_scope IS NEW.script_source_scope
+        AND OLD.script_package_kind IS NEW.script_package_kind
+        AND OLD.script_catalog_root_kind IS NEW.script_catalog_root_kind
+        AND OLD.script_package_path IS NEW.script_package_path
+        AND OLD.script_entry_file IS NEW.script_entry_file
+        AND OLD.script_workflow_ref IS NEW.script_workflow_ref
+        AND OLD.script_package_sha256 IS NEW.script_package_sha256
+        AND OLD.script_sha256 IS NEW.script_sha256
+        AND OLD.outcome_kind IS NEW.outcome_kind AND OLD.outcome_json IS NEW.outcome_json
+        AND EXISTS (
+          SELECT 1 FROM workflow_runs parent
+           WHERE parent.workspace_id = NEW.workspace_id
+             AND parent.run_id = NEW.run_id
+             AND parent.status IN ('succeeded', 'failed', 'cancelled', 'skipped')
+        )
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_node_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_nodes_immutable_delete
+      BEFORE DELETE ON workflow_run_node_specs
+      WHEN EXISTS (
+        SELECT 1 FROM workflow_runs parent
+         WHERE parent.workspace_id = OLD.workspace_id
+           AND parent.run_id = OLD.run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_node_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_edges_immutable_update
+      BEFORE UPDATE ON workflow_run_edges
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_edge_immutable');
+      END`,
+  `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_edges_immutable_delete
+      BEFORE DELETE ON workflow_run_edges
+      WHEN EXISTS (
+        SELECT 1 FROM workflow_runs parent
+         WHERE parent.workspace_id = OLD.workspace_id
+           AND parent.run_id = OLD.run_id
+      )
+      BEGIN
+        SELECT RAISE(ABORT, 'workflow_run_edge_immutable');
+      END`,
   `CREATE TRIGGER IF NOT EXISTS trg_workflow_run_authority_insert
-     BEFORE INSERT ON workflow_runs
-     WHEN (NEW.owner_root_task_id IS NULL) <> (NEW.caller_task_id IS NULL)
-       OR (NEW.caller_task_id IS NULL) <> (NEW.caller_turn_id IS NULL)
+      BEFORE INSERT ON workflow_runs
+      WHEN (NEW.authority_kind NOT IN ('definition', 'composite'))
+        OR ((NEW.authority_kind = 'definition') <> (NEW.source_definition_id IS NOT NULL))
+        OR ((NEW.source_definition_id IS NULL) <> (NEW.source_definition_version IS NULL))
+        OR (NEW.owner_root_task_id IS NULL) <> (NEW.caller_task_id IS NULL)
+        OR (NEW.caller_task_id IS NULL) <> (NEW.caller_turn_id IS NULL)
        OR (NEW.owner_root_task_id IS NOT NULL AND NOT EXISTS (
              SELECT 1
                FROM tasks caller

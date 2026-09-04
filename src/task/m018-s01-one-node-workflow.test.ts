@@ -418,15 +418,16 @@ describe('M018 S01 one-node workflow activation', () => {
       expect(payload.activationTurnId).toBeTruthy();
 
       const runs = await ctx.client.all(
-        'SELECT run_id, status, definition_id, definition_version FROM workflow_runs WHERE workspace_id = ?',
+        'SELECT run_id, status, authority_kind, source_definition_id, source_definition_version FROM workflow_runs WHERE workspace_id = ?',
         ['ws'],
       );
       expect(runs).toHaveLength(1);
       expect(runs[0]).toMatchObject({
         run_id: payload.runId,
         status: 'running',
-        definition_id: 'wf-one',
-        definition_version: 1,
+        authority_kind: 'definition',
+        source_definition_id: 'wf-one',
+        source_definition_version: 1,
       });
 
       const gates = await ctx.client.all(
@@ -1187,8 +1188,9 @@ describe('M018 S01 one-node workflow activation', () => {
               fail: { when: 'The sink result cannot be produced.' },
             },
           }],
-          edges: [{ fromNodeId: 'decision', toNodeId: 'sink', inputRef: 'decision_result' }],
+        edges: [{ fromNodeId: 'decision', toNodeId: 'sink', inputRef: 'decision_result' }],
         },
+        policy: { ...DEFAULT_WORKFLOW_POLICY, runTimeoutMs: 2_000 },
         createdAt,
       })).resolves.toMatchObject({ ok: true, changed: true });
       const started = await ctx.repository.execute({
@@ -1212,12 +1214,6 @@ describe('M018 S01 one-node workflow activation', () => {
         payload.activationTurnId,
         '2026-07-19T06:00:01.000Z',
       )).resolves.toMatchObject({ result: { changed: true } });
-      await ctx.client.run(
-        `UPDATE workflow_runs SET deadline_at = ?
-          WHERE workspace_id = ? AND run_id = ?`,
-        ['2026-07-19T06:00:02.000Z', 'ws', payload.runId],
-      );
-
       await expect(ctx.repository.execute({
         kind: 'reapWorkflowTimeouts',
         workspaceId: 'ws',
@@ -2301,7 +2297,7 @@ describe('M018 S01 one-node workflow activation', () => {
       )).resolves.toEqual([{ definition_id: 'wf-concurrent', name: 'concurrent' }]);
       await expect(first.client.all(
         `SELECT run_id FROM workflow_runs
-          WHERE workspace_id = ? AND definition_id = ?`,
+          WHERE workspace_id = ? AND source_definition_id = ?`,
         ['ws', 'wf-concurrent'],
       )).resolves.toHaveLength(1);
     } finally {
@@ -2375,10 +2371,10 @@ describe('M018 S01 one-node workflow activation', () => {
       expect(conflict.conflict).toBe(true);
       expect(conflict.reason).toMatch(/fingerprint conflict|start fingerprint conflict/i);
       expect(
-        await ctx.client.all('SELECT run_id, definition_id FROM workflow_runs WHERE workspace_id = ?', [
+        await ctx.client.all('SELECT run_id, source_definition_id FROM workflow_runs WHERE workspace_id = ?', [
           'ws',
         ]),
-      ).toEqual([expect.objectContaining({ definition_id: 'wf-a' })]);
+      ).toEqual([expect.objectContaining({ source_definition_id: 'wf-a' })]);
     } finally {
       await ctx.close();
     }

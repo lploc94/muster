@@ -1742,7 +1742,7 @@ planner session
 
 There is no live planner process between those turns.
 
-### 20.4 Canonical workflow definition and frozen run
+### 20.4 Canonical workflow definition and immutable run authority
 
 The sole authoring contract is a closed `muster.workflow/v2` manifest. Its normalized
 domain shape preserves these semantics:
@@ -1755,7 +1755,7 @@ interface WorkflowDefinition {
   topology: {
     kind: 'workflow';
     inputs: Array<{ name: string; semanticKind: string; entryNodeId: string; inputRef: string }>;
-    outputs: Array<{ name: string; semanticKind: string; terminalNodeId: string }>;
+    outputs: Array<{ name: string; semanticKind: string; sourceNodeId: string }>;
     nodes: WorkflowNodeSpec[];
     edges: Array<{ fromNodeId: string; toNodeId: string; inputRef: string }>;
   };
@@ -1765,11 +1765,13 @@ interface WorkflowDefinition {
 
 The coordinator defines the complete semantic graph before execution and the engine
 freezes its public interfaces, topology, optional display titles, instruction bytes,
-outcomes, resolved task profiles, script provenance, and effective policy into the
-workflow run. Authors never provide physical task/gate/artifact IDs or host routing
-authority. Dynamic graph mutation, partial/streaming gates, `ANY`, quorum, and arbitrary
-predicate gates are outside the contract. A dependency gate must close before it
-activates its consumer.
+outcomes, resolved task profiles, script provenance, and effective policy into immutable
+run-owned authority. Reusable definitions remain source products only; after a run is
+accepted, prompt compilation, routing, recovery, inspection, and completion never reread
+definition or package rows. Authors never provide physical task/gate/artifact IDs or host
+routing authority. Dynamic graph mutation, partial/streaming gates, `ANY`, quorum, and
+arbitrary predicate gates are outside the contract. A dependency gate must close before
+it activates its consumer.
 
 The engine validates before release:
 
@@ -1795,11 +1797,13 @@ graph; it does not make dependency readiness itself cyclic.
 
 Starting a workflow is one idempotent repository command. The caller binds every
 destination only by its public input `name`, using either a literal value or a
-`(fromRun, outputName)` source. Internal entry coordinates are resolved from the frozen
-definition inside the transaction. The command:
+`(fromRun, outputName)` source. Internal entry coordinates are resolved from the
+immutable run-authority snapshot inside the transaction. The command:
 
-1. Persists the frozen definition version, workflow run, optional top-level
-   `start_wait` caller continuation, and caller-supplied entry artifacts.
+1. Persists the immutable run-authority snapshot (including optional source-definition
+   provenance), workflow run, optional top-level `start_wait` caller continuation, and
+   caller-supplied entry artifacts in one transaction. A composite run has no source
+   definition.
 2. Creates one dependency gate for every task. Entry gates include the exact declared
    caller-input references; an entry with no caller data receives one explicit
    engine-authored start artifact rather than an implicit empty prompt.
@@ -1815,8 +1819,8 @@ whose declared caller inputs are incomplete remains blocked; release validation 
 reject a run request that cannot ever supply its required entry contract.
 
 For a prior-run input, output selection and start creation share this transaction. The
-repository authorizes a succeeded source run, resolves the frozen public output name to
-its declared terminal node, loads that exact immutable `next_result` artifact/revision,
+repository authorizes a source run, resolves the immutable public output name to its
+declared source node, loads that exact immutable `next_result` artifact/revision,
 checks semantic-kind equality, pins provenance, and fills the destination gate. The
 multi-terminal run aggregate remains continuation data and is never named-output
 authority. Changing only the selected output name changes start idempotency material.
@@ -2172,24 +2176,11 @@ definition, continuation, or run row. A workflow node may still delegate ordinar
 tasks through its task profile, but it cannot create, start, invoke, or dynamically
 insert another workflow.
 
-Task-facing lists and snapshots omit task rows owned by persisted pre-cutover child
-workflow runs and every task descended from those rows. They also omit the complete
-primary/current/retry turn lineage of a retired activation and rows owned by those turns.
-At the schema-7 cleanup/terminalization boundary, that obsolete `child_return` state is
-purged—not retained—as one idempotent transaction. The purge uses a bounded
-workspace-qualified retry-lineage relation and table-specific ownership: dependent
-return gates, child continuations, repairs, disposition/runtime/session/resource claims,
-turn inputs, messages/reasoning/tool rows, routed child messages, and exact turn-owned
-operation keys are deleted before their referenced activation/run/turn rows. Exact
-operation ownership uses the longest existing turn-ID prefix, so a visible turn whose ID
-prefixes a retired turn cannot expose or delete the retired turn's ledger. Ambiguous
-  lineage, external artifact pins, or a foreign-key failure rolls back the entire cleanup. The
-  purge also verifies the full composite identity of routed messages, start claims, and artifact
-  sources; matching a `source_turn_id`, caller task, or producer run alone is never sufficient.
-Unscoped operations, shared artifacts/provenance, ordinary delegated child tasks,
-canonical active workflow rows, and the bounded `run_closure` record remain intact.
-This cleanup is not a nested-workflow recovery path or a schema migration; schema 8
-remains reset-only.
+Task-facing lists and snapshots expose only current schema-8 task and workflow state.
+Pre-cutover schema-7 stores are rejected before repository access and are not migrated,
+inspected, or selectively purged by the current process. The schema-8 runtime therefore
+has no legacy `child_return` cleanup reader and no nested-workflow recovery path; an
+explicit reset is required before current task-management operations can proceed.
 
 An accepted top-level start atomically creates the run and one `start_wait`
 continuation addressed to the caller task and turn. The tool result is delivered before

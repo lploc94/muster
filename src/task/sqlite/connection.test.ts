@@ -113,7 +113,7 @@ describe('openStoreDatabase', () => {
       ]);
       expect(columns('workflow_definition_outputs')).toEqual([
         'workspace_id', 'definition_id', 'definition_version', 'name', 'semantic_kind',
-        'terminal_node_id', 'ordinal', 'expected_artifact_kind',
+        'source_node_id', 'ordinal', 'expected_artifact_kind',
       ]);
       expect(columns('workflow_definition_nodes')).toEqual([
         'workspace_id', 'definition_id', 'definition_version', 'node_id', 'ordinal', 'title',
