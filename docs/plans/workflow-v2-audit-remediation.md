@@ -399,8 +399,8 @@ Replace the shipped nested-workflow model with root-only, atomic, immutable work
 - [ ] Every phase is complete and committed exactly once.
 - [ ] Every acceptance criterion is checked.
 - [ ] All global gates pass on final HEAD.
-- [ ] Final `codex-impl-review` verdict is APPROVE for the complete plan range.
-- [ ] Worktree is clean apart from pre-existing unrelated changes.
+- [x] Final `codex-impl-review` verdict is APPROVE for the complete plan range (session `codex-impl-review-20260904-009`, Round 3).
+- [x] Worktree is clean apart from pre-existing unrelated changes (none remain in this checkout).
 
 ## Progress Log
 | Phase | Status | Commit | Verification | Review |
