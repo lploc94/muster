@@ -10,8 +10,8 @@ described below.
 ## Observation
 
 - Verdict: PASS
-- Timestamp: 2026-09-01T10:56:10.733Z
-- Command: `MUSTER_VSCODE_VERSION=1.135.0 npm run test:script-workflow-native-uat`
+- Timestamp: 2026-09-05T03:10:25.727Z
+- Command: `MUSTER_VSCODE_VERSION=1.135.0 npm run test:script-workflow-acceptance`
 - Exit code: 0
 - Host: VS Code `1.135.0`, `extension-development-host`
 - Evidence artifact: `artifacts/script-workflow-native-qa.json` (generated, redacted, not required to be committed)
