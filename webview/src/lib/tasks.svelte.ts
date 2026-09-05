@@ -17,7 +17,6 @@ import {
 } from './backend-eligibility';
 import { isHardTerminalLifecycle, post } from './protocol';
 import { sortQueuedTurns } from './queued-turns';
-import { parseBackendId, parseModelFromSelectValue } from './backend-resolve';
 import { vscode } from './vscode';
 import type { WorkspacePatchViewState } from './workspace-patch-reducer';
 
@@ -420,14 +419,20 @@ class TasksState {
 
   /**
    * Sync task chrome from a pure workspace-patch reducer result (protocol v9).
-   * Does not touch draftMode/pending focus beyond focusedTaskId when removed.
+   *
+   * Focus adoption is gated on `draftMode` for the same reason `applySnapshot`
+   * gates it: the reducer's view still names the task the user just left, so an
+   * unguarded assignment silently re-points the draft at it. The draft keeps
+   * rendering (that branch checks `draftMode` first), but everything that falls
+   * back to `focusedTaskId` — the conversation menu's handoff/export target,
+   * the thread's read-only and running flags — starts acting on the old task.
    */
   applyPatchView(state: WorkspacePatchViewState): void {
     this.storeRevision = state.revision;
     this.needsRecovery = state.needsRecovery;
     this.tasks = new Map(state.tasks);
     this.subtree = [...state.subtree];
-    if (state.focusedTaskId) {
+    if (state.focusedTaskId && !this.draftMode) {
       this.focusedTaskId = state.focusedTaskId;
       this.queuedTurns = sortQueuedTurns(state.queuedTurns);
       this.reconcilePendingHandoffTarget(state.focusedTaskId);
@@ -547,46 +552,3 @@ class TasksState {
 }
 
 export const tasks = new TasksState();
-
-let backendSelectEl: (HTMLElement & { value: string }) | undefined;
-
-export function registerBackendSelect(el: (HTMLElement & { value: string }) | undefined): void {
-  backendSelectEl = el;
-}
-
-/**
- * Backend for a draft send. The live select is authoritative when it has a
- * parseable value (`backend` or `backend::model`) — that is what the user sees.
- * preferredBackend is only a fallback when the select is missing/unmounted.
- */
-export function resolveBackendForSend(): WebviewBackendId {
-  return parseBackendId(backendSelectEl?.value) ?? tasks.preferredBackend;
-}
-
-/**
- * Model for a draft send. Prefer the encoded select value, then preferredModel
- * when it belongs to the resolved backend.
- */
-export function resolveModelForSend(): string | null {
-  const raw = backendSelectEl?.value;
-  const fromDom = parseModelFromSelectValue(raw);
-  if (fromDom) return fromDom;
-  const backend = resolveBackendForSend();
-  if (backend === tasks.preferredBackend) return tasks.preferredModel;
-  return null;
-}
-
-/**
- * Sync preferred* from the live select (or current preferred) so persistence
- * and subsequent drafts match what was just sent.
- */
-export function syncPreferenceFromSend(): { backend: WebviewBackendId; model: string | null } {
-  const backend = resolveBackendForSend();
-  const model = resolveModelForSend();
-  if (model) {
-    tasks.setModelSelection(backend, model);
-  } else {
-    tasks.setBackend(backend);
-  }
-  return { backend, model };
-}

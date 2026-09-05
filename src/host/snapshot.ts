@@ -12,6 +12,7 @@ import {
   type TranscriptSortKey,
 } from '../task/transcript-order';
 import type {
+  TaskBriefKind,
   MusterTask,
   TaskLifecycleState,
   TaskMessageState,
@@ -93,6 +94,11 @@ export interface TaskSummary {
   workflowNodeStatus?: string | null;
   /** Owner workflow run status for coordinator roots that stay open after run succeeds (needs review). */
   ownerWorkflowStatus?: string | null;
+  /**
+   * Host brief kind for the running agent's display name (plan → Planner).
+   * Omitted when the task has no structured brief (pre-schema-5 records).
+   */
+  briefKind?: TaskBriefKind;
 }
 
 /** Optional ACP diff-block evidence projected to the webview (M020 / M021 S04). */
@@ -535,6 +541,7 @@ export function projectTaskSummary(
     ...(childOrchestration ? { childOrchestration } : {}),
     ...(task.contextUsage ? { contextUsage: task.contextUsage } : {}),
     ...(workflowNodeStatus !== undefined ? { workflowNodeStatus } : {}),
+    ...(task.brief?.kind !== undefined ? { briefKind: task.brief.kind } : {}),
   };
 }
 

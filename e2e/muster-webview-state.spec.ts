@@ -81,6 +81,8 @@ interface TaskSummary {
   backend: string;
   /** Optional model id selected for this task. */
   model?: string;
+  /** Host brief kind naming the running agent (plan → Planner). */
+  briefKind?: string;
   /** Sanitized task-scoped handoff chrome (never digests/session ids/bodies). */
   handoffProgress?: HandoffProgress;
 }
@@ -434,6 +436,20 @@ function isPastedImagePost(message: unknown): message is { type: 'importPastedIm
   );
 }
 
+/**
+ * Narrow a recorded outbound message to the requestRuntimeHandoff envelope.
+ * postedMessages() returns structured-cloned wire traffic, so the type tag is
+ * checked here rather than asserted at the read site.
+ */
+function isRuntimeHandoffPost(message: unknown): message is { type: 'requestRuntimeHandoff' } {
+  return (
+    typeof message === 'object' &&
+    message !== null &&
+    'type' in message &&
+    message.type === 'requestRuntimeHandoff'
+  );
+}
+
 async function expectPostedMessage(page: Page, expected: unknown) {
   // Partial match: Phase C send messages include ephemeral clientRequestId.
   await expect
@@ -508,19 +524,31 @@ async function postModelsAvailable(
   await postRawHostMessage(page, { type: 'modelsAvailable', models });
 }
 
+/** Open the conversation ("more") menu in the composer footer. */
+async function openConversationMenu(page: Page) {
+  await page.getByTestId('conversation-menu-trigger').click();
+  await expect(page.getByTestId('conversation-menu')).toBeVisible();
+}
+
+/** Activate one conversation menu action by id. */
+async function clickConversationAction(page: Page, action: string) {
+  await openConversationMenu(page);
+  await page
+    .locator(`[data-testid="conversation-menu-item"][data-action="${action}"]`)
+    .click();
+}
+
 /**
- * Drive vscode-single-select like a user pick: set value + dispatch change.
- * vscode-elements fires `new Event('change')` (isTrusted=false) for real clicks too.
+ * Change model the way a user now does: conversation menu -> panel -> confirm.
+ * The old inline dropdown committed a handoff on a single stray change event;
+ * the panel requires an explicit pick plus confirmation.
  */
-async function selectTaskModelSwitch(page: Page, value: string) {
-  const picker = page.getByTestId('task-model-switch');
-  await expect(picker).toBeVisible();
-  await picker.evaluate((element, nextValue) => {
-    const select = element as HTMLElement & { value: string };
-    select.value = nextValue;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-    select.dispatchEvent(new Event('input', { bubbles: true }));
-  }, value);
+async function switchTaskModel(page: Page, value: string) {
+  await clickConversationAction(page, 'change-model');
+  await expect(page.getByTestId('model-handoff-panel')).toBeVisible();
+  await page.locator(`[data-testid="model-handoff-option"][data-value="${value}"]`).click();
+  await page.getByTestId('model-handoff-commit').click();
+  await expect(page.getByTestId('model-handoff-panel')).toHaveCount(0);
 }
 
 function handoffProgressFixture(
@@ -2984,9 +3012,9 @@ test('compact icon targets', async ({ page }) => {
 
   // Shared toolbar icon controls must expose practical ≥28×28 CSS-pixel hit areas.
   const toolbarIcons = page.locator(
-    'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Export task/chat"], button.icon-btn[aria-label="Settings"]',
+    'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Settings"]',
   );
-  await expect(toolbarIcons).toHaveCount(5);
+  await expect(toolbarIcons).toHaveCount(4);
 
   const boxes = await toolbarIcons.evaluateAll((els) =>
     els.map((el) => {
@@ -5554,10 +5582,12 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.getByText('S03 flow ready.')).toBeVisible();
 
+    // Export moved into the composer conversation menu, so the app toolbar is
+    // back/history/new-task/settings only.
     const toolbarIcons = page.locator(
-      'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Export task/chat"], button.icon-btn[aria-label="Settings"]',
+      'button.icon-btn[aria-label="Back to tasks list"], button.icon-btn[aria-label="History (previous coordinator tasks)"], button.icon-btn[aria-label="New task"], button.icon-btn[aria-label="Settings"]',
     );
-    await expect(toolbarIcons).toHaveCount(5);
+    await expect(toolbarIcons).toHaveCount(4);
 
     const boxes = await toolbarIcons.evaluateAll((els) =>
       els.map((el) => {
@@ -7488,9 +7518,16 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       storeRevision: 201,
     });
 
-    const exportBtn = page.getByTestId('export-task-chat');
-    await expect(exportBtn).toBeVisible();
-    await expect(exportBtn).toHaveAttribute('aria-label', 'Export task/chat');
+    // Export lives in the conversation menu now, not the app toolbar: the toolbar
+    // is app-scoped (back/history/workflows/settings) while export acts on one task.
+    await expect(page.getByTestId('export-task-chat')).toHaveCount(0);
+    await openConversationMenu(page);
+    const exportItem = page.locator(
+      '[data-testid="conversation-menu-item"][data-action="export-conversation"]',
+    );
+    await expect(exportItem).toBeVisible();
+    await expect(exportItem).toHaveAttribute('aria-label', 'Export conversation');
+    await expect(exportItem).toHaveAttribute('aria-disabled', 'false');
 
     // Stale failure chrome is cleared when Export is re-triggered.
     await postCommandError(page, {
@@ -7500,7 +7537,9 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
     await expect(page.getByRole('alert').getByText('Previous export failed.')).toBeVisible();
 
-    await exportBtn.click();
+    await exportItem.click();
+    // Activating an item dismisses the menu.
+    await expect(page.getByTestId('conversation-menu')).toHaveCount(0);
     await expectPostedMessage(page, { type: 'exportTask', taskId: 'task-export' });
     // Click path only posts exportTask with focused taskId — no extra payload fields required by host.
     const exportPosts = (await postedMessages(page)).filter(
@@ -7566,7 +7605,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     // Cancel is silent: host posts nothing after exportTask. Click clears prior error chrome
     // so a cancelled Save As does not leave a stale failure banner.
     const beforeCancel = await postedMessages(page);
-    await exportBtn.click();
+    await clickConversationAction(page, 'export-conversation');
     await expect.poll(async () => (await postedMessages(page)).length).toBe(beforeCancel.length + 1);
     const cancelExportPosts = (await postedMessages(page)).filter(
       (m) => (m as { type?: string }).type === 'exportTask',
@@ -7614,6 +7653,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       lifecycle: 'open',
       backend: 'claude',
       model: 'sonnet',
+      role: 'worker',
+      briefKind: 'plan',
     });
 
     await postSnapshot(page, {
@@ -7643,12 +7684,34 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       },
     });
 
-    const modelSwitch = page.getByTestId('task-model-switch');
-    await expect(modelSwitch).toBeVisible();
+    // Model switch moved out of the footer into the conversation menu: on an
+    // existing task a change is always a runtime handoff, so it needs an
+    // explicit confirm rather than firing on a stray dropdown change event.
+    await expect(page.getByTestId('task-model-switch')).toHaveCount(0);
     await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
 
+    // Footer names the agent, not the runtime: brief kind `plan` reads as
+    // "Planner" and backend/model never leaks into the composer chrome.
+    const agentLabel = page.getByTestId('task-agent-label');
+    await expect(agentLabel).toBeVisible();
+    await expect(agentLabel).toHaveText('Planner');
+    await expect(agentLabel).not.toContainText(/claude|sonnet/i);
+
+    // Panel opens on the committed binding and only arms once a different pick is made.
+    await clickConversationAction(page, 'change-model');
+    const panel = page.getByTestId('model-handoff-panel');
+    await expect(panel).toBeVisible();
+    await expect(panel).toHaveAttribute('data-current', 'claude::sonnet');
+    await expect(page.getByTestId('model-handoff-commit')).toBeDisabled();
+    // Escape dismisses without any handoff request.
+    await page.keyboard.press('Escape');
+    await expect(panel).toHaveCount(0);
+    expect(
+      (await postedMessages(page)).filter(isRuntimeHandoffPost),
+    ).toEqual([]);
+
     // User changes model on the existing idle task.
-    await selectTaskModelSwitch(page, 'grok::grok-4');
+    await switchTaskModel(page, 'grok::grok-4');
 
     await expectPostedMessage(page, {
       type: 'requestRuntimeHandoff',
@@ -7667,9 +7730,8 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     await expect(page.getByText(digestCanary)).toHaveCount(0);
     await expect(page.getByText(summaryBodyCanary)).toHaveCount(0);
     await expect(page.getByText(bootstrapCanary)).toHaveCount(0);
-    await expect
-      .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
-      .toBe(false);
+    // Menu stays usable right after the outbound request.
+    await expect(page.getByTestId('conversation-menu-trigger')).toBeEnabled();
 
     // Host projects updated binding after a successful switch (no progress chrome).
     const completedTask = task({
@@ -7694,14 +7756,15 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
     });
 
     await expect(page.getByTestId('handoff-progress')).toHaveCount(0);
-    // Binding lives in the composer switch; task-tree chrome does not repeat backend metadata.
-    await expect
-      .poll(() => modelSwitch.evaluate((el) => (el as HTMLElement & { value: string }).value))
-      .toBe('grok::grok-4');
+    // Binding lives in the change-model panel; task-tree chrome does not repeat backend metadata.
+    await clickConversationAction(page, 'change-model');
+    await expect(page.getByTestId('model-handoff-panel')).toHaveAttribute(
+      'data-current',
+      'grok::grok-4',
+    );
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('model-handoff-panel')).toHaveCount(0);
     await expect(page.getByTestId('task-chrome').getByText('grok', { exact: true })).toHaveCount(0);
-    await expect
-      .poll(() => modelSwitch.evaluate((el) => el.hasAttribute('disabled')))
-      .toBe(false);
     await expect(page.getByText(conversationOnly)).toBeVisible();
     await expect(page.getByText(sessionCanary)).toHaveCount(0);
     await expect(page.getByText(digestCanary)).toHaveCount(0);
@@ -7729,7 +7792,9 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       ],
       storeRevision: 305,
     });
-    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    // Busy (running) tasks keep the menu reachable — never blocked.
+    await expect(page.getByTestId('conversation-menu-trigger')).toBeEnabled();
+    await expect(page.getByTestId('task-model-switch')).toHaveCount(0);
     await expect(page.getByTestId('task-model-readonly')).toHaveCount(0);
 
     // Extension/webview reload with a persisted terminal record must not replay
@@ -7747,7 +7812,7 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
       ],
       storeRevision: 306,
     });
-    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    await expect(page.getByTestId('conversation-menu-trigger')).toBeVisible();
     await expect(page.getByTestId('handoff-progress')).toHaveCount(0);
 
     // A refreshed/partial catalog must not coerce the committed task model to
@@ -7758,11 +7823,13 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         options: [{ value: 'grok-next', name: 'grok-next' }],
       },
     });
-    await expect
-      .poll(() =>
-        page.getByTestId('task-model-switch').evaluate((el) => (el as HTMLElement & { value: string }).value),
-      )
-      .toBe('grok::grok-4');
+    await clickConversationAction(page, 'change-model');
+    await expect(page.getByTestId('model-handoff-panel')).toHaveAttribute(
+      'data-current',
+      'grok::grok-4',
+    );
+    await page.keyboard.press('Escape');
+    await expect(page.getByTestId('model-handoff-panel')).toHaveCount(0);
 
     await page.locator('.composer-input__textarea').fill('Continue after the model switch.');
     await page.getByRole('button', { name: 'Send', exact: true }).click();
@@ -7773,6 +7840,116 @@ test('Add Context menu keeps the existing file picker and mention flow', async (
         ).length,
       )
       .toBe(0);
+  });
+
+  test('change-model panel is keyboard operable: roving radiogroup plus a real focus trap', async ({
+    page,
+  }) => {
+    const taskId = 'task-handoff-keyboard';
+    await openWebview(page);
+
+    const focused = task({
+      id: taskId,
+      goal: 'Keyboard-drive the model switch',
+      viewStatus: 'idle',
+      backend: 'claude',
+      model: 'sonnet',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [focused],
+      focusedTaskId: taskId,
+      subtree: [focused],
+      transcript: [{ id: 'msg-kbd', kind: 'user', content: 'Switch by keyboard.' }],
+      storeRevision: 401,
+    });
+    await postModelsAvailable(page, {
+      claude: {
+        current: 'sonnet',
+        options: [
+          { value: 'sonnet', name: 'sonnet' },
+          { value: 'opus', name: 'opus' },
+        ],
+      },
+      grok: { current: 'grok-4', options: [{ value: 'grok-4', name: 'grok-4' }] },
+    });
+
+    await clickConversationAction(page, 'change-model');
+    const panel = page.getByTestId('model-handoff-panel');
+    await expect(panel).toBeVisible();
+
+    // The picker lists every eligible backend, not just the fixture's two, so
+    // read the real option order rather than assuming it.
+    const optionValues = await page
+      .locator('[data-testid="model-handoff-option"]')
+      .evaluateAll((els) => els.map((el) => el.getAttribute('data-value') ?? ''));
+    expect(optionValues.length).toBeGreaterThan(2);
+    expect(optionValues).toContain('claude::sonnet');
+    expect(optionValues).toContain('grok::grok-4');
+
+    // `role="radiogroup"` means ONE tab stop for the group, and it must be the
+    // committed binding — not the dialog container, or arrows do nothing until
+    // the user first tabs into a row.
+    const rovingStop = page.locator('[data-testid="model-handoff-option"][tabindex="0"]');
+    await expect(rovingStop).toHaveCount(1);
+    await expect(rovingStop).toHaveAttribute('data-value', 'claude::sonnet');
+
+    const activeOption = () =>
+      page.evaluate(() => document.activeElement?.getAttribute('data-value') ?? null);
+    await expect.poll(activeOption).toBe('claude::sonnet');
+
+    // Arrows move selection and focus together; a screen reader must never
+    // announce a row the user is no longer standing on.
+    const currentIndex = optionValues.indexOf('claude::sonnet');
+    const nextValue = optionValues[(currentIndex + 1) % optionValues.length]!;
+    await page.keyboard.press('ArrowDown');
+    await expect(panel).toHaveAttribute('data-selected', nextValue);
+    await expect.poll(activeOption).toBe(nextValue);
+
+    await page.keyboard.press('End');
+    await expect(panel).toHaveAttribute('data-selected', optionValues.at(-1)!);
+    await expect.poll(activeOption).toBe(optionValues.at(-1)!);
+
+    await page.keyboard.press('Home');
+    await expect(panel).toHaveAttribute('data-selected', optionValues[0]!);
+    // Wrap-around: Up from the first row lands on the last.
+    await page.keyboard.press('ArrowUp');
+    await expect(panel).toHaveAttribute('data-selected', optionValues.at(-1)!);
+
+    // The roving stop follows the selection, so Tab still sees one group stop.
+    await expect(rovingStop).toHaveCount(1);
+    await expect(rovingStop).toHaveAttribute('data-value', optionValues.at(-1)!);
+
+    // `aria-modal="true"` claims the rest of the page is inert. Nothing makes it
+    // inert, so Tab must cycle: walk further than the dialog has stops and
+    // confirm focus never lands in the composer behind the backdrop.
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Tab');
+      expect(await controlHasFocus(panel)).toBe(true);
+    }
+    for (let i = 0; i < 8; i += 1) {
+      await page.keyboard.press('Shift+Tab');
+      expect(await controlHasFocus(panel)).toBe(true);
+    }
+
+    // Keyboard-only walk to a known binding, then commit: the host must receive
+    // the arrow-selected target, not the one the panel opened on.
+    const grokIndex = optionValues.indexOf('grok::grok-4');
+    await page.locator('[data-testid="model-handoff-option"][tabindex="0"]').focus();
+    await page.keyboard.press('Home');
+    for (let i = 0; i < grokIndex; i += 1) await page.keyboard.press('ArrowDown');
+    await expect(panel).toHaveAttribute('data-selected', 'grok::grok-4');
+
+    await page.getByTestId('model-handoff-commit').focus();
+    await page.keyboard.press('Enter');
+    await expect(panel).toHaveCount(0);
+    await expectPostedMessage(page, {
+      type: 'requestRuntimeHandoff',
+      taskId,
+      targetBackend: 'grok',
+      targetModel: 'grok-4',
+    });
+    await expectControlFocused(page.getByTestId('conversation-menu-trigger'));
   });
 });
 
@@ -8098,6 +8275,11 @@ test.describe('Task-tree chrome navigation', () => {
     await page.getByRole('button', { name: 'New task' }).first().click();
     await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
     await expect(page.getByTestId('task-chrome')).toHaveCount(0);
+    // Draft must also drop the focused transcript: task chrome and thread are
+    // separate stores, and a stale thread would also receive the draft's first
+    // message instead of the new task's.
+    await expect(page.getByText('again', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('No messages yet.')).toBeVisible();
 
     // Different multi-node root → collapse.
     await postSnapshot(page, {
@@ -8137,6 +8319,56 @@ test.describe('Task-tree chrome navigation', () => {
     await expect(page.getByTestId('task-tree-row').filter({ hasText: 'Other worker' })).toBeVisible();
   });
 
+  test('a patch batch during a draft does not re-adopt the departed task', async ({ page }) => {
+    await openWebview(page);
+
+    // A running task is the interesting case: its runtime flags are what leak
+    // onto the draft thread if focus is re-adopted.
+    const running = task({
+      id: 'coord-running',
+      goal: 'Long running coordinator',
+      viewStatus: 'running',
+    });
+    await postSnapshot(page, {
+      type: 'snapshot',
+      rootTasks: [running],
+      focusedTaskId: 'coord-running',
+      subtree: [running],
+      transcript: [{ id: 'msg-running', kind: 'user', content: 'old conversation' }],
+      storeRevision: 1,
+    });
+    await expect(page.getByTestId('task-chrome')).toContainText('Long running coordinator');
+
+    await page.getByRole('button', { name: 'New task' }).first().click();
+    await expectPostedMessage(page, { type: 'newTask' });
+    const draftComposer = page.getByPlaceholder('Start a new coordinator task with claude…');
+    await expect(draftComposer).toBeEnabled();
+
+    // The host keeps streaming the old task while the draft is open. The patch
+    // view still names it as focused, so an unguarded adopt would push its
+    // running flag onto the draft's fresh thread and disable Send.
+    await postRawHostMessage(page, {
+      type: 'workspacePatchBatch',
+      revision: 2,
+      patches: [{ type: 'taskUpserted', task: running }],
+    });
+
+    await expect(page.getByText('First message creates the coordinator task.')).toBeVisible();
+    await expect(page.getByTestId('task-chrome')).toHaveCount(0);
+    await expect(page.getByText('old conversation', { exact: true })).toHaveCount(0);
+    await expect(draftComposer).toBeEnabled();
+    await expect(page.getByRole('button', { name: 'Send' })).toBeVisible();
+
+    // Send still creates a new task rather than a turn on the departed one.
+    await draftComposer.fill('start fresh');
+    await page.getByRole('button', { name: 'Send' }).click();
+    const sends = (await postedMessages(page)).filter(
+      (message) => (message as { type?: string }).type === 'send',
+    ) as Array<{ taskId?: string }>;
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.taskId).toBeUndefined();
+  });
+
   test('narrow viewport keeps selected child as compact header without horizontal overflow', async ({
     page,
   }) => {
@@ -8167,7 +8399,7 @@ test.describe('Task-tree chrome navigation', () => {
     });
 
     await expect(page.getByTestId('task-chrome')).toBeVisible();
-    await expect(page.getByTestId('export-task-chat')).toBeVisible();
+    await expect(page.getByTestId('conversation-menu-trigger')).toBeVisible();
     await expect(page.getByTestId('task-chrome')).toContainText('Auth worker');
     await expect(page.getByTestId('task-chrome').getByRole('button', { name: /Task status:/i })).toBeVisible();
     await expect(page.getByTestId('task-tree-summary')).toBeVisible();
@@ -9147,7 +9379,7 @@ test.describe('M019 S01 Composer readiness', () => {
       transcriptPage: { hasMoreBefore: false, workspaceRevision: 1 },
       storeRevision: 1,
     });
-    await expect(page.getByTestId('task-model-switch')).toBeVisible();
+    await expect(page.getByTestId('conversation-menu-trigger')).toBeVisible();
     const taskComposer = page.getByPlaceholder('Message this task…');
     await expect(taskComposer).toBeVisible();
     await expect(taskComposer).not.toBeDisabled();

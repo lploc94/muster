@@ -43,7 +43,10 @@
   } from './lib/workspace-patch-reducer';
   import { tip } from './lib/tooltip';
   import { outboxList, outboxMarkRejected, outboxPending, outboxRejected, outboxRemove, outboxReplaceAll } from './lib/send-outbox';
-  import { selectTask as navSelectTask } from './lib/task-nav';
+  import {
+    openNewTaskDraft as navOpenNewTaskDraft,
+    selectTask as navSelectTask,
+  } from './lib/task-nav';
   import {
     DATA_RUNTIME_STORAGE_IDS,
     EXECUTION_RUNTIME_STORAGE_IDS,
@@ -439,8 +442,7 @@
   }
 
   function startFirstTaskFromJourney(): void {
-    tasks.openNewTaskDraft();
-    post({ type: 'newTask' });
+    navOpenNewTaskDraft();
     historyOpen = false;
   }
 
@@ -1409,7 +1411,7 @@
       <button
         type="button"
         class="flex-1 flex items-center gap-2 px-3 py-2 text-sm font-medium text-left"
-        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+        onclick={() => { navOpenNewTaskDraft(); historyOpen = false; }}
       >
         <span class="codicon codicon-add" style="font-size: 16px;"></span>
         <span>New task</span>
@@ -1523,28 +1525,11 @@
         type="button"
         class="icon-btn"
        
-        onclick={() => { tasks.openNewTaskDraft(); post({ type: 'newTask' }); historyOpen = false; }}
+        onclick={() => { navOpenNewTaskDraft(); historyOpen = false; }}
         aria-label="New task"
         use:tip={'New task'}
       >
         <span class="codicon codicon-add"></span>
-      </button>
-
-      <button
-        type="button"
-        class="icon-btn"
-       
-        aria-label="Export task/chat"
-        data-testid="export-task-chat"
-        use:tip={'Export task/chat'}
-        disabled={!tasks.focusedTaskId}
-        onclick={() => {
-          if (!tasks.focusedTaskId) return;
-          tasks.setCommandError(null);
-          post({ type: 'exportTask', taskId: tasks.focusedTaskId });
-        }}
-      >
-        <span class="codicon codicon-export"></span>
       </button>
 
       <button

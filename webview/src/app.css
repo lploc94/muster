@@ -1089,6 +1089,32 @@ body {
   height: 20px;
 }
 
+/* Names the agent running the focused task. Reads as metadata, not a control:
+   changing which model serves it lives in the conversation menu. */
+.agent-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 1px 6px;
+  border: 1px solid color-mix(in srgb, var(--vscode-foreground) 18%, transparent);
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--vscode-descriptionForeground);
+}
+
+.agent-label .codicon {
+  font-size: 12px;
+  line-height: 1;
+}
+
+.agent-label__text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .add-context__menu {
   position: absolute;
   /* Anchor to the button's right edge and grow leftward so the menu stays
